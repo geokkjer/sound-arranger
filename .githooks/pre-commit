@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Agent Note gate: verify the notes tree and refuse any change to the frozen archive.
+# Wired via `git config core.hooksPath .githooks`.
+set -euo pipefail
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "pre-commit: node not found on PATH (devenv provides it) — skipping Agent Note verification" >&2
+  exit 0
+fi
+
+staged=$(git diff --cached --name-only || true)
+
+if printf '%s\n' "$staged" | grep -q '^\.agents/notes/archived/'; then
+  echo "pre-commit: .agents/notes/archived/ is frozen — never modify archived Agent Notes." >&2
+  exit 1
+fi
+
+node scripts/verify-agent-notes.mjs

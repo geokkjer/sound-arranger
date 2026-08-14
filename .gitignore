@@ -1,0 +1,12 @@
+# devenv / direnv
+.devenv/
+.direnv/
+devenv.local.nix
+
+# frontend
+node_modules/
+dist/
+
+# rust
+target/
+src-tauri/target/
