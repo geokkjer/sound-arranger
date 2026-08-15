@@ -2,7 +2,7 @@
 
 > **Working title.** A clip-based **arrangement / composition** tool: record long live jams, then cut, paste, rearrange and shape them into a finished piece, and master the result. No MIDI note sequencing. The tape heritage (Macero, musique concrète, dub) is *inspiration* — it tells us which gestures are worth having; the *model* is the modern visual computer: clips as first-class objects, cut/paste, paint-to-fit time-stretch (the ACID workflow).
 >
-> *Status: research draft, rev 5. Locked decisions are marked 🔒. Crate/license facts checked against crates.io / npm / GitHub on 2026-08-13 and listed in §15. Plugin-architecture research added 2026-08-15 (§16); minimal-core architecture reframed 2026-08-15 (§11 + note); tape framing demoted to inspiration 2026-08-15 (§1).*
+> *Status: research draft, rev 6. Locked decisions are marked 🔒. Crate/license facts checked against crates.io / npm / GitHub on 2026-08-13 and listed in §15. Plugin-architecture research added 2026-08-15 (§16); minimal-core architecture reframed 2026-08-15 (§11 + note); tape framing demoted to inspiration 2026-08-15 (§1). Rev 6 (2026-08-15): **umbrella-first locked** — the platform is the goal, sound-arranger is the first profile; offline processing split into the deferred sound-sculptor profile (§3, §11, [umbrella-first note](.agents/notes/proposed/architecture/2026-08-15-umbrella-first-product-direction.md)); second review folded in (per-node latency/PDC, log rate-scoping, varispeed — minimal-core note).*
 
 ---
 
@@ -11,6 +11,7 @@
 | Area | Recommendation | Why |
 |---|---|---|
 | **Target** | **x86 desktop first** (Linux primary; macOS/Windows via Tauri). ARM/RPi + hardware controls = a separate later phase | Best technical solution trumps; don't pre-optimize for a Pi |
+| **Direction** | **Umbrella-first** — the platform is the goal; profiles are the products; sound-arranger is profile #1 | [umbrella-first note](.agents/notes/proposed/architecture/2026-08-15-umbrella-first-product-direction.md) |
 | **App shell** | Tauri v2 + Vue 3 + TypeScript | Rust audio engine + web UI |
 | **Architecture** | **Minimal core (clock · graph interpreter · session log · context plumbing) + everything-else-as-plugin; the product is an assembled profile** | §11, §16.7, [minimal-core note](.agents/notes/proposed/architecture/2026-08-15-minimal-core-clock-graph-session-log.md) |
 | **UI library** | **Keep your `cdp-front` stack: `reka-ui` + shadcn-vue + Tailwind v4** | You already use it; headless primitives fit a bespoke DAW. Do **not** add Naive UI / PrimeVue |
@@ -20,7 +21,7 @@
 | **Time-stretch** | `rubato` (real-time) · CDP8 pvoc / own `rustfft` stretch (offline) | Real-time vs "lush spectral" are different jobs |
 | **Effects** | `fundsp` (real-time) · CDP8 as **offline sidecar** (later phase) | Dub sends in-engine; spectral rendered to disk |
 | **License** | App **GPL-3.0-or-later**; CDP8 (LGPL-2.1) as a sidecar binary | Compliant + lets you embed/port anything GPL/LGPL (§12) |
-| **Phase 1 (the goal)** | **Core + the sound-arranger profile: record → cut/splice → clip/loop arrange → soft mixer** | See §11 |
+| **Phase 1 (first profile)** | **Core + the sound-arranger profile: record → cut/splice → clip/loop arrange → soft mixer** | See §11 |
 
 ---
 
@@ -43,8 +44,8 @@ The creative brief above is grounded in the **music-composition-theory** corpus 
 - [Bitches Brew — the studio cut as composition](../music/music-composition-theory/analyses/miles-davis/bitches-brew.md) — Teo Macero's razor-blade editing; Onion Layer 6 (Time / Editing)
 - [On the Corner](../music/music-composition-theory/analyses/miles-davis/on-the-corner.md)
 - [Dub reggae (1968)](../music/music-composition-theory/theory/movements/1968-dub-reggae.md) — console-as-instrument; the §7 dub workflow
-- [The Two Tracks](../music/music-composition-theory/theory/framework/the-two-tracks.md) — compose → perform → select → *recompose*: live recordings return as raw material; the product thesis, stated as theory
 - [The Composer's Onion](../music/music-composition-theory/theory/framework/the-composers-onion.md) — Layer 6 = the studio cut; Layer 7 = system/process (generative)
+- [The Two Tracks](../music/music-composition-theory/theory/framework/the-two-tracks.md) — compose → perform → select → *recompose*: live recordings return as raw material; the product thesis, stated as theory
 - [Modular patching DSL sketch (Haskell)](../music/music-composition-theory/notes/modular-dsl-sketch.md) — idea source for a future scripting layer (§10 glicol)
 
 The tool is a **clip-based visual arranger**, not a groovebox or MIDI sequencer. MIDI enters only later as *control* (knobs/faders), never as a note-sequencing UI — though generators (euclidean, chords) produce *note events as values*; see the [musical-event model note](.agents/notes/proposed/architecture/2026-08-15-musical-event-model.md).
@@ -58,17 +59,21 @@ The tool is a **clip-based visual arranger**, not a groovebox or MIDI sequencer.
 | `pi5-daisy-synth-rig` | **The jam source** (Pi 5 + JUCE mixer + Daisy voices, USB interface, JACK) | In a **later phase** the arranger can record its output. Not part of the x86 prototype. |
 | `cdp-front` | Vue 3 + **reka-ui + shadcn-vue + Tailwind v4** frontend (a CDP wrapper) | **Reuse this exact frontend stack.** Its CDP-wrapping idea becomes the arranger's "offline process" tier (§6). |
 
+**Phase-1 capture hardware:** the [Soundcraft Notepad-12FX](research/gear/mixer-notepad-12fx.md) — 4-channel multitrack USB (2 mono + 1 stereo pair), class-compliant, routing protocol already reverse-engineered for a Rust `nusb` provider. The pi5 rig's own WAV recording is *that* project's Phase 2 — the arranger records the rig only once that exists.
+
 Keep the arranger's **engine** as a standalone Rust crate (not Tauri-coupled), so a future headless/ARM "box mode" is possible — but don't design for it now.
 
 ---
 
-## 3. Decisions 🔒 (rev 2)
+## 3. Decisions 🔒 (rev 3)
 
 - 🔒 **x86 desktop is the primary target** (Linux first; Tauri also gives macOS/Windows). Raspberry Pi 5 / ARM / hardware controls are a **separate, later phase**. Hobby/boutique, price not an issue → best technical solution wins.
 - 🔒 **License: GPL-3.0-or-later** for the app (rationale + dependency matrix in §12).
 - 🔒 **CDP8: embed the C as a sidecar CLI**, port to Rust only per-algorithm and only if a specific effect must run real-time (§6).
 - 🔒 **Phase 1 scope:** audio input (record) → Acid-like cutting → clip/loop arrangement → soft mixer. No MIDI, no effects beyond the mixer.
 - 🔒 **Horizontal timeline** — time flows left→right, tracks are stacked lanes.
+- 🔒 **Umbrella-first** (rev 3, 2026-08-15) — the platform (minimal core + everything-as-plugin) is the goal; the product is assembled profiles. The clip-arranger profile ("sound-arranger") is first because it exercises recording, editing, mixing and the realtime path end-to-end ([umbrella-first note](.agents/notes/proposed/architecture/2026-08-15-umbrella-first-product-direction.md)).
+- 🔒 **Offline/non-realtime processing is its own deferred profile** ("sound sculptor", working name) — CDP8, PaulStretch, phase-vocoder live there, not in the arranger; unscheduled, no earlier than Phase 3.
 
 ---
 
@@ -179,7 +184,7 @@ Clip   { id, source_id, src_in, src_out,     // which region of the take
 
 ## 6. Effects & offline processing (CDP8 + spectral stretch)
 
-Three tiers, matching "extendable to include audio effects":
+Three tiers, matching "extendable to include audio effects". Tier 2 below is **not arranger functionality** — it belongs to the deferred sound-sculptor profile (§11, [umbrella-first note](.agents/notes/proposed/architecture/2026-08-15-umbrella-first-product-direction.md)); Tier 1 real-time effects are arranger Phase 2–3 territory:
 
 ### Tier 1 — real-time (in-engine)
 `fundsp` nodes on tracks, aux buses (dub sends → delay/reverb) and master (EQ → compressor → limiter). **Phase 2.**
@@ -220,7 +225,7 @@ For the "PaulStretch sound," the clean paths are CDP8's own `.pvx` pvoc tools (L
 
 ## 7. Workflow feature map
 
-Concrete features by inspiration. **Bold = Phase 1 (the goal).**
+Concrete features by inspiration. **Bold = Phase 1 (first profile).**
 
 **Capture — record (Phase 1)**
 - **Record long takes** (mono/stereo; multitrack later) straight into the **media pool**; non-destructive; waveform preview via peak pyramids.
@@ -239,7 +244,7 @@ Concrete features by inspiration. **Bold = Phase 1 (the goal).**
 
 **Sound — Feldman, time & texture (Phase 2+)**
 - Seconds-based timeline, long durations, fine gain (0.1 dB), very long fades.
-- Spectral/textural processing (CDP8 / own phase-vocoder) as "render to new source" actions.
+- Spectral/textural processing (CDP8 / own phase-vocoder) as "render to new source" actions — sound-sculptor profile, deferred.
 
 **Dub — console-as-instrument (Phase 2+)**
 - Aux sends → delay bus (tape delay + feedback + filter) and reverb bus.
@@ -296,14 +301,15 @@ Not part of the x86 prototype. Kept here as the target for the eventual ARM phas
 
 ## 11. Phased plan (revised — core + plugins)
 
-Architecture: a **minimal core** — clock, audio graph interpreter, session event log, context plumbing (the [minimal-core note](.agents/notes/proposed/architecture/2026-08-15-minimal-core-clock-graph-session-log.md)) — with every capability as a plugin; the product is an assembled profile. "sound-arranger" is the **clip-arranger profile** (ACID-style cut/paste; the tape techniques as inspiration).
+Architecture: a **minimal core** — clock, audio graph interpreter, session event log, context plumbing (the [minimal-core note](.agents/notes/proposed/architecture/2026-08-15-minimal-core-clock-graph-session-log.md)) — with every capability as a plugin; the product is an assembled profile. "sound-arranger" is the **clip-arranger profile** (ACID-style cut/paste; the tape techniques as inspiration). Direction locked 2026-08-15: **umbrella-first** — the platform is the goal, the phases below build it, and the clip-arranger profile is the first product ([umbrella-first note](.agents/notes/proposed/architecture/2026-08-15-umbrella-first-product-direction.md)).
 
-- **Phase 0 — Core spikes (x86 Linux):** *Spike A* — core (clock with tempo/meter map, graph interpreter, session log, context) + a euclidean rhythm plugin driving a sine blip, plus a log-replay check (replay ⇒ identical output); *Spike B* — record 20–30 min while playing a long file from disk, splice a clip during playback glitch-free, bounce. Both constrain the core shape before it hardens (kimi review, `research/architecture/2026-08-15-kimi-review-minimal-core.md`).
+- **Phase 0 — Core spikes (x86 Linux):** *Spike A* — core (clock with tempo/meter map, graph interpreter, session log, context) + a euclidean rhythm plugin driving a sine blip, plus a log-replay check (replay ⇒ identical output); *Spike B* — record 20–30 min while playing a long file from disk, splice a clip during playback glitch-free, bounce. Both constrain the core shape before it hardens (kimi review, `research/architecture/2026-08-15-kimi-review-minimal-core.md`). Both spikes live in the engine crate alone — no Tauri, no frontend; scaffold the app shell only after they pass.
 - **Phase 1 — The sound-arranger profile (the old product goal):** recorder plugin (`cpal` → media pool, live peaks) + clip-editor plugin (cut/paste, razor-split, trim, copy/paste/duplicate, crossfade, loop regions, paint-to-fit time-stretch, drag on the horizontal canvas timeline) + soft mixer plugin (gain/pan/mute/solo, master fader, meters, bounce to WAV). Seconds-based timebase.
-- **Phase 2 — Generators & improv:** euclidean rhythm and chord-progression plugins (pure generators providing `ctx.rhythm` / `ctx.progression`); an improv plugin consuming the session log and responding — the paper's self-evolving component, made safe by core reversibility.
-- **Phase 3 — Effects & offline processes:** `fundsp` effect plugins + dub sends; the offline-process tier (CDP8 sidecar, PaulStretch, phase-vocoder stretch) as `OfflineProcess` plugins with progress events.
+- **Phase 2 — Generators & improv:** euclidean rhythm and chord-progression plugins (pure generators providing `ctx.rhythm` / `ctx.progression`); an improv plugin consuming the session log and responding — the paper's self-evolving component; made *auditable* by the log, not reversible (minimal-core note).
+- **Phase 3 — Real-time effects:** `fundsp` effect plugins + dub sends.
 - **Phase 4 — Master & export:** master chain (EQ/comp/limiter), automation, FLAC/MP3 codecs (`Codec` plugins); CLAP hosting (`clack`) and plugin export (`nih-plug`).
 - **Phase 5 (separate) — ARM/Pi 5 + hardware controls:** `midir` + GPIO/Daisy, headless box mode. Only then revisit §8.
+- **Deferred, own profile — "sound sculptor":** offline/non-realtime processing — CDP8 sidecar, PaulStretch, phase-vocoder stretch as `OfflineProcess` plugins with progress events. Unscheduled; no earlier than Phase 3, and only after the arranger profile and generators have exercised the seams ([umbrella-first note](.agents/notes/proposed/architecture/2026-08-15-umbrella-first-product-direction.md)).
 
 ---
 
@@ -350,6 +356,8 @@ Dependency compatibility matrix (verified where marked):
 4. **`rolldown-vite` + Tauri** — should be transparent (scripts are just called); confirm the dev-server port wiring.
 5. **Tauri + Nix friction** — on x86 you can use plain system deps (webkit2gtk-4.1 etc.) and keep Nix optional; less of an issue than on a Pi.
 6. **CDP8 sidecar adds a C/CMake toolchain step** to the build matrix (Phase 2+) — accepted trade-off for 800 mature DSP programs.
+7. **Project name** — "sound-arranger" names the first profile, not the platform. Rename candidates: "audio", "sound". Cost of renaming: repo path, the `~/Projects/music` view, back-references from the theory corpus. Resolve before the first tag/release.
+8. **Voice management** (allocation/stealing) is undesigned — invisible until euclid drives polyphony (Phase 2); decide then, not now.
 
 ---
 
@@ -363,7 +371,7 @@ Dependency compatibility matrix (verified where marked):
 
 **Confirmed absent:** crate `paulstretch`.
 
-**Local prior art:** `~/Projects/cdp-front` (reka-ui + shadcn-vue + Tailwind v4 + rolldown-vite), `~/Projects/pi5-daisy-synth-rig` (Pi 5 + JUCE + Daisy + JACK + USB-MIDI), `~/faust-juce-writeup.md` §6.8–6.10.
+**Local prior art:** `~/Projects/cdp-front` (reka-ui + shadcn-vue + Tailwind v4 + rolldown-vite), `~/Projects/pi5-daisy-synth-rig` (Pi 5 + JUCE + Daisy + JACK + USB-MIDI), `~/faust-juce-writeup.md` §6.8–6.10, `~/Projects/Algorithmic composer` (bp4 porting plan — sound-object placement semantics: pivot/cover/gap/relocation, pre/post-roll; rational integer-ratio time with LCM-aware quantization; strong prior art for clip placement and auto-arrange, added 2026-08-15).
 
 ---
 
@@ -455,7 +463,7 @@ One deliberate difference: NixOS modules **merge** option sets with priority-bas
 The project is pre-code: the cheapest possible moment to fix the missing composition story. Plugin surfaces that already exist in the plan, unlabelled:
 
 - **Recorders / input backends** — cpal devices; the Notepad-12FX routing (`nusb`) as a second provider behind one `Recorder` seam.
-- **Offline processes** — CDP8 programs, PaulStretch, phase-vocoder stretch: each an `OfflineProcess` plugin; file-in/file-out, non-realtime, naturally isolated — the first plugin domain.
+- **Offline processes** — CDP8 programs, PaulStretch, phase-vocoder stretch: each an `OfflineProcess` plugin; file-in/file-out, non-realtime, naturally isolated — their own deferred profile (sound sculptor) and the cheapest *second* domain to prove the seams.
 - **Effects** — fundsp graphs as *data*; CLAP hosting via `clack` (Phase 4) is the industry plugin ABI.
 - **Codecs** — WAV/FLAC/MP3 import/export behind one interface.
 - **UI** — panels / toolbars / inspectors around the canvas timeline core.

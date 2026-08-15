@@ -2,7 +2,7 @@
 
 > **Source:** `kimi-cli` non-interactive review, 2026-08-15 (kimi session `session_db378242-7ed9-4cf2-bf01-b75abc6040a5`).
 > **Reviewed:** `RESEARCH.md` (§11, §15) and the composition-seams + minimal-core notes.
-> **Disposition:** folded into the minimal-core note (media engine as core-privileged, tempo/meter map + sample-accurate scheduler + clock-source seam, two-tier node model, audio teardown protocol, log infrastructure rules, Spike B); prompted the new musical-event-model note; the tape framing was demoted to *inspiration* in `RESEARCH.md` §1 per user decision. Full text preserved below verbatim.
+> **Disposition:** folded into the minimal-core note (media engine as core-privileged, tempo/meter map + sample-accurate scheduler + clock-source seam, two-tier node model, audio teardown protocol, log infrastructure rules, Spike B); prompted the new musical-event-model note; the tape framing was demoted to *inspiration* in `RESEARCH.md` §1 per user decision. Subsequently also folded into the umbrella-first note (strategic commitment, plugin-machinery budget rule) and the rev-6 note patches (per-node latency/PDC, log rate-scoping, varispeed decision). Full text preserved below verbatim.
 
 ---
 
