@@ -14,6 +14,8 @@ sound-arranger has no composition story. Every planned extension — CDP8 offlin
 - **First plugin domain: the OfflineProcess tier.** File-in/file-out, non-realtime, naturally isolated — the cheapest place to prove the seams. In the same change, write down the IPC command list: it is the engine/host contract and the first surface the seams must hold.
 - **Kernel honesty:** "no privileged core" holds everywhere except the audio callback; the callback is privileged by physical necessity, and stating that boundary is part of the design.
 
+The core this runs on — clock, graph interpreter, session log, context plumbing — is defined in the [minimal-core note](2026-08-15-minimal-core-clock-graph-session-log.md).
+
 ## Alternatives considered
 
 - **Adopt Cordis wholesale into the Rust engine** — Cordis is a TypeScript/npm runtime; it belongs on the host side. The paper's own language guidance (§6.4) is that typeclasses/traits are how a host language extends the context type, i.e. Rust traits *are* the recommended mechanism here.

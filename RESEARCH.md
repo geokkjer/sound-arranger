@@ -2,7 +2,7 @@
 
 > **Working title.** A tape-style **arrangement / composition** tool: record long live jams, then cut, rearrange and shape them into a finished piece, and master the result. No MIDI note sequencing.
 >
-> *Status: research draft, rev 3. Locked decisions are marked 🔒. Crate/license facts checked against crates.io / npm / GitHub on 2026-08-13 and listed in §14. Plugin-architecture research (paper / cordis / deepseek-harness) added 2026-08-15, §15.*
+> *Status: research draft, rev 4. Locked decisions are marked 🔒. Crate/license facts checked against crates.io / npm / GitHub on 2026-08-13 and listed in §14. Plugin-architecture research added 2026-08-15 (§15); minimal-core architecture reframed 2026-08-15 (§11 + note).*
 
 ---
 
@@ -12,6 +12,7 @@
 |---|---|---|
 | **Target** | **x86 desktop first** (Linux primary; macOS/Windows via Tauri). ARM/RPi + hardware controls = a separate later phase | Best technical solution trumps; don't pre-optimize for a Pi |
 | **App shell** | Tauri v2 + Vue 3 + TypeScript | Rust audio engine + web UI |
+| **Architecture** | **Minimal core (clock · graph interpreter · session log · context plumbing) + everything-else-as-plugin; the product is an assembled profile** | §11, §15.7, [minimal-core note](.agents/notes/proposed/architecture/2026-08-15-minimal-core-clock-graph-session-log.md) |
 | **UI library** | **Keep your `cdp-front` stack: `reka-ui` + shadcn-vue + Tailwind v4** | You already use it; headless primitives fit a bespoke DAW. Do **not** add Naive UI / PrimeVue |
 | **Timeline rendering** | `<canvas>` 2D + precomputed waveform **peak pyramids** + viewport culling + offscreen clip caching | Fast and predictable; DOM-per-clip is a dead end |
 | **Audio I/O** | `cpal` (in **and** out) — ALSA/JACK on Linux, CoreAudio on macOS, WASAPI on Windows | Lowest latency; owns the device directly |
@@ -19,7 +20,7 @@
 | **Time-stretch** | `rubato` (real-time) · CDP8 pvoc / own `rustfft` stretch (offline) | Real-time vs "lush spectral" are different jobs |
 | **Effects** | `fundsp` (real-time) · CDP8 as **offline sidecar** (later phase) | Dub sends in-engine; spectral rendered to disk |
 | **License** | App **GPL-3.0-or-later**; CDP8 (LGPL-2.1) as a sidecar binary | Compliant + lets you embed/port anything GPL/LGPL (§12) |
-| **Phase 1 (the goal)** | **Record → cut/splice → clip/loop arrange → soft mixer** | See §11 |
+| **Phase 1 (the goal)** | **Core + the sound-arranger profile: record → cut/splice → clip/loop arrange → soft mixer** | See §11 |
 
 ---
 
@@ -290,17 +291,15 @@ Not part of the x86 prototype. Kept here as the target for the eventual ARM phas
 
 ---
 
-## 11. Phased plan (revised)
+## 11. Phased plan (revised — core + plugins)
 
-- **Phase 0 — Spike (x86 Linux):** Tauri v2 + Vue from your `cdp-front` stack + a canvas timeline drawing a few hundred clips; `cpal` plays a file. Validates rendering, IPC, and the audio skeleton end-to-end.
-- **Phase 1 — The goal:** **audio in → cut → clip/loop arrange → soft mixer.**
-  1. **Record**: `cpal` input → `hound` WAV into the media pool; live peaks.
-  2. **Cut**: razor/splice, trim, copy/paste/duplicate, crossfade (Acid-like).
-  3. **Arrange**: drag clips on the horizontal timeline, loop regions, non-destructive.
-  4. **Mix**: track strips (gain/pan/mute/solo) + master fader + meters; bounce to WAV.
-- **Phase 2 — Effects:** `fundsp` track/master + dub sends; offline-process tier with CDP8 sidecar + phase-vocoder stretch.
-- **Phase 3 — Master:** EQ/comp/limiter, automation, offline render.
-- **Phase 4 — Extensions:** CLAP hosting (`clack`), plugin export (`nih-plug`), scripting.
+Architecture: a **minimal core** — clock, audio graph interpreter, session event log, context plumbing (the [minimal-core note](.agents/notes/proposed/architecture/2026-08-15-minimal-core-clock-graph-session-log.md)) — with every capability as a plugin; the product is an assembled profile. "sound-arranger" is the tape-editor profile.
+
+- **Phase 0 — Core spike (x86 Linux):** the four core pieces + one euclidean rhythm plugin driving a sine blip. Validates the sample-accurate clock, realtime-safe graph rendering, live plugin mount/unmount, and the ctx/IPC contract end-to-end.
+- **Phase 1 — The sound-arranger profile (the old product goal):** recorder plugin (`cpal` → media pool, live peaks) + tape-editor plugin (razor/splice, trim, copy/paste/duplicate, crossfade, loop regions, drag on the horizontal canvas timeline) + soft mixer plugin (gain/pan/mute/solo, master fader, meters, bounce to WAV). Seconds-based timebase.
+- **Phase 2 — Generators & improv:** euclidean rhythm and chord-progression plugins (pure generators providing `ctx.rhythm` / `ctx.progression`); an improv plugin consuming the session log and responding — the paper's self-evolving component, made safe by core reversibility.
+- **Phase 3 — Effects & offline processes:** `fundsp` effect plugins + dub sends; the offline-process tier (CDP8 sidecar, PaulStretch, phase-vocoder stretch) as `OfflineProcess` plugins with progress events.
+- **Phase 4 — Master & export:** master chain (EQ/comp/limiter), automation, FLAC/MP3 codecs (`Codec` plugins); CLAP hosting (`clack`) and plugin export (`nih-plug`).
 - **Phase 5 (separate) — ARM/Pi 5 + hardware controls:** `midir` + GPIO/Daisy, headless box mode. Only then revisit §8.
 
 ---
@@ -458,7 +457,7 @@ The project is pre-code: the cheapest possible moment to fix the missing composi
 - **Codecs** — WAV/FLAC/MP3 import/export behind one interface.
 - **UI** — panels / toolbars / inspectors around the canvas timeline core.
 
-The FP-shaped architecture: immutable Session + typed edit functions (pure, testable, undoable); the cpal callback as a pure interpreter of a small value-level instruction stream (never allocates, never registers plugin callbacks — the realtime path is the privileged kernel); plugin boundaries produce *values* (graphs, configs) the interpreter reads. Composition / orchestration (reversible effects, declarative rows, patches) lives on the Tauri/TypeScript side, where Cordis itself could eventually run. Decision candidates: see the note.
+The FP-shaped architecture: immutable Session + typed edit functions (pure, testable, undoable); the cpal callback as a pure interpreter of a small value-level instruction stream (never allocates, never registers plugin callbacks — the realtime path is the privileged kernel); plugin boundaries produce *values* (graphs, configs) the interpreter reads. Composition / orchestration (reversible effects, declarative rows, patches) lives on the Tauri/TypeScript side, where Cordis itself could eventually run. Decision candidates: see the [composition-seams](.agents/notes/proposed/architecture/2026-08-15-composition-seams-plugin-architecture.md) and [minimal-core](.agents/notes/proposed/architecture/2026-08-15-minimal-core-clock-graph-session-log.md) notes.
 
 ### 15.8 Sources (2026-08-15)
 
