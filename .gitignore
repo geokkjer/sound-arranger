@@ -10,3 +10,6 @@ dist/
 # rust
 target/
 src-tauri/target/
+
+# local research downloads (cordiverse/paper preprint + reading companions)
+.research/

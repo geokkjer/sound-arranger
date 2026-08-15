@@ -2,7 +2,7 @@
 
 > **Working title.** A tape-style **arrangement / composition** tool: record long live jams, then cut, rearrange and shape them into a finished piece, and master the result. No MIDI note sequencing.
 >
-> *Status: research draft, rev 2. Locked decisions are marked 🔒. Crate/license facts checked against crates.io / npm / GitHub on 2026-08-13 and listed in §14.*
+> *Status: research draft, rev 3. Locked decisions are marked 🔒. Crate/license facts checked against crates.io / npm / GitHub on 2026-08-13 and listed in §14. Plugin-architecture research (paper / cordis / deepseek-harness) added 2026-08-15, §15.*
 
 ---
 
@@ -352,3 +352,106 @@ Dependency compatibility matrix (verified where marked):
 **Confirmed absent:** crate `paulstretch`.
 
 **Local prior art:** `~/Projects/cdp-front` (reka-ui + shadcn-vue + Tailwind v4 + rolldown-vite), `~/Projects/pi5-daisy-synth-rig` (Pi 5 + JUCE + Daisy + JACK + USB-MIDI), `~/faust-juce-writeup.md` §6.8–6.10.
+
+---
+
+## 15. Plugin architecture research — "everything as a plugin" (paper · cordis · deepseek-harness)
+
+> Working research, 2026-08-15. The decision candidates live in the note [Composition seams — plugin architecture for the engine and host](.agents/notes/proposed/architecture/2026-08-15-composition-seams-plugin-architecture.md); this section holds the background. Primary sources read in full: the paper text at `.research/paper/paper.txt` (88-page PDF, draft 2026-08-13) and a local checkout of deepseek-harness; a reading companion sits at `.research/paper/SUMMARY.md`.
+
+### 15.1 cordiverse/paper — the theory: dynamic composition made formal
+
+Preprint (draft 2026-08-13) by Yifan Shi & Wei Zhang (Peking University) and Tianyi Cui (DeepSeek-AI). Thesis: static composition (functions, modules, inheritance) has formal foundations; **dynamic composition** — loading, unloading, and reconfiguring components at runtime, as plugin systems and self-evolving agent harnesses demand — has none. Two orthogonal dimensions:
+
+- **Temporal composability** — on removal, a component's side effects on the shared environment must be fully reversed.
+- **Spatial composability** — components declare dependencies; the runtime resolves and re-wires them reactively as providers appear, disappear, or change.
+
+Both are lifted from compile-time type systems to **runtime mechanisms**:
+
+- **Revertible effects**: an effect is a context transformation paired with an inverse, `Γ → Γ × (Γ→Γ)`. The runtime accumulates inverses (LIFO) in an effect context `∂Γ = Γ × (Γ→Γ)`; unloading a component applies the accumulator. The author writes an inverse only per *atomic* effect; the inverse of any composite is derived by composition — teardown is derived from loading, not written alongside it. Withdrawing one component among many requires effect **independence** (commutation of transformation monoids; recovery in any permutation order, Corollary 21). Where effects don't commute, order is imposed by the accumulator (within a component) or a declared dependency (across components).
+- **Reactive coeffects**: the environment is a typed dependency table `Σ = (k:K) ⇀ V_k`; `set` is itself an effect, so provision is revertible. A component declares a coeffect specification (the keys it needs); every context change is classified **activating / deactivating / neutral** and drives the lifecycle. Two refinements: **isolation** (realms — the same key resolves differently per context; runtime ad-hoc polymorphism / scoped DI) and **interception** (mergeable metadata changing *how* a dependency is used without touching the provider — the basis for access control).
+- **The context paradigm**: effects and coeffects unify into one recursive context type `Γ∞ = μΓ. Γ × (Γ→Γ) × Σ` — every interaction with the environment passes through one explicit context. The paper positions it between functional state-threading (traceable, verbose) and implicit mutation (ergonomic, untraceable). Recovery is up to an **observational equivalence** ≃: behavior, not representation.
+
+Then: a **calculus of dynamic composition** (components `(d, p, e)` instantiated as fibers with an inertial lifecycle state machine; metatheory: preservation, temporal/spatial composability, progress, confluence) and the **Cordis** implementation with the **Koishi** case study (chatbot framework, 4 years, 4000+ community plugins; every feature is a plugin; server and web console are two independent Cordis applications).
+
+### 15.2 cordiverse/cordis — the meta-framework
+
+TypeScript, by shigma (Koishi author); v4 in active development (API unstable). "Meta-framework": it fixes how effects and coeffects compose and leaves domain vocabulary to the application. Five ideas (official primer):
+
+1. **A plugin is an object implementing Service** — a function with optional `inject` + `apply(ctx)`, or a `Service` subclass mounted by Cordis.
+2. **A context is a repository of services** — a service claims a stable `ctx.<key>`; consumers find it by key, never by importing an implementation.
+3. **Declare dependencies via `inject`** — load order is expressed through service requirements, not manual boot sequencing.
+4. **Typed events** — names via TS declaration merging; dispatched `emit` (observe) / `waterfall` (wrap; `next()` delegates) / `parallel` (fan out) / `serial` (ordered, returns value); the dispatch mode is part of the event's public contract.
+5. **Registrations are reversible effects** — installed via `ctx.effect()` / `ctx.on()`, unwound on reload and teardown.
+
+Plus a **declarative loader**: the system is a configuration tree of entries `{id, url, config, disabled, isolate, intercept}`; the loader reconciles incrementally (keyed diff, only changed rows), and HMR swaps modules transactionally with rollback. Headline property: **path independence** — the final system state depends only on the declared config, never on load order. `group` / `include` / `hmr` are themselves ordinary components.
+
+### 15.3 deepseek-ai/deepseek-harness — "everything is a plugin" in production
+
+MIT agent harness (v0.1 developer preview, 2026-08-13) whose README states the architecture verbatim: "everything is a plugin", powered by Cordis. TS monorepo (~7,400 files, 230+ workspace members), ~100k stars within two days of release. DeepSeek used this exact harness to produce its published agent-benchmark scores (Terminal Bench 2.1 87.9, DeepSWE 62.7, Toolathlon-Verified 74.1 for V4 Pro); anyone can reproduce them via the Python SDK (`BENCHMARK.md`).
+
+- **Composition**: a running dsh is a plugin tree built from ordered layers — profiles list bundles; bundles ship config rows (`dsh.bundle` → `cordis.patch.yml`); patches replace any row by id (whole-row replacement, not deep merge; later layers win); `dsh --profile web --dump-config` prints the exact booted tree.
+- **Core service keys**: `ctx.sessions` (append-only SessionEvent log — "model-visible means logged" is a runtime invariant), `ctx.systemPrompt`, `ctx.tools`, `ctx.agents`, `ctx.agentLoop` (the driver is itself swappable), `ctx.llm` (adapter seam).
+- **Events are the extension points**: session events (durable facts), agent events (live interception), capability events (policy at seams); turn/step flow (`turn/start` → … → `llm/stream` → `tools/execute` → `step/end` → `turn/end`).
+- **Capability seams**: every swappable capability is a triple of Service Definition / Provider / Consumer; one provider swap re-points everything downstream (fs/subprocess → remote sandbox moves Bash, PTY, and LSP with it).
+- **Self-referential**: the `extensions` package lets an agent mount/unmount its own plugins at runtime — the paper's motivating endgame, shipped.
+
+### 15.4 The paradigm against design principles
+
+| Principle | Where it shows up |
+|---|---|
+| Parnas modularity | The paper's opening citation; plugins as modules with declared interfaces |
+| Open/Closed | Extend via seams / extension points; never modify the core |
+| Inversion of Control / DI | The Context is a service repository; `inject` replaces service locators; the paper formalizes IoC containers as a coeffect context |
+| Dependency inversion | Consumers depend on service keys / trait definitions, never concrete providers |
+| Hexagonal (ports & adapters) | Harness capability seams are exactly ports + adapters |
+| Command/undo, saga compensations | Temporal composability's lineage: developer-authored inverses; Cordis makes the inverse structural (derived by composition) |
+| Capability-based security | Access = declared inject + mediating proxy; undeclared access fails |
+| Microkernel | Cordis is the microkernel; Koishi / dsh / our app are the personalities |
+| Desired-state reconciliation | Loader diffing + layered patches — same family as Kubernetes desired state, NixOS config |
+
+### 15.5 The FP (Haskell) reading
+
+The formalism is category-theoretic and maps cleanly onto FP:
+
+- **Context = Reader environment**: `App a = ReaderT Context IO a`; a plugin is a pure description `Config -> Context -> App ()` the kernel interprets. Coeffects = typed `ask` (requirements); `inject` is a constraint set. The paper's own §6.4: typeclasses (Haskell) / traits (Rust) are how a host extends the context type — a provider is an instance, a consumer's constraints are its inject.
+- **Revertible effects = State with an undo stack**: `∂Γ = (γ, φ)` is `StateT Γ` with an inverse accumulator (`track (f,g)` composes `g` onto `φ`; `recover` applies `φ`). Twisted composition is just "inverses stack in reverse order". The witnessed type `𝔈Γ*` carries the proof obligation `g(f(γ)) = γ` — refinement-type territory.
+- **Effects as values**: "every effect carries its inverse" is one step from a free-monad-style DSL the kernel interprets (`foldFree` accumulating inverses).
+- **Interception ≈ effect handlers**: metadata that reshapes how a dependency is used, provider untouched — interpretation without modifying the operation (cf. Koka/Eff/Effekt; the paper positions itself against Effekt in §7.1).
+- **Recovery up to ≃ = observational equivalence / logical relations**: states equal when no observer distinguishes them — the FP move that makes independence attainable (heap layout forgotten, behavior kept).
+- **Adjacent literatures** (§7.3): STM (statically scoped reversal), linear types / RAII / Rust ownership (lexical reversal — complementary), reversible computing (global reversibility vs. Cordis's per-effect one-sided inverses).
+
+### 15.6 The Nix reading
+
+The NixOS module system is the canonical declarative composition; the correspondence is tight (a Chinese analysis literally titled harness+Cordis "活着的Nix" — a living Nix):
+
+| Nix | Cordis / plugin systems |
+|---|---|
+| Modules declare options + set config | Entries declare inject/provide; loader reconciles |
+| System = fixpoint of module functions | System = fixpoint of the plugin tree; path independence |
+| `mkIf` / `mkDefault` / `mkForce` | `disabled` fields, defaults, layered patches |
+| Overlays (redefine a package) | Patches (`cordis.patch.yml`) — replace any row without forking |
+| Generations / rollback | Revertible effects — unload = rollback of a contribution |
+| Purity & reproducibility | Path independence (same config → same state, order-independent) |
+| NixOS = "everything is a module" | dsh = "everything is a plugin" |
+| Composition offline, once, at activation | Composition online, continuously, reversibly |
+
+One deliberate difference: NixOS modules **merge** option sets with priority-based conflict resolution; Cordis patches use **whole-row replacement**. Less merge cleverness, more predictability — a trade worth keeping in mind if we ever build layered config.
+
+### 15.7 What it means for sound-arranger
+
+The project is pre-code: the cheapest possible moment to fix the missing composition story. Plugin surfaces that already exist in the plan, unlabelled:
+
+- **Recorders / input backends** — cpal devices; the Notepad-12FX routing (`nusb`) as a second provider behind one `Recorder` seam.
+- **Offline processes** — CDP8 programs, PaulStretch, phase-vocoder stretch: each an `OfflineProcess` plugin; file-in/file-out, non-realtime, naturally isolated — the first plugin domain.
+- **Effects** — fundsp graphs as *data*; CLAP hosting via `clack` (Phase 4) is the industry plugin ABI.
+- **Codecs** — WAV/FLAC/MP3 import/export behind one interface.
+- **UI** — panels / toolbars / inspectors around the canvas timeline core.
+
+The FP-shaped architecture: immutable Session + typed edit functions (pure, testable, undoable); the cpal callback as a pure interpreter of a small value-level instruction stream (never allocates, never registers plugin callbacks — the realtime path is the privileged kernel); plugin boundaries produce *values* (graphs, configs) the interpreter reads. Composition / orchestration (reversible effects, declarative rows, patches) lives on the Tauri/TypeScript side, where Cordis itself could eventually run. Decision candidates: see the note.
+
+### 15.8 Sources (2026-08-15)
+
+- **`cordiverse/paper`** — full text read locally at `.research/paper/paper.txt` (paper PDF 88 pages, draft 2026-08-13; repo holds exactly 3 files, no license, 1,399★/50 forks at fetch); reading companion `.research/paper/SUMMARY.md`.
+- **`cordiverse/cordis`** — repo + core-package READMEs; official primer at <https://deepseek-harness.github.io/deepseek-harness/reference/cordis-primer>; <https://floatboat.ai/blog/cordis-plugin-framework>.
+- **`deepseek-ai/deepseek-harness`** — README + `docs/{architecture,cordis-primer,capability-seams}.md` read from a local checkout; `BENCHMARK.md`; external coverage: 36kr, servola.de, forklog.com.
