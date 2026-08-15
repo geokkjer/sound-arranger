@@ -2,7 +2,7 @@
 
 > **Working title.** A clip-based **arrangement / composition** tool: record long live jams, then cut, paste, rearrange and shape them into a finished piece, and master the result. No MIDI note sequencing. The tape heritage (Macero, musique concrète, dub) is *inspiration* — it tells us which gestures are worth having; the *model* is the modern visual computer: clips as first-class objects, cut/paste, paint-to-fit time-stretch (the ACID workflow).
 >
-> *Status: research draft, rev 5. Locked decisions are marked 🔒. Crate/license facts checked against crates.io / npm / GitHub on 2026-08-13 and listed in §14. Plugin-architecture research added 2026-08-15 (§15); minimal-core architecture reframed 2026-08-15 (§11 + note); tape framing demoted to inspiration 2026-08-15 (§1).*
+> *Status: research draft, rev 5. Locked decisions are marked 🔒. Crate/license facts checked against crates.io / npm / GitHub on 2026-08-13 and listed in §15. Plugin-architecture research added 2026-08-15 (§16); minimal-core architecture reframed 2026-08-15 (§11 + note); tape framing demoted to inspiration 2026-08-15 (§1).*
 
 ---
 
@@ -12,7 +12,7 @@
 |---|---|---|
 | **Target** | **x86 desktop first** (Linux primary; macOS/Windows via Tauri). ARM/RPi + hardware controls = a separate later phase | Best technical solution trumps; don't pre-optimize for a Pi |
 | **App shell** | Tauri v2 + Vue 3 + TypeScript | Rust audio engine + web UI |
-| **Architecture** | **Minimal core (clock · graph interpreter · session log · context plumbing) + everything-else-as-plugin; the product is an assembled profile** | §11, §15.7, [minimal-core note](.agents/notes/proposed/architecture/2026-08-15-minimal-core-clock-graph-session-log.md) |
+| **Architecture** | **Minimal core (clock · graph interpreter · session log · context plumbing) + everything-else-as-plugin; the product is an assembled profile** | §11, §16.7, [minimal-core note](.agents/notes/proposed/architecture/2026-08-15-minimal-core-clock-graph-session-log.md) |
 | **UI library** | **Keep your `cdp-front` stack: `reka-ui` + shadcn-vue + Tailwind v4** | You already use it; headless primitives fit a bespoke DAW. Do **not** add Naive UI / PrimeVue |
 | **Timeline rendering** | `<canvas>` 2D + precomputed waveform **peak pyramids** + viewport culling + offscreen clip caching | Fast and predictable; DOM-per-clip is a dead end |
 | **Audio I/O** | `cpal` (in **and** out) — ALSA/JACK on Linux, CoreAudio on macOS, WASAPI on Windows | Lowest latency; owns the device directly |
@@ -43,6 +43,7 @@ The creative brief above is grounded in the **music-composition-theory** corpus 
 - [Bitches Brew — the studio cut as composition](../music/music-composition-theory/analyses/miles-davis/bitches-brew.md) — Teo Macero's razor-blade editing; Onion Layer 6 (Time / Editing)
 - [On the Corner](../music/music-composition-theory/analyses/miles-davis/on-the-corner.md)
 - [Dub reggae (1968)](../music/music-composition-theory/theory/movements/1968-dub-reggae.md) — console-as-instrument; the §7 dub workflow
+- [The Two Tracks](../music/music-composition-theory/theory/framework/the-two-tracks.md) — compose → perform → select → *recompose*: live recordings return as raw material; the product thesis, stated as theory
 - [The Composer's Onion](../music/music-composition-theory/theory/framework/the-composers-onion.md) — Layer 6 = the studio cut; Layer 7 = system/process (generative)
 - [Modular patching DSL sketch (Haskell)](../music/music-composition-theory/notes/modular-dsl-sketch.md) — idea source for a future scripting layer (§10 glicol)
 
@@ -334,14 +335,14 @@ Dependency compatibility matrix (verified where marked):
 
 ---
 
-## Dev environment & audio latency
+## 13. Dev environment & audio latency
 
 - **Nix + devenv** (same pattern as `tidal-lsp`): `flake.nix`, `devenv.nix`, `devenv.yaml`, `.envrc` are committed. Run `direnv allow` (or `devenv shell`) for Rust + Node/pnpm + the Tauri (webkit2gtk) and ALSA build deps.
 - **Kernel / latency on Linux & NixOS**: see [`docs/audio-latency.md`](docs/audio-latency.md). TL;DR — nixpkgs has **removed the `-rt` kernels** (PREEMPT_RT is mainlined since 6.12, so the separate package is gone); run `linuxPackages_latest`/`zen` + `rtkit` + `performance` governor, and talk to ALSA `hw:` from `cpal`. No RT kernel needed for an arranger.
 
 ---
 
-## 13. Risks & open questions
+## 14. Risks & open questions
 
 1. **`ness_stretch` is unlicensed** — resolved by using CDP8's `.pvx` pvoc tools or a `rustfft` stretch instead.
 2. **PaulStretch's exact GPL version** — verify; if GPL-2.0-only, set the app to GPL-2.0-or-later.
@@ -352,7 +353,7 @@ Dependency compatibility matrix (verified where marked):
 
 ---
 
-## 14. Verified sources (2026-08-13)
+## 15. Verified sources (2026-08-13)
 
 **Versions (crates.io):** `cpal` 0.18.1, `symphonia` 0.6.1, `hound` 3.5.1, `rubato` 5.0.0, `fundsp` 0.23.0, `dasp`/`dasp_graph` 0.11.0, `rustfft` 6.4.1, `midir` 0.11.0, `rppal` 0.22.1, `crossbeam-channel` 0.5.16, `rayon` 1.12.0, `rodio` 0.22.2, `clack-host`/`clack-extensions`/`clap-sys` 0.1.1/0.1.1/0.5.0, `ness_stretch` 0.5.1, `augmented-dsp-filters` 2.5.0, `augmented-oscillator` 1.4.0, `vst` 0.4.0, `rtrb` 0.3.4, `basedrop` 0.1.3, `audio_thread_priority` 0.37.0.
 
@@ -366,11 +367,11 @@ Dependency compatibility matrix (verified where marked):
 
 ---
 
-## 15. Plugin architecture research — "everything as a plugin" (paper · cordis · deepseek-harness)
+## 16. Plugin architecture research — "everything as a plugin" (paper · cordis · deepseek-harness)
 
 > Working research, 2026-08-15. The decision candidates live in the note [Composition seams — plugin architecture for the engine and host](.agents/notes/proposed/architecture/2026-08-15-composition-seams-plugin-architecture.md); this section holds the background. Primary sources read in full: the paper text at `.research/paper/paper.txt` (88-page PDF, draft 2026-08-13) and a local checkout of deepseek-harness; a reading companion sits at `.research/paper/SUMMARY.md`.
 
-### 15.1 cordiverse/paper — the theory: dynamic composition made formal
+### 16.1 cordiverse/paper — the theory: dynamic composition made formal
 
 Preprint (draft 2026-08-13) by Yifan Shi & Wei Zhang (Peking University) and Tianyi Cui (DeepSeek-AI). Thesis: static composition (functions, modules, inheritance) has formal foundations; **dynamic composition** — loading, unloading, and reconfiguring components at runtime, as plugin systems and self-evolving agent harnesses demand — has none. Two orthogonal dimensions:
 
@@ -385,7 +386,7 @@ Both are lifted from compile-time type systems to **runtime mechanisms**:
 
 Then: a **calculus of dynamic composition** (components `(d, p, e)` instantiated as fibers with an inertial lifecycle state machine; metatheory: preservation, temporal/spatial composability, progress, confluence) and the **Cordis** implementation with the **Koishi** case study (chatbot framework, 4 years, 4000+ community plugins; every feature is a plugin; server and web console are two independent Cordis applications).
 
-### 15.2 cordiverse/cordis — the meta-framework
+### 16.2 cordiverse/cordis — the meta-framework
 
 TypeScript, by shigma (Koishi author); v4 in active development (API unstable). "Meta-framework": it fixes how effects and coeffects compose and leaves domain vocabulary to the application. Five ideas (official primer):
 
@@ -397,7 +398,7 @@ TypeScript, by shigma (Koishi author); v4 in active development (API unstable). 
 
 Plus a **declarative loader**: the system is a configuration tree of entries `{id, url, config, disabled, isolate, intercept}`; the loader reconciles incrementally (keyed diff, only changed rows), and HMR swaps modules transactionally with rollback. Headline property: **path independence** — the final system state depends only on the declared config, never on load order. `group` / `include` / `hmr` are themselves ordinary components.
 
-### 15.3 deepseek-ai/deepseek-harness — "everything is a plugin" in production
+### 16.3 deepseek-ai/deepseek-harness — "everything is a plugin" in production
 
 MIT agent harness (v0.1 developer preview, 2026-08-13) whose README states the architecture verbatim: "everything is a plugin", powered by Cordis. TS monorepo (~7,400 files, 230+ workspace members), ~100k stars within two days of release. DeepSeek used this exact harness to produce its published agent-benchmark scores (Terminal Bench 2.1 87.9, DeepSWE 62.7, Toolathlon-Verified 74.1 for V4 Pro); anyone can reproduce them via the Python SDK (`BENCHMARK.md`).
 
@@ -407,7 +408,7 @@ MIT agent harness (v0.1 developer preview, 2026-08-13) whose README states the a
 - **Capability seams**: every swappable capability is a triple of Service Definition / Provider / Consumer; one provider swap re-points everything downstream (fs/subprocess → remote sandbox moves Bash, PTY, and LSP with it).
 - **Self-referential**: the `extensions` package lets an agent mount/unmount its own plugins at runtime — the paper's motivating endgame, shipped.
 
-### 15.4 The paradigm against design principles
+### 16.4 The paradigm against design principles
 
 | Principle | Where it shows up |
 |---|---|
@@ -421,7 +422,7 @@ MIT agent harness (v0.1 developer preview, 2026-08-13) whose README states the a
 | Microkernel | Cordis is the microkernel; Koishi / dsh / our app are the personalities |
 | Desired-state reconciliation | Loader diffing + layered patches — same family as Kubernetes desired state, NixOS config |
 
-### 15.5 The FP (Haskell) reading
+### 16.5 The FP (Haskell) reading
 
 The formalism is category-theoretic and maps cleanly onto FP:
 
@@ -432,7 +433,7 @@ The formalism is category-theoretic and maps cleanly onto FP:
 - **Recovery up to ≃ = observational equivalence / logical relations**: states equal when no observer distinguishes them — the FP move that makes independence attainable (heap layout forgotten, behavior kept).
 - **Adjacent literatures** (§7.3): STM (statically scoped reversal), linear types / RAII / Rust ownership (lexical reversal — complementary), reversible computing (global reversibility vs. Cordis's per-effect one-sided inverses).
 
-### 15.6 The Nix reading
+### 16.6 The Nix reading
 
 The NixOS module system is the canonical declarative composition; the correspondence is tight (a Chinese analysis literally titled harness+Cordis "活着的Nix" — a living Nix):
 
@@ -449,7 +450,7 @@ The NixOS module system is the canonical declarative composition; the correspond
 
 One deliberate difference: NixOS modules **merge** option sets with priority-based conflict resolution; Cordis patches use **whole-row replacement**. Less merge cleverness, more predictability — a trade worth keeping in mind if we ever build layered config.
 
-### 15.7 What it means for sound-arranger
+### 16.7 What it means for sound-arranger
 
 The project is pre-code: the cheapest possible moment to fix the missing composition story. Plugin surfaces that already exist in the plan, unlabelled:
 
@@ -461,7 +462,7 @@ The project is pre-code: the cheapest possible moment to fix the missing composi
 
 The FP-shaped architecture: immutable Session + typed edit functions (pure, testable, undoable); the cpal callback as a pure interpreter of a small value-level instruction stream (never allocates, never registers plugin callbacks — the realtime path is the privileged kernel); plugin boundaries produce *values* (graphs, configs) the interpreter reads. Composition / orchestration (reversible effects, declarative rows, patches) lives on the Tauri/TypeScript side, where Cordis itself could eventually run. Decision candidates: see the [composition-seams](.agents/notes/proposed/architecture/2026-08-15-composition-seams-plugin-architecture.md), [minimal-core](.agents/notes/proposed/architecture/2026-08-15-minimal-core-clock-graph-session-log.md), and [musical-event model](.agents/notes/proposed/architecture/2026-08-15-musical-event-model.md) notes.
 
-### 15.8 Sources (2026-08-15)
+### 16.8 Sources (2026-08-15)
 
 - **`cordiverse/paper`** — full text read locally at `.research/paper/paper.txt` (paper PDF 88 pages, draft 2026-08-13; repo holds exactly 3 files, no license, 1,399★/50 forks at fetch); reading companion `.research/paper/SUMMARY.md`.
 - **`cordiverse/cordis`** — repo + core-package READMEs; official primer at <https://deepseek-harness.github.io/deepseek-harness/reference/cordis-primer>; <https://floatboat.ai/blog/cordis-plugin-framework>.
