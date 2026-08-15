@@ -1,8 +1,8 @@
 # sound-arranger — Research & Architecture
 
-> **Working title.** A tape-style **arrangement / composition** tool: record long live jams, then cut, rearrange and shape them into a finished piece, and master the result. No MIDI note sequencing.
+> **Working title.** A clip-based **arrangement / composition** tool: record long live jams, then cut, paste, rearrange and shape them into a finished piece, and master the result. No MIDI note sequencing. The tape heritage (Macero, musique concrète, dub) is *inspiration* — it tells us which gestures are worth having; the *model* is the modern visual computer: clips as first-class objects, cut/paste, paint-to-fit time-stretch (the ACID workflow).
 >
-> *Status: research draft, rev 4. Locked decisions are marked 🔒. Crate/license facts checked against crates.io / npm / GitHub on 2026-08-13 and listed in §14. Plugin-architecture research added 2026-08-15 (§15); minimal-core architecture reframed 2026-08-15 (§11 + note).*
+> *Status: research draft, rev 5. Locked decisions are marked 🔒. Crate/license facts checked against crates.io / npm / GitHub on 2026-08-13 and listed in §14. Plugin-architecture research added 2026-08-15 (§15); minimal-core architecture reframed 2026-08-15 (§11 + note); tape framing demoted to inspiration 2026-08-15 (§1).*
 
 ---
 
@@ -28,11 +28,13 @@
 
 The through-line is **"composition happens in the edit, after the performance."**
 
+**The model is the visual computer, not the tape machine.** The tape and edit-as-composition techniques below (splicing, looping, dropping tracks, the studio cut) are *inspiration*: they tell us what gestures are worth having. This tool implements them in the modern paradigm — clips as first-class objects, cut/paste, paint-to-fit time-stretch, non-linear visual editing — where every tape technique becomes easier, reversible, and searchable. The design question throughout is: *how do the modern tools make these techniques better?*
+
 - **Teo Macero** (producer/editor for Miles Davis — *Bitches Brew*, *On the Corner*): record long live sessions, then *compose* by splicing tape, looping fragments, dropping tracks in and out. The edit *is* the composition.
 - **Morton Feldman**: long durations, quiet dynamics, sparse placement, non-goal-directed structure, texture/timbre over rhythm. Suggests a **seconds-based timebase** (not bars/beats), very long fades, fine gain resolution.
 - **Tape artists** (musique concrète / early tape music): non-destructive splicing, varispeed, reversal, loops, layering takes.
 - **Dub production** (King Tubby, Lee Perry): the mix console as instrument — aux sends into delay/reverb, "dropping" tracks to leave only the echo tail, EQ kills, fader rides recorded as automation.
-- **Sony ACID (early 2000s)**: the "paint clips onto a timeline and it time-stretches them to fit" workflow — the closest mainstream ancestor for ease of use.
+- **Sony ACID (early 2000s)**: the "paint clips onto a timeline and it time-stretches them to fit" workflow — the **direct ancestor of the substrate**: clips as objects that stretch to fit, cut and paste as the primary verbs. The Macero gestures are re-expressed *in this model*, not in tape terms.
 
 ### Reading — the composition-theory corpus
 
@@ -44,7 +46,7 @@ The creative brief above is grounded in the **music-composition-theory** corpus 
 - [The Composer's Onion](../music/music-composition-theory/theory/framework/the-composers-onion.md) — Layer 6 = the studio cut; Layer 7 = system/process (generative)
 - [Modular patching DSL sketch (Haskell)](../music/music-composition-theory/notes/modular-dsl-sketch.md) — idea source for a future scripting layer (§10 glicol)
 
-The tool is an **arranger / tape editor**, not a groovebox or MIDI sequencer. MIDI enters only later as *control* (knobs/faders), never as *notes*.
+The tool is a **clip-based visual arranger**, not a groovebox or MIDI sequencer. MIDI enters only later as *control* (knobs/faders), never as a note-sequencing UI — though generators (euclidean, chords) produce *note events as values*; see the [musical-event model note](.agents/notes/proposed/architecture/2026-08-15-musical-event-model.md).
 
 ---
 
@@ -156,7 +158,7 @@ Supporting techniques:
 ```
 
 - The **audio callback** (`cpal`) pulls from a lock-free mix buffer; it must never allocate or block. Use `rtrb`/`basedrop` for realtime-safe handoff and `audio_thread_priority` for RT scheduling on Linux.
-- **Non-destructive, tape-style data model** — the heart of the Macero workflow:
+- **Non-destructive, clip-based data model** — the heart of the edit-as-composition workflow:
 
 ```rust
 Source { id, path, sample_rate, channels, duration_samples, peaks /* pyramids */ }
@@ -223,7 +225,7 @@ Concrete features by inspiration. **Bold = Phase 1 (the goal).**
 - **Record long takes** (mono/stereo; multitrack later) straight into the **media pool**; non-destructive; waveform preview via peak pyramids.
 - **Markers while recording**; optional silence-based auto-split.
 
-**Arrange — Macero, edit-as-composition (Phase 1)**
+**Arrange — edit-as-composition (Phase 1)**
 - **Razor/splice at playhead; ripple delete; copy/paste/duplicate regions; crossfades.**
 - **Drag clips on the horizontal timeline; loop a clip region with adjustable loop crossfade.**
 - **Trim/crop (src_in/src_out); move/layer takes on tracks.**
@@ -293,10 +295,10 @@ Not part of the x86 prototype. Kept here as the target for the eventual ARM phas
 
 ## 11. Phased plan (revised — core + plugins)
 
-Architecture: a **minimal core** — clock, audio graph interpreter, session event log, context plumbing (the [minimal-core note](.agents/notes/proposed/architecture/2026-08-15-minimal-core-clock-graph-session-log.md)) — with every capability as a plugin; the product is an assembled profile. "sound-arranger" is the tape-editor profile.
+Architecture: a **minimal core** — clock, audio graph interpreter, session event log, context plumbing (the [minimal-core note](.agents/notes/proposed/architecture/2026-08-15-minimal-core-clock-graph-session-log.md)) — with every capability as a plugin; the product is an assembled profile. "sound-arranger" is the **clip-arranger profile** (ACID-style cut/paste; the tape techniques as inspiration).
 
-- **Phase 0 — Core spike (x86 Linux):** the four core pieces + one euclidean rhythm plugin driving a sine blip. Validates the sample-accurate clock, realtime-safe graph rendering, live plugin mount/unmount, and the ctx/IPC contract end-to-end.
-- **Phase 1 — The sound-arranger profile (the old product goal):** recorder plugin (`cpal` → media pool, live peaks) + tape-editor plugin (razor/splice, trim, copy/paste/duplicate, crossfade, loop regions, drag on the horizontal canvas timeline) + soft mixer plugin (gain/pan/mute/solo, master fader, meters, bounce to WAV). Seconds-based timebase.
+- **Phase 0 — Core spikes (x86 Linux):** *Spike A* — core (clock with tempo/meter map, graph interpreter, session log, context) + a euclidean rhythm plugin driving a sine blip, plus a log-replay check (replay ⇒ identical output); *Spike B* — record 20–30 min while playing a long file from disk, splice a clip during playback glitch-free, bounce. Both constrain the core shape before it hardens (kimi review, `research/architecture/2026-08-15-kimi-review-minimal-core.md`).
+- **Phase 1 — The sound-arranger profile (the old product goal):** recorder plugin (`cpal` → media pool, live peaks) + clip-editor plugin (cut/paste, razor-split, trim, copy/paste/duplicate, crossfade, loop regions, paint-to-fit time-stretch, drag on the horizontal canvas timeline) + soft mixer plugin (gain/pan/mute/solo, master fader, meters, bounce to WAV). Seconds-based timebase.
 - **Phase 2 — Generators & improv:** euclidean rhythm and chord-progression plugins (pure generators providing `ctx.rhythm` / `ctx.progression`); an improv plugin consuming the session log and responding — the paper's self-evolving component, made safe by core reversibility.
 - **Phase 3 — Effects & offline processes:** `fundsp` effect plugins + dub sends; the offline-process tier (CDP8 sidecar, PaulStretch, phase-vocoder stretch) as `OfflineProcess` plugins with progress events.
 - **Phase 4 — Master & export:** master chain (EQ/comp/limiter), automation, FLAC/MP3 codecs (`Codec` plugins); CLAP hosting (`clack`) and plugin export (`nih-plug`).
@@ -457,7 +459,7 @@ The project is pre-code: the cheapest possible moment to fix the missing composi
 - **Codecs** — WAV/FLAC/MP3 import/export behind one interface.
 - **UI** — panels / toolbars / inspectors around the canvas timeline core.
 
-The FP-shaped architecture: immutable Session + typed edit functions (pure, testable, undoable); the cpal callback as a pure interpreter of a small value-level instruction stream (never allocates, never registers plugin callbacks — the realtime path is the privileged kernel); plugin boundaries produce *values* (graphs, configs) the interpreter reads. Composition / orchestration (reversible effects, declarative rows, patches) lives on the Tauri/TypeScript side, where Cordis itself could eventually run. Decision candidates: see the [composition-seams](.agents/notes/proposed/architecture/2026-08-15-composition-seams-plugin-architecture.md) and [minimal-core](.agents/notes/proposed/architecture/2026-08-15-minimal-core-clock-graph-session-log.md) notes.
+The FP-shaped architecture: immutable Session + typed edit functions (pure, testable, undoable); the cpal callback as a pure interpreter of a small value-level instruction stream (never allocates, never registers plugin callbacks — the realtime path is the privileged kernel); plugin boundaries produce *values* (graphs, configs) the interpreter reads. Composition / orchestration (reversible effects, declarative rows, patches) lives on the Tauri/TypeScript side, where Cordis itself could eventually run. Decision candidates: see the [composition-seams](.agents/notes/proposed/architecture/2026-08-15-composition-seams-plugin-architecture.md), [minimal-core](.agents/notes/proposed/architecture/2026-08-15-minimal-core-clock-graph-session-log.md), and [musical-event model](.agents/notes/proposed/architecture/2026-08-15-musical-event-model.md) notes.
 
 ### 15.8 Sources (2026-08-15)
 

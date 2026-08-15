@@ -1,6 +1,6 @@
 # AGENTS.md
 
-sound-arranger — a tape-style arrangement/composition tool: record long live jams, then cut, rearrange, and shape them into a finished piece. Rust audio engine + Tauri v2 + Vue 3. Working research lives in [RESEARCH.md](RESEARCH.md); decision records live in [.agents/notes/](.agents/notes/README.md).
+sound-arranger — a clip-based arrangement/composition tool: record long live jams, then cut, paste, rearrange, and shape them into a finished piece. Rust audio engine + Tauri v2 + Vue 3. Working research lives in [RESEARCH.md](RESEARCH.md); decision records live in [.agents/notes/](.agents/notes/README.md).
 
 ## Standing orders
 
