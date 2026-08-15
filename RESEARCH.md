@@ -33,6 +33,16 @@ The through-line is **"composition happens in the edit, after the performance."*
 - **Dub production** (King Tubby, Lee Perry): the mix console as instrument — aux sends into delay/reverb, "dropping" tracks to leave only the echo tail, EQ kills, fader rides recorded as automation.
 - **Sony ACID (early 2000s)**: the "paint clips onto a timeline and it time-stretches them to fit" workflow — the closest mainstream ancestor for ease of use.
 
+### Reading — the composition-theory corpus
+
+The creative brief above is grounded in the **music-composition-theory** corpus (the Composer's Onion framework). Paths below resolve on this machine through the `~/Projects/music` symlink view — `../music/…` from this repo (see `~/Projects/music/README.md`):
+
+- [Bitches Brew — the studio cut as composition](../music/music-composition-theory/analyses/miles-davis/bitches-brew.md) — Teo Macero's razor-blade editing; Onion Layer 6 (Time / Editing)
+- [On the Corner](../music/music-composition-theory/analyses/miles-davis/on-the-corner.md)
+- [Dub reggae (1968)](../music/music-composition-theory/theory/movements/1968-dub-reggae.md) — console-as-instrument; the §7 dub workflow
+- [The Composer's Onion](../music/music-composition-theory/theory/framework/the-composers-onion.md) — Layer 6 = the studio cut; Layer 7 = system/process (generative)
+- [Modular patching DSL sketch (Haskell)](../music/music-composition-theory/notes/modular-dsl-sketch.md) — idea source for a future scripting layer (§10 glicol)
+
 The tool is an **arranger / tape editor**, not a groovebox or MIDI sequencer. MIDI enters only later as *control* (knobs/faders), never as *notes*.
 
 ---
