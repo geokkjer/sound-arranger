@@ -1,23 +1,29 @@
-//! The plugin discipline (composition-seams note): plugins declare service
-//! dependencies (`inject`), register contributions through [`PluginApi`], and
-//! return a [`Disposer`] that undoes them — the reversible-effects pattern, in
-//! miniature. Generators are pure pattern queries the render loop pulls from.
+//! The plugin discipline (composition-seams + patch-bay notes): plugins declare
+//! service dependencies (`inject`) and a port surface (`ports`), register their
+//! contributions through [`PluginApi`], and return a disposer that undoes them
+//! — reversible effects, in miniature. The patch bay turns trigger/note/audio
+//! streams into first-class, typed, patchable outputs.
 
 pub mod euclidean;
+pub mod scale;
+pub mod tone;
 
 use std::ops::Range;
 
-use crate::clock::{Clock, Scheduler, TempoMap};
+use crate::clock::{Clock, Scheduler};
 use crate::ctx::Context;
-use crate::graph::{Graph, NodeId};
+use crate::graph::{NodeId, Port};
 use crate::render::SchedEvent;
+
+pub use euclidean::{euclid, euclidean_factory, Euclidean, Rhythm};
+pub use scale::{scale_factory, Scale};
+pub use tone::{tone_factory, Tone};
 
 /// What a disposer may touch to undo a plugin's contributions.
 pub struct DisposerCtx<'a> {
     pub ctx: &'a mut Context,
     pub scheduler: &'a mut Scheduler<SchedEvent>,
-    pub graph: &'a mut Graph,
-    pub generators: &'a mut Vec<GeneratorMount>,
+    pub graph: &'a mut crate::graph::Graph,
 }
 
 /// The inverse of a plugin's effects: run on unmount to remove every
@@ -29,34 +35,49 @@ pub type Disposer = Box<dyn FnOnce(&mut DisposerCtx<'_>)>;
 pub struct PluginApi<'a> {
     pub ctx: &'a mut Context,
     pub scheduler: &'a mut Scheduler<SchedEvent>,
-    pub graph: &'a mut Graph,
+    pub graph: &'a mut crate::graph::Graph,
     pub clock: &'a Clock,
-    pub generators: &'a mut Vec<GeneratorMount>,
 }
 
-/// A mountable plugin: declares its service dependencies (`inject`) and, on
-/// apply, registers its contributions, returning a disposer that undoes them.
+/// A mountable plugin: declares its service dependencies (`inject`) and its
+/// port surface (`ports`), then on apply registers its node, returning its id
+/// plus a disposer that undoes everything.
 pub trait Plugin {
     fn id(&self) -> &'static str;
     /// Declared service dependencies (the coeffect specification).
     fn inject(&self) -> &'static [&'static str];
-    fn apply(&mut self, api: &mut PluginApi) -> Result<Disposer, String>;
+    /// Declared patch-bay surface (the dropdown's data source).
+    fn ports(&self) -> &'static [Port];
+    fn apply(&mut self, api: &mut PluginApi) -> Result<(NodeId, Disposer), String>;
 }
 
-/// A pure pattern generator mounted into the render loop. `for_each_trigger`
-/// emits the absolute frame of every trigger inside `block` — the pull-based,
-/// sample-accurate scheduling query. Must be a pure function of the tempo map
-/// (determinism).
-pub trait Generator: Send {
+/// An external event entering the patch bay (MIDI, OSC, another host).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ExternalEvent {
+    NoteOn { offset: u32, pitch: f32, velocity: f32 },
+    NoteOff { offset: u32, pitch: f32 },
+    Trigger { offset: u32 },
+    Control { value: f32 },
+}
+
+/// A source of external events for a block (seam declaration — patch-bay note
+/// §4; implementations arrive with Phase 2 integrations).
+pub trait EventSource: Send {
     fn id(&self) -> &'static str;
-    fn for_each_trigger(&self, block: Range<u64>, tempo: &TempoMap, emit: &mut dyn FnMut(u64));
+    fn for_each_event(&self, block: Range<u64>, emit: &mut dyn FnMut(ExternalEvent));
 }
 
-/// A mounted generator: which graph node its triggers address.
-pub struct GeneratorMount {
-    pub id: &'static str,
-    pub node: NodeId,
-    pub generator: Box<dyn Generator>,
+/// A sink our events are sent to (e.g. scsynth via OSC `/s_new`).
+pub trait EventSink: Send {
+    fn id(&self) -> &'static str;
+    fn send(&mut self, events: &[ExternalEvent], frame: u64);
 }
 
-pub use euclidean::{euclid, euclidean_factory, Euclidean, Rhythm};
+/// MIDI input seam (notes/CC in; MIDI-learn later — RESEARCH §8).
+pub trait MidiSource: EventSource {}
+/// MIDI output seam.
+pub trait MidiSink: EventSink {}
+/// OSC input seam (Tidal → our SuperDirt-compatible endpoint).
+pub trait OscSource: EventSource {}
+/// OSC output seam (our notes → scsynth).
+pub trait OscSink: EventSink {}

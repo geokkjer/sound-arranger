@@ -1,14 +1,19 @@
 //! The euclidean rhythm plugin: a pure maximally-even pulse generator.
 //!
-//! `euclid` is a pure function (Bresenham-style even pulse placement). The
-//! plugin mounts a [`Generator`] that the render loop pulls from block by block,
-//! plus an opaque [`BlipSynth`] voice node that turns each trigger into a
-//! sample-accurate blip. Unmounting removes both — no residual sound or state.
+//! In the patch-bay model this plugin mounts a *generator node* with an
+//! `out("triggers", Trigger)` port — it produces no sound itself. Patch the
+//! triggers into a scale and a tone generator (or MIDI out, or anything else).
+//! It also provides the `rhythm` service for consumers that want the pattern.
 
-use super::{Disposer, DisposerCtx, Generator, GeneratorMount, Plugin, PluginApi};
-use crate::clock::TempoMap;
-use crate::graph::{BlipSynth, NodeId, NodeKind};
-use std::ops::Range;
+use super::{Disposer, DisposerCtx, Plugin, PluginApi};
+use crate::graph::{Direction, EuclideanGen, NodeId, NodeKind, Port, SignalKind};
+
+/// The plugin's declared port surface (the dropdown's data source).
+pub const EUCLIDEAN_PORTS: &[Port] = &[Port {
+    name: "triggers",
+    direction: Direction::Out,
+    kind: SignalKind::Trigger,
+}];
 
 /// Maximally-even pulse placement: a pulse at `floor(i * steps / pulses)`,
 /// rotated by `rotation` steps. A valid Euclidean rhythm generator (the
@@ -33,19 +38,6 @@ pub fn euclid(steps: u32, pulses: u32, rotation: u32) -> Vec<bool> {
     pattern
 }
 
-/// Configurable euclidean rhythm plugin.
-pub struct Euclidean {
-    pub steps: u32,
-    pub pulses: u32,
-    pub rotation: u32,
-    /// Pattern subdivisions per beat (4 = sixteenth notes).
-    pub pulses_per_beat: u32,
-    pub pitch: f32,
-    pub gain: f32,
-    /// Blip length in samples.
-    pub blip_len: u32,
-}
-
 /// The service the euclidean plugin *provides*: the resolved rhythm pattern.
 /// A consumer plugin declares `inject: ["rhythm"]` and reads it (spatial
 /// composability: providers and consumers coordinate on nothing but the key).
@@ -54,6 +46,15 @@ pub struct Rhythm {
     pub steps: u32,
     pub pulses: u32,
     pub pattern: Vec<bool>,
+}
+
+/// Configurable euclidean rhythm plugin.
+pub struct Euclidean {
+    pub steps: u32,
+    pub pulses: u32,
+    pub rotation: u32,
+    /// Pattern subdivisions per beat (4 = sixteenth notes).
+    pub pulses_per_beat: u32,
 }
 
 impl Plugin for Euclidean {
@@ -65,74 +66,37 @@ impl Plugin for Euclidean {
         &["clock"]
     }
 
-    fn apply(&mut self, api: &mut PluginApi) -> Result<Disposer, String> {
+    fn ports(&self) -> &'static [Port] {
+        EUCLIDEAN_PORTS
+    }
+
+    fn apply(&mut self, api: &mut PluginApi) -> Result<(NodeId, Disposer), String> {
         // The 'clock' dependency is a core service: satisfied by the engine
-        // (see `Engine::core_services`), read-only via `api.clock`. Not in ctx.
+        // (see `Engine::core_services`), read via the block's tempo map.
         let pattern = euclid(self.steps, self.pulses, self.rotation);
-        let node: NodeId = api
-            .graph
-            .add_node(NodeKind::Opaque(Box::new(BlipSynth::new(
-                self.pitch,
-                self.gain,
-                self.blip_len,
-            ))));
-        api.graph.set_out(node);
+        let node = api.graph.add_node(
+            NodeKind::Opaque(Box::new(EuclideanGen {
+                steps: self.steps,
+                pulses_per_beat: self.pulses_per_beat.max(1),
+                pattern: pattern.clone(),
+            })),
+            EUCLIDEAN_PORTS.to_vec(),
+        );
         api.ctx.provide(
             "rhythm",
             Rhythm {
                 steps: self.steps,
                 pulses: self.pulses,
-                pattern: pattern.clone(),
+                pattern,
             },
         );
-        api.generators.push(GeneratorMount {
-            id: self.id(),
+        Ok((
             node,
-            generator: Box::new(EuclideanGen {
-                steps: self.steps,
-                pulses_per_beat: self.pulses_per_beat.max(1),
-                pattern,
+            Box::new(move |dis: &mut DisposerCtx| {
+                dis.graph.remove_node(node);
+                dis.ctx.remove("rhythm");
             }),
-        });
-        Ok(Box::new(move |dis: &mut DisposerCtx| {
-            dis.graph.remove_node(node);
-            dis.generators.retain(|mount| mount.id != "euclidean");
-            dis.ctx.remove("rhythm");
-        }))
-    }
-}
-
-struct EuclideanGen {
-    steps: u32,
-    pulses_per_beat: u32,
-    pattern: Vec<bool>,
-}
-
-impl Generator for EuclideanGen {
-    fn id(&self) -> &'static str {
-        "euclidean"
-    }
-
-    fn for_each_trigger(&self, block: Range<u64>, tempo: &TempoMap, emit: &mut dyn FnMut(u64)) {
-        let step_beats = 1.0 / self.pulses_per_beat as f64;
-        // Beat range covered by the block (one step of margin at the top).
-        let b0 = tempo.beat_at(block.start);
-        let b1 = tempo.beat_at(block.end.saturating_sub(1)) + step_beats;
-        let s0 = (b0 / step_beats).floor() as i64;
-        let s1 = (b1 / step_beats).ceil() as i64;
-        for step in s0..s1 {
-            if step < 0 {
-                continue;
-            }
-            let step = step as u64;
-            if !self.pattern[(step % self.steps as u64) as usize] {
-                continue;
-            }
-            let frame = tempo.frame_at(step as f64 * step_beats);
-            if frame >= block.start && frame < block.end {
-                emit(frame);
-            }
-        }
+        ))
     }
 }
 
@@ -151,9 +115,6 @@ pub fn euclidean_factory(params: &[(&'static str, f32)]) -> Result<Box<dyn Plugi
         pulses: get("pulses", 3.0) as u32,
         rotation: get("rotation", 0.0) as u32,
         pulses_per_beat: get("pulses_per_beat", 4.0) as u32,
-        pitch: get("pitch", 440.0),
-        gain: get("gain", 0.25),
-        blip_len: get("blip_len", 1200.0) as u32,
     }))
 }
 
@@ -167,17 +128,13 @@ mod tests {
             let pattern = euclid(steps, pulses, 0);
             assert_eq!(pattern.len(), steps as usize);
             assert_eq!(pattern.iter().filter(|p| **p).count(), pulses as usize);
-            // gaps between pulses (including wraparound) differ by at most 1
             let positions: Vec<usize> = pattern
                 .iter()
                 .enumerate()
                 .filter(|(_, p)| **p)
                 .map(|(i, _)| i)
                 .collect();
-            let mut gaps: Vec<usize> = positions
-                .windows(2)
-                .map(|w| w[1] - w[0])
-                .collect();
+            let mut gaps: Vec<usize> = positions.windows(2).map(|w| w[1] - w[0]).collect();
             gaps.push(positions[0] + steps as usize - positions[positions.len() - 1]);
             let min = *gaps.iter().min().unwrap();
             let max = *gaps.iter().max().unwrap();
@@ -189,7 +146,6 @@ mod tests {
     fn euclid_rotation_shifts() {
         let base = euclid(8, 3, 0);
         let rot = euclid(8, 3, 2);
-        // rotate_right(2): element k of the base lands at (k - 2) mod 8.
         let shifted = base
             .iter()
             .cycle()
@@ -202,7 +158,6 @@ mod tests {
 
     #[test]
     fn euclid_edge_cases() {
-        // steps clamped to 1; zero pulses → all rests; pulses ≥ steps → all hits.
         assert_eq!(euclid(0, 3, 0), vec![false]);
         assert_eq!(euclid(8, 0, 0), vec![false; 8]);
         assert_eq!(euclid(8, 99, 0), vec![true; 8]);

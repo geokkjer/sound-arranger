@@ -1,25 +1,23 @@
 //! The engine: assembles the four core pieces and drives the render loop.
 //!
-//! The public mutation API — `mount`, `schedule_unmount`, `unmount`, `set_tempo`,
-//! `replay_from` — is the seed of the core plugin contract (the future IPC
-//! command list, per the composition-seams note).
+//! The public mutation API — `mount`, `patch`, `schedule_unmount`, `unmount`,
+//! `set_tempo`, `replay_from`, `providers_of` — is the seed of the core plugin
+//! contract (the future IPC command list, per the composition-seams note).
 //!
 //! Invariants:
 //! - every mutation is **logged at call time with its absolute frame**, then
 //!   scheduled; the render loop applies it when the clock reaches that frame
 //!   (sample-accurate lifecycle; a refused mutation is never logged);
 //! - rendering is a pure function of the log: `same log ⇒ byte-identical bounce`
-//!   (determinism is tested, including mid-session changes);
-//! - the render loop never allocates: fixed block size, preallocated scratch,
-//!   lazy scheduler drains, generators that emit via callback (enforced by a
-//!   counting-allocator test).
+//!   (determinism is tested, including mid-session changes and patches);
+//! - the render loop never allocates (enforced by a counting-allocator test).
 
 use std::collections::HashMap;
 
 use crate::clock::{Clock, Scheduler};
-use crate::graph::{Graph, RenderBlock, BLOCK};
+use crate::graph::{Graph, NodeId, Port, RenderBlock, SignalKind, BLOCK};
 use crate::log::{Event, SessionLog};
-use crate::plugins::{Disposer, DisposerCtx, GeneratorMount, Plugin, PluginApi};
+use crate::plugins::{Disposer, DisposerCtx, Plugin, PluginApi};
 
 /// One-shot events the scheduling queue delivers at an exact absolute frame.
 #[derive(Debug, Clone, PartialEq)]
@@ -29,6 +27,12 @@ pub enum SchedEvent {
         params: Vec<(&'static str, f32)>,
     },
     Unmount { plugin: &'static str },
+    Patch {
+        from_plugin: &'static str,
+        from_port: &'static str,
+        to_plugin: &'static str,
+        to_port: &'static str,
+    },
     SetTempo { bpm: f64, beats_per_bar: u32 },
 }
 
@@ -43,7 +47,10 @@ pub struct Engine {
     pub ctx: crate::ctx::Context,
     pub log: SessionLog,
     factories: HashMap<&'static str, PluginFactory>,
-    generators: Vec<GeneratorMount>,
+    /// registered port surfaces (validated against the plugin at apply).
+    port_table: HashMap<&'static str, &'static [Port]>,
+    /// plugin name → its mounted primary node.
+    node_of: HashMap<&'static str, NodeId>,
     disposers: HashMap<&'static str, Disposer>,
     /// plugins whose mount is queued but not yet applied.
     scheduled: std::collections::HashSet<&'static str>,
@@ -52,7 +59,7 @@ pub struct Engine {
 impl Engine {
     /// Core services the engine itself satisfies — the clock is core, never a
     /// ctx-provided service (a plugin may not own time, and a clone would go
-    /// stale). Plugins access it read-only via `PluginApi.clock`.
+    /// stale). Plugins access it read-only via the block's tempo map.
     fn core_services() -> &'static [&'static str] {
         &["clock"]
     }
@@ -66,14 +73,23 @@ impl Engine {
             ctx: crate::ctx::Context::new(),
             log: SessionLog::new(),
             factories: HashMap::new(),
-            generators: Vec::new(),
+            port_table: HashMap::new(),
+            node_of: HashMap::new(),
             disposers: HashMap::new(),
             scheduled: std::collections::HashSet::new(),
         }
     }
 
-    pub fn register_factory(&mut self, name: &'static str, factory: PluginFactory) {
+    /// Register a plugin factory and its declared port surface (the patch
+    /// bay's registry; `providers_of` reads it from mounted nodes).
+    pub fn register_factory(
+        &mut self,
+        name: &'static str,
+        factory: PluginFactory,
+        ports: &'static [Port],
+    ) {
         self.factories.insert(name, factory);
+        self.port_table.insert(name, ports);
     }
 
     /// Mount a plugin at the current frame: validated synchronously (fail-loud),
@@ -101,7 +117,7 @@ impl Engine {
     /// all provided (core or ctx), one instance per name.
     fn validate_mount(&self, name: &'static str, params: &[(&'static str, f32)]) -> Result<(), String> {
         if self.disposers.contains_key(name) || self.scheduled.contains(name) {
-            return Err(format!("plugin '{name}' is already mounted (one instance per name in spike A)"));
+            return Err(format!("plugin '{name}' is already mounted (one instance per name in spike A.5)"));
         }
         let factory = *self
             .factories
@@ -113,6 +129,7 @@ impl Engine {
                 return Err(format!("plugin '{name}' requires missing service '{key}'"));
             }
         }
+        debug_assert_eq!(plugin.ports(), self.port_table[name], "registered ports must match the plugin");
         Ok(())
     }
 
@@ -123,13 +140,12 @@ impl Engine {
             .ok_or_else(|| format!("unknown plugin '{name}'"))?;
         let mut plugin = factory(params)?;
         let id = plugin.id();
-        let disposer = {
+        let (node, disposer) = {
             let Engine {
                 ctx,
                 scheduler,
                 graph,
                 clock,
-                generators,
                 ..
             } = self;
             let mut api = PluginApi {
@@ -137,17 +153,108 @@ impl Engine {
                 scheduler,
                 graph,
                 clock,
-                generators,
             };
             plugin.apply(&mut api)?
         };
         self.scheduled.remove(name);
+        self.node_of.insert(id, node);
         self.disposers.insert(id, disposer);
         Ok(())
     }
 
+    /// Patch two plugins' ports at the current frame. Validated synchronously
+    /// against the *declared* port surfaces (kinds and directions), logged, and
+    /// applied by the render loop once both plugins are mounted.
+    pub fn patch(
+        &mut self,
+        from: (&'static str, &'static str),
+        to: (&'static str, &'static str),
+    ) -> Result<(), String> {
+        self.validate_patch(from, to)?;
+        let at_frame = self.clock.frame();
+        self.log.push(Event::Patch {
+            from_plugin: from.0,
+            from_port: from.1,
+            to_plugin: to.0,
+            to_port: to.1,
+            at_frame,
+        });
+        self.scheduler.schedule(
+            at_frame,
+            SchedEvent::Patch {
+                from_plugin: from.0,
+                from_port: from.1,
+                to_plugin: to.0,
+                to_port: to.1,
+            },
+        );
+        Ok(())
+    }
+
+    fn validate_patch(&self, from: (&'static str, &'static str), to: (&'static str, &'static str)) -> Result<(), String> {
+        let (fp, tp) = (from.0, to.0);
+        if !self.factories.contains_key(fp) {
+            return Err(format!("unknown plugin '{fp}'"));
+        }
+        if !self.factories.contains_key(tp) {
+            return Err(format!("unknown plugin '{tp}'"));
+        }
+        // Both endpoints must be scheduled or mounted, or the patch would have
+        // nothing to apply to at its frame (fail-loud, never logged).
+        if !(self.scheduled.contains(fp) || self.node_of.contains_key(fp)) {
+            return Err(format!("plugin '{fp}' is neither scheduled nor mounted"));
+        }
+        if !(self.scheduled.contains(tp) || self.node_of.contains_key(tp)) {
+            return Err(format!("plugin '{tp}' is neither scheduled nor mounted"));
+        }
+        let from_port = self
+            .port_table
+            .get(fp)
+            .and_then(|ports| ports.iter().find(|p| p.name == from.1))
+            .ok_or_else(|| format!("no port '{}' on plugin '{fp}'", from.1))?;
+        let to_port = self
+            .port_table
+            .get(tp)
+            .and_then(|ports| ports.iter().find(|p| p.name == to.1))
+            .ok_or_else(|| format!("no port '{}' on plugin '{tp}'", to.1))?;
+        if from_port.direction != crate::graph::Direction::Out
+            || to_port.direction != crate::graph::Direction::In
+        {
+            return Err(format!(
+                "patch: '{}' must be an Out port and '{}' an In port",
+                from.1, to.1
+            ));
+        }
+        if from_port.kind != to_port.kind {
+            return Err(format!(
+                "patch: signal kind mismatch — '{}' is {:?}, '{}' is {:?}",
+                from.1, from_port.kind, to.1, to_port.kind
+            ));
+        }
+        Ok(())
+    }
+
+    /// Apply a patch at its scheduled frame. Never panics: if an endpoint is
+    /// not mounted (a log-order error) or the graph refuses the cord (forward
+    /// order, single-driver control), the intent stays in the log and the
+    /// refusal is asserted in debug — no audio-thread crash, no silent
+    /// divergence (replay reproduces the same refused state).
+    fn apply_patch(&mut self, from: (&'static str, &'static str), to: (&'static str, &'static str)) {
+        let Some(&from_node) = self.node_of.get(from.0) else {
+            debug_assert!(false, "patch endpoint '{}' not mounted at apply (log-order error)", from.0);
+            return;
+        };
+        let Some(&to_node) = self.node_of.get(to.0) else {
+            debug_assert!(false, "patch endpoint '{}' not mounted at apply (log-order error)", to.0);
+            return;
+        };
+        if let Err(e) = self.graph.connect(from_node, from.1, to_node, to.1) {
+            debug_assert!(false, "scheduled patch refused at apply: {e}");
+        }
+    }
+
     /// Schedule an unmount at an absolute frame — the scheduling queue driving
-    /// lifecycle, sample-accurately (the render loop applies it at that frame).
+    /// lifecycle, sample-accurately.
     pub fn schedule_unmount(&mut self, name: &'static str, at_frame: u64) {
         self.log.push(Event::ScheduleUnmount {
             plugin: name,
@@ -167,24 +274,14 @@ impl Engine {
     fn apply_unmount(&mut self, name: &'static str) {
         self.scheduled.remove(name);
         if let Some(disposer) = self.disposers.remove(name) {
-            let Engine {
-                ctx,
-                scheduler,
-                graph,
-                generators,
-                ..
-            } = self;
-            disposer(&mut DisposerCtx {
-                ctx,
-                scheduler,
-                graph,
-                generators,
-            });
+            self.node_of.remove(name);
+            let Engine { ctx, scheduler, graph, .. } = self;
+            disposer(&mut DisposerCtx { ctx, scheduler, graph });
         }
     }
 
-    /// A tempo change at the current frame (logged with its frame, then applied
-    /// by the render loop at that frame — sample-accurate tempo changes).
+    /// A tempo change at the current frame (sample-accurate: applied by the
+    /// render loop at that frame).
     pub fn set_tempo(&mut self, bpm: f64, beats_per_bar: u32) {
         let at_frame = self.clock.frame();
         self.log.push(Event::SetTempo {
@@ -221,6 +318,24 @@ impl Engine {
                     self.scheduler
                         .schedule(*at_frame, SchedEvent::Unmount { plugin });
                 }
+                Event::Patch {
+                    from_plugin,
+                    from_port,
+                    to_plugin,
+                    to_port,
+                    at_frame,
+                } => {
+                    self.validate_patch((*from_plugin, *from_port), (*to_plugin, *to_port))?;
+                    self.scheduler.schedule(
+                        *at_frame,
+                        SchedEvent::Patch {
+                            from_plugin,
+                            from_port,
+                            to_plugin,
+                            to_port,
+                        },
+                    );
+                }
                 Event::SetTempo {
                     bpm,
                     beats_per_bar,
@@ -243,17 +358,59 @@ impl Engine {
         match event {
             SchedEvent::Unmount { plugin } => self.apply_unmount(plugin),
             SchedEvent::Mount { plugin, params } => {
-                // The log was validated at schedule time; a failure here is a
-                // bug in the log, not a runtime error.
                 debug_assert!(
                     self.apply_mount(plugin, &params).is_ok(),
                     "scheduled mount must apply (log was validated)"
                 );
             }
+            SchedEvent::Patch {
+                from_plugin,
+                from_port,
+                to_plugin,
+                to_port,
+            } => self.apply_patch((from_plugin, from_port), (to_plugin, to_port)),
             SchedEvent::SetTempo { bpm, beats_per_bar } => {
                 self.clock.push_tempo(bpm, beats_per_bar);
             }
         }
+    }
+
+    /// The patch-bay registry view: every mounted `Out` port of the given kind —
+    /// the data source for the "dropdown of available inputs".
+    pub fn providers_of(&self, kind: SignalKind) -> Vec<(NodeId, &'static str)> {
+        self.graph
+            .nodes()
+            .iter()
+            .filter_map(|node| {
+                node.ports
+                    .iter()
+                    .find(|p| p.direction == crate::graph::Direction::Out && p.kind == kind)
+                    .map(|p| (node.id, p.name))
+            })
+            .collect()
+    }
+
+    /// Plugin names providing an `Out` port of the given kind — the dropdown
+    /// wants names, not node ids.
+    pub fn provider_names_of(&self, kind: SignalKind) -> Vec<&'static str> {
+        let mut names: Vec<&'static str> = self
+            .node_of
+            .iter()
+            .filter(|(_, node)| {
+                self.graph
+                    .nodes()
+                    .iter()
+                    .find(|n| n.id == **node)
+                    .is_some_and(|n| {
+                        n.ports
+                            .iter()
+                            .any(|p| p.direction == crate::graph::Direction::Out && p.kind == kind)
+                    })
+            })
+            .map(|(name, _)| *name)
+            .collect();
+        names.sort();
+        names
     }
 
     /// Render `frames` samples into a fresh buffer.
@@ -271,8 +428,7 @@ impl Engine {
     }
 
     /// Render one block, interleaving the scheduling queue: events are applied
-    /// at their exact absolute frame by splitting the block around them, so a
-    /// lifecycle change mid-block takes effect at the right sample.
+    /// at their exact absolute frame by splitting the block around them.
     fn render_block(&mut self, out: &mut [f32]) {
         let f1 = self.clock.frame() + out.len() as u64;
         let mut pos = self.clock.frame();
@@ -288,8 +444,6 @@ impl Engine {
             if next == f1 {
                 break;
             }
-            // Apply every event scheduled at this frame (FIFO). Pops, so no
-            // allocation; the iterator form exists for tests.
             loop {
                 let frame = self.scheduler.peek_frame();
                 match frame {
@@ -304,28 +458,15 @@ impl Engine {
         debug_assert_eq!(written, out.len());
     }
 
-    /// Render one contiguous chunk: pull generator triggers, render the graph,
-    /// advance the clock. The render path allocates nothing.
+    /// Render one contiguous chunk. The render path allocates nothing.
     fn render_chunk(&mut self, out: &mut [f32], f0: u64) {
-        let f1 = f0 + out.len() as u64;
-        let Engine {
-            clock,
-            graph,
-            generators,
-            ..
-        } = self;
-        let range = f0..f1;
-        for mount in generators.iter() {
-            let tempo = &clock.tempo_map;
-            mount.generator.for_each_trigger(range.clone(), tempo, &mut |frame| {
-                let offset = (frame - f0) as u32;
-                graph.trigger(mount.node, offset);
-            });
-        }
-        graph.render(out, RenderBlock {
+        let Engine { clock, graph, .. } = self;
+        let block = RenderBlock {
             frame: f0,
             sample_rate: clock.sample_rate,
-        });
+            tempo: &clock.tempo_map,
+        };
+        graph.render(out, block);
         clock.advance(out.len() as u64);
     }
 }

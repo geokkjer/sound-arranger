@@ -21,6 +21,14 @@ pub enum Event {
     /// A plugin is scheduled to unmount at an absolute frame (the scheduling
     /// queue drives lifecycle).
     ScheduleUnmount { plugin: &'static str, at_frame: u64 },
+    /// A patch cord between two plugins' ports, at an absolute frame.
+    Patch {
+        from_plugin: &'static str,
+        from_port: &'static str,
+        to_plugin: &'static str,
+        to_port: &'static str,
+        at_frame: u64,
+    },
     /// A tempo change at an absolute frame.
     SetTempo {
         bpm: f64,
