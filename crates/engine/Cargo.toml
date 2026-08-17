@@ -1,0 +1,6 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "sound-arranger minimal core — clock, graph interpreter, session log, context plumbing (Phase 0 Spike A)"
