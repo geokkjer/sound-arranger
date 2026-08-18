@@ -1,0 +1,10 @@
+[package]
+name = "media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "sound-arranger media engine — disk streaming, recording writer, device-clock drift, cpal device path (Phase 0 Spike B)"
+
+[dependencies]
+engine = { path = "../engine" }
+cpal = "0.18.2"
