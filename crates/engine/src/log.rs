@@ -35,6 +35,16 @@ pub enum Event {
         beats_per_bar: u32,
         at_frame: u64,
     },
+    /// A discrete parameter change on a mounted plugin's node, at an absolute
+    /// frame (Phase 1: the generic control path for the mixer's gain/mute/
+    /// solo/fader). Automation *curves* are a later event type — the log rules
+    /// (minimal-core note §3) coalesce control-rate streams into gestures.
+    SetParam {
+        plugin: &'static str,
+        param: &'static str,
+        value: f32,
+        at_frame: u64,
+    },
 }
 
 /// The append-only session log.

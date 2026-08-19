@@ -24,6 +24,10 @@
 //! - a take is crash-recoverable from the first byte: the WAV header is
 //!   written with placeholder sizes before any audio, and [`wav::WavWriter::recover`]
 //!   patches it after a crash.
+//!
+//! Phase 1 adds the profile-level helper [`bounce`]: render the engine's
+//! master out (owned by the mixer plugin) to a 16-bit WAV — 16-bit at
+//! bounce/export; the media *pool* keeps 32-bit float sources.
 
 pub mod devices;
 pub mod drift;
@@ -32,8 +36,20 @@ pub mod ring;
 pub mod stream;
 pub mod wav;
 
+use std::path::Path;
+
 pub use drift::DriftCompensator;
 pub use record::{Recorder, RecordNode, WavRecorder};
 pub use ring::Spsc;
 pub use stream::{mailbox, ClipRef, FilePlayer, Mailbox, PlaybackNode, SpliceCmd, DEFAULT_RING_CAPACITY};
 pub use wav::{WavReader, WavWriter};
+
+/// Bounce: render `frames` of the engine's master out and write it to a
+/// 16-bit WAV (16-bit at bounce/export; the media pool keeps float sources).
+pub fn bounce(e: &mut engine::Engine, frames: usize, path: &Path) -> Result<(), String> {
+    let out = e.render(frames);
+    let mut w = wav::WavWriter::create(path, e.clock.sample_rate, 1)?;
+    w.write(&out)?;
+    w.finalize()?;
+    Ok(())
+}

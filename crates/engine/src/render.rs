@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use crate::clock::{Clock, Scheduler};
 use crate::graph::{Graph, NodeId, Port, RenderBlock, SignalKind, BLOCK};
 use crate::log::{Event, SessionLog};
-use crate::plugins::{Disposer, DisposerCtx, Plugin, PluginApi};
+use crate::plugins::{Disposer, DisposerCtx, ParamDef, Plugin, PluginApi};
 
 /// One-shot events the scheduling queue delivers at an exact absolute frame.
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +34,11 @@ pub enum SchedEvent {
         to_port: &'static str,
     },
     SetTempo { bpm: f64, beats_per_bar: u32 },
+    SetParam {
+        plugin: &'static str,
+        param: &'static str,
+        value: f32,
+    },
 }
 
 /// Builds a plugin from a flat parameter list (the `Event::Mount` payload).
@@ -49,6 +54,8 @@ pub struct Engine {
     factories: HashMap<&'static str, PluginFactory>,
     /// registered port surfaces (validated against the plugin at apply).
     port_table: HashMap<&'static str, &'static [Port]>,
+    /// registered runtime parameter surfaces (validated by `set_param`).
+    params_table: HashMap<&'static str, &'static [ParamDef]>,
     /// plugin name → its mounted primary node.
     node_of: HashMap<&'static str, NodeId>,
     disposers: HashMap<&'static str, Disposer>,
@@ -74,22 +81,26 @@ impl Engine {
             log: SessionLog::new(),
             factories: HashMap::new(),
             port_table: HashMap::new(),
+            params_table: HashMap::new(),
             node_of: HashMap::new(),
             disposers: HashMap::new(),
             scheduled: std::collections::HashSet::new(),
         }
     }
 
-    /// Register a plugin factory and its declared port surface (the patch
-    /// bay's registry; `providers_of` reads it from mounted nodes).
+    /// Register a plugin factory and its declared port + parameter surfaces
+    /// (the patch bay's registry; `providers_of` reads it from mounted nodes,
+    /// and `set_param` validates names against the declared params).
     pub fn register_factory(
         &mut self,
         name: &'static str,
         factory: PluginFactory,
         ports: &'static [Port],
+        params: &'static [ParamDef],
     ) {
         self.factories.insert(name, factory);
         self.port_table.insert(name, ports);
+        self.params_table.insert(name, params);
     }
 
     /// Mount a plugin at the current frame: validated synchronously (fail-loud),
@@ -293,6 +304,48 @@ impl Engine {
             .schedule(at_frame, SchedEvent::SetTempo { bpm, beats_per_bar });
     }
 
+    /// Set a discrete parameter on a plugin at the current frame: validated
+    /// fail-loud (plugin registered and mounted-or-scheduled, name declared in
+    /// the plugin's parameter surface, value finite and in range), logged, and
+    /// applied by the render loop at its frame — sample-accurate and
+    /// replayable (Phase 1: the generic control path for the mixer's
+    /// gain/mute/solo/fader). A refused call is never logged; automation
+    /// curves are a later event type.
+    pub fn set_param(&mut self, plugin: &'static str, param: &'static str, value: f32) -> Result<(), String> {
+        if !self.factories.contains_key(plugin) {
+            return Err(format!("unknown plugin '{plugin}'"));
+        }
+        if !(self.node_of.contains_key(plugin) || self.scheduled.contains(plugin)) {
+            return Err(format!("plugin '{plugin}' is neither scheduled nor mounted"));
+        }
+        let declared = self.params_table.get(plugin).copied().unwrap_or(&[]);
+        let Some(def) = declared.iter().find(|d| d.name == param) else {
+            return Err(format!("plugin '{plugin}' has no parameter '{param}'"));
+        };
+        if !value.is_finite() {
+            return Err(format!("parameter '{param}' must be finite, got {value}"));
+        }
+        if value < def.min || value > def.max {
+            return Err(format!("parameter '{param}' out of range [{}, {}]: {value}", def.min, def.max));
+        }
+        let at_frame = self.clock.frame();
+        self.log.push(Event::SetParam {
+            plugin,
+            param,
+            value,
+            at_frame,
+        });
+        self.scheduler.schedule(
+            at_frame,
+            SchedEvent::SetParam {
+                plugin,
+                param,
+                value,
+            },
+        );
+        Ok(())
+    }
+
     /// Replay a log onto this engine. Must be a *fresh* engine: every event is
     /// scheduled at its recorded frame and applied by the render loop — nothing
     /// is applied eagerly, so the timeline reproduces exactly.
@@ -349,6 +402,21 @@ impl Engine {
                         },
                     );
                 }
+                Event::SetParam {
+                    plugin,
+                    param,
+                    value,
+                    at_frame,
+                } => {
+                    self.scheduler.schedule(
+                        *at_frame,
+                        SchedEvent::SetParam {
+                            plugin,
+                            param,
+                            value: *value,
+                        },
+                    );
+                }
             }
         }
         Ok(())
@@ -371,6 +439,19 @@ impl Engine {
             } => self.apply_patch((from_plugin, from_port), (to_plugin, to_port)),
             SchedEvent::SetTempo { bpm, beats_per_bar } => {
                 self.clock.push_tempo(bpm, beats_per_bar);
+            }
+            SchedEvent::SetParam {
+                plugin,
+                param,
+                value,
+            } => {
+                // Never panics: an unmounted plugin at apply is a log-order
+                // error (the set_param was validated against a mount) —
+                // debug-asserted, skipped in release, replay reproduces it.
+                match self.node_of.get(plugin) {
+                    Some(&node) => self.graph.set_param(node, param, value),
+                    None => debug_assert!(false, "set_param endpoint '{plugin}' not mounted at apply"),
+                }
             }
         }
     }

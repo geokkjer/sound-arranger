@@ -42,13 +42,14 @@ pub mod render;
 pub use clock::{Clock, Scheduler, TempoMap};
 pub use ctx::Context;
 pub use graph::{
-    AudioNode, Direction, EventBuf, EuclideanGen, Gain, Graph, Node, NodeId, NodeIO, NodeKind,
-    NoteEvent, Port, RenderBlock, ScaleGen, SignalKind, Sine, ToneGen, Trigger, BLOCK,
+    AudioNode, Direction, EventBuf, EuclideanGen, Gain, Graph, MAX_AUDIO_INS, Node, NodeId, NodeIO,
+    NodeKind, NoteEvent, Port, RenderBlock, ScaleGen, SignalKind, Sine, ToneGen, Trigger, BLOCK,
     CAP_EVENTS, MERGE_CAP,
 };
 pub use log::{Event, SessionLog};
 pub use plugins::{
-    euclid, Disposer, DisposerCtx, Euclidean, ExternalEvent, EventSink, EventSource, MidiSink,
-    MidiSource, OscSink, OscSource, Plugin, PluginApi, Rhythm, Scale, Tone,
+    euclid, mixer_factory, Disposer, DisposerCtx, Euclidean, ExternalEvent, EventSink, EventSource,
+    MeterBank, MidiSink, MidiSource, MixerNode, MixerPlugin, MIXER_CHANNELS, MIXER_PARAMS,
+    MIXER_PORTS, OscSink, OscSource, ParamDef, Plugin, PluginApi, Rhythm, Scale, Tone, TONE_PARAMS,
 };
 pub use render::{Engine, PluginFactory, SchedEvent};

@@ -17,9 +17,10 @@ const SR: u32 = 48_000;
 
 fn engine() -> Engine {
     let mut e = Engine::new(SR, 120.0, 4);
-    e.register_factory("euclidean", plugins::euclidean_factory, plugins::euclidean::EUCLIDEAN_PORTS);
-    e.register_factory("scale", plugins::scale_factory, plugins::scale::SCALE_PORTS);
-    e.register_factory("tone", plugins::tone_factory, plugins::tone::TONE_PORTS);
+    e.register_factory("euclidean", plugins::euclidean_factory, plugins::euclidean::EUCLIDEAN_PORTS, &[]);
+    e.register_factory("scale", plugins::scale_factory, plugins::scale::SCALE_PORTS, &[]);
+    e.register_factory("tone", plugins::tone_factory, plugins::tone::TONE_PORTS, plugins::tone::TONE_PARAMS);
+    e.register_factory("mixer", plugins::mixer_factory, plugins::mixer::MIXER_PORTS, plugins::mixer::MIXER_PARAMS);
     e
 }
 
@@ -37,6 +38,10 @@ fn mount_chain(e: &mut Engine) {
     e.mount("tone", &[("gain", 0.2), ("blip_len", 800.0)]).unwrap();
     e.patch(("euclidean", "triggers"), ("scale", "trigger")).unwrap();
     e.patch(("scale", "note"), ("tone", "note")).unwrap();
+    // Phase 1: the mixer owns the master bus — the chain's audio routes
+    // through it (tone.audio → mixer.ch0); the tone no longer claims the out.
+    e.mount("mixer", &[]).unwrap();
+    e.patch(("tone", "audio"), ("mixer", "ch0")).unwrap();
 }
 
 /// The patch works end to end: a trigger lands sample-accurately at frame 6000
@@ -53,6 +58,8 @@ fn chain_trigger_is_sample_accurate() {
     e.mount("tone", &[("gain", 0.25), ("blip_len", 1200.0)]).unwrap();
     e.patch(("euclidean", "triggers"), ("scale", "trigger")).unwrap();
     e.patch(("scale", "note"), ("tone", "note")).unwrap();
+    e.mount("mixer", &[]).unwrap();
+    e.patch(("tone", "audio"), ("mixer", "ch0")).unwrap();
     let out = e.render(7000);
 
     assert_eq!(out[5999], 0.0);
@@ -75,6 +82,8 @@ fn scale_changes_pitch() {
         e.mount("tone", &[("gain", 0.25), ("blip_len", 800.0)]).unwrap();
         e.patch(("euclidean", "triggers"), ("scale", "trigger")).unwrap();
         e.patch(("scale", "note"), ("tone", "note")).unwrap();
+        e.mount("mixer", &[]).unwrap();
+        e.patch(("tone", "audio"), ("mixer", "ch0")).unwrap();
         let out = e.render(7000);
         // count sign changes in the blip window (6001..6800)
         let window = &out[6001..6800];
@@ -182,6 +191,8 @@ fn unmount_is_sample_accurate() {
     e.mount("tone", &[("gain", 0.2), ("blip_len", 20_000.0)]).unwrap();
     e.patch(("euclidean", "triggers"), ("scale", "trigger")).unwrap();
     e.patch(("scale", "note"), ("tone", "note")).unwrap();
+    e.mount("mixer", &[]).unwrap();
+    e.patch(("tone", "audio"), ("mixer", "ch0")).unwrap();
 
     let at = 96_000 + 100;
     // Unmount the whole chain: stopping the *generator* would leave the tone's
@@ -225,6 +236,7 @@ fn remount_reproduces_identical_signal() {
     e2.unmount("euclidean");
     e2.unmount("scale");
     e2.unmount("tone");
+    e2.unmount("mixer");
     let _gone = e2.render(2 * 48_000);
     mount_chain(&mut e2);
     let again = e2.render(2 * 48_000);
@@ -259,7 +271,7 @@ fn plugins_cooperate_via_service_key() {
     let bass_factory: PluginFactory = |_| Ok(Box::new(BassFollower));
 
     let mut e = engine();
-    e.register_factory("bass", bass_factory, &[]);
+    e.register_factory("bass", bass_factory, &[], &[]);
     let err = e.mount("bass", &[]).unwrap_err();
     assert!(err.contains("rhythm"), "got: {err}");
     assert!(e.log.is_empty(), "a refused mount must not be logged");
@@ -288,7 +300,7 @@ fn inject_fails_loud() {
     }
     let factory: PluginFactory = |_| Ok(Box::new(NeedsMissing));
     let mut e = engine();
-    e.register_factory("needs-missing", factory, &[]);
+    e.register_factory("needs-missing", factory, &[], &[]);
     let err = e.mount("needs-missing", &[]).unwrap_err();
     assert!(err.contains("definitely-not-provided"), "got: {err}");
     assert!(e.log.is_empty(), "a refused mount must not be logged");
@@ -307,6 +319,8 @@ fn tempo_change_moves_triggers() {
     e.mount("tone", &[("gain", 0.25), ("blip_len", 1200.0)]).unwrap();
     e.patch(("euclidean", "triggers"), ("scale", "trigger")).unwrap();
     e.patch(("scale", "note"), ("tone", "note")).unwrap();
+    e.mount("mixer", &[]).unwrap();
+    e.patch(("tone", "audio"), ("mixer", "ch0")).unwrap();
     e.set_tempo(240.0, 4);
     let out = e.render(5000);
     assert_eq!(out[2999], 0.0);
@@ -357,7 +371,7 @@ fn providers_of_lists_external_sources() {
     let osc_ports: &'static [Port] = &[Port { name: "triggers", direction: Direction::Out, kind: SignalKind::Trigger }];
 
     let mut e = engine();
-    e.register_factory("fakeosc", osc_factory, osc_ports);
+    e.register_factory("fakeosc", osc_factory, osc_ports, &[]);
     e.mount("euclidean", &[]).unwrap();
     e.mount("fakeosc", &[]).unwrap();
     e.render(1); // apply
@@ -418,7 +432,7 @@ fn fan_in_merges_events_sorted() {
     let osc_ports: &'static [Port] = &[Port { name: "triggers", direction: Direction::Out, kind: SignalKind::Trigger }];
 
     let mut e = engine();
-    e.register_factory("fakeosc", osc_factory, osc_ports);
+    e.register_factory("fakeosc", osc_factory, osc_ports, &[]);
     // euclidean triggers at 6000; fakeosc at 100. Patch order puts the *later*
     // offset first into the merge, exercising the sorted insert.
     e.mount(
@@ -432,6 +446,8 @@ fn fan_in_merges_events_sorted() {
     e.patch(("euclidean", "triggers"), ("scale", "trigger")).unwrap();
     e.patch(("fakeosc", "triggers"), ("scale", "trigger")).unwrap();
     e.patch(("scale", "note"), ("tone", "note")).unwrap();
+    e.mount("mixer", &[]).unwrap();
+    e.patch(("tone", "audio"), ("mixer", "ch0")).unwrap();
 
     let out = e.render(7000);
     assert!(out[101] > 0.0, "fakeosc blip must fire at frame 101 (offset 100)");
@@ -508,6 +524,7 @@ fn provider_names_and_osc_seam() {
         "fakeosc",
         |_| Ok(Box::new(ProviderNamesFakeOsc)),
         &[Port { name: "triggers", direction: Direction::Out, kind: SignalKind::Trigger }],
+        &[],
     );
     e.mount("euclidean", &[]).unwrap();
     e.mount("fakeosc", &[]).unwrap();

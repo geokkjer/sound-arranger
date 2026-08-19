@@ -5,6 +5,7 @@
 //! streams into first-class, typed, patchable outputs.
 
 pub mod euclidean;
+pub mod mixer;
 pub mod scale;
 pub mod tone;
 
@@ -16,8 +17,9 @@ use crate::graph::{NodeId, Port};
 use crate::render::SchedEvent;
 
 pub use euclidean::{euclid, euclidean_factory, Euclidean, Rhythm};
+pub use mixer::{mixer_factory, MixerNode, MixerPlugin, MIXER_CHANNELS, MIXER_PARAMS, MIXER_PORTS, MeterBank};
 pub use scale::{scale_factory, Scale};
-pub use tone::{tone_factory, Tone};
+pub use tone::{tone_factory, Tone, TONE_PARAMS};
 
 /// What a disposer may touch to undo a plugin's contributions.
 pub struct DisposerCtx<'a> {
@@ -48,7 +50,21 @@ pub trait Plugin {
     fn inject(&self) -> &'static [&'static str];
     /// Declared patch-bay surface (the dropdown's data source).
     fn ports(&self) -> &'static [Port];
+    /// Declared runtime parameter surface (the logged `SetParam` namespace).
+    /// `Engine::set_param` refuses names not declared here — fail-loud, never
+    /// logged (Phase 1: the mixer's gain/mute/solo/fader).
+    fn params(&self) -> &'static [ParamDef] {
+        &[]
+    }
     fn apply(&mut self, api: &mut PluginApi) -> Result<(NodeId, Disposer), String>;
+}
+
+/// A declared runtime parameter: name plus a sane range (validation + doc).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ParamDef {
+    pub name: &'static str,
+    pub min: f32,
+    pub max: f32,
 }
 
 /// An external event entering the patch bay (MIDI, OSC, another host).

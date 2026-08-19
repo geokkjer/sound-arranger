@@ -8,9 +8,10 @@
 //! - **Trigger** / **Note** — sample-timestamped event streams (offsets within
 //!   the block), carried in fixed-capacity buffers.
 //!
-//! Spike A.5 constraint (documented): at most one port per (kind, direction)
-//! per node. Fan-out is free; fan-in sums audio, merges events, and is
-//! single-driver for control. The Phase 1 mixer generalizes the bus.
+//! Phase 1 port rule: **many audio `In` ports per node** (the mixer's
+//! channels, fan-in summed per port), **at most one audio `Out`**, and at most
+//! one control/trigger/note port per kind (fan-in sums audio, merges events,
+//! single-driver for control). The Phase 1 mixer generalizes the bus.
 //!
 //! Per-node latency (PDC) is part of the value from day one; the interpreter
 //! delays earlier stages so audio paths align at the output.
@@ -149,10 +150,20 @@ pub struct RenderBlock<'a> {
     pub tempo: &'a TempoMap,
 }
 
+/// Maximum audio inputs a node may declare (the mixer's channels, Phase 1).
+pub const MAX_AUDIO_INS: usize = 8;
+
 /// What a node may read this block: its inputs, merged from connected
-/// producers by the interpreter.
+/// producers by the interpreter. Audio inputs are per *port* (a mixer's
+/// channels are separate inputs, `audio_ins[..audio_in_count]`); control,
+/// trigger, and note stay single-port per node in Phase 1.
 pub struct NodeIO<'a> {
+    /// the first audio input (convenience for single-input nodes; `&[]` when
+    /// the node declares none)
     pub audio_in: &'a [f32],
+    /// per audio-In port, in port order; meaningful up to `audio_in_count`
+    pub audio_ins: [&'a [f32]; MAX_AUDIO_INS],
+    pub audio_in_count: usize,
     pub control_in: f32,
     pub triggers_in: &'a [Trigger],
     pub notes_in: &'a [NoteEvent],
@@ -192,6 +203,12 @@ impl Node {
 
     pub fn port(&self, name: &str) -> Option<Port> {
         self.ports.iter().copied().find(|p| p.name == name)
+    }
+
+    /// The position of a port within this node's ports vec — patch cords
+    /// carry port indices, which are stable for the node's lifetime.
+    pub fn port_index(&self, name: &str) -> Option<usize> {
+        self.ports.iter().position(|p| p.name == name)
     }
 }
 
@@ -560,11 +577,16 @@ impl RingDelay {
     }
 }
 
-/// A patch cord: a typed connection between two ports.
+/// A patch cord: a typed connection between two ports, identified by
+/// (node index, port index within that node's ports vec). For audio, `to.1`
+/// is the *audio-in scratch index* (the port's position among the node's
+/// audio-In ports) so the interpreter can fan in per channel; control/trigger/
+/// note merge per kind into the node's single per-kind buffer (`to.1` unused).
 #[derive(Clone, Copy)]
 struct PatchCord {
-    from: (usize, SignalKind),
-    to: (usize, SignalKind),
+    from: (usize, usize),
+    to: (usize, usize),
+    kind: SignalKind,
 }
 
 /// The graph value + interpreter: a patch bay over typed ports.
@@ -581,8 +603,11 @@ pub struct Graph {
     /// per-node merged fan-in buffers.
     triggers_in: Vec<EventBuf<Trigger, MERGE_CAP>>,
     notes_in: Vec<EventBuf<NoteEvent, MERGE_CAP>>,
-    /// audio fan-in sum scratch.
-    audio_sum: Vec<f32>,
+    /// per-node per-audio-In-port fan-in scratch, preallocated (a mixer's
+    /// channels are separate inputs; single-input nodes have one buffer).
+    audio_ins: Vec<Vec<Vec<f32>>>,
+    /// per-node: indices of its audio-In ports (into the node's ports vec).
+    audio_in_ports: Vec<Vec<usize>>,
     /// per-node cumulative audio latency + PDC delay lines.
     cum: Vec<u32>,
     delays: Vec<RingDelay>,
@@ -603,7 +628,8 @@ impl Graph {
             notes_out: Vec::new(),
             triggers_in: Vec::new(),
             notes_in: Vec::new(),
-            audio_sum: vec![0.0; BLOCK],
+            audio_ins: Vec::new(),
+            audio_in_ports: Vec::new(),
             cum: Vec::new(),
             delays: Vec::new(),
             next_id: 0,
@@ -615,6 +641,20 @@ impl Graph {
     pub fn add_node(&mut self, kind: NodeKind, ports: Vec<Port>) -> NodeId {
         let id = NodeId(self.next_id);
         self.next_id += 1;
+        let audio_in_ports: Vec<usize> = ports
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.direction == Direction::In && p.kind == SignalKind::Audio)
+            .map(|(i, _)| i)
+            .collect();
+        let audio_out_ports = ports
+            .iter()
+            .filter(|p| p.direction == Direction::Out && p.kind == SignalKind::Audio)
+            .count();
+        // Phase-1 shape (kimi review findings 2 + 8): many audio Ins (the
+        // mixer's channels), at most one audio Out — enforced loudly.
+        assert!(audio_in_ports.len() <= MAX_AUDIO_INS, "node declares {} audio inputs (max {MAX_AUDIO_INS})", audio_in_ports.len());
+        assert!(audio_out_ports <= 1, "node declares {audio_out_ports} audio outputs (max 1 in Phase 1)");
         self.nodes.push(Node { id, kind, ports });
         self.audio_out.push(vec![0.0; BLOCK]);
         self.control_out.push(0.0);
@@ -622,9 +662,14 @@ impl Graph {
         self.notes_out.push(EventBuf::new());
         self.triggers_in.push(EventBuf::new());
         self.notes_in.push(EventBuf::new());
+        self.audio_ins.push(audio_in_ports.iter().map(|_| vec![0.0; BLOCK]).collect());
+        self.audio_in_ports.push(audio_in_ports);
         self.cum.push(0);
         self.delays.push(RingDelay::with_capacity(MAX_PDC));
-        if self.out_node.is_none() {
+        // The master-bus fallback: only a node with an audio output may claim
+        // it (the mixer claims it explicitly on mount; a trigger-only first
+        // node must not become the bus — kimi review finding 9).
+        if self.out_node.is_none() && audio_out_ports == 1 {
             self.out_node = Some(id);
         }
         id
@@ -635,20 +680,23 @@ impl Graph {
     }
 
     /// Connect two ports (type-checked, forward order). Multiple producers are
-    /// allowed for audio (sum) and events (merge); control inputs are
-    /// single-driver in Spike A.5.
+    /// allowed for audio (summed per input port) and events (merged); control
+    /// inputs are single-driver in Phase 1. Audio `In` ports may be many per
+    /// node (the mixer's channels); other kinds stay one-per-node.
     pub fn connect(&mut self, from: NodeId, from_port: &str, to: NodeId, to_port: &str) -> Result<(), String> {
         let fi = self.index_of(from).ok_or("connect: unknown 'from' node")?;
         let ti = self.index_of(to).ok_or("connect: unknown 'to' node")?;
         if fi >= ti {
             return Err("connect: patch cords must go forward (topological order)".into());
         }
-        let out_port = self.nodes[fi]
-            .port(from_port)
+        let from_port_idx = self.nodes[fi]
+            .port_index(from_port)
             .ok_or_else(|| format!("no port '{from_port}' on node {fi}"))?;
-        let in_port = self.nodes[ti]
-            .port(to_port)
+        let to_port_idx = self.nodes[ti]
+            .port_index(to_port)
             .ok_or_else(|| format!("no port '{to_port}' on node {ti}"))?;
+        let out_port = self.nodes[fi].ports[from_port_idx];
+        let in_port = self.nodes[ti].ports[to_port_idx];
         if out_port.direction != Direction::Out || in_port.direction != Direction::In {
             return Err(format!(
                 "connect: '{from_port}' must be an Out port and '{to_port}' an In port"
@@ -661,13 +709,22 @@ impl Graph {
             ));
         }
         if in_port.kind == SignalKind::Control
-            && self.cords.iter().any(|c| c.to == (ti, SignalKind::Control))
+            && self.cords.iter().any(|c| c.to.0 == ti && c.kind == SignalKind::Control)
         {
-            return Err("connect: control inputs are single-driver in spike A.5".into());
+            return Err("connect: control inputs are single-driver in phase 1".into());
         }
+        let to_scratch = if in_port.kind == SignalKind::Audio {
+            self.audio_in_ports[ti]
+                .iter()
+                .position(|&p| p == to_port_idx)
+                .expect("audio-in port must be registered")
+        } else {
+            0
+        };
         self.cords.push(PatchCord {
-            from: (fi, out_port.kind),
-            to: (ti, in_port.kind),
+            from: (fi, from_port_idx),
+            to: (ti, to_scratch),
+            kind: in_port.kind,
         });
         Ok(())
     }
@@ -692,11 +749,16 @@ impl Graph {
         self.notes_out.remove(idx);
         self.triggers_in.remove(idx);
         self.notes_in.remove(idx);
+        self.audio_ins.remove(idx);
+        self.audio_in_ports.remove(idx);
         self.cum.remove(idx);
         self.delays.remove(idx);
         Some(self.nodes.remove(idx))
     }
 
+    /// Set a node parameter directly. **Unlogged** — the logged, replayable
+    /// path is `Engine::set_param`; direct use bypasses the log (kimi review
+    /// nit 11). Needed by the engine's apply path and node-level tests.
     pub fn set_param(&mut self, id: NodeId, name: &str, value: f32) {
         if let Some(i) = self.index_of(id) {
             self.nodes[i].kind.set_param(name, value);
@@ -720,6 +782,9 @@ impl Graph {
             self.notes_out[i].clear();
             self.triggers_in[i].clear();
             self.notes_in[i].clear();
+            for port in self.audio_ins[i].iter_mut() {
+                port[..len].fill(0.0);
+            }
         }
 
         // Cumulative audio latency per node (longest audio path) + PDC max.
@@ -728,7 +793,7 @@ impl Graph {
             let base = self
                 .cords
                 .iter()
-                .filter(|c| c.to == (i, SignalKind::Audio))
+                .filter(|c| c.to.0 == i && c.kind == SignalKind::Audio)
                 .map(|c| self.cum[c.from.0])
                 .max()
                 .unwrap_or(0);
@@ -737,14 +802,15 @@ impl Graph {
         }
 
         for i in 0..self.nodes.len() {
-            // Gather inputs from producers (all earlier nodes). The audio fan-in
-            // sum resets per node.
-            self.audio_sum[..len].fill(0.0);
+            // Gather inputs from producers (all earlier nodes). Audio fans in
+            // per input port (a mixer's channels stay separate); control/
+            // trigger/note merge into the node's single per-kind buffer.
             for cord in self.cords.iter().filter(|c| c.to.0 == i) {
-                match cord.to.1 {
+                match cord.kind {
                     SignalKind::Audio => {
                         let src = &self.audio_out[cord.from.0][..len];
-                        for (acc, s) in self.audio_sum[..len].iter_mut().zip(src) {
+                        let dst = &mut self.audio_ins[i][cord.to.1][..len];
+                        for (acc, s) in dst.iter_mut().zip(src) {
                             *acc += *s;
                         }
                     }
@@ -769,8 +835,15 @@ impl Graph {
                 }
             }
 
+            let mut io_ins = [&[][..]; MAX_AUDIO_INS];
+            let count = self.audio_in_ports[i].len().min(MAX_AUDIO_INS);
+            for (k, _) in self.audio_in_ports[i].iter().enumerate().take(count) {
+                io_ins[k] = &self.audio_ins[i][k][..len];
+            }
             let io = NodeIO {
-                audio_in: &self.audio_sum[..len],
+                audio_in: io_ins[0],
+                audio_ins: io_ins,
+                audio_in_count: count,
                 control_in: self.control_scratch,
                 triggers_in: self.triggers_in[i].as_slice(),
                 notes_in: self.notes_in[i].as_slice(),

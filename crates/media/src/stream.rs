@@ -405,7 +405,14 @@ mod tests {
         let total = frames as usize + engine::BLOCK;
         let mut out = vec![0.0f32; total];
         for (bi, chunk) in out.chunks_mut(engine::BLOCK).enumerate() {
-            let io = NodeIO { audio_in: &[], control_in: 0.0, triggers_in: &[], notes_in: &[] };
+            let io = NodeIO {
+                audio_in: &[],
+                audio_ins: [&[][..]; engine::MAX_AUDIO_INS],
+                audio_in_count: 0,
+                control_in: 0.0,
+                triggers_in: &[],
+                notes_in: &[],
+            };
             let mut control = 0.0f32;
             let mut triggers = EventBuf::new();
             let mut notes = EventBuf::new();

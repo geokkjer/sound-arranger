@@ -1,14 +1,21 @@
 //! The tone plugin: the sound generator. `in("note")` → `out("audio")` — each
 //! note starts a fixed-decay blip at the note's pitch, sample-accurately. This
-//! is where patched notes become audible; it owns the master audio output in
-//! Spike A.5 (the Phase 1 mixer generalizes the bus).
+//! is where patched notes become audible. The **mixer owns the master bus in
+//! Phase 1** (tone.audio is patched into a mixer channel); the tone no longer
+//! claims the output (Spike-A.5's mount-order bus limitation is gone).
 
-use super::{Disposer, DisposerCtx, Plugin, PluginApi};
+use super::{Disposer, DisposerCtx, ParamDef, Plugin, PluginApi};
 use crate::graph::{Direction, NodeId, NodeKind, Port, SignalKind, ToneGen};
 
 pub const TONE_PORTS: &[Port] = &[
     Port { name: "note", direction: Direction::In, kind: SignalKind::Note },
     Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio },
+];
+
+/// The tone's runtime parameter surface (the logged `SetParam` namespace).
+pub const TONE_PARAMS: &[ParamDef] = &[
+    ParamDef { name: "gain", min: 0.0, max: 1.0 },
+    ParamDef { name: "blip_len", min: 1.0, max: 1_000_000.0 },
 ];
 
 /// Configurable tone plugin.
@@ -30,13 +37,15 @@ impl Plugin for Tone {
         TONE_PORTS
     }
 
+    fn params(&self) -> &'static [ParamDef] {
+        TONE_PARAMS
+    }
+
     fn apply(&mut self, api: &mut PluginApi) -> Result<(NodeId, Disposer), String> {
         let node = api.graph.add_node(
             NodeKind::Opaque(Box::new(ToneGen::new(self.gain, self.blip_len))),
             TONE_PORTS.to_vec(),
         );
-        // The tone node owns the audio output in Spike A.5.
-        api.graph.set_out(node);
         Ok((
             node,
             Box::new(move |dis: &mut DisposerCtx| {
