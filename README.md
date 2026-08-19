@@ -2,13 +2,17 @@
 
 An **audio platform where everything is a plugin**: a minimal core — clock · audio graph
 interpreter · session event log · context plumbing — with every capability as a plugin, and
-the product an **assembled profile**. Rust audio engine (standalone crate, `cpal`) +
-Tauri v2 + Vue 3.
+the product an **assembled profile**. Rust (engine core + media engine + host), with Tauri v2
++ Vue 3 planned as the first graphical shell.
 
 > **Working title.** The repo name names the *first profile*, not the platform; a rename
 > ("audio" / "sound") is an open question — see RESEARCH.md §14.
 
-**Status: pre-code** — research and decisions only. The direction is locked
+**Status: pre-alpha.** The audio core works and is tested; there is **no UI yet**. What
+exists today: the minimal core, the media engine (disk streaming, recording, splicing,
+multi-channel capture), the soft mixer, and a **headless reference host** that proves the
+UI-as-plugin contract. What doesn't exist yet: the Tauri/Vue shell, the clip editor, stereo,
+effects, MIDI/OSC implementations, CLAP hosting. The direction is locked
 ([umbrella-first note](.agents/notes/proposed/architecture/2026-08-15-umbrella-first-product-direction.md)):
 
 - **Profile #1 — the clip arranger ("sound-arranger"):** record long live jams, then cut,
@@ -16,14 +20,51 @@ Tauri v2 + Vue 3.
   tape heritage (Macero, dub, musique concrète) as inspiration. Chosen first because it
   stresses the substrate end-to-end: recording, editing, mixing, the realtime path.
 - **Deferred, own profile — "sound sculptor":** offline/non-realtime processing (CDP8,
-  PaulStretch, phase-vocoder) as `OfflineProcess` plugins.
+  PaulStretch, Csound offline, phase-vocoder) as `OfflineProcess` plugins.
+
+## Where the code is
+
+| Crate | What it is | Status |
+|---|---|---|
+| `crates/engine` | The minimal core: clock (tempo map + sample-accurate scheduler), patch-bay graph interpreter (typed ports, PDC), session event log, context plumbing — plus plugins: euclidean, scale, tone, **soft mixer** (gain/mute/solo, master fader, meters). Std-only, zero dependencies. | works, tested |
+| `crates/media` | The media engine (core-privileged, not a plugin): disk streaming, splice-during-playback, recording writer with crash recovery, device-clock drift compensation, multi-channel capture → **float-WAV media pool with live peak pyramids**, cpal device path. | works, tested |
+| `crates/host` | The **Host API contract** (commands = logged events, events, values) + the **headless reference host**: `run_script` assembles the profile and bounces byte-identically; a CLI smoke binary. The UI-as-plugin seam — a future Tauri shell implements the same contract, nothing else changes. | works, tested |
+
+85 tests across the workspace; the core's invariants (byte-identical replay, no-allocation
+render, sample-accurate lifecycle) are tested, and the 25-minute streaming soak + real
+hardware capture run as `#[ignore]`d tests.
+
+**Honest gaps** (deliberate, pre-alpha): the graph is **mono** (stereo/pan is its own step);
+control-side mutations apply on the render call stack (the real control→render handoff is
+seeded by `flush_scheduled`, not finished); media commands (play/splice) are not yet logged
+events (P1.3 merges them); MIDI/OSC are declared seams, not implementations.
+
+## Try it
+
+```sh
+cargo test --workspace        # everything that doesn't need hardware
+cargo clippy --workspace --all-targets
+
+# hardware-dependent tests (this machine: a Scarlett 2i2):
+cargo test -p media -- --ignored
+cargo test -p media --release -- --ignored soak   # 25-minute stream+record+splice+bounce
+```
+
+The headless smoke binary speaks a versioned command script — the same contract a future
+Tauri shell sends:
+
+```sh
+printf 'host v1\nmount mixer channels=4 @0\nbounce 512 /tmp/out.wav\n' | cargo run -p host
+```
 
 ## Documentation map
 
 - [RESEARCH.md](RESEARCH.md) — working research & architecture (verified crate versions,
-  licensing matrix, latency notes, plugin-architecture research)
+  licensing matrix, latency notes, plugin-architecture research, DAW prior art)
 - [.agents/notes/](.agents/notes/README.md) — decision records (Agent Notes); standing
   orders in [AGENTS.md](AGENTS.md)
+- [docs/architecture-explainer.md](docs/architecture-explainer.md) — a plain-English tour of
+  the code, top-down
 - [docs/audio-latency.md](docs/audio-latency.md) — Linux kernel/userspace latency tuning
 - [research/](research/) — dated research inputs (gear notes, external reviews)
 
