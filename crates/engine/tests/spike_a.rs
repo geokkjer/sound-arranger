@@ -127,7 +127,7 @@ fn patching_is_logged_and_replayable() {
     let mut e1 = engine();
     mount_chain(&mut e1);
     e1.schedule_unmount("euclidean", 1_200_000);
-    e1.set_tempo(96.0, 4);
+    e1.set_tempo(96.0, 4).unwrap();
     let a = e1.render(2 * 48_000);
     let log = e1.log.clone();
     assert!(log.events().iter().any(|ev| matches!(ev, Event::Patch { .. })));
@@ -145,7 +145,7 @@ fn replay_is_exact_for_mid_session_tempo_change() {
     let mut e1 = engine();
     mount_chain(&mut e1);
     let first = e1.render(2 * 48_000);
-    e1.set_tempo(240.0, 4);
+    e1.set_tempo(240.0, 4).unwrap();
     e1.schedule_unmount("euclidean", 3 * 48_000);
     let second = e1.render(2 * 48_000);
     let log = e1.log.clone();
@@ -233,10 +233,10 @@ fn remount_reproduces_identical_signal() {
 
     let mut e2 = engine();
     mount_chain(&mut e2);
-    e2.unmount("euclidean");
-    e2.unmount("scale");
-    e2.unmount("tone");
-    e2.unmount("mixer");
+    e2.unmount("euclidean").unwrap();
+    e2.unmount("scale").unwrap();
+    e2.unmount("tone").unwrap();
+    e2.unmount("mixer").unwrap();
     let _gone = e2.render(2 * 48_000);
     mount_chain(&mut e2);
     let again = e2.render(2 * 48_000);
@@ -321,7 +321,7 @@ fn tempo_change_moves_triggers() {
     e.patch(("scale", "note"), ("tone", "note")).unwrap();
     e.mount("mixer", &[]).unwrap();
     e.patch(("tone", "audio"), ("mixer", "ch0")).unwrap();
-    e.set_tempo(240.0, 4);
+    e.set_tempo(240.0, 4).unwrap();
     let out = e.render(5000);
     assert_eq!(out[2999], 0.0);
     assert!(out[3001] > 0.0, "pulse must land at frame 3000 under 240bpm");

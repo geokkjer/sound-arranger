@@ -275,10 +275,16 @@ impl Engine {
             .schedule(at_frame, SchedEvent::Unmount { plugin: name });
     }
 
-    /// Unmount at the current frame.
-    pub fn unmount(&mut self, name: &'static str) {
+    /// Unmount at the current frame. Fail-loud: an unknown plugin is refused
+    /// and never logged (kimi review finding 10 — the log must not record
+    /// things that never happened).
+    pub fn unmount(&mut self, name: &'static str) -> Result<(), String> {
+        if !self.node_of.contains_key(name) && !self.scheduled.contains(name) {
+            return Err(format!("plugin '{name}' is neither scheduled nor mounted"));
+        }
         let at_frame = self.clock.frame();
         self.schedule_unmount(name, at_frame);
+        Ok(())
     }
 
     /// Apply an unmount: run the disposer (reversible effects). Idempotent.
@@ -292,8 +298,12 @@ impl Engine {
     }
 
     /// A tempo change at the current frame (sample-accurate: applied by the
-    /// render loop at that frame).
-    pub fn set_tempo(&mut self, bpm: f64, beats_per_bar: u32) {
+    /// render loop at that frame). Fail-loud: a non-finite or non-positive
+    /// tempo is refused and never logged (kimi review finding 10).
+    pub fn set_tempo(&mut self, bpm: f64, beats_per_bar: u32) -> Result<(), String> {
+        if !bpm.is_finite() || bpm <= 0.0 {
+            return Err(format!("tempo must be finite and positive, got {bpm}"));
+        }
         let at_frame = self.clock.frame();
         self.log.push(Event::SetTempo {
             bpm,
@@ -302,6 +312,7 @@ impl Engine {
         });
         self.scheduler
             .schedule(at_frame, SchedEvent::SetTempo { bpm, beats_per_bar });
+        Ok(())
     }
 
     /// Set a discrete parameter on a plugin at the current frame: validated
@@ -505,6 +516,20 @@ impl Engine {
     pub fn render_into(&mut self, out: &mut [f32]) {
         for chunk in out.chunks_mut(BLOCK) {
             self.render_block(chunk);
+        }
+    }
+
+    /// Apply every scheduled event due at the current frame **without
+    /// rendering audio** — the control→render handoff's seed (the reference
+    /// host materializes scheduled mounts before wiring cords; kimi review
+    /// finding 5: no discarded block).
+    pub fn flush_scheduled(&mut self) {
+        while let Some(frame) = self.scheduler.peek_frame() {
+            if frame > self.clock.frame() {
+                break;
+            }
+            let event = self.scheduler.pop().expect("peeked");
+            self.apply_event(event);
         }
     }
 

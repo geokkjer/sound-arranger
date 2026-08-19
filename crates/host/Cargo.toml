@@ -1,0 +1,10 @@
+[package]
+name = "host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "sound-arranger reference host — the Host API contract (commands/events/values) and the headless host that exercises it deterministically (UI-as-plugin note)"
+
+[dependencies]
+engine = { path = "../engine" }
+media = { path = "../media" }

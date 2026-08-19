@@ -244,7 +244,7 @@ fn mixer_owns_the_master_bus() {
     let out = e.render(7000);
     assert!(out[6001..7000].iter().any(|s| *s != 0.0), "blip routes through the mixer");
 
-    e.unmount("mixer");
+    e.unmount("mixer").unwrap();
     let out = e.render(2000);
     assert!(
         out.iter().all(|s| *s == 0.0),
@@ -335,7 +335,7 @@ fn remove_middle_node_rewires_cords() {
     let out = e.render(7000);
     assert!(out[6001..7000].iter().any(|s| *s != 0.0), "chain sounds");
 
-    e.unmount("scale");
+    e.unmount("scale").unwrap();
     let out = e.render(2000); // 7000..9000: the first blip's tail rings to 7200
     assert!(
         out[200..].iter().all(|s| *s == 0.0),
@@ -381,7 +381,7 @@ fn mixer_meters_are_a_context_service() {
         .get::<Arc<MeterBank>>("mixer.meters")
         .expect("the mixer provides its meters under 'mixer.meters'");
     assert_eq!(meters.master_peak(), 0.0, "no input → master meters 0");
-    e.unmount("mixer");
+    e.unmount("mixer").unwrap();
     e.render(512); // the scheduled unmount applies (disposer runs)
     assert!(e.ctx.get::<Arc<MeterBank>>("mixer.meters").is_none(), "the disposer withdraws the service");
 }
