@@ -3,6 +3,7 @@
 //! never allocate, never block. Thin and isolated here so cpal API drift
 //! (0.18.x is pre-1.0) cannot leak into the machinery the numeric tests cover.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -32,10 +33,24 @@ pub struct OutputHandle {
     pub channels: u16,
 }
 
-/// An open input stream plus the device's actual sample rate.
+/// An open input stream plus the device's actual sample rate and a shared
+/// source-ring overrun counter: the callback drops samples when the ring is
+/// full, and every drop is counted here — a dropped take sample must never be
+/// silent (kimi review finding 1).
 pub struct InputHandle {
     pub stream: cpal::Stream,
     pub sample_rate: u32,
+    pub overruns: Arc<AtomicU64>,
+}
+
+/// The default input device's capture layout: (sample_rate, channel count).
+/// The profile sizes the capture and the adaptable mixer from this (P1.2: the
+/// Notepad-12FX reports 4, the Scarlett 2i2 2).
+pub fn default_input_config() -> Result<(u32, u16), String> {
+    let host = cpal::default_host();
+    let device = host.default_input_device().ok_or("no default input device")?;
+    let config = device.default_input_config().map_err(|e| format!("input config: {e}"))?;
+    Ok((config.sample_rate(), config.channels()))
 }
 
 /// Open the default output device; the callback pops mono frames from `ring`
@@ -102,23 +117,25 @@ pub fn open_input(ring: Arc<Spsc<f32>>) -> Result<InputHandle, String> {
         let err = err.clone();
         move |e: cpal::Error| *err.lock().unwrap() = Some(format!("input stream: {e}"))
     };
+    let overruns = Arc::new(AtomicU64::new(0));
     let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => build_input::<f32>(&device, stream_config, ring, err_cb)?,
-        cpal::SampleFormat::I16 => build_input::<i16>(&device, stream_config, ring, err_cb)?,
-        cpal::SampleFormat::U16 => build_input::<u16>(&device, stream_config, ring, err_cb)?,
+        cpal::SampleFormat::F32 => build_input::<f32>(&device, stream_config, ring, overruns.clone(), err_cb)?,
+        cpal::SampleFormat::I16 => build_input::<i16>(&device, stream_config, ring, overruns.clone(), err_cb)?,
+        cpal::SampleFormat::U16 => build_input::<u16>(&device, stream_config, ring, overruns.clone(), err_cb)?,
         other => return Err(format!("unsupported input sample format {other:?}")),
     };
     stream.play().map_err(|e| format!("play input: {e}"))?;
     if let Some(e) = err.lock().unwrap().take() {
         return Err(e);
     }
-    Ok(InputHandle { stream, sample_rate })
+    Ok(InputHandle { stream, sample_rate, overruns })
 }
 
 fn build_input<T>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
     ring: Arc<Spsc<f32>>,
+    overruns: Arc<AtomicU64>,
     err_cb: impl FnMut(cpal::Error) + Send + 'static,
 ) -> Result<cpal::Stream, String>
 where
@@ -129,7 +146,9 @@ where
             config,
             move |data: &[T], _: &cpal::InputCallbackInfo| {
                 for d in data {
-                    let _ = ring.try_push(d.to_float_sample());
+                    if !ring.try_push(d.to_float_sample()) {
+                        overruns.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             },
             err_cb,

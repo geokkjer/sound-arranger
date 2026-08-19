@@ -343,6 +343,32 @@ fn remove_middle_node_rewires_cords() {
     );
 }
 
+/// Patches beyond the mounted channel count are accepted but ignored
+/// (documented): with `channels = 2`, a source into ch3 is silent.
+#[test]
+fn mixer_ignores_channels_beyond_the_mounted_count() {
+    let mut g = Graph::new();
+    let s0 = g.add_node(
+        NodeKind::Sine(Sine::new(440.0)),
+        vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio }],
+    );
+    let s3 = g.add_node(
+        NodeKind::Sine(Sine::new(880.0)),
+        vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio }],
+    );
+    let mixer_node = MixerNode::with_channels(2, Arc::new(MeterBank::default()));
+    let mixer = g.add_node(NodeKind::Opaque(Box::new(mixer_node)), MIXER_PORTS.to_vec());
+    g.set_out(mixer);
+    g.connect(s0, "audio", mixer, "ch0").unwrap();
+    g.connect(s3, "audio", mixer, "ch3").unwrap(); // beyond channels=2: ignored
+    let out = render_node(&mut g, BLOCK);
+    let mut p0 = 0.0f64;
+    for s in out.iter() {
+        let expected = sine_sample(440.0, &mut p0);
+        assert!((*s - expected).abs() < 1e-6, "ch3 must be ignored: {s} vs {expected}");
+    }
+}
+
 /// The mixer's meters are reachable through the real plugin path (kimi
 /// finding 1): mounting the mixer provides `mixer.meters` on the context.
 #[test]
@@ -375,4 +401,37 @@ fn more_than_max_audio_ins_refused() {
         .collect();
     ports.push(Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio });
     let _ = g.add_node(NodeKind::Opaque(Box::new(MixerNode::new())), ports);
+}
+
+/// The mixer adapts to the input layout (P1.2): mounted with `channels = 2`,
+/// only the first two inputs are processed — a patch to ch2 is accepted but
+/// ignored.
+#[test]
+fn mixer_adapts_to_channel_count() {
+    let mut g = Graph::new();
+    let s0 = g.add_node(
+        NodeKind::Sine(Sine::new(440.0)),
+        vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio }],
+    );
+    let s1 = g.add_node(
+        NodeKind::Sine(Sine::new(660.0)),
+        vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio }],
+    );
+    let s2 = g.add_node(
+        NodeKind::Sine(Sine::new(880.0)),
+        vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio }],
+    );
+    let mixer_node = MixerNode::with_channels(2, Arc::new(MeterBank::default()));
+    let mixer = g.add_node(NodeKind::Opaque(Box::new(mixer_node)), MIXER_PORTS.to_vec());
+    g.set_out(mixer);
+    g.connect(s0, "audio", mixer, "ch0").unwrap();
+    g.connect(s1, "audio", mixer, "ch1").unwrap();
+    g.connect(s2, "audio", mixer, "ch2").unwrap(); // accepted, ignored
+    let out = render_node(&mut g, BLOCK);
+
+    let (mut p0, mut p1) = (0.0f64, 0.0f64);
+    for s in out.iter() {
+        let expected = sine_sample(440.0, &mut p0) + sine_sample(660.0, &mut p1);
+        assert!((*s - expected).abs() < 1e-6, "ch2 must be ignored: {s} vs {expected}");
+    }
 }

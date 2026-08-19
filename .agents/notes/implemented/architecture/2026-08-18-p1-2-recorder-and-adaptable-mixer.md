@@ -1,0 +1,31 @@
+# Agent Note: P1.2 — the recorder path, the adaptable mixer, and the USB-hardware-mixer target
+
+Status: implemented
+
+## Problem
+
+P1.1 shipped a fixed-4-channel soft mixer. The user requirement (2026-08-18): the mixer must be **adaptable to the inputs**, and the recording target is **USB audio via the hardware mixer** — the Soundcraft Notepad-12FX (gear note): class-compliant USB with **4 capture channels** (inputs 1 & 2 fixed, 3–4 a routable stereo pair), each USB channel one non-destructive source. The recorder (`cpal` → media pool, live peaks) must discover the device's input layout, the mixer must mount with that channel count, and the capture must land as **per-channel float-WAV pool sources with a live peak pyramid**.
+
+## Decision
+
+- **The adaptable mixer (engine, `plugins::mixer`)** — the channel count is a **mount parameter** (`channels`, 1..=8): the factory reads it (whole numbers only), the node processes exactly that many inputs, the profile sets it from the device's input config (`devices::default_input_config`). The declared port/parameter surfaces cover the maximum (`ch0..ch7`, static — the graph's `MAX_AUDIO_INS`); patches beyond the mounted count are accepted but ignored (tested). The logged `Mount` params make the channel count replayable (byte-identical replay tested).
+- **Float-WAV pool writer (media, `wav`)** — `WavWriter::create_float` (format 3, 32-bit float LE): the pool stores float sources; 16-bit stays for bounce/export. Bit-identical float round-trip tested; crashed float takes recover.
+- **Live peak pyramid (media, `peaks`)** — the Audacity structure: min/max per **256-sample base bin**, accumulated **incrementally** as samples arrive (the recorder's write side feeds it), upper levels (×2 per level; level k covers 2^k bins — **level 0 is the base**, matching the sidecar) computed on demand, persisted per-source `.peaks` sidecar. `levels()` and `PeakFile::read` are indexing-consistent (tested).
+- **Multi-channel capture (media, `capture`)** — `Capture` owns the interleaved source ring (fed by the cpal callback — with a shared **overrun counter** on the input handle, a dropped take sample is never silent — or by a test's virtual device), a demux thread that splits frames into per-channel SPSC rings (monitoring) and writes each channel to its own **float WAV + peaks sidecar in the pool** (whole-frame batching with partial-frame preservation across batches; drain-before-break on stop; the pool write is authoritative, monitoring rings best-effort with drop counting). Pool writers open **synchronously in `start()`** (fail-loud), `take_id` is validated for filenames, channels out of range return `Err`. `CaptureNode` (a graph `AudioNode`, `out("audio")` per channel) exposes a channel for monitoring.
+- **Device discovery (media, `devices`)** — `default_input_config()` reports the input device's (sample rate, channel count); the profile sizes the capture and the mixer from it.
+- **Monitoring into the mixer** — the profile wires `CaptureNode`s into the adaptable mixer with **direct graph calls** (`graph.add_node`/`connect`), not `Engine::patch`: per-channel plugin ids are inexpressible under the engine's one-instance-per-name + function-pointer factory model (see Alternatives). This is the Spike-B pattern for media nodes, with a documented **log-visibility carve-out**: the monitoring topology is not part of the session log, and rendering a graph containing a live `CaptureNode` is not log-deterministic — bounce must exclude it (P1.3 decides formally).
+
+## Alternatives considered
+
+- **A `RecorderPlugin { channels }` mounting per-channel nodes** — the note's original shape; impossible under the current model: `validate_mount` enforces one instance per name, and `PluginFactory` is a function pointer that cannot carry a per-channel `id()` (the plugin's name is its node_of key). Rejected; recorded as the seam P1.3's session-log work should revisit (multi-audio-Out nodes or a name-carrying factory).
+- **Keep the mixer at 4** — fails "adaptable to the inputs" (Scarlett 2, Notepad 4, future devices differ). Rejected.
+- **Dynamic ports at runtime** — a trait change for no current need; the mount param over a static max surface is the honest Phase-1 shape.
+- **Record the mono master only** — loses the Notepad's whole point (per-channel multitrack). The capture is per-channel; the master is the monitoring/export path.
+
+## Consequences
+
+- **Verified by tests (media: 22 unit + 4 P1.2 + 1 hardware; engine: 16 mixer):** a virtual 4-channel device captured concurrently with the monitoring render lands as 4 float-WAV pool sources + peaks sidecars with **bit-exact** round-trip; the summed master equals the four channel sines exactly (the glitch-freedom proof — a dropped monitoring sample would shift the stream); the pool peaks match an independent min/max reduction; the capture→mixer render path allocates nothing (counting allocator); the mixer `channels` param replays byte-identically; patches beyond the mounted count are ignored; real hardware (Scarlett 2i2) captured 2 channels @ 48 kHz into the pool with readback + peaks parse.
+- **kimi review (2026-08-18)**: no criticals; three majors + fixes folded — see [the review archive](research/architecture/2026-08-18-kimi-review-p1-2-recorder.md).
+- **Known limitations (Phase-1 scope):** the graph is mono (each device channel becomes a mono mixer channel; the stereo step generalizes); monitoring is best-effort (the consumer must keep up — real monitoring is real-time, tests pace); the peaks upper levels are computed on demand (the live view is the base level); the `.peaks` sidecar exists only after a clean `stop` — a crashed take has a recoverable WAV and no peaks.
+- **Recorded for P1.3 (the clip editor):** the pool needs a real abstraction — enumeration, `seek_frames` reads, `PeakFile::read`, and the **crash-recovery pass** (on pool open, `recover` un-finalized WAVs and rebuild their peaks); the log-visibility carve-out for graph-level media nodes (exclude from bounce or log their presence); `Capture` as a ctx-shaped service like `mixer.meters`; multi-audio-Out nodes or a name-carrying factory if per-channel plugins are wanted.
+- **Next:** P1.3 the clip editor — the ACID operations as logged commands on the pool's sources.

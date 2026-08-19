@@ -192,12 +192,15 @@ impl WavReader {
     }
 }
 
-/// A 16-bit PCM WAV writer whose header sizes are patched on `finalize`
-/// (and best-effort on drop), and whose crashed takes are recoverable.
+/// A WAV writer whose header sizes are patched on `finalize` (and best-effort
+/// on drop), and whose crashed takes are recoverable. 16-bit PCM by default;
+/// [`WavWriter::create_float`] writes 32-bit float — the media *pool*'s format
+/// (prior-art research: float on disk, 16-bit at bounce/export).
 pub struct WavWriter {
     writer: BufWriter<File>,
     pub sample_rate: u32,
     pub channels: u16,
+    float: bool,
     frames: u64,
     finalized: bool,
     path: PathBuf,
@@ -207,13 +210,22 @@ impl WavWriter {
     /// Create (truncate) the file and write a complete header with placeholder
     /// sizes — the take is recoverable from the first byte.
     pub fn create(path: &Path, sample_rate: u32, channels: u16) -> Result<Self, String> {
+        Self::create_with(path, sample_rate, channels, false)
+    }
+
+    /// Create a 32-bit float WAV (format 3) — the media pool's source format.
+    pub fn create_float(path: &Path, sample_rate: u32, channels: u16) -> Result<Self, String> {
+        Self::create_with(path, sample_rate, channels, true)
+    }
+
+    fn create_with(path: &Path, sample_rate: u32, channels: u16, float: bool) -> Result<Self, String> {
         if channels != 1 && channels != 2 {
             return Err(format!("WAV writer supports mono/stereo, got {channels} channels"));
         }
         let file = File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
         let mut writer = BufWriter::new(file);
-        write_header(&mut writer, sample_rate, channels)?;
-        Ok(WavWriter { writer, sample_rate, channels, frames: 0, finalized: false, path: path.to_path_buf() })
+        write_header(&mut writer, sample_rate, channels, float)?;
+        Ok(WavWriter { writer, sample_rate, channels, float, frames: 0, finalized: false, path: path.to_path_buf() })
     }
 
     pub fn path(&self) -> &Path {
@@ -221,15 +233,21 @@ impl WavWriter {
     }
 
     /// Append interleaved frames (mono: one sample per frame; stereo: pairs).
-    /// The last partial frame is dropped.
+    /// The last partial frame is dropped. 16-bit clamps to [-1, 1] and
+    /// quantizes; float writes the raw samples (the pool keeps the signal).
     pub fn write(&mut self, samples: &[f32]) -> Result<(), String> {
         let frames = samples.len() / self.channels as usize;
-        let mut bytes = Vec::with_capacity(frames * self.channels as usize * 2);
+        let bytes_per_sample = if self.float { 4 } else { 2 };
+        let mut bytes = Vec::with_capacity(frames * self.channels as usize * bytes_per_sample);
         for f in 0..frames {
             for ch in 0..self.channels as usize {
-                let s = samples[f * self.channels as usize + ch].clamp(-1.0, 1.0);
-                let v = (s * 32767.0).round() as i16;
-                bytes.extend_from_slice(&v.to_le_bytes());
+                let s = samples[f * self.channels as usize + ch];
+                if self.float {
+                    bytes.extend_from_slice(&s.to_le_bytes());
+                } else {
+                    let v = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
             }
         }
         self.writer.write_all(&bytes).map_err(|e| format!("write {}: {e}", self.path.display()))?;
@@ -254,7 +272,7 @@ impl WavWriter {
             return Ok(());
         }
         self.writer.flush().map_err(|e| format!("flush: {e}"))?;
-        patch_sizes(&mut self.writer, self.frames, self.channels)?;
+        patch_sizes(&mut self.writer, self.frames, self.channels, self.float)?;
         self.finalized = true;
         Ok(())
     }
@@ -268,11 +286,16 @@ impl WavWriter {
         let file_len = file.metadata().map_err(|e| e.to_string())?.len();
         let actual_bytes = file_len.saturating_sub(h.data_offset);
         let frames = actual_bytes / h.block_align();
+        // Patch a *frame-aligned* size: a torn tail from a crash mid-flush is
+        // truncated away so the recovered file is formally well-formed
+        // (kimi review finding 7).
+        let data_bytes = frames * h.block_align();
         let mut f = File::options().write(true).open(path).map_err(|e| format!("open rw {}: {e}", path.display()))?;
         f.seek(SeekFrom::Start(RIFF_SIZE_POS)).map_err(|e| e.to_string())?;
-        f.write_all(&(36u32 + actual_bytes as u32).to_le_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(&(36u32 + data_bytes as u32).to_le_bytes()).map_err(|e| e.to_string())?;
         f.seek(SeekFrom::Start(DATA_SIZE_POS)).map_err(|e| e.to_string())?;
-        f.write_all(&(actual_bytes as u32).to_le_bytes()).map_err(|e| e.to_string())?;
+        f.write_all(&(data_bytes as u32).to_le_bytes()).map_err(|e| e.to_string())?;
+        f.set_len(h.data_offset + data_bytes).map_err(|e| e.to_string())?;
         f.flush().map_err(|e| e.to_string())?;
         Ok(frames)
     }
@@ -289,25 +312,27 @@ impl Drop for WavWriter {
     }
 }
 
-fn write_header(w: &mut impl Write, sample_rate: u32, channels: u16) -> Result<(), String> {
+fn write_header(w: &mut impl Write, sample_rate: u32, channels: u16, float: bool) -> Result<(), String> {
     w.write_all(RIFF_TAG).map_err(|e| e.to_string())?;
     w.write_all(&0xFFFF_FFFFu32.to_le_bytes()).map_err(|e| e.to_string())?; // riff size placeholder
     w.write_all(WAVE_TAG).map_err(|e| e.to_string())?;
     w.write_all(FMT_TAG).map_err(|e| e.to_string())?;
     w.write_all(&16u32.to_le_bytes()).map_err(|e| e.to_string())?;
-    w.write_all(&FMT_PCM.to_le_bytes()).map_err(|e| e.to_string())?;
+    w.write_all(&(if float { FMT_FLOAT } else { FMT_PCM }).to_le_bytes()).map_err(|e| e.to_string())?;
     w.write_all(&channels.to_le_bytes()).map_err(|e| e.to_string())?;
     w.write_all(&sample_rate.to_le_bytes()).map_err(|e| e.to_string())?;
-    w.write_all(&(sample_rate * channels as u32 * 2).to_le_bytes()).map_err(|e| e.to_string())?; // byte rate
-    w.write_all(&(channels * 2).to_le_bytes()).map_err(|e| e.to_string())?; // block align
-    w.write_all(&16u16.to_le_bytes()).map_err(|e| e.to_string())?; // bits
+    let bytes_per_sample: u16 = if float { 4 } else { 2 };
+    w.write_all(&(sample_rate * channels as u32 * bytes_per_sample as u32).to_le_bytes()).map_err(|e| e.to_string())?; // byte rate
+    w.write_all(&(channels * bytes_per_sample).to_le_bytes()).map_err(|e| e.to_string())?; // block align
+    w.write_all(&(bytes_per_sample * 8).to_le_bytes()).map_err(|e| e.to_string())?; // bits
     w.write_all(DATA_TAG).map_err(|e| e.to_string())?;
     w.write_all(&0xFFFF_FFFFu32.to_le_bytes()).map_err(|e| e.to_string())?; // data size placeholder
     Ok(())
 }
 
-fn patch_sizes(w: &mut (impl Write + Seek), frames: u64, channels: u16) -> Result<(), String> {
-    let data_bytes = (frames * channels as u64 * 2) as u32;
+fn patch_sizes(w: &mut (impl Write + Seek), frames: u64, channels: u16, float: bool) -> Result<(), String> {
+    let bytes_per_sample: u64 = if float { 4 } else { 2 };
+    let data_bytes = (frames * channels as u64 * bytes_per_sample) as u32;
     w.seek(SeekFrom::Start(RIFF_SIZE_POS)).map_err(|e| e.to_string())?;
     w.write_all(&(36u32 + data_bytes).to_le_bytes()).map_err(|e| e.to_string())?;
     w.seek(SeekFrom::Start(DATA_SIZE_POS)).map_err(|e| e.to_string())?;
@@ -408,6 +433,44 @@ mod tests {
         let path = tmp("garbage");
         std::fs::write(&path, b"not a wave file at all").unwrap();
         assert!(WavReader::open(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod float_tests {
+    use super::*;
+
+    #[test]
+    fn float_roundtrip_is_lossless() {
+        let path = std::env::temp_dir().join(format!("media-wav-float-{}.wav", std::process::id()));
+        let samples: Vec<f32> = (0..1000).map(|i| (i as f32 / 1000.0) * 2.0 - 1.0).collect();
+        {
+            let mut w = WavWriter::create_float(&path, 48_000, 1).unwrap();
+            w.write(&samples).unwrap();
+            w.finalize().unwrap();
+        }
+        let mut r = WavReader::open(&path).unwrap();
+        assert_eq!(r.sample_rate(), 48_000);
+        assert_eq!(r.total_frames(), 1000);
+        let mut back = vec![0.0f32; 1000];
+        assert_eq!(r.read_into(&mut back), 1000);
+        for (a, b) in samples.iter().zip(&back) {
+            assert_eq!(*a, *b, "float WAV must round-trip exactly (bit-identical)");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A crashed float take recovers to its full length like the 16-bit one.
+    #[test]
+    fn float_take_crash_recovers() {
+        let path = std::env::temp_dir().join(format!("media-wav-float-crash-{}.wav", std::process::id()));
+        {
+            let mut w = WavWriter::create_float(&path, 48_000, 1).unwrap();
+            w.write(&vec![0.5; 777]).unwrap();
+            // no finalize — the "crash"
+        }
+        assert_eq!(WavWriter::recover(&path).unwrap(), 777);
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -29,8 +29,10 @@
 //! master out (owned by the mixer plugin) to a 16-bit WAV — 16-bit at
 //! bounce/export; the media *pool* keeps 32-bit float sources.
 
+pub mod capture;
 pub mod devices;
 pub mod drift;
+pub mod peaks;
 pub mod record;
 pub mod ring;
 pub mod stream;
@@ -38,7 +40,9 @@ pub mod wav;
 
 use std::path::Path;
 
+pub use capture::{Capture, CaptureNode};
 pub use drift::DriftCompensator;
+pub use peaks::{PeakBuilder, PeakFile, PEAK_BASE_BIN, PEAK_LEVELS};
 pub use record::{Recorder, RecordNode, WavRecorder};
 pub use ring::Spsc;
 pub use stream::{mailbox, ClipRef, FilePlayer, Mailbox, PlaybackNode, SpliceCmd, DEFAULT_RING_CAPACITY};
