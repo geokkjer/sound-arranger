@@ -103,6 +103,20 @@ pub enum HostCommand {
     Record {
         take_id: String,
     },
+    /// An arrangement edit (the clip editor's ACID op) — a **logged command**
+    /// carrying `at_frame`. The host applies it to the clip editor's value and
+    /// wires the arrangement nodes into the mixer before rendering. This is the
+    /// P1.3.4 replacement for `Play`/`Splice` (which remain for the recorder
+    /// player path).
+    Arrange {
+        op: media::ArrangeOp,
+        at_frame: Option<u64>,
+    },
+    /// Point the host at the media pool (where arrangement clip source paths
+    /// resolve). Part of the script so it is self-describing.
+    Pool {
+        dir: PathBuf,
+    },
     /// Render `frames` from the current position and write the master to a
     /// 16-bit WAV.
     Bounce {
@@ -119,7 +133,8 @@ impl HostCommand {
             | HostCommand::SetParam { at_frame, .. }
             | HostCommand::SetTempo { at_frame, .. }
             | HostCommand::Unmount { at_frame, .. }
-            | HostCommand::Play { at_frame, .. } => *at_frame,
+            | HostCommand::Play { at_frame, .. }
+            | HostCommand::Arrange { at_frame, .. } => *at_frame,
             _ => None,
         }
     }
@@ -140,6 +155,10 @@ pub struct HostSession {
     /// media commands applied (the log covers engine commands only until
     /// P1.3; the host reports both — kimi review finding 9).
     media_commands: usize,
+    /// the clip editor (lazy): owns the arrangement value + op handlers.
+    editor: Option<media::ClipEditor>,
+    /// resolves a pool source id (stem) to its `.wav` path, set by `set_pool`.
+    pool_resolver: Option<media::PoolResolver>,
 }
 
 impl HostSession {
@@ -157,7 +176,32 @@ impl HostSession {
             player_deferred: None,
             mixer_channels: None,
             media_commands: 0,
+            editor: None,
+            pool_resolver: None,
         }
+    }
+
+    /// Set the media pool for arrangement clips. The pool (float-WAV sources by
+    /// stem id) is where the clip editor's clips resolve their source paths.
+    pub fn set_pool(&mut self, pool_dir: impl Into<PathBuf>) -> Result<(), String> {
+        let dir: PathBuf = pool_dir.into();
+        media::Pool::open(&dir)?; // validate it exists as a directory
+        let resolver: media::PoolResolver = std::sync::Arc::new(move |id| {
+            let p = dir.join(format!("{id}.wav"));
+            p.is_file().then_some(p)
+        });
+        self.pool_resolver = Some(resolver);
+        Ok(())
+    }
+
+    /// Ensure the clip editor exists and its op handlers are registered.
+    fn ensure_editor(&mut self) -> Result<(), String> {
+        if self.editor.is_none() {
+            let ed = media::ClipEditor::new();
+            ed.register(&mut self.engine)?;
+            self.editor = Some(ed);
+        }
+        Ok(())
     }
 
     /// Test scaffolding (a real host speaks `HostCommand`, not `&mut Engine` —
@@ -251,6 +295,21 @@ impl HostSession {
             HostCommand::Record { .. } => {
                 Err("recording the input requires a device — the reference host bounces the master instead (see Bounce)".into())
             }
+            HostCommand::Arrange { op, .. } => {
+                self.ensure_editor()?;
+                if self.pool_resolver.is_none() {
+                    return Err("arrange requires set_pool first (clips need pool-source paths)".into());
+                }
+                let editor = self.editor.as_mut().expect("ensured");
+                editor.apply(&mut self.engine, op)?;
+                self.media_commands += 1;
+                Ok(())
+            }
+            HostCommand::Pool { dir } => {
+                self.set_pool(dir.clone())?;
+                self.media_commands += 1;
+                Ok(())
+            }
             HostCommand::Bounce { frames, path } => {
                 self.wire_pending()?;
                 let out = self.engine.render(*frames);
@@ -285,6 +344,7 @@ impl HostSession {
         Ok(())
     }
 
+    /// Wire one `ArrangerNode` per track (in the timeline value) into the mixer,
     /// Render `frames` from the current position (wiring pending cords first).
     pub fn render(&mut self, frames: usize) -> Vec<f32> {
         self.wire_pending().expect("wiring is validated at Play apply");
@@ -301,6 +361,16 @@ impl HostSession {
 
     pub fn media_command_count(&self) -> usize {
         self.media_commands
+    }
+
+    /// The clip editor's arrangement value (read-only snapshot). Empty when no
+    /// arrangement has been built. The value is a pure reconstruction of the
+    /// logged `Arrange` commands (byte-identically replayable).
+    pub fn arrangement(&self) -> media::Timeline {
+        self.editor
+            .as_ref()
+            .map(|e| e.snapshot())
+            .unwrap_or_default()
     }
 
     pub fn underruns(&self) -> u64 {
