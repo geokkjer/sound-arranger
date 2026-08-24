@@ -36,6 +36,7 @@ pub mod peaks;
 pub mod record;
 pub mod ring;
 pub mod stream;
+pub mod timeline;
 pub mod wav;
 
 use std::path::Path;
@@ -46,6 +47,7 @@ pub use peaks::{PeakBuilder, PeakFile, PEAK_BASE_BIN, PEAK_LEVELS};
 pub use record::{Recorder, RecordNode, WavRecorder};
 pub use ring::Spsc;
 pub use stream::{mailbox, ClipRef, FilePlayer, Mailbox, PlaybackNode, SpliceCmd, DEFAULT_RING_CAPACITY};
+pub use timeline::{ArrangeOp, Clip, Edge, Frame, Id, Timeline, Track};
 pub use wav::{WavReader, WavWriter};
 
 /// Bounce: render `frames` of the engine's master out and write it to a
