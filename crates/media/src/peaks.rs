@@ -7,7 +7,7 @@
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Samples per base bin (the Audacity "reduction" granularity).
 pub const PEAK_BASE_BIN: usize = 256;
@@ -156,25 +156,35 @@ pub struct PeakFile;
 
 impl PeakFile {
     /// Write the sidecar (16-bit-quantized min/max would suffice, but the
-    /// pool keeps float — store f32 pairs). Finalizes the builder.
+    /// pool keeps float — store f32 pairs). Finalizes the builder. **Atomic:** writes
+    /// to `${path}.tmp` then renames, so "exists ⇒ valid" (kimi pool must-fix 2).
     pub fn write(path: &Path, builder: &mut PeakBuilder, sample_rate: u32) -> Result<(), String> {
         builder.finalize();
-        let file = File::create(path).map_err(|e| format!("peaks create {}: {e}", path.display()))?;
-        let mut w = BufWriter::new(file);
-        w.write_all(PEAK_MAGIC).map_err(|e| e.to_string())?;
-        w.write_all(&(PEAK_BASE_BIN as u32).to_le_bytes()).map_err(|e| e.to_string())?;
-        w.write_all(&(PEAK_LEVELS as u8).to_le_bytes()).map_err(|e| e.to_string())?;
-        w.write_all(&builder.frames().to_le_bytes()).map_err(|e| e.to_string())?;
-        w.write_all(&sample_rate.to_le_bytes()).map_err(|e| e.to_string())?;
-        let mut level_min = builder.base_min.clone();
-        let mut level_max = builder.base_max.clone();
-        for _ in 0..PEAK_LEVELS {
-            write_level(&mut w, &level_min, &level_max)?;
-            level_min = pair_min(&level_min);
-            level_max = pair_max(&level_max);
+        let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+        let write = || -> Result<(), String> {
+            let file = File::create(&tmp).map_err(|e| format!("peaks create {}: {e}", tmp.display()))?;
+            let mut w = BufWriter::new(file);
+            w.write_all(PEAK_MAGIC).map_err(|e| e.to_string())?;
+            w.write_all(&(PEAK_BASE_BIN as u32).to_le_bytes()).map_err(|e| e.to_string())?;
+            w.write_all(&(PEAK_LEVELS as u8).to_le_bytes()).map_err(|e| e.to_string())?;
+            w.write_all(&builder.frames().to_le_bytes()).map_err(|e| e.to_string())?;
+            w.write_all(&sample_rate.to_le_bytes()).map_err(|e| e.to_string())?;
+            let mut level_min = builder.base_min.clone();
+            let mut level_max = builder.base_max.clone();
+            for _ in 0..PEAK_LEVELS {
+                write_level(&mut w, &level_min, &level_max)?;
+                level_min = pair_min(&level_min);
+                level_max = pair_max(&level_max);
+            }
+            w.flush().map_err(|e| e.to_string())?;
+            Ok(())
+        };
+        let r = write();
+        if r.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return r;
         }
-        w.flush().map_err(|e| e.to_string())?;
-        Ok(())
+        std::fs::rename(&tmp, path).map_err(|e| format!("peaks rename {}: {e}", path.display()))
     }
 
     /// Read the sidecar: (base_bin, levels, frames, sample_rate, per-level
@@ -192,15 +202,23 @@ impl PeakFile {
         let base_bin = u32::from_le_bytes(u32b);
         let mut level_byte = [0u8; 1];
         f.read_exact(&mut level_byte).map_err(|e| e.to_string())?;
-        let levels = level_byte[0] as usize;
         f.read_exact(&mut u64b).map_err(|e| e.to_string())?;
         let frames = u64::from_le_bytes(u64b);
         f.read_exact(&mut u32b).map_err(|e| e.to_string())?;
         let sample_rate = u32::from_le_bytes(u32b);
+        // Bound the per-level allocation: a valid sidecar's largest level (base) has
+        // ~frames/base_bin bins, and higher levels keep halving. A corrupt/hostile
+        // sidecar claiming billions of bins must fail loud, not allocate gigabytes
+        // (kimi pool should-fix 4).
+        let max_bins = (frames as usize).div_ceil(PEAK_BASE_BIN).max(1);
+        let levels = (level_byte[0] as usize).min(PEAK_LEVELS);
         let mut out = Vec::with_capacity(levels);
         for _ in 0..levels {
             f.read_exact(&mut u32b).map_err(|e| e.to_string())?;
             let n = u32::from_le_bytes(u32b) as usize;
+            if n > max_bins {
+                return Err(format!("peaks level length {n} exceeds the source's frame count"));
+            }
             let mut mn = vec![0.0f32; n];
             let mut mx = vec![0.0f32; n];
             for v in mn.iter_mut() {

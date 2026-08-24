@@ -299,6 +299,16 @@ impl WavWriter {
         f.flush().map_err(|e| e.to_string())?;
         Ok(frames)
     }
+
+    /// Whether a file is formally well-formed (its declared data size exactly
+    /// matches the bytes after the data header) — i.e. a crashed take whose
+    /// placeholder size was never patched returns `false` (the pool recovers it).
+    pub fn is_finalized(path: &Path) -> Result<bool, String> {
+        let mut file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let h = parse_header(&mut file)?;
+        let file_len = file.metadata().map_err(|e| e.to_string())?.len();
+        Ok(h.data_offset + h.data_bytes as u64 == file_len)
+    }
 }
 
 impl Drop for WavWriter {
