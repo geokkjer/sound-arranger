@@ -38,6 +38,7 @@ pub mod graph;
 pub mod log;
 pub mod plugins;
 pub mod render;
+pub mod value;
 
 pub use clock::{Clock, Scheduler, TempoMap};
 pub use ctx::Context;
@@ -52,4 +53,5 @@ pub use plugins::{
     MeterBank, MidiSink, MidiSource, MixerNode, MixerPlugin, MIXER_CHANNELS, MIXER_PARAMS,
     MIXER_PORTS, OscSink, OscSource, ParamDef, Plugin, PluginApi, Rhythm, Scale, Tone, TONE_PARAMS,
 };
-pub use render::{Engine, PluginFactory, SchedEvent};
+pub use render::{Engine, OpHandler, PluginFactory, SchedEvent};
+pub use value::{OpMsg, Value};

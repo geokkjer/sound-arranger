@@ -45,6 +45,16 @@ pub enum Event {
         value: f32,
         at_frame: u64,
     },
+    /// A plugin message at an absolute frame — the closed-core carrier for
+    /// profile-level ops (P1.3.2: the clip-editor's ACID ops). The engine logs
+    /// and schedules it; a handler the plugin registered interprets it (the
+    /// core never grows one variant per plugin op). Fields carry interned ids
+    /// and canonical values; a refused op is never logged.
+    Arrangement {
+        op: &'static str,
+        fields: Vec<(&'static str, crate::value::Value)>,
+        at_frame: u64,
+    },
 }
 
 /// The append-only session log.

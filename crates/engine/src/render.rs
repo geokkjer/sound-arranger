@@ -18,6 +18,7 @@ use crate::clock::{Clock, Scheduler};
 use crate::graph::{Graph, NodeId, Port, RenderBlock, SignalKind, BLOCK};
 use crate::log::{Event, SessionLog};
 use crate::plugins::{Disposer, DisposerCtx, ParamDef, Plugin, PluginApi};
+use crate::value::Value;
 
 /// One-shot events the scheduling queue delivers at an exact absolute frame.
 #[derive(Debug, Clone, PartialEq)]
@@ -39,10 +40,25 @@ pub enum SchedEvent {
         param: &'static str,
         value: f32,
     },
+    Arrangement {
+        op: &'static str,
+        fields: Vec<(&'static str, Value)>,
+    },
 }
 
 /// Builds a plugin from a flat parameter list (the `Event::Mount` payload).
 pub type PluginFactory = fn(&[(&'static str, f32)]) -> Result<Box<dyn Plugin>, String>;
+
+/// A registered plugin-message handler: interprets an op's fields (the media
+/// side decodes them into a profile-level op and applies it to its value). The
+/// engine logs and schedules the op; this is what actually applies it.
+///
+/// **Contract:** the handler is invoked on the control side (`flush_scheduled`),
+/// never on the render stack. It must be **atomic** — validate before mutating,
+/// so an `Err` means "nothing changed" — and a **deterministic function of the
+/// op stream** (plus its own logged state), so replay reproduces the same value.
+/// If it reconciles readers, referenced pool files must be immutable by id.
+pub type OpHandler = Box<dyn FnMut(&[(&'static str, Value)]) -> Result<(), String>>;
 
 /// The assembled minimal core.
 pub struct Engine {
@@ -61,6 +77,8 @@ pub struct Engine {
     disposers: HashMap<&'static str, Disposer>,
     /// plugins whose mount is queued but not yet applied.
     scheduled: std::collections::HashSet<&'static str>,
+    /// registered plugin-message handlers, keyed by op (closed-core dispatch).
+    op_handlers: HashMap<&'static str, OpHandler>,
 }
 
 impl Engine {
@@ -85,6 +103,7 @@ impl Engine {
             node_of: HashMap::new(),
             disposers: HashMap::new(),
             scheduled: std::collections::HashSet::new(),
+            op_handlers: HashMap::new(),
         }
     }
 
@@ -357,6 +376,51 @@ impl Engine {
         Ok(())
     }
 
+    /// Register a plugin-message handler for an op name. Called by a plugin on
+    /// mount (its `apply`); the engine logs `arrange` ops and dispatches them
+    /// here. Fail-loud when the op is already claimed.
+    pub fn register_op_handler(&mut self, op: &'static str, handler: OpHandler) -> Result<(), String> {
+        if self.op_handlers.contains_key(op) {
+            return Err(format!("op '{op}' already has a handler"));
+        }
+        self.op_handlers.insert(op, handler);
+        Ok(())
+    }
+
+    /// Unregister an op handler (a plugin's disposer on unmount). Idempotent.
+    pub fn unregister_op_handler(&mut self, op: &'static str) {
+        self.op_handlers.remove(op);
+    }
+
+    /// A plugin message at the current frame: validated (a handler must be
+    /// registered for the op, and every `F32` field finite — fail-loud), logged
+    /// with its frame, and applied **on the control side** by `flush_scheduled`
+    /// (a media handler reconciles readers — threads/file I/O — so it must not
+    /// run on the render stack; see `apply_event`). A refused op is never logged.
+    /// Note: a handler is registered when the plugin's mount is *applied*, so
+    /// call `flush_scheduled()` between mounting the plugin and the first
+    /// `arrange` of its ops (or the op is refused as unregistered).
+    pub fn arrange(&mut self, op: &'static str, fields: Vec<(&'static str, Value)>) -> Result<(), String> {
+        if !self.op_handlers.contains_key(op) {
+            return Err(format!("no handler registered for op '{op}'"));
+        }
+        for (name, v) in &fields {
+            if let Value::F32(x) = v
+                && !x.is_finite()
+            {
+                return Err(format!("field '{name}' must be finite, got {x}"));
+            }
+        }
+        let at_frame = self.clock.frame();
+        self.log.push(Event::Arrangement {
+            op,
+            fields: fields.clone(),
+            at_frame,
+        });
+        self.scheduler.schedule(at_frame, SchedEvent::Arrangement { op, fields });
+        Ok(())
+    }
+
     /// Replay a log onto this engine. Must be a *fresh* engine: every event is
     /// scheduled at its recorded frame and applied by the render loop — nothing
     /// is applied eagerly, so the timeline reproduces exactly.
@@ -428,7 +492,23 @@ impl Engine {
                         },
                     );
                 }
+                Event::Arrangement { op, fields, at_frame } => {
+                    self.scheduler.schedule(
+                        *at_frame,
+                        SchedEvent::Arrangement {
+                            op,
+                            fields: fields.clone(),
+                        },
+                    );
+                }
             }
+            // Repopulate the engine's own log with each replayed event, so a
+            // *continued* session (load a log, keep editing, save) has a log that
+            // still describes the audio actually produced — model-visible means
+            // logged, even across a replay. A Mount/Patch validation failure
+            // returns `Err` above before this runs, so a refused event is never
+            // logged (the replayed log was invalid).
+            self.log.push(event.clone());
         }
         Ok(())
     }
@@ -462,6 +542,19 @@ impl Engine {
                 match self.node_of.get(plugin) {
                     Some(&node) => self.graph.set_param(node, param, value),
                     None => debug_assert!(false, "set_param endpoint '{plugin}' not mounted at apply"),
+                }
+            }
+            SchedEvent::Arrangement { op, fields } => {
+                // Never panics: a missing handler or a refused op at apply is a
+                // log-order error (the op was validated when logged) — debug-
+                // asserted, skipped in release, replay reproduces the same state.
+                match self.op_handlers.get_mut(op) {
+                    Some(handler) => {
+                        if let Err(e) = handler(&fields) {
+                            debug_assert!(false, "arrangement op '{op}' refused at apply: {e}");
+                        }
+                    }
+                    None => debug_assert!(false, "arrangement op '{op}' has no registered handler at apply"),
                 }
             }
         }
@@ -555,6 +648,17 @@ impl Engine {
                 match frame {
                     Some(f) if f <= next => {
                         let event = self.scheduler.pop().expect("peeked");
+                        if matches!(&event, SchedEvent::Arrangement { .. }) {
+                            // Arrangement ops apply on the CONTROL side
+                            // (flush_scheduled), never on the render stack: a
+                            // media handler reconciles readers (threads, file
+                            // I/O), which must not run on the audio thread. A
+                            // host that reaches one here failed to flush before
+                            // rendering — fail loud in debug (the op stays
+                            // logged; replay reproduces the same skip).
+                            debug_assert!(false, "an arrangement op reached the render stack; flush_scheduled before rendering");
+                            continue;
+                        }
                         self.apply_event(event);
                     }
                     _ => break,
