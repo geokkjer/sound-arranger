@@ -61,7 +61,7 @@ fn capture_into_adaptable_mixer_and_pool() {
     let frames = SR as usize * 2; // 2 s of virtual device time
 
     let source = Arc::new(Spsc::new(1 << 18));
-    let cap = Capture::start(&dir, "jam1", CHANNELS, SR, source.clone()).unwrap();
+    let cap = Capture::start(&dir, "jam1", CHANNELS, SR, SR, source.clone()).unwrap();
 
     let mut e = engine();
     // Monitoring nodes first (indices 0..3) — the mixer's node lands after
@@ -201,7 +201,7 @@ fn hardware_capture_lands_pool_sources() {
     };
     let dir = std::env::temp_dir().join(format!("p12-hw-{}", std::process::id()));
     let source = Arc::new(Spsc::new(1 << 18));
-    let cap = Capture::start(&dir, "hw", ch as usize, rate, source.clone()).unwrap();
+    let cap = Capture::start(&dir, "hw", ch as usize, rate, rate, source.clone()).unwrap();
     let handle = media::devices::open_input(source.clone()).expect("open input");
     std::thread::sleep(Duration::from_millis(800));
     drop(handle);
@@ -231,7 +231,7 @@ fn pool_peaks_match_independent_reduction() {
     let dir = std::env::temp_dir().join(format!("p12-peaks-{}", std::process::id()));
     let frames = 5120usize;
     let source = Arc::new(Spsc::new(1 << 18));
-    let cap = Capture::start(&dir, "peaktake", CHANNELS, SR, source.clone()).unwrap();
+    let cap = Capture::start(&dir, "peaktake", CHANNELS, SR, SR, source.clone()).unwrap();
     let mut dev = Device::new();
     for _ in 0..frames {
         dev.push_frame(&source);
@@ -289,7 +289,7 @@ static GLOBAL_ALLOC: CountingAllocator = CountingAllocator;
 fn capture_to_mixer_render_path_does_not_allocate() {
     let dir = std::env::temp_dir().join(format!("p12-noalloc-{}", std::process::id()));
     let source = Arc::new(Spsc::new(1 << 18));
-    let cap = Capture::start(&dir, "na", CHANNELS, SR, source.clone()).unwrap();
+    let cap = Capture::start(&dir, "na", CHANNELS, SR, SR, source.clone()).unwrap();
 
     let mut e = engine();
     let mut capture_ids = Vec::new();

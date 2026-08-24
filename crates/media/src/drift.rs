@@ -6,8 +6,13 @@
 //! without bound. [`DriftCompensator`] is a pure fractional-accumulator
 //! linear-interpolation resampler: [`DriftCompensator::push_input`] accepts a
 //! drifting input block, [`DriftCompensator::pull_output`] produces exactly
-//! `out.len()` session frames. The ratio is a parameter in the spike; real
-//! measurement from cpal device frame counts is Phase 1.
+//! `out.len()` session frames. The ratio is passed in; real measurement from
+//! cpal device frame counts is deferred.
+//!
+//! Wired into the capture demux (one per channel, P1.3.3+): the `Vec` buffering
+//! is fine there — the demux is a background thread off the audio path. An
+//! input-device-callback placement (the comment in an earlier revision) would
+//! need a fixed ring for no-alloc.
 
 pub struct DriftCompensator {
     /// input frames per output frame (in_rate / out_rate)
@@ -54,8 +59,11 @@ impl DriftCompensator {
             written += 1;
             self.pos += self.ratio;
         }
-        // Drop consumed input, keep the fractional remainder.
-        let consumed = self.pos.floor() as usize;
+        // Drop consumed input, keep the fractional remainder. Clamp to the
+        // pending length: a fractional `pos` carried into a *short* batch (e.g.
+        // the tail of a take) can floor above `pending.len()`, and a bare
+        // `drain(..floor(pos))` would panic.
+        let consumed = (self.pos.floor() as usize).min(self.pending.len());
         if consumed > 0 {
             self.pending.drain(..consumed);
             self.pos -= consumed as f64;
