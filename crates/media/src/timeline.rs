@@ -175,7 +175,7 @@ fn add_signed(base: u64, delta: i64) -> Option<u64> {
 }
 
 /// Validates a clip's invariant fields; `Err` names the first violation.
-fn validate_clip(c: &Clip) -> Result<(), String> {
+pub fn validate_clip(c: &Clip) -> Result<(), String> {
     if c.src_len == 0 {
         return Err(format!("clip '{}' src_len must be > 0", c.id));
     }

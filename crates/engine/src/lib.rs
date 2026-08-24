@@ -50,8 +50,9 @@ pub use graph::{
 pub use log::{Event, SessionLog};
 pub use plugins::{
     euclid, mixer_factory, Disposer, DisposerCtx, Euclidean, ExternalEvent, EventSink, EventSource,
-    MeterBank, MidiSink, MidiSource, MixerNode, MixerPlugin, MIXER_CHANNELS, MIXER_PARAMS,
-    MIXER_PORTS, OscSink, OscSource, ParamDef, Plugin, PluginApi, Rhythm, Scale, Tone, TONE_PARAMS,
+    MeterBank, MidiSink, MidiSource, MixerNode, MixerPlugin, MIXER_CHANNELS, MIXER_CHANNELS_MAX,
+    MIXER_PARAMS, MIXER_PORTS, OscSink, OscSource, ParamDef, Plugin, PluginApi, Rhythm, Scale,
+    Tone, TONE_PARAMS,
 };
 pub use render::{Engine, OpHandler, PluginFactory, SchedEvent};
 pub use value::{OpMsg, Value};

@@ -210,12 +210,9 @@ impl HostSession {
         Ok(())
     }
 
-    /// Test scaffolding (a real host speaks `HostCommand`, not `&mut Engine` —
-    /// the boundary the note draws against in-process shells; kimi nit 16).
-    pub fn engine(&mut self) -> &mut Engine {
-        &mut self.engine
-    }
-
+    /// Read access to the engine (the summary/`summarize` reads the graph). A
+    /// real host speaks `HostCommand`, not `&mut Engine` — the boundary the note
+    /// draws against in-process shells (kimi nit 16).
     pub fn engine_ref(&self) -> &Engine {
         &self.engine
     }
@@ -331,9 +328,7 @@ impl HostSession {
                 Ok(())
             }
             HostCommand::Bounce { frames, path } => {
-                self.wire_pending()?;
-                self.wire_arranger()?; // build arranger nodes + flush the mixer last
-                let out = self.engine.render(*frames);
+                let out = self.render(*frames)?; // wires (pending + arranger) then renders
                 let mut w = media::WavWriter::create(path, self.engine.clock.sample_rate, 1)?;
                 w.write(&out)?;
                 w.finalize()?;
@@ -377,7 +372,7 @@ impl HostSession {
         self.arrange_dirty = false;
         let Some(resolver) = self.pool_resolver.clone() else { return Ok(()) };
         let Some(editor) = &self.editor else { return Ok(()) };
-        let timeline = editor.snapshot();
+        let timeline = editor.snapshot()?;
         let channels = self.mixer_channels.unwrap_or(4);
         // add the arranger source nodes before the mixer is applied
         let mut pending: Vec<(String, engine::NodeId, usize)> = Vec::new();
@@ -408,10 +403,17 @@ impl HostSession {
         Ok(())
     }
 
+    /// The reference host renders the whole bounce into one f32 buffer; bound the
+    /// *bytes* so a malformed `bounce 999999999999` cannot OOM (≈1.5 h @48 kHz).
+    const MAX_BOUNCE_BYTES: usize = 1 << 30;
+
     /// Render `frames` from the current position (wiring pending cords/arranger
     /// first). A wiring failure (e.g. the mixer was unmounted after a `play`) is
     /// a clean `Err`, never a panic in a host.
     pub fn render(&mut self, frames: usize) -> Result<Vec<f32>, String> {
+        if frames.saturating_mul(std::mem::size_of::<f32>()) > Self::MAX_BOUNCE_BYTES {
+            return Err(format!("bounce of {frames} frames exceeds the ~{:.0} MiB budget", Self::MAX_BOUNCE_BYTES / (1 << 20)));
+        }
         self.wire_pending()?;
         self.wire_arranger()?;
         Ok(self.engine.render(frames))
@@ -435,7 +437,7 @@ impl HostSession {
     pub fn arrangement(&self) -> media::Timeline {
         self.editor
             .as_ref()
-            .map(|e| e.snapshot())
+            .and_then(|e| e.snapshot().ok()) // poison → empty (fail-safe read)
             .unwrap_or_default()
     }
 
@@ -487,13 +489,23 @@ pub fn run_script(script: &[HostCommand]) -> Result<HostSession, String> {
     let mut session = HostSession::new();
     for cmd in script {
         if let HostCommand::Mount { plugin: "mixer", params, .. } = cmd {
-            // The mixer's channel count is the contract's own state (validated
-            // at Play apply).
+            // The mixer's channel count is the contract's own state. A fraction
+            // (e.g. channels=4.5) must be refused, not silently truncated (the
+            // review's "float cast" nit), and it must be a sane positive count.
             let channels = params
                 .iter()
                 .find(|(name, _)| *name == "channels")
-                .map(|(_, v)| *v as usize)
+                .map(|(_, v)| {
+                    if !v.is_finite() || *v <= 0.0 || v.fract() != 0.0 {
+                        return Err(format!("mixer channels must be a positive whole number, got {v}"));
+                    }
+                    Ok(*v as usize)
+                })
+                .transpose()?
                 .unwrap_or(4);
+            if channels > MIXER_CHANNELS_MAX {
+                return Err(format!("mixer channels {channels} exceeds the max {MIXER_CHANNELS_MAX}"));
+            }
             session.mixer_channels = Some(channels);
         }
         if let Some(frame) = cmd.at_frame() {

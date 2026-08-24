@@ -101,6 +101,44 @@ fn arrange_without_pool_is_refused() {
 }
 
 #[test]
+fn bounce_over_byte_budget_is_refused() {
+    let pool = tmp_dir("bouncebudget");
+    write_source(&pool, "s1", 100);
+    let out = tmp_dir("o").join("o.wav");
+    let script = vec![
+        HostCommand::Mount { plugin: "mixer", params: vec![("channels", 1.0)], at_frame: Some(0) },
+        HostCommand::Pool { dir: pool.clone() },
+        HostCommand::Bounce { frames: 1 << 40, path: out }, // ~4 TB of f32
+    ];
+    assert!(run_script(&script).is_err(), "a bounce over the byte budget must be refused");
+    let _ = std::fs::remove_dir_all(&pool);
+}
+
+#[test]
+fn fractional_or_zero_mixer_channels_is_refused() {
+    let pool = tmp_dir("channels");
+    // a fraction (4.5) must not be silently truncated to 4
+    let frac = vec![
+        HostCommand::Mount { plugin: "mixer", params: vec![("channels", 4.5)], at_frame: Some(0) },
+        HostCommand::Pool { dir: pool.clone() },
+    ];
+    assert!(run_script(&frac).is_err(), "fractional mixer channels must be refused");
+    // zero / negative refused
+    let zero = vec![
+        HostCommand::Mount { plugin: "mixer", params: vec![("channels", 0.0)], at_frame: Some(0) },
+        HostCommand::Pool { dir: pool.clone() },
+    ];
+    assert!(run_script(&zero).is_err(), "zero mixer channels must be refused");
+    // over the max (8) refused
+    let big = vec![
+        HostCommand::Mount { plugin: "mixer", params: vec![("channels", 9.0)], at_frame: Some(0) },
+        HostCommand::Pool { dir: pool.clone() },
+    ];
+    assert!(run_script(&big).is_err(), "channels over the mixer max must be refused");
+    let _ = std::fs::remove_dir_all(&pool);
+}
+
+#[test]
 fn arrangement_bounces_audio_and_replays_byte_identically() {
     let pool = tmp_dir("audio");
     write_source(&pool, "s1", 8000);

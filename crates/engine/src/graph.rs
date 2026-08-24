@@ -542,8 +542,11 @@ pub struct RingDelay {
     delay: usize,
 }
 
-/// Maximum per-node latency the interpreter compensates (PDC) in Spike A.5.
-pub const MAX_PDC: usize = 64;
+/// Maximum per-node latency the interpreter compensates (PDC). 64 samples was
+/// far below real lookahead (~5 ms limiters ≈ 240 samples @48 kHz); 4096 ≈ 85 ms
+/// covers limiters/reverb/PFX. A node whose latency exceeds this is clamped
+/// silently (release) — raise the cap before an effect with more latency lands.
+pub const MAX_PDC: usize = 4096;
 
 impl RingDelay {
     pub fn with_capacity(cap: usize) -> Self {

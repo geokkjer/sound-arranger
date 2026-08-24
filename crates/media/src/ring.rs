@@ -10,15 +10,18 @@
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-#[repr(align(64))]
+#[repr(C, align(64))]
 pub struct Spsc<T> {
-    slots: Box<[UnsafeCell<Option<T>>]>,
+    /// Atomics first, each padded onto its own 64-byte cache line: `head` is
+    /// producer-written, `tail` consumer-written, `count` written by both. The
+    /// buffer (a fat pointer) is last, so the padding does not depend on its size.
     head: AtomicUsize,
+    _pad0: [u8; 56],
     tail: AtomicUsize,
-    /// Pad so `count` (hammered by both threads) sits on its own cache line,
-    /// away from the per-side head/tail (kimi review nit — false sharing).
-    _pad: [u8; 48],
+    _pad1: [u8; 56],
     count: AtomicUsize,
+    _pad2: [u8; 56],
+    slots: Box<[UnsafeCell<Option<T>>]>,
 }
 
 // SAFETY: the SPSC contract — one producer, one consumer, and the count
@@ -26,15 +29,25 @@ pub struct Spsc<T> {
 // sharing the `UnsafeCell` slots sound.
 unsafe impl<T: Send> Sync for Spsc<T> {}
 
+// Compile-time check that the cache-line isolation actually holds (the hand-rolled
+// pads are layout-dependent; this pins it for the targets we build on).
+const _: () = {
+    assert!(std::mem::offset_of!(Spsc<f32>, head) % 64 == 0, "Spsc head not cache-line-aligned");
+    assert!(std::mem::offset_of!(Spsc<f32>, tail) % 64 == 0, "Spsc tail not cache-line-aligned");
+    assert!(std::mem::offset_of!(Spsc<f32>, count) % 64 == 0, "Spsc count not cache-line-aligned");
+};
+
 impl<T> Spsc<T> {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity.is_power_of_two() && capacity > 0, "Spsc capacity must be a power of two");
         Spsc {
-            slots: (0..capacity).map(|_| UnsafeCell::new(None)).collect(),
             head: AtomicUsize::new(0),
+            _pad0: [0; 56],
             tail: AtomicUsize::new(0),
-            _pad: [0; 48],
+            _pad1: [0; 56],
             count: AtomicUsize::new(0),
+            _pad2: [0; 56],
+            slots: (0..capacity).map(|_| UnsafeCell::new(None)).collect(),
         }
     }
 
@@ -137,6 +150,20 @@ mod tests {
                 assert_eq!(ring.try_pop(), Some(round * 8 + i));
             }
         }
+    }
+
+    #[test]
+    fn head_tail_count_on_distinct_cache_lines() {
+        // pins the false-sharing fix: the producer's `head`, the consumer's
+        // `tail`, and the shared `count` must each be on their own 64-byte line.
+        let ring = Spsc::<f32>::new(4);
+        let line = |p: *const AtomicUsize| (p as usize) / 64;
+        let h = line(&ring.head);
+        let t = line(&ring.tail);
+        let c = line(&ring.count);
+        assert_ne!(h, t, "head and tail must not share a cache line");
+        assert_ne!(t, c, "tail and count must not share a cache line");
+        assert_ne!(h, c, "head and count must not share a cache line");
     }
 
     /// Cross-thread stress: 100k samples, one producer thread, one consumer

@@ -314,8 +314,9 @@ impl ClipEditor {
     /// A snapshot of the current value — a **read-only** window (no write handle
     /// around the log; kimi must-fix M1). The value is only ever mutated by the
     /// op handlers, so it stays a pure reconstruction of the logged op stream.
-    pub fn snapshot(&self) -> Timeline {
-        self.timeline.lock().expect("timeline poisoned").clone()
+    /// Poison maps to `Err` (matching `register_handlers`) — never a panic.
+    pub fn snapshot(&self) -> Result<Timeline, String> {
+        self.timeline.lock().map(|g| g.clone()).map_err(|_| "timeline poisoned".to_string())
     }
 
     /// Register the op handlers on an engine (once, after the engine is built).

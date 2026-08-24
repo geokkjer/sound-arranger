@@ -101,6 +101,10 @@ impl ArrangerNode {
     pub fn new(track: Track, resolve: &PoolResolver, ring_capacity: usize, session_rate: u32) -> Result<Self, String> {
         let mut readers = HashMap::new();
         for c in &track.clips {
+            // a hand-built Track bypasses Timeline validation — validate here so
+            // an invalid clip (zero length, NaN gain, bad loop, frame overflow)
+            // never reaches the readers.
+            crate::timeline::validate_clip(c).map_err(|e| format!("arranger: {e}"))?;
             let path = resolve(&c.source)
                 .ok_or_else(|| format!("arranger: pool has no source '{}'", c.source))?;
             let src_rate = crate::wav::WavReader::open(&path)

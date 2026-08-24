@@ -48,7 +48,7 @@ fn logged_ops_reconstruct_the_timeline_on_replay() {
     ea.register(&mut a).unwrap();
     apply_and_flush(&mut a, &mut ea, &ops());
 
-    let timeline_a: Timeline = ea.snapshot();
+    let timeline_a: Timeline = ea.snapshot().unwrap();
     // sanity: the live value has both tracks and the split clips.
     assert_eq!(timeline_a.tracks.len(), 2);
     assert_eq!(timeline_a.tracks[0].clips.len(), 2);
@@ -60,7 +60,7 @@ fn logged_ops_reconstruct_the_timeline_on_replay() {
     b.replay_from(&a.log).unwrap();
     b.flush_scheduled();
 
-    let timeline_b: Timeline = eb.snapshot();
+    let timeline_b: Timeline = eb.snapshot().unwrap();
     assert_eq!(timeline_a, timeline_b, "replay must reconstruct the identical Timeline value");
     assert!(!timeline_b.tracks.is_empty());
 }
@@ -78,5 +78,5 @@ fn refused_op_is_never_logged() {
     let res = ea.apply(&mut a, &ArrangeOp::AddClip { track: "t0".into(), clip: bad });
     assert!(res.is_err(), "a zero-length clip must be refused");
     assert!(a.log.events().iter().all(|ev| !matches!(ev, engine::Event::Arrangement { .. })));
-    assert!(ea.snapshot().tracks.is_empty());
+    assert!(ea.snapshot().unwrap().tracks.is_empty());
 }

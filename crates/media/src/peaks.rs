@@ -77,13 +77,16 @@ impl PeakBuilder {
     }
 
     /// Min/max of base bin `bin`.
-    pub fn base_minmax(&self, bin: usize) -> (f32, f32) {
+    /// Min/max of a base bin; `None` for an out-of-range bin (a UI zoom query can
+    /// hit one). A genuine bin of silence returns `Some((0.0, 0.0))` — silence is
+    /// data; an error sentinel must not be representable as data (kimi must-fix).
+    pub fn base_minmax(&self, bin: usize) -> Option<(f32, f32)> {
         if bin < self.base_min.len() {
-            (self.base_min[bin], self.base_max[bin])
+            Some((self.base_min[bin], self.base_max[bin]))
         } else if bin == self.base_min.len() && self.cur_count > 0 {
-            (self.cur_min, self.cur_max)
+            Some((self.cur_min, self.cur_max))
         } else {
-            panic!("peaks: base bin {bin} out of range ({} bins)", self.base_bins())
+            None
         }
     }
 
@@ -125,18 +128,22 @@ impl PeakBuilder {
     /// Min/max over the frame range `[start, end)`, walking base bins
     /// (correct for any range; the zoom-out fast path via the levels is a UI
     /// refinement).
-    pub fn range_minmax(&self, start: u64, end: u64) -> (f32, f32) {
-        assert!(start < end && end <= self.frames, "peaks: range {start}..{end} out of {}", self.frames);
+    pub fn range_minmax(&self, start: u64, end: u64) -> Option<(f32, f32)> {
+        // bounds-safe: None for an empty/invalid range or no data (never panic).
+        if start >= end || end > self.frames || self.base_bins() == 0 {
+            return None;
+        }
         let b0 = (start / PEAK_BASE_BIN as u64) as usize;
         let b1 = ((end - 1) / PEAK_BASE_BIN as u64) as usize;
         let mut mn = f32::INFINITY;
         let mut mx = f32::NEG_INFINITY;
         for b in b0..=b1.min(self.base_bins() - 1) {
-            let (lo, hi) = self.base_minmax(b);
-            mn = mn.min(lo);
-            mx = mx.max(hi);
+            if let Some((lo, hi)) = self.base_minmax(b) {
+                mn = mn.min(lo);
+                mx = mx.max(hi);
+            }
         }
-        (mn, mx)
+        Some((mn, mx))
     }
 }
 
@@ -279,7 +286,7 @@ mod tests {
             let window = &samples[bin * PEAK_BASE_BIN..(bin + 1) * PEAK_BASE_BIN];
             let expect_min = window.iter().copied().fold(f32::INFINITY, f32::min);
             let expect_max = window.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let (lo, hi) = b.base_minmax(bin);
+            let Some((lo, hi)) = b.base_minmax(bin) else { panic!("bin {bin} should exist") };
             assert!((lo - expect_min).abs() < 1e-7, "bin {bin} min {lo} vs {expect_min}");
             assert!((hi - expect_max).abs() < 1e-7, "bin {bin} max {hi} vs {expect_max}");
         }
@@ -290,7 +297,7 @@ mod tests {
         let mut b = PeakBuilder::new();
         let mut phase = 0.0f64;
         b.push(&sine_block(440.0, 48_000, 4096, &mut phase));
-        let (lo, hi) = b.range_minmax(1000, 2000);
+        let (lo, hi) = b.range_minmax(1000, 2000).unwrap();
         assert!(lo < 0.0 && hi > 0.0, "a sine crosses zero in any window: {lo}..{hi}");
     }
 
@@ -324,8 +331,8 @@ mod tests {
         assert_eq!(data[0].0.len(), 20); // 5120/256 = 20 base bins
         assert_eq!(data[1].0.len(), 10);
         // base level min/max match the builder
-        assert_eq!(data[0].0[0], b.base_minmax(0).0);
-        assert_eq!(data[0].1[0], b.base_minmax(0).1);
+        assert_eq!(data[0].0[0], b.base_minmax(0).unwrap().0);
+        assert_eq!(data[0].1[0], b.base_minmax(0).unwrap().1);
         // levels() indexing matches the sidecar: level k is identical data
         // (kimi review finding 2 — regression guard).
         let api = b.levels();

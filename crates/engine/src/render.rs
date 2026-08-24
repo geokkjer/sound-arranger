@@ -149,6 +149,13 @@ impl Engine {
         if self.disposers.contains_key(name) || self.scheduled.contains(name) {
             return Err(format!("plugin '{name}' is already mounted (one instance per name in spike A.5)"));
         }
+        // Mount params get a finiteness check (GLM-5.3 #9): `set_param` has one,
+        // but a `mount ... NaN` would otherwise reach the plugin's apply silently.
+        for (pname, v) in params {
+            if !v.is_finite() {
+                return Err(format!("mount param '{pname}' must be finite, got {v}"));
+            }
+        }
         let factory = *self
             .factories
             .get(name)

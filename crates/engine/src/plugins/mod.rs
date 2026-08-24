@@ -17,7 +17,7 @@ use crate::graph::{NodeId, Port};
 use crate::render::SchedEvent;
 
 pub use euclidean::{euclid, euclidean_factory, Euclidean, Rhythm};
-pub use mixer::{mixer_factory, MixerNode, MixerPlugin, MIXER_CHANNELS, MIXER_PARAMS, MIXER_PORTS, MeterBank};
+pub use mixer::{mixer_factory, MixerNode, MixerPlugin, MIXER_CHANNELS, MIXER_CHANNELS_MAX, MIXER_PARAMS, MIXER_PORTS, MeterBank};
 pub use scale::{scale_factory, Scale};
 pub use tone::{tone_factory, Tone, TONE_PARAMS};
 
