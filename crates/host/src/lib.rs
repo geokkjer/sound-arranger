@@ -513,9 +513,13 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
     let mut lines = text.lines();
     let mut commands = Vec::new();
 
-    // version line (the first non-empty, non-comment line)
+    // version line (the first non-empty, non-comment line), tracking the
+    // 1-based line number so error messages stay correct even with leading
+    // blank/comment lines before the header.
+    let mut header_line = 0usize;
     let version_line = loop {
         let raw = lines.next().ok_or("empty script (want 'host v1' first)")?;
+        header_line += 1;
         let line = raw.split('#').next().unwrap_or("").trim();
         if !line.is_empty() {
             break line;
@@ -531,7 +535,7 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
         if line.is_empty() {
             continue;
         }
-        let at = lineno + 2; // account for the version line
+        let at = header_line + lineno + 1; // header line + loop offset (lineno is 0-based)
         let mut words: Vec<&str> = line.split_whitespace().collect();
         // optional trailing @frame token
         let at_frame = match words.last() {
@@ -547,7 +551,7 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
         let kind = words.first().copied().unwrap_or("");
         match kind {
             "mount" => {
-                let plugin = in_list(HOST_PLUGINS, words[1], "plugin")?;
+                let plugin = in_list(HOST_PLUGINS, word(&words, 1, at)?, "plugin")?;
                 let mut params = Vec::new();
                 for w in &words[2..] {
                     let Some((k, v)) = w.split_once('=') else {
@@ -564,43 +568,53 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
                 commands.push(HostCommand::Patch { from, to, at_frame });
             }
             "set_param" => {
-                let plugin = in_list(HOST_PLUGINS, words[1], "plugin")?;
-                let param = in_list(HOST_PARAMS, words[2], "param")?;
-                let value = words[3].parse::<f32>().map_err(|_| format!("line {at}: bad value"))?;
+                let plugin = in_list(HOST_PLUGINS, word(&words, 1, at)?, "plugin")?;
+                let param = in_list(HOST_PARAMS, word(&words, 2, at)?, "param")?;
+                let value = word(&words, 3, at)?.parse::<f32>().map_err(|_| format!("line {at}: bad value"))?;
                 commands.push(HostCommand::SetParam { plugin, param, value, at_frame });
             }
             "set_tempo" => {
-                let bpm = words[1].parse().map_err(|_| format!("line {at}: bad bpm"))?;
-                let beats = words[2].parse().map_err(|_| format!("line {at}: bad beats"))?;
+                let bpm = word(&words, 1, at)?.parse().map_err(|_| format!("line {at}: bad bpm"))?;
+                let beats = word(&words, 2, at)?.parse().map_err(|_| format!("line {at}: bad beats"))?;
                 commands.push(HostCommand::SetTempo { bpm, beats_per_bar: beats, at_frame });
             }
             "unmount" => {
-                let plugin = in_list(HOST_PLUGINS, words[1], "plugin")?;
+                let plugin = in_list(HOST_PLUGINS, word(&words, 1, at)?, "plugin")?;
                 commands.push(HostCommand::Unmount { plugin, at_frame });
             }
             "play" => {
-                let clip = ClipRef { path: PathBuf::from(words[1]), start: 0, len: 0 };
-                let channel = channel_of(words[2], at)?;
+                let clip = ClipRef { path: PathBuf::from(word(&words, 1, at)?), start: 0, len: 0 };
+                let channel = channel_of(word(&words, 2, at)?, at)?;
                 commands.push(HostCommand::Play { clip, channel, at_frame });
             }
             "splice" => {
-                let at_frame = words[1].parse().map_err(|_| format!("line {at}: bad frame"))?;
-                let clip = ClipRef { path: PathBuf::from(words[2]), start: 0, len: 0 };
-                let crossfade = words[3].parse().map_err(|_| format!("line {at}: bad crossfade"))?;
+                let at_frame = word(&words, 1, at)?.parse().map_err(|_| format!("line {at}: bad frame"))?;
+                let clip = ClipRef { path: PathBuf::from(word(&words, 2, at)?), start: 0, len: 0 };
+                let crossfade = word(&words, 3, at)?.parse().map_err(|_| format!("line {at}: bad crossfade"))?;
                 commands.push(HostCommand::Splice { at_frame, clip, crossfade });
             }
             "record" => {
-                commands.push(HostCommand::Record { take_id: words[1].to_string() });
+                commands.push(HostCommand::Record { take_id: word(&words, 1, at)?.to_string() });
             }
             "bounce" => {
-                let frames = words[1].parse().map_err(|_| format!("line {at}: bad frames"))?;
-                let path = PathBuf::from(words[2]);
+                let frames = word(&words, 1, at)?.parse().map_err(|_| format!("line {at}: bad frames"))?;
+                let path = PathBuf::from(word(&words, 2, at)?);
                 commands.push(HostCommand::Bounce { frames, path });
             }
             other => return Err(format!("line {at}: unknown command '{other}'")),
         }
     }
     Ok(commands)
+}
+
+/// The `idx`-th word of a command line; a missing operand is a clean parse error
+/// (never an index-out-of-bounds panic on a truncated line — the wire schema's
+/// public parser must not panic).
+fn word<'a>(words: &'a [&str], idx: usize, at: usize) -> Result<&'a str, String> {
+    words
+        .get(idx)
+        .copied()
+        .ok_or_else(|| format!("line {at}: missing command operand (need {})", idx + 1))
 }
 
 fn port_ref(words: &[&str], idx: usize, at: usize) -> Result<(&'static str, &'static str), String> {
