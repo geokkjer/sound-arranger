@@ -99,3 +99,39 @@ fn arrange_without_pool_is_refused() {
     assert!(run_script(&script).is_err(), "arrange requires set_pool first");
     let _ = std::fs::remove_dir_all(&pool);
 }
+
+#[test]
+fn arrangement_bounces_audio_and_replays_byte_identically() {
+    let pool = tmp_dir("audio");
+    write_source(&pool, "s1", 8000);
+    let out_dir = tmp_dir("out");
+    let a = out_dir.join("a.wav");
+    let b = out_dir.join("b.wav");
+
+    let script = |out: &Path| -> Vec<HostCommand> {
+        let mut s = vec![
+            HostCommand::Mount { plugin: "mixer", params: vec![("channels", 2.0)], at_frame: Some(0) },
+            HostCommand::Pool { dir: pool.clone() },
+        ];
+        s.extend(arrange_ops());
+        s.push(HostCommand::Bounce { frames: 6000, path: out.to_path_buf() });
+        s
+    };
+
+    let sess = run_script(&script(&a)).unwrap();
+    let frames_a = std::fs::read(&a).unwrap();
+    // the arrangement actually plays (not a silent bounce)
+    let mut r = media::WavReader::open(&a).unwrap();
+    let mut audio = vec![0.0f32; r.total_frames() as usize];
+    let n = r.read_into(&mut audio);
+    assert!(audio[..n].iter().any(|s| s.abs() > 1e-4), "the arrangement must produce audio");
+    assert_eq!(sess.arrangement().tracks.len(), 2);
+
+    // replay: a fresh host, same script → byte-identical bounce.
+    let _ = run_script(&script(&b)).unwrap();
+    let frames_b = std::fs::read(&b).unwrap();
+    assert_eq!(frames_a, frames_b, "replay must bounce byte-identically");
+
+    let _ = std::fs::remove_dir_all(&pool);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}

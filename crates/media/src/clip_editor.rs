@@ -323,22 +323,19 @@ impl ClipEditor {
         register_handlers(engine, self.timeline.clone())
     }
 
-    /// Issue a logged command for `op` at the current frame. **Validates by
-    /// dry-running the op against the current value first** — a refused op is
-    /// never logged (fail-loud, the patch-bay rule). It then logs the op and
-    /// **flushes immediately**, so the handler applies it to the value right away
-    /// and the value is current for the *next* dry-run — no stale-state window
-    /// that could wrongly accept a duplicate op (kimi must-fix M2). Byte-identical
-    /// replay reconstructs the same value from the log alone.
+    /// Issue a logged command for `op` at the current frame. **Applies the op to
+    /// the live value eagerly** (validating fail-loud first — a refused op is
+    /// never logged), and logs it via `arrange_logged` (for replay) without
+    /// scheduling it — arrangement ops are value-level, so they never touch the
+    /// scheduler and cannot flush the mixer early. `replay_from` re-schedules the
+    /// logged ops to reconstruct the identical value.
     pub fn apply(&mut self, engine: &mut Engine, op: &ArrangeOp) -> Result<(), String> {
         {
-            let tl = self.timeline.lock().map_err(|_| "timeline poisoned".to_string())?;
-            tl.apply(op)?; // dry-run: reject a semantically invalid op before logging
+            let mut tl = self.timeline.lock().map_err(|_| "timeline poisoned".to_string())?;
+            *tl = tl.apply(op)?; // validate + apply live; a refused op returns before logging
         }
         let (name, fields) = encode_op(&mut self.intern, op);
-        engine.arrange(name, fields)?;
-        engine.flush_scheduled(); // apply the op to the value on the control side now
-        Ok(())
+        engine.arrange_logged(name, fields)
     }
 }
 

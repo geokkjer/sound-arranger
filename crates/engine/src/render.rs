@@ -392,6 +392,32 @@ impl Engine {
         self.op_handlers.remove(op);
     }
 
+    /// Validate a plugin-message op: a handler registered and every `F32` field
+    /// finite (fail-loud; a refused op is never logged).
+    fn validate_op(&self, op: &'static str, fields: &[(&'static str, Value)]) -> Result<(), String> {
+        if !self.op_handlers.contains_key(op) {
+            return Err(format!("no handler registered for op '{op}'"));
+        }
+        for (name, v) in fields {
+            if let Value::F32(x) = v
+                && !x.is_finite()
+            {
+                return Err(format!("field '{name}' must be finite, got {x}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Push an `Arrangement` event to the log at the current frame; returns the
+    /// frame. The caller decides whether to also schedule it (value-level ops are
+    /// logged but not scheduled — the live value is updated eagerly by the
+    /// clip editor; `replay_from` re-schedules the logged op to reconstruct it).
+    fn log_arrangement(&mut self, op: &'static str, fields: Vec<(&'static str, Value)>) -> u64 {
+        let at_frame = self.clock.frame();
+        self.log.push(Event::Arrangement { op, fields, at_frame });
+        at_frame
+    }
+
     /// A plugin message at the current frame: validated (a handler must be
     /// registered for the op, and every `F32` field finite — fail-loud), logged
     /// with its frame, and applied **on the control side** by `flush_scheduled`
@@ -401,23 +427,19 @@ impl Engine {
     /// call `flush_scheduled()` between mounting the plugin and the first
     /// `arrange` of its ops (or the op is refused as unregistered).
     pub fn arrange(&mut self, op: &'static str, fields: Vec<(&'static str, Value)>) -> Result<(), String> {
-        if !self.op_handlers.contains_key(op) {
-            return Err(format!("no handler registered for op '{op}'"));
-        }
-        for (name, v) in &fields {
-            if let Value::F32(x) = v
-                && !x.is_finite()
-            {
-                return Err(format!("field '{name}' must be finite, got {x}"));
-            }
-        }
-        let at_frame = self.clock.frame();
-        self.log.push(Event::Arrangement {
-            op,
-            fields: fields.clone(),
-            at_frame,
-        });
+        self.validate_op(op, &fields)?;
+        let at_frame = self.log_arrangement(op, fields.clone());
         self.scheduler.schedule(at_frame, SchedEvent::Arrangement { op, fields });
+        Ok(())
+    }
+
+    /// Like [`arrange`], but only **logs** the op — it is not scheduled. Used for
+    /// value-level arrangement ops whose live value is applied eagerly by the
+    /// clip editor (so they never touch the scheduler and cannot flush the mixer
+    /// early); `replay_from` re-schedules them to reconstruct the value.
+    pub fn arrange_logged(&mut self, op: &'static str, fields: Vec<(&'static str, Value)>) -> Result<(), String> {
+        self.validate_op(op, &fields)?;
+        self.log_arrangement(op, fields);
         Ok(())
     }
 

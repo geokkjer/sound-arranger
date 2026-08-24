@@ -24,10 +24,10 @@ value is a pure function of the op stream.
   applies to the shared `Timeline` (`*tl = tl.apply(&op)?` — validate-first, so an `Err`
   leaves the value untouched). The engine logs + dispatches on the control side.
 - **`ClipEditor`** owns the interner + the shared `Timeline` (private `Arc<Mutex<>>`).
-  `apply` **dry-runs** the op against the current value (fail-loud, a refused op is never
-  logged), encodes, `engine.arrange`s, and **flushes immediately** so the value is current
-  for the next dry-run. `snapshot()` gives a read-only window (no write handle around the
-  log).
+  `apply` applies the op **eagerly** to the value (validate-first `*tl = tl.apply(&op)?` — a
+  refused op returns before logging) and logs it via `engine.arrange_logged` (value-level ops
+  never touch the scheduler, so they cannot flush the mixer early — P1.3.4). `snapshot()`
+  gives a read-only window (no write handle around the log).
 
 The reconstruction is a pure function of the op **order** (the handler ignores `at_frame`;
 the scheduler preserves same-frame insertion order). This is the **log-visibility carve-out**:

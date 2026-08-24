@@ -159,6 +159,10 @@ pub struct HostSession {
     editor: Option<media::ClipEditor>,
     /// resolves a pool source id (stem) to its `.wav` path, set by `set_pool`.
     pool_resolver: Option<media::PoolResolver>,
+    /// track id → the arranger node mounted for it (avoids re-wiring on a rebuild).
+    wired_tracks: std::collections::HashMap<String, engine::NodeId>,
+    /// the arrangement value changed since last wiring (re-wire before render).
+    arrange_dirty: bool,
 }
 
 impl HostSession {
@@ -178,6 +182,8 @@ impl HostSession {
             media_commands: 0,
             editor: None,
             pool_resolver: None,
+            wired_tracks: std::collections::HashMap::new(),
+            arrange_dirty: false,
         }
     }
 
@@ -302,6 +308,7 @@ impl HostSession {
                 }
                 let editor = self.editor.as_mut().expect("ensured");
                 editor.apply(&mut self.engine, op)?;
+                self.arrange_dirty = true;
                 self.media_commands += 1;
                 Ok(())
             }
@@ -312,6 +319,7 @@ impl HostSession {
             }
             HostCommand::Bounce { frames, path } => {
                 self.wire_pending()?;
+                self.wire_arranger()?; // build arranger nodes + flush the mixer last
                 let out = self.engine.render(*frames);
                 let mut w = media::WavWriter::create(path, self.engine.clock.sample_rate, 1)?;
                 w.write(&out)?;
@@ -344,10 +352,53 @@ impl HostSession {
         Ok(())
     }
 
-    /// Wire one `ArrangerNode` per track (in the timeline value) into the mixer,
+    /// Wire one `ArrangerNode` per track (from the arrangement value) into the
+    /// mixer. **Order matters:** the arranger nodes are added to the graph FIRST,
+    /// then the mixer is flushed (applied last, so `arranger → mixer` is a forward
+    /// cord under the graph's topological rule) — the candidate-play path only
+    /// works when the sources precede the sink. Control side.
+    fn wire_arranger(&mut self) -> Result<(), String> {
+        if !self.arrange_dirty {
+            return Ok(());
+        }
+        self.arrange_dirty = false;
+        let Some(resolver) = self.pool_resolver.clone() else { return Ok(()) };
+        let Some(editor) = &self.editor else { return Ok(()) };
+        let timeline = editor.snapshot();
+        let channels = self.mixer_channels.unwrap_or(4);
+        // add the arranger source nodes before the mixer is applied
+        let mut pending: Vec<(String, engine::NodeId, usize)> = Vec::new();
+        for (ti, track) in timeline.tracks.iter().enumerate() {
+            if self.wired_tracks.contains_key(&track.id) {
+                continue;
+            }
+            if ti >= channels {
+                return Err(format!("track '{}' has no mixer channel ch{ti} (channels={channels})", track.id));
+            }
+            let node = media::ArrangerNode::new(track.clone(), &resolver, media::DEFAULT_RING_CAPACITY)?;
+            let id = self.engine.graph.add_node(
+                engine::NodeKind::Opaque(Box::new(node)),
+                vec![engine::Port { name: "audio", direction: engine::Direction::Out, kind: engine::SignalKind::Audio }],
+            );
+            pending.push((track.id.clone(), id, ti));
+        }
+        // now apply the mixer (it was scheduled by the Mount command) as the last node
+        self.engine.flush_scheduled();
+        let mixer = self.engine.graph.out_node.ok_or("arrange requires the mixer to be mounted")?;
+        for (tid, id, ti) in &pending {
+            self.engine
+                .graph
+                .connect(*id, "audio", mixer, &format!("ch{ti}"))
+                .map_err(|e| format!("arranger→mixer cord: {e}"))?;
+            self.wired_tracks.insert(tid.clone(), *id);
+        }
+        Ok(())
+    }
+
     /// Render `frames` from the current position (wiring pending cords first).
     pub fn render(&mut self, frames: usize) -> Vec<f32> {
         self.wire_pending().expect("wiring is validated at Play apply");
+        self.wire_arranger().expect("arranger wiring is validated at Arrange apply");
         self.engine.render(frames)
     }
 
