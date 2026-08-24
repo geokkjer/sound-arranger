@@ -1,0 +1,411 @@
+//! The arrangement render node (P1.3, `arranger`): one opaque `ArrangerNode` per
+//! track, interpreting a [`Timeline`] value on the render path.
+//!
+//! The node reads a track's `Clip`s (sorted by `at_frame`, from
+//! [`crate::timeline`]) and, for each block, produces the track's audio:
+//! - **active-clip selection** by overlapping `[frame, frame+BLOCK)` with each
+//!   clip's span `[at_frame, end)` (a sorted-by-`at_frame` scan, no allocation);
+//! - **per-read-position streaming** — one reader per active clip *instance*
+//!   (a source read at two `src_start` offsets is two readers; kimi must-fix 3),
+//!   warmed on the control side and detached (never joined) on retire;
+//! - **overlap summing** — layered clips sum; a gap is silence;
+//! - **per-clip fades** — `fade_in`/`fade_out` are *authoritative* (the
+//!   auto-splice/equal-power boundary crossfade is not applied here, so there is
+//!   no double-fade; kimi must-fix 2);
+//!
+//! The render path allocates nothing and only pops rings. **Determinism scope:**
+//! byte-identical output holds for a **reader that never underruns**. An underrun
+//! is counted and is a *hard error the bounce must surface* (assert `underruns ==
+//! 0`), because an underrun cannot be recovered without shifting every later
+//! sample of that clip (an SPSC ring has no random access — you cannot skip a
+//! frame you never received). The module asserts `popped == off` in debug so a
+//! test that slips fails loudly instead of shipping shifted audio. The profile
+//! must also render **contiguously from frame 0** (a bounce from an offset would
+//! begin every reader at its source frame 0 while `off` claims otherwise).
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use engine::{AudioNode, EventBuf, NodeIO, NoteEvent, RenderBlock, Trigger, CAP_EVENTS};
+
+use crate::stream::{ClipRef, FilePlayer};
+use crate::timeline::{Clip, Id, Track};
+
+/// Resolves a pool source id to a WAV path (the media pool's id → path index;
+/// supplied by the pool in P1.3.3).
+pub type PoolResolver = Arc<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>;
+
+/// A clip's stream on the node: the reader plus how many frames it has popped.
+struct ClipReader {
+    player: FilePlayer,
+    popped: u64,
+}
+
+/// One track's arrangement interpreter — an opaque audio node (`out("audio")`).
+pub struct ArrangerNode {
+    clips: Vec<Clip>,
+    readers: HashMap<Id, ClipReader>,
+    underruns: Arc<AtomicU64>,
+}
+
+fn warm(player: &FilePlayer, want: u64, cap: usize) -> Result<(), String> {
+    let target = (cap as u64).min(want);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while player.produced() < target && !player.eof() {
+        if std::time::Instant::now() > deadline {
+            return Err("arranger reader did not warm up in 10 s".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    Ok(())
+}
+
+fn pop_sample(reader: &mut ClipReader, underruns: &AtomicU64) -> f32 {
+    match reader.player.ring().try_pop() {
+        Some(v) => {
+            reader.popped += 1;
+            v
+        }
+        None => {
+            if reader.player.eof() || reader.popped >= reader.player.expected() {
+                0.0 // legitimate: clip done
+            } else {
+                underruns.fetch_add(1, Ordering::Relaxed);
+                0.0
+            }
+        }
+    }
+}
+
+/// The per-clip fade gain: linear ramp up over `fade_in` and down over
+/// `fade_out` (authoritative per-clip fades; `off` is frames into the clip).
+fn fade_gain(c: &Clip, off: u64) -> f32 {
+    let gin = if c.fade_in > 0 { (off as f32 / c.fade_in as f32).min(1.0) } else { 1.0 };
+    let gout = if c.fade_out > 0 {
+        let remaining = c.src_len.saturating_sub(off);
+        (remaining as f32 / c.fade_out as f32).min(1.0)
+    } else {
+        1.0
+    };
+    gin.min(gout)
+}
+
+impl ArrangerNode {
+    /// Build the node for a track, creating and warming one reader per clip.
+    /// Control side only (threads, file opens, ring warm-up happen here).
+    pub fn new(track: Track, resolve: &PoolResolver, ring_capacity: usize) -> Result<Self, String> {
+        let mut readers = HashMap::new();
+        for c in &track.clips {
+            let path = resolve(&c.source)
+                .ok_or_else(|| format!("arranger: pool has no source '{}'", c.source))?;
+            let clip_ref = ClipRef { path, start: c.src_start, len: c.src_len };
+            let player = FilePlayer::start_looped(clip_ref, c.loop_len, ring_capacity)?;
+            warm(&player, c.src_len, ring_capacity)?;
+            readers.insert(c.id.clone(), ClipReader { player, popped: 0 });
+        }
+        Ok(ArrangerNode {
+            clips: track.clips,
+            readers,
+            underruns: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    pub fn underruns(&self) -> u64 {
+        self.underruns.load(Ordering::Relaxed)
+    }
+
+    pub fn clips(&self) -> &[Clip] {
+        &self.clips
+    }
+
+    /// Reset the underrun counter (a test/control convenience, not the render path).
+    pub fn reset_underruns(&mut self) {
+        self.underruns.store(0, Ordering::Relaxed);
+    }
+}
+
+impl AudioNode for ArrangerNode {
+    fn latency(&self) -> u32 {
+        0 // disk read-ahead is a stream buffer, not processing latency
+    }
+
+    fn render(
+        &mut self,
+        _io: &NodeIO,
+        out: &mut [f32],
+        _control: &mut f32,
+        _triggers: &mut EventBuf<Trigger, CAP_EVENTS>,
+        _notes: &mut EventBuf<NoteEvent, CAP_EVENTS>,
+        block: RenderBlock,
+    ) {
+        let f0 = block.frame;
+        let f1 = f0 + out.len() as u64;
+        debug_assert!(out.len() <= engine::BLOCK, "render chunk exceeds BLOCK");
+        let mut acc = [0.0f32; engine::BLOCK];
+        for c in self.clips.iter() {
+            if c.end() <= f0 {
+                continue; // fully before this block
+            }
+            if c.at_frame >= f1 {
+                break; // sorted by at_frame: nothing later is active
+            }
+            let start = c.at_frame.max(f0);
+            let end = c.end().min(f1);
+            let j0 = (start - f0) as usize;
+            let j1 = (end - f0) as usize;
+            let Some(reader) = self.readers.get_mut(&c.id) else {
+                // A clip with no reader (a value change landed without reconcile) —
+                // count it as an underrun and play silence, deterministic.
+                self.underruns.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            for (k, slot) in acc[j0..j1].iter_mut().enumerate() {
+                let fr = f0 + (j0 + k) as u64;
+                let off = fr - c.at_frame;
+                // Alignment: for contiguous-from-zero rendering, popped must equal off
+                // while the reader still has data. A slip (underrun) or an offset render
+                // violates it — fail loud in debug rather than silently shifting the rest
+                // of the clip. At a legitimate end (source EOF or fully popped), off runs
+                // ahead into silence and popped is capped; that is not a slip.
+                let at_end = reader.player.eof() || reader.popped >= reader.player.expected();
+                if !at_end {
+                    debug_assert_eq!(reader.popped, off, "clip '{}' reader slipped (off {off}, popped {})", c.id, reader.popped);
+                }
+                let s = pop_sample(reader, &self.underruns);
+                *slot += s * c.gain * fade_gain(c, off);
+            }
+        }
+        let len = out.len().min(engine::BLOCK);
+        out[..len].copy_from_slice(&acc[..len]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DEFAULT_RING_CAPACITY;
+    use crate::timeline::{ArrangeOp, Timeline};
+    use crate::wav::{WavReader, WavWriter};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    fn tmp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("media-arranger-{name}-{}.wav", std::process::id()))
+    }
+
+    /// Write a mono float WAV `frames` long, every sample = `value`.
+    fn write_const(path: &Path, frames: u64, sr: u32, value: f32) {
+        let mut w = WavWriter::create_float(path, sr, 1).unwrap();
+        let mut buf = vec![0.0f32; 2048];
+        let mut i = 0u64;
+        while i < frames {
+            let n = buf.len().min((frames - i) as usize);
+            buf[..n].fill(value);
+            w.write(&buf[..n]).unwrap();
+            i += n as u64;
+        }
+        w.finalize().unwrap();
+    }
+
+    /// Write a mono float WAV `frames` long, sample i = ((i % period) / period)
+    /// — a deterministic ramp, so loop wraps and sample alignment are observable.
+    fn write_ramp(path: &Path, frames: u64, sr: u32, period: u64) {
+        let mut w = WavWriter::create_float(path, sr, 1).unwrap();
+        let mut buf = vec![0.0f32; 2048];
+        let mut i = 0u64;
+        while i < frames {
+            let n = buf.len().min((frames - i) as usize);
+            for (k, s) in buf[..n].iter_mut().enumerate() {
+                *s = ((i + k as u64) % period.max(1)) as f32 / period.max(1) as f32;
+            }
+            w.write(&buf[..n]).unwrap();
+            i += n as u64;
+        }
+        w.finalize().unwrap();
+    }
+
+    fn resolver(map: &[(&str, PathBuf)]) -> PoolResolver {
+        let map: Vec<(String, PathBuf)> = map.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+        Arc::new(move |id| map.iter().find(|(k, _)| k == id).map(|(_, p)| p.clone()))
+    }
+
+    fn make_track(ops: &[ArrangeOp]) -> crate::timeline::Track {
+        let mut t = Timeline::new();
+        for op in ops {
+            t = t.apply(op).unwrap();
+        }
+        t.tracks.into_iter().next().expect("a track")
+    }
+
+    fn clip(id: &str, source: &str, at: u64, len: u64) -> crate::timeline::Clip {
+        crate::timeline::Clip {
+            id: id.into(),
+            source: source.into(),
+            src_start: 0,
+            src_len: len,
+            at_frame: at,
+            fade_in: 0,
+            fade_out: 0,
+            gain: 1.0,
+            loop_len: None,
+        }
+    }
+
+    fn render_node(node: &mut ArrangerNode, frames: u64, sr: u32) -> Vec<f32> {
+        let tempo = engine::TempoMap::new(sr, 120.0, 4);
+        let mut out = vec![0.0f32; frames as usize];
+        for (bi, chunk) in out.chunks_mut(engine::BLOCK).enumerate() {
+            let io = NodeIO {
+                audio_in: &[],
+                audio_ins: [&[][..]; engine::MAX_AUDIO_INS],
+                audio_in_count: 0,
+                control_in: 0.0,
+                triggers_in: &[],
+                notes_in: &[],
+            };
+            let mut control = 0.0f32;
+            let mut triggers = EventBuf::new();
+            let mut notes = EventBuf::new();
+            node.render(&io, chunk, &mut control, &mut triggers, &mut notes, RenderBlock {
+                frame: (bi * engine::BLOCK) as u64,
+                sample_rate: sr,
+                tempo: &tempo,
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn single_clip_streams_exactly_its_content() {
+        let p = tmp("single");
+        let sr = 48_000u32;
+        let len = 3000u64;
+        write_const(&p, len, sr, 0.5);
+        let resolve = resolver(&[("s0", p.clone())]);
+        let track = make_track(&[
+            ArrangeOp::AddTrack { track: "t0".into() },
+            ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", "s0", 0, len) },
+        ]);
+        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY).unwrap();
+        let out = render_node(&mut node, len, sr);
+        assert_eq!(node.underruns(), 0, "a warm source must not underrun");
+        let mut expected = vec![0.0f32; len as usize];
+        let mut r = WavReader::open(&p).unwrap();
+        assert_eq!(r.read_into(&mut expected), len as usize);
+        for (a, b) in expected.iter().zip(&out) {
+            assert_eq!(*a, *b, "streamed content must equal the source");
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn gap_is_silence_and_exact_alignment() {
+        let p = tmp("gap");
+        let sr = 48_000u32;
+        let period = 100u64;
+        write_ramp(&p, 1000, sr, period);
+        let resolve = resolver(&[("s0", p.clone())]);
+        let track = make_track(&[
+            ArrangeOp::AddTrack { track: "t0".into() },
+            ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", "s0", 100, 200) },
+        ]);
+        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY).unwrap();
+        let out = render_node(&mut node, 1000, sr);
+        assert_eq!(node.underruns(), 0);
+        assert!(out[..100].iter().all(|s| *s == 0.0), "leading gap must be silence");
+        assert!(out[300..].iter().all(|s| *s == 0.0), "trailing gap must be silence");
+        // Exact alignment: out[100 + k] == source[k], i.e. the clip's source window
+        // lands at its at_frame without slip.
+        let mut expected = vec![0.0f32; 200];
+        let mut r = WavReader::open(&p).unwrap();
+        assert_eq!(r.read_into(&mut expected), 200);
+        for (k, e) in expected.iter().enumerate() {
+            assert_eq!(out[100 + k], *e, "clip must align exactly at its at_frame (k={k})");
+        }
+    }
+
+    #[test]
+    fn overlapping_clips_sum() {
+        let pa = tmp("suma");
+        let pb = tmp("sumb");
+        let sr = 48_000u32;
+        write_const(&pa, 1000, sr, 0.5);
+        write_const(&pb, 1000, sr, -0.25);
+        let resolve = resolver(&[("a", pa), ("b", pb)]);
+        let track = make_track(&[
+            ArrangeOp::AddTrack { track: "t0".into() },
+            ArrangeOp::AddClip { track: "t0".into(), clip: clip("ca", "a", 0, 500) },
+            ArrangeOp::AddClip { track: "t0".into(), clip: clip("cb", "b", 250, 250) },
+        ]);
+        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY).unwrap();
+        let out = render_node(&mut node, 500, sr);
+        // [0,250) = clip a only = 0.5; [250,500) = a + b = 0.25.
+        assert!((out[0] - 0.5).abs() < 1e-5);
+        assert!((out[250] - 0.25).abs() < 1e-5, "overlap must sum: {}", out[250]);
+    }
+
+    #[test]
+    fn per_clip_fade_ramps() {
+        let p = tmp("fade");
+        let sr = 48_000u32;
+        write_const(&p, 1000, sr, 1.0);
+        let resolve = resolver(&[("s0", p)]);
+        let mut c = clip("c0", "s0", 0, 1000);
+        c.fade_in = 100;
+        c.fade_out = 100;
+        let track = make_track(&[
+            ArrangeOp::AddTrack { track: "t0".into() },
+            ArrangeOp::AddClip { track: "t0".into(), clip: c },
+        ]);
+        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY).unwrap();
+        let out = render_node(&mut node, 1000, sr);
+        // gain = fade_in min fade_out; with a constant 1.0 source, out = gain curve.
+        assert!(out[0].abs() < out[10].abs(), "fade_in ramps up: {} < {}", out[0].abs(), out[10].abs());
+        assert!(out[10].abs() < out[100].abs(), "fade_in reaches full: {} < {}", out[10].abs(), out[100].abs());
+        assert!(out[999].abs() < out[950].abs(), "fade_out ramps down: {} > {}", out[950].abs(), out[999].abs());
+        assert!((out[100] - 1.0).abs() < 1e-5, "mid clip is full after fade_in");
+    }
+
+    #[test]
+    fn loop_region_repeats_source_and_wraps() {
+        let p = tmp("loop");
+        let sr = 48_000u32;
+        let period = 100u64;
+        write_ramp(&p, 1000, sr, period);
+        let resolve = resolver(&[("s0", p)]);
+        let mut c = clip("c0", "s0", 0, 1000);
+        c.src_len = 300;
+        c.loop_len = Some(100);
+        let track = make_track(&[
+            ArrangeOp::AddTrack { track: "t0".into() },
+            ArrangeOp::AddClip { track: "t0".into(), clip: c },
+        ]);
+        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY).unwrap();
+        let out = render_node(&mut node, 300, sr);
+        assert_eq!(node.underruns(), 0);
+        // The reader must wrap back to the region start every 100 frames: sample
+        // 100 == sample 0 and sample 200 == sample 0 (a constant source would pass
+        // even if it never sought back, so we use a ramp).
+        assert!((out[100] - out[0]).abs() < 1e-6, "loop must wrap: {} vs {}", out[100], out[0]);
+        assert!((out[200] - out[0]).abs() < 1e-6, "loop must wrap: {} vs {}", out[200], out[0]);
+        assert!((out[50] - out[150]).abs() < 1e-6, "mid-region must repeat: {} vs {}", out[50], out[150]);
+        assert!((out[50] - 0.5).abs() < 1e-6, "ramp value at 50 must be 0.5: {}", out[50]);
+    }
+
+    #[test]
+    fn eof_is_silence_not_panic() {
+        let p = tmp("short");
+        let sr = 48_000u32;
+        write_const(&p, 100, sr, 0.5); // only 100 frames
+        let resolve = resolver(&[("s0", p)]);
+        let track = make_track(&[
+            ArrangeOp::AddTrack { track: "t0".into() },
+            ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", "s0", 0, 1000) },
+        ]);
+        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY).unwrap();
+        let out = render_node(&mut node, 1000, sr);
+        assert!(out[100..].iter().all(|s| *s == 0.0), "beyond EOF must be silence");
+    }
+}

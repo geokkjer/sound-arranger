@@ -63,6 +63,15 @@ impl FilePlayer {
     /// Start the reader thread for `clip`. Control side only: allocates,
     /// opens the file, spawns a thread, begins filling the ring immediately.
     pub fn start(clip: ClipRef, ring_capacity: usize) -> Result<Self, String> {
+        Self::start_looped(clip, None, ring_capacity)
+    }
+
+    /// Start the reader for `clip`, optionally looping: when `loop_len` is
+    /// `Some(r > 0)`, the reader reads `r` frames from `clip.start`, seeks back
+    /// to `clip.start`, and repeats — until it has produced `clip.len` frames
+    /// total (so a baked loop with `clip.len == r * times` wraps). `Some(0)` or
+    /// `None` reads `clip.len` contiguous frames once. Control side only.
+    pub fn start_looped(clip: ClipRef, loop_len: Option<u64>, ring_capacity: usize) -> Result<Self, String> {
         let ring = Arc::new(Spsc::new(ring_capacity));
         let stop = Arc::new(AtomicBool::new(false));
         let eof = Arc::new(AtomicBool::new(false));
@@ -71,6 +80,8 @@ impl FilePlayer {
         let mut reader = WavReader::open(&clip.path)?;
         reader.seek_frames(clip.start)?;
         let want = clip.len;
+        let region = loop_len.filter(|r| *r > 0).unwrap_or(want);
+        let looping = loop_len.is_some_and(|r| r > 0);
         let (ring2, stop2, eof2, produced2) = (ring.clone(), stop.clone(), eof.clone(), produced.clone());
 
         let handle = std::thread::Builder::new()
@@ -78,14 +89,19 @@ impl FilePlayer {
             .spawn(move || {
                 let mut buf = [0.0f32; 1024];
                 let mut remaining = want;
+                let mut produced_in_loop = 0u64;
                 while remaining > 0 {
                     if stop2.load(Ordering::Acquire) {
                         return;
                     }
-                    let want_now = buf.len().min(remaining as usize);
+                    let budget = (region - produced_in_loop).min(remaining);
+                    let want_now = buf.len().min(budget as usize);
                     let n = reader.read_into(&mut buf[..want_now]);
                     if n == 0 {
-                        break; // EOF (or clipped region end)
+                        // EOF before the region finished: the source is shorter than
+                        // the clip claimed — stop (render treats it as silence). A
+                        // loop that runs out is also done; no silent repeat ad infinitum.
+                        break;
                     }
                     let mut i = 0;
                     while i < n {
@@ -102,6 +118,13 @@ impl FilePlayer {
                         }
                     }
                     remaining -= n as u64;
+                    produced_in_loop += n as u64;
+                    if produced_in_loop >= region && looping {
+                        produced_in_loop = 0;
+                        if reader.seek_frames(clip.start).is_err() {
+                            break; // seek failure: stop rather than loop forever
+                        }
+                    }
                 }
                 eof2.store(true, Ordering::Release);
             })
