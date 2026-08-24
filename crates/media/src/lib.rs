@@ -31,6 +31,7 @@
 
 pub mod arranger;
 pub mod capture;
+pub mod clip_editor;
 pub mod devices;
 pub mod drift;
 pub mod peaks;
@@ -44,6 +45,7 @@ use std::path::Path;
 
 pub use arranger::{ArrangerNode, PoolResolver};
 pub use capture::{Capture, CaptureNode};
+pub use clip_editor::{decode_op, encode_op, register_handlers, ClipEditor, Interner};
 pub use drift::DriftCompensator;
 pub use peaks::{PeakBuilder, PeakFile, PEAK_BASE_BIN, PEAK_LEVELS};
 pub use record::{Recorder, RecordNode, WavRecorder};
