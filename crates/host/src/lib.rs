@@ -254,7 +254,20 @@ impl HostSession {
             HostCommand::SetTempo { bpm, beats_per_bar, .. } => {
                 self.engine.set_tempo(*bpm, *beats_per_bar)
             }
-            HostCommand::Unmount { plugin, .. } => self.engine.unmount(plugin),
+            HostCommand::Unmount { plugin, .. } => {
+                let r = self.engine.unmount(plugin);
+                if *plugin == "mixer" {
+                    // the mixer (the bus) is gone — clear the host's mixer-dependent
+                    // state so a later engine command cannot reach a stale
+                    // `wire_pending`/`wire_arranger` and panic (GLM-5.3 review #6).
+                    self.pending_cords.clear();
+                    self.player_mailbox = None;
+                    self.player_underruns = None;
+                    self.player_deferred = None;
+                    self.mixer_channels = None;
+                }
+                r
+            }
             HostCommand::Play { clip, channel, .. } => {
                 let channels = self.mixer_channels.ok_or(
                     "play requires the mixer to be mounted first (mount mixer channels=N)",
@@ -306,7 +319,7 @@ impl HostSession {
                 if self.pool_resolver.is_none() {
                     return Err("arrange requires set_pool first (clips need pool-source paths)".into());
                 }
-                let editor = self.editor.as_mut().expect("ensured");
+                let editor = self.editor.as_mut().ok_or("clip editor not initialized")?;
                 editor.apply(&mut self.engine, op)?;
                 self.arrange_dirty = true;
                 self.media_commands += 1;
@@ -375,7 +388,7 @@ impl HostSession {
             if ti >= channels {
                 return Err(format!("track '{}' has no mixer channel ch{ti} (channels={channels})", track.id));
             }
-            let node = media::ArrangerNode::new(track.clone(), &resolver, media::DEFAULT_RING_CAPACITY)?;
+            let node = media::ArrangerNode::new(track.clone(), &resolver, media::DEFAULT_RING_CAPACITY, self.engine.clock.sample_rate)?;
             let id = self.engine.graph.add_node(
                 engine::NodeKind::Opaque(Box::new(node)),
                 vec![engine::Port { name: "audio", direction: engine::Direction::Out, kind: engine::SignalKind::Audio }],
@@ -395,11 +408,13 @@ impl HostSession {
         Ok(())
     }
 
-    /// Render `frames` from the current position (wiring pending cords first).
-    pub fn render(&mut self, frames: usize) -> Vec<f32> {
-        self.wire_pending().expect("wiring is validated at Play apply");
-        self.wire_arranger().expect("arranger wiring is validated at Arrange apply");
-        self.engine.render(frames)
+    /// Render `frames` from the current position (wiring pending cords/arranger
+    /// first). A wiring failure (e.g. the mixer was unmounted after a `play`) is
+    /// a clean `Err`, never a panic in a host.
+    pub fn render(&mut self, frames: usize) -> Result<Vec<f32>, String> {
+        self.wire_pending()?;
+        self.wire_arranger()?;
+        Ok(self.engine.render(frames))
     }
 
     pub fn log(&self) -> &SessionLog {
@@ -484,7 +499,9 @@ pub fn run_script(script: &[HostCommand]) -> Result<HostSession, String> {
         if let Some(frame) = cmd.at_frame() {
             let now = session.engine.clock.frame();
             if frame > now {
-                session.render((frame - now) as usize);
+                // The pre-render wiring can fail (a later command after the
+                // mixer was unmounted); a clean Err, never a panic in a host.
+                session.render((frame - now) as usize)?;
             }
         }
         session.apply(cmd)?;

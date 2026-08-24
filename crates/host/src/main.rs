@@ -16,7 +16,10 @@ fn main() {
         })
     } else {
         let mut text = String::new();
-        std::io::stdin().read_to_string(&mut text).expect("read stdin");
+        if let Err(e) = std::io::stdin().read_to_string(&mut text) {
+            eprintln!("host: cannot read script from stdin: {e}");
+            std::process::exit(2);
+        }
         text
     };
 

@@ -127,6 +127,16 @@ impl FilePlayer {
                     }
                 }
                 eof2.store(true, Ordering::Release);
+                // Park at EOF, *holding our Arc clones*, until the player is
+                // dropped (its `Drop` sets `stop`). The retires a finished clip
+                // on the render thread (`self.cur = Some(finished.incoming)` drops
+                // the old player) — if the reader had already exited here, the
+                // 256 KiB ring + Arcs would free ON THE RENDER THREAD, violating
+                // the no-alloc-on-render invariant. Parking defers that free to
+                // this reader thread's own exit, off the audio path.
+                while !stop2.load(Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                }
             })
             .map_err(|e| format!("player thread spawn: {e}"))?;
 

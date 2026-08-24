@@ -288,8 +288,9 @@ impl WavWriter {
         let frames = actual_bytes / h.block_align();
         // Patch a *frame-aligned* size: a torn tail from a crash mid-flush is
         // truncated away so the recovered file is formally well-formed
-        // (kimi review finding 7).
-        let data_bytes = frames * h.block_align();
+        // (kimi review finding 7). Refuse a take that would overflow the u32
+        // size field rather than writing a corrupt small header (>4 GiB).
+        let data_bytes = data_bytes(frames, h.channels, h.bits == 32)?;
         let mut f = File::options().write(true).open(path).map_err(|e| format!("open rw {}: {e}", path.display()))?;
         f.seek(SeekFrom::Start(RIFF_SIZE_POS)).map_err(|e| e.to_string())?;
         f.write_all(&(36u32 + data_bytes as u32).to_le_bytes()).map_err(|e| e.to_string())?;
@@ -341,13 +342,36 @@ fn write_header(w: &mut impl Write, sample_rate: u32, channels: u16, float: bool
 }
 
 fn patch_sizes(w: &mut (impl Write + Seek), frames: u64, channels: u16, float: bool) -> Result<(), String> {
-    let bytes_per_sample: u64 = if float { 4 } else { 2 };
-    let data_bytes = (frames * channels as u64 * bytes_per_sample) as u32;
+    let data_bytes = data_bytes(frames, channels, float)?;
+    let data_bytes = data_bytes as u32;
     w.seek(SeekFrom::Start(RIFF_SIZE_POS)).map_err(|e| e.to_string())?;
     w.write_all(&(36u32 + data_bytes).to_le_bytes()).map_err(|e| e.to_string())?;
     w.seek(SeekFrom::Start(DATA_SIZE_POS)).map_err(|e| e.to_string())?;
     w.write_all(&data_bytes.to_le_bytes()).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// The RIFF data-chunk size, or `Err` if it would exceed the u32 field — a take
+/// that big must not silently truncate to a corrupt small header (the pool
+/// records long live jams; ~6.2 h mono float @48 kHz crosses 4 GiB). RF64 is the
+/// longer-term answer; for now a >4 GiB take fails loud.
+fn data_bytes(frames: u64, channels: u16, float: bool) -> Result<u64, String> {
+    let bytes_per_sample: u64 = if float { 4 } else { 2 };
+    let data_bytes = frames
+        .checked_mul(channels as u64)
+        .and_then(|b| b.checked_mul(bytes_per_sample))
+        .ok_or("take length overflows the WAV size arithmetic")?;
+    // The RIFF size field is `36 + data_bytes (+ 1 pad byte if data_bytes is odd,
+    // since WAV chunks are word-aligned)` — both must fit u32. `-37` (not `-36`)
+    // covers the odd-data pad case; an odd data_bytes at the exact `-36` boundary
+    // would still overflow the patched header.
+    if data_bytes > u32::MAX as u64 - 37 {
+        return Err(format!(
+            "take of {data_bytes} audio bytes exceeds the WAV u32 size field (max {}) — an RF64/segmented take is not yet supported",
+            u32::MAX as u64 - 37
+        ));
+    }
+    Ok(data_bytes)
 }
 
 #[cfg(test)]
@@ -482,5 +506,18 @@ mod float_tests {
         }
         assert_eq!(WavWriter::recover(&path).unwrap(), 777);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A take crossing the u32 WAV size field must fail loud, never silently
+    /// truncate to a corrupt small header (>4 GiB — the pool records long jams).
+    #[test]
+    fn data_bytes_guard_refuses_oversized_take() {
+        // mono float: data_bytes = frames * 4. The RIFF field is `36 + data_bytes
+        // (+1 pad if odd)`; the guard is `> u32::MAX - 37` (conservative, covers
+        // the odd-data pad even though our writers always produce even data_bytes).
+        let ok_frames = (u32::MAX as u64 - 37) / 4; // data_bytes just under the bound
+        assert!(data_bytes(ok_frames, 1, true).is_ok(), "just under the boundary is ok");
+        let err_frames = ok_frames + 1; // data_bytes just over
+        assert!(data_bytes(err_frames, 1, true).is_err(), "just over the boundary must refuse");
     }
 }

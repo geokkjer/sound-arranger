@@ -95,11 +95,23 @@ fn fade_gain(c: &Clip, off: u64) -> f32 {
 impl ArrangerNode {
     /// Build the node for a track, creating and warming one reader per clip.
     /// Control side only (threads, file opens, ring warm-up happen here).
-    pub fn new(track: Track, resolve: &PoolResolver, ring_capacity: usize) -> Result<Self, String> {
+    /// `session_rate` is the engine's sample rate; a clip whose source differs is
+    /// **refused** (a rate-mismatched take would play pitch-shifted with no
+    /// diagnostic — a real-hardware-invisible bug).
+    pub fn new(track: Track, resolve: &PoolResolver, ring_capacity: usize, session_rate: u32) -> Result<Self, String> {
         let mut readers = HashMap::new();
         for c in &track.clips {
             let path = resolve(&c.source)
                 .ok_or_else(|| format!("arranger: pool has no source '{}'", c.source))?;
+            let src_rate = crate::wav::WavReader::open(&path)
+                .map_err(|e| format!("arranger: source {}: {e}", c.source))?
+                .sample_rate();
+            if src_rate != session_rate {
+                return Err(format!(
+                    "clip '{}' source is {src_rate} Hz but the session is {session_rate} Hz (rate-mismatched; wire DriftCompensator or resample)",
+                    c.id
+                ));
+            }
             let clip_ref = ClipRef { path, start: c.src_start, len: c.src_len };
             let player = FilePlayer::start_looped(clip_ref, c.loop_len, ring_capacity)?;
             warm(&player, c.src_len, ring_capacity)?;
@@ -288,7 +300,7 @@ mod tests {
             ArrangeOp::AddTrack { track: "t0".into() },
             ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", "s0", 0, len) },
         ]);
-        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY).unwrap();
+        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, sr).unwrap();
         let out = render_node(&mut node, len, sr);
         assert_eq!(node.underruns(), 0, "a warm source must not underrun");
         let mut expected = vec![0.0f32; len as usize];
@@ -311,7 +323,7 @@ mod tests {
             ArrangeOp::AddTrack { track: "t0".into() },
             ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", "s0", 100, 200) },
         ]);
-        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY).unwrap();
+        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, sr).unwrap();
         let out = render_node(&mut node, 1000, sr);
         assert_eq!(node.underruns(), 0);
         assert!(out[..100].iter().all(|s| *s == 0.0), "leading gap must be silence");
@@ -339,7 +351,7 @@ mod tests {
             ArrangeOp::AddClip { track: "t0".into(), clip: clip("ca", "a", 0, 500) },
             ArrangeOp::AddClip { track: "t0".into(), clip: clip("cb", "b", 250, 250) },
         ]);
-        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY).unwrap();
+        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, sr).unwrap();
         let out = render_node(&mut node, 500, sr);
         // [0,250) = clip a only = 0.5; [250,500) = a + b = 0.25.
         assert!((out[0] - 0.5).abs() < 1e-5);
@@ -359,7 +371,7 @@ mod tests {
             ArrangeOp::AddTrack { track: "t0".into() },
             ArrangeOp::AddClip { track: "t0".into(), clip: c },
         ]);
-        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY).unwrap();
+        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, sr).unwrap();
         let out = render_node(&mut node, 1000, sr);
         // gain = fade_in min fade_out; with a constant 1.0 source, out = gain curve.
         assert!(out[0].abs() < out[10].abs(), "fade_in ramps up: {} < {}", out[0].abs(), out[10].abs());
@@ -382,7 +394,7 @@ mod tests {
             ArrangeOp::AddTrack { track: "t0".into() },
             ArrangeOp::AddClip { track: "t0".into(), clip: c },
         ]);
-        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY).unwrap();
+        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, sr).unwrap();
         let out = render_node(&mut node, 300, sr);
         assert_eq!(node.underruns(), 0);
         // The reader must wrap back to the region start every 100 frames: sample
@@ -404,8 +416,28 @@ mod tests {
             ArrangeOp::AddTrack { track: "t0".into() },
             ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", "s0", 0, 1000) },
         ]);
-        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY).unwrap();
+        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, sr).unwrap();
         let out = render_node(&mut node, 1000, sr);
         assert!(out[100..].iter().all(|s| *s == 0.0), "beyond EOF must be silence");
+    }
+
+    #[test]
+    fn rate_mismatched_source_is_refused() {
+        // a 44.1 kHz take in a 48 kHz session would play pitch-shifted with no
+        // diagnostic; ArrangerNode::new must refuse it (fail-loud), not silently
+        // render wrong audio.
+        let p = tmp("rate");
+        write_const(&p, 1000, 44_100, 0.5); // source at 44.1 kHz
+        let resolve = resolver(&[("s0", p)]);
+        let mut c = clip("c0", "s0", 0, 1000);
+        c.source = "s0".into();
+        let track = make_track(&[
+            ArrangeOp::AddTrack { track: "t0".into() },
+            ArrangeOp::AddClip { track: "t0".into(), clip: c },
+        ]);
+        let err = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, 48_000)
+            .err()
+            .expect("a rate-mismatched source must be refused");
+        assert!(err.contains("44100") && err.contains("Hz"), "error names the mismatch: {err}");
     }
 }
