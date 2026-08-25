@@ -1,0 +1,174 @@
+@import "tailwindcss";
+
+/* ------------------------------------------------------------------ *
+ * design tokens — mirror ./docs/design/design-system.md
+ * WebKitGTK 2.52.6 (webkit2gtk-4.1). See the design-system perf rules:
+ * no backdrop-filter, no large box-shadow, thin hairlines, flat surfaces.
+ * ------------------------------------------------------------------ */
+:root {
+  --bg: #0f1114;
+  --surface: #14171b;
+  --panel: #1a1e24;
+  --raised: #21262e;
+  --hover: #242a32;
+
+  --line: #2b313a;
+  --line-soft: #22272e;
+
+  --fg: #dfe3e8;
+  --fg-dim: #9aa3ad;
+  --fg-mute: #5f6872;
+
+  --accent: #6b8afd;
+  --accent-dim: #3b4a7c;
+  --playhead: #e5b567;
+  --record: #e06a76;
+
+  --bar-h: 44px;
+  --radius: 5px;
+  --radius-sm: 3px;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 400 13px/1.5 ui-monospace, "SF Mono", Menlo, "DejaVu Sans Mono", monospace;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  user-select: none;
+}
+
+/* ---- the core shell (placeholder until a profile loads) ---- */
+.shell {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.bar {
+  height: var(--bar-h);
+  flex: 0 0 var(--bar-h);
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  letter-spacing: 0.14em;
+  font-size: 12px;
+  font-weight: 500;
+}
+.brand .glyph {
+  width: 15px;
+  height: 13px;
+  position: relative;
+}
+.brand .glyph::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border: 1.5px solid var(--accent);
+  border-radius: 2px;
+}
+.brand .glyph::after {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 3px;
+  width: 2px;
+  height: 5px;
+  background: var(--accent);
+}
+.brand .muted {
+  color: var(--fg-mute);
+}
+
+.spacer {
+  flex: 1;
+}
+
+.btn {
+  height: 28px;
+  padding: 0 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  background: transparent;
+  color: var(--fg-dim);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.12s ease-out, color 0.12s ease-out;
+  white-space: nowrap;
+}
+.btn:hover {
+  background: var(--hover);
+  color: var(--fg);
+}
+
+.surface {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface);
+}
+.empty {
+  text-align: center;
+  color: var(--fg-mute);
+}
+.empty .ring {
+  width: 68px;
+  height: 68px;
+  margin: 0 auto 24px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.empty .ring::after {
+  content: ",";
+  font-weight: 800;
+  color: var(--fg-mute);
+  letter-spacing: -0.4em;
+  transform: translateX(-3px);
+}
+.empty h1 {
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  margin: 0 0 8px;
+}
+.empty p {
+  font-size: 12px;
+  color: var(--fg-mute);
+  margin: 0 0 20px;
+}
+.empty kbd {
+  font: inherit;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-bottom: 2px solid var(--line);
+  color: var(--fg);
+  border-radius: 3px;
+  padding: 1px 6px;
+  margin: 0 2px;
+}
