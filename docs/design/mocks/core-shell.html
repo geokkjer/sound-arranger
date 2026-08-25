@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>sound-arranger — core shell</title>
+<style>
+  :root{
+    --bg:#0f1114; --surface:#14171b; --panel:#1a1e24; --raised:#21262e; --hover:#242a32;
+    --line:#2b313a; --line-soft:#22272e;
+    --fg:#dfe3e8; --fg-dim:#9aa3ad; --fg-mute:#5f6872;
+    --accent:#6b8afd; --accent-dim:#3b4a7c; --playhead:#e5b567; --record:#e06a76;
+    --ok:#7fc9a0; --warn:#d9a13f;
+    --bar-h:44px; --ruler-h:24px; --radius:5px; --radius-sm:3px;
+  }
+  *{box-sizing:border-box;}
+  html,body{height:100%;}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font:400 13px/1.5 ui-monospace,"SF Mono",Menlo,"DejaVu Sans Mono",monospace;
+    -webkit-font-smoothing:antialiased; overflow:hidden;
+  }
+  .app{display:flex; flex-direction:column; height:100vh;}
+
+  /* ---------- top bar ---------- */
+  .bar{
+    height:var(--bar-h); flex:0 0 var(--bar-h);
+    display:flex; align-items:center; gap:14px; padding:0 14px;
+    background:var(--panel); border-bottom:1px solid var(--line); user-select:none;
+  }
+  .brand{display:flex; align-items:center; gap:9px; letter-spacing:.14em; font-weight:500; font-size:12px; color:var(--fg);}
+  .brand .glyph{width:15px;height:13px;position:relative;}
+  .brand .glyph::before{content:"";position:absolute;inset:0;border:1.5px solid var(--accent);border-radius:2px;}
+  .brand .glyph::after{content:"";position:absolute;left:2px;top:3px;width:2px;height:5px;background:var(--accent);}
+  .brand b{color:var(--fg);} .brand span{color:var(--fg-mute);}
+
+  .spacer{flex:1;}
+
+  .transport{display:flex; align-items:center; gap:14px;}
+  .t-time{font-size:15px; color:var(--fg); letter-spacing:.05em; font-variant-numeric:tabular-nums;}
+  .t-time .f{color:var(--fg-mute);}
+  .t-beat{display:flex; align-items:center; gap:7px; color:var(--fg-dim); font-size:12px;}
+  .t-beat .tickbox{display:inline-flex; gap:2px;}
+  .t-beat .tickbox i{width:2px; height:11px; background:var(--accent); border-radius:1px; opacity:.85;}
+  .t-beat .tickbox i.n{background:var(--fg-mute);}
+  .t-bpm{color:var(--fg-dim);}
+  .t-bpm b{color:var(--fg);}
+  .t-rec{margin-left:2px; width:10px;height:10px;border:1.5px solid var(--record);border-radius:50%;}
+  .t-rec.live{background:var(--record); animation:pulse 1s steps(2,end) infinite;}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+  .btn{
+    height:28px; padding:0 11px; display:inline-flex; align-items:center; gap:7px;
+    background:transparent; color:var(--fg-dim); border:1px solid var(--line);
+    border-radius:var(--radius-sm); font:inherit; font-size:12px; cursor:pointer;
+    transition:background .12s ease-out,color .12s ease-out,border-color .12s ease-out;
+  }
+  .btn:hover{background:var(--hover); color:var(--fg); border-color:var(--line);}
+  .btn.ghost{border-color:transparent;}
+  .btn.ghost:hover{border-color:var(--line);}
+  .btn .arr{color:var(--fg-mute);}
+  .btn.on{color:var(--fg);border-color:var(--accent);}
+  .btn.on .arr{color:var(--accent);}
+
+  /* ---------- surface ---------- */
+  .surface{flex:1; display:flex; align-items:center; justify-content:center; position:relative; background:var(--surface);}
+  .empty{ text-align:center; color:var(--fg-mute);}
+  .empty .ring{
+    width:72px;height:72px;margin:0 auto 26px; border:1px dashed var(--line); border-radius:8px;
+    display:flex;align-items:center;justify-content:center;
+  }
+  .empty .ring::after{content:",,"; font-weight:800; color:var(--fg-mute); letter-spacing:-.4em; transform:translateX(-3px);}
+  .empty h1{font-size:14px; font-weight:500; color:var(--fg-dim); letter-spacing:.1em; margin:0 0 8px; text-transform:uppercase;}
+  .empty p{font-size:12px; color:var(--fg-mute); margin:0 0 20px;}
+  .empty .keys{color:var(--fg-dim); font-size:12px;}
+  .empty .keys kbd{
+    font:inherit; background:var(--panel); border:1px solid var(--line); border-bottom:2px solid var(--line);
+    color:var(--fg); border-radius:3px; padding:1px 6px; margin:0 2px;
+  }
+
+  .corner{position:absolute; right:12px; bottom:12px; color:var(--fg-mute); font-size:11px; letter-spacing:.05em;}
+  .corner b{color:var(--fg-dim); font-weight:400;}
+
+  /* footer hint */
+  .hint{position:absolute; left:12px; bottom:12px; color:var(--fg-mute); font-size:11px; display:flex; gap:16px;}
+  .hint span b{color:var(--fg-dim); font-weight:400;}
+</style>
+</head>
+<body>
+  <div class="app">
+    <header class="bar">
+      <div class="brand">
+        <span class="glyph"></span>
+        <span>SOUND-<b>ARRANGER</b><span> ·core</span></span>
+      </div>
+      <div class="spacer"></div>
+
+      <div class="transport">
+        <div class="t-time">01:23<span class="f">:45</span>:<span class="f">12</span></div>
+        <div class="t-beat">
+          <span class="tickbox"><i></i><i class="n"></i><i class="n"></i><i class="n"></i><i class="n"></i></span>
+        </div>
+        <div class="t-bpm"><b>120</b> BPM · 4/4</div>
+        <div class="t-rec"></div>
+      </div>
+
+      <div class="spacer"></div>
+
+      <button class="btn ghost">⌗ grid</button>
+      <button class="btn">PROFILE <span class="arr">▾</span></button>
+      <button class="btn ghost">⚙</button>
+    </header>
+
+    <main class="surface">
+      <div class="empty">
+        <div class="ring"></div>
+        <h1>Load a profile</h1>
+        <p>Profiles assemble plugins. The surface stays empty until one loads.</p>
+        <div class="keys"><kbd>⌘</kbd><kbd>k</kbd> open profile &nbsp;·&nbsp; <kbd>⌘</kbd><kbd>shift</kbd><kbd>p</kbd> command palette</div>
+      </div>
+      <div class="hint"><span>engine <b>idle</b></span><span>48 kHz / 32-bit</span></div>
+      <div class="corner">host v1 · <b>0:00</b> session</div>
+    </main>
+  </div>
+</body>
+</html>
