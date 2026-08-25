@@ -37,10 +37,16 @@ use crate::timeline::{Clip, Id, Track};
 /// supplied by the pool in P1.3.3).
 pub type PoolResolver = Arc<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>;
 
-/// A clip's stream on the node: the reader plus how many frames it has popped.
+/// A clip's stream on the node: the reader, frames popped *relative to the
+/// reader's start* (`popped`), and the clip offset the reader was built at
+/// (`off0`). `off0` is how far into the clip the transport was when the node was
+/// (re)built — a rebuilt-at-current-frame reader must begin there, not at the
+/// clip's source start, or it plays the wrong region (and `popped + off0` is
+/// what the render path compares against the absolute clip offset `off`).
 struct ClipReader {
     player: FilePlayer,
     popped: u64,
+    off0: u64,
 }
 
 /// One track's arrangement interpreter — an opaque audio node (`out("audio")`).
@@ -69,6 +75,8 @@ fn pop_sample(reader: &mut ClipReader, underruns: &AtomicU64) -> f32 {
             v
         }
         None => {
+            // The reader produces `src_len - off0` frames (its `expected`); the
+            // clip is done when the reader's own frame count reaches that.
             if reader.player.eof() || reader.popped >= reader.player.expected() {
                 0.0 // legitimate: clip done
             } else {
@@ -97,8 +105,11 @@ impl ArrangerNode {
     /// Control side only (threads, file opens, ring warm-up happen here).
     /// `session_rate` is the engine's sample rate; a clip whose source differs is
     /// **refused** (a rate-mismatched take would play pitch-shifted with no
-    /// diagnostic — a real-hardware-invisible bug).
-    pub fn new(track: Track, resolve: &PoolResolver, ring_capacity: usize, session_rate: u32) -> Result<Self, String> {
+    /// diagnostic — a real-hardware-invisible bug). `from_frame` is the transport
+    /// frame the node is being built at: a reader is positioned `off0 =
+    /// `from_frame - at_frame` frames into the clip (clamped to its length), so a
+    /// node rebuilt mid-transport continues the clip instead of restarting it.
+    pub fn new(track: Track, resolve: &PoolResolver, ring_capacity: usize, session_rate: u32, from_frame: u64) -> Result<Self, String> {
         let mut readers = HashMap::new();
         for c in &track.clips {
             // a hand-built Track bypasses Timeline validation — validate here so
@@ -116,10 +127,14 @@ impl ArrangerNode {
                     c.id
                 ));
             }
+            // How far into the clip the transport already is. If the clip hasn't
+            // started (`from_frame <= at_frame`) this is 0 (read from its start);
+            // if it has already ended, clamp to the length (reader emits silence).
+            let off0 = from_frame.saturating_sub(c.at_frame).min(c.src_len);
             let clip_ref = ClipRef { path, start: c.src_start, len: c.src_len };
-            let player = FilePlayer::start_looped(clip_ref, c.loop_len, ring_capacity)?;
-            warm(&player, c.src_len, ring_capacity)?;
-            readers.insert(c.id.clone(), ClipReader { player, popped: 0 });
+            let player = FilePlayer::start_looped_anchored(clip_ref, c.loop_len, ring_capacity, off0)?;
+            warm(&player, c.src_len.saturating_sub(off0), ring_capacity)?;
+            readers.insert(c.id.clone(), ClipReader { player, popped: 0, off0 });
         }
         Ok(ArrangerNode {
             clips: track.clips,
@@ -180,14 +195,16 @@ impl AudioNode for ArrangerNode {
             for (k, slot) in acc[j0..j1].iter_mut().enumerate() {
                 let fr = f0 + (j0 + k) as u64;
                 let off = fr - c.at_frame;
-                // Alignment: for contiguous-from-zero rendering, popped must equal off
-                // while the reader still has data. A slip (underrun) or an offset render
-                // violates it — fail loud in debug rather than silently shifting the rest
-                // of the clip. At a legitimate end (source EOF or fully popped), off runs
-                // ahead into silence and popped is capped; that is not a slip.
+                // Alignment: for contiguous-from-`off0` rendering, the reader's
+                // own `popped` plus its offset `off0` must equal the clip's
+                // absolute offset `off`. A slip (underrun) or an offset render
+                // violates it — fail loud in debug rather than silently shifting
+                // the rest of the clip. At a legitimate end (source EOF or fully
+                // popped), off runs ahead into silence and popped is capped; that
+                // is not a slip.
                 let at_end = reader.player.eof() || reader.popped >= reader.player.expected();
                 if !at_end {
-                    debug_assert_eq!(reader.popped, off, "clip '{}' reader slipped (off {off}, popped {})", c.id, reader.popped);
+                    debug_assert_eq!(reader.popped + reader.off0, off, "clip '{}' reader slipped (off {off}, popped {} + off0 {})", c.id, reader.popped, reader.off0);
                 }
                 let s = pop_sample(reader, &self.underruns);
                 *slot += s * c.gain * fade_gain(c, off);
@@ -270,6 +287,12 @@ mod tests {
     }
 
     fn render_node(node: &mut ArrangerNode, frames: u64, sr: u32) -> Vec<f32> {
+        render_node_from(node, frames, sr, 0)
+    }
+
+    /// Render `frames` samples starting at absolute timeline frame `start_frame`
+    /// (a rebuild-at-`from_frame` node must render from there, not frame 0).
+    fn render_node_from(node: &mut ArrangerNode, frames: u64, sr: u32, start_frame: u64) -> Vec<f32> {
         let tempo = engine::TempoMap::new(sr, 120.0, 4);
         let mut out = vec![0.0f32; frames as usize];
         for (bi, chunk) in out.chunks_mut(engine::BLOCK).enumerate() {
@@ -285,7 +308,7 @@ mod tests {
             let mut triggers = EventBuf::new();
             let mut notes = EventBuf::new();
             node.render(&io, chunk, &mut control, &mut triggers, &mut notes, RenderBlock {
-                frame: (bi * engine::BLOCK) as u64,
+                frame: start_frame + (bi * engine::BLOCK) as u64,
                 sample_rate: sr,
                 tempo: &tempo,
             });
@@ -304,7 +327,7 @@ mod tests {
             ArrangeOp::AddTrack { track: "t0".into() },
             ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", "s0", 0, len) },
         ]);
-        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, sr).unwrap();
+        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, sr, 0).unwrap();
         let out = render_node(&mut node, len, sr);
         assert_eq!(node.underruns(), 0, "a warm source must not underrun");
         let mut expected = vec![0.0f32; len as usize];
@@ -327,7 +350,7 @@ mod tests {
             ArrangeOp::AddTrack { track: "t0".into() },
             ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", "s0", 100, 200) },
         ]);
-        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, sr).unwrap();
+        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, sr, 0).unwrap();
         let out = render_node(&mut node, 1000, sr);
         assert_eq!(node.underruns(), 0);
         assert!(out[..100].iter().all(|s| *s == 0.0), "leading gap must be silence");
@@ -355,7 +378,7 @@ mod tests {
             ArrangeOp::AddClip { track: "t0".into(), clip: clip("ca", "a", 0, 500) },
             ArrangeOp::AddClip { track: "t0".into(), clip: clip("cb", "b", 250, 250) },
         ]);
-        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, sr).unwrap();
+        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, sr, 0).unwrap();
         let out = render_node(&mut node, 500, sr);
         // [0,250) = clip a only = 0.5; [250,500) = a + b = 0.25.
         assert!((out[0] - 0.5).abs() < 1e-5);
@@ -375,7 +398,7 @@ mod tests {
             ArrangeOp::AddTrack { track: "t0".into() },
             ArrangeOp::AddClip { track: "t0".into(), clip: c },
         ]);
-        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, sr).unwrap();
+        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, sr, 0).unwrap();
         let out = render_node(&mut node, 1000, sr);
         // gain = fade_in min fade_out; with a constant 1.0 source, out = gain curve.
         assert!(out[0].abs() < out[10].abs(), "fade_in ramps up: {} < {}", out[0].abs(), out[10].abs());
@@ -398,7 +421,7 @@ mod tests {
             ArrangeOp::AddTrack { track: "t0".into() },
             ArrangeOp::AddClip { track: "t0".into(), clip: c },
         ]);
-        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, sr).unwrap();
+        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, sr, 0).unwrap();
         let out = render_node(&mut node, 300, sr);
         assert_eq!(node.underruns(), 0);
         // The reader must wrap back to the region start every 100 frames: sample
@@ -408,6 +431,48 @@ mod tests {
         assert!((out[200] - out[0]).abs() < 1e-6, "loop must wrap: {} vs {}", out[200], out[0]);
         assert!((out[50] - out[150]).abs() < 1e-6, "mid-region must repeat: {} vs {}", out[50], out[150]);
         assert!((out[50] - 0.5).abs() < 1e-6, "ramp value at 50 must be 0.5: {}", out[50]);
+    }
+
+    /// A looped clip **rebuilt mid-clip** must stay in phase: off0 = 150 leaves
+    /// the transport at source offset 150 % 100 = 50, so the first cycle is the
+    /// 50-frame tail of the current cycle before it wraps back to the region
+    /// start. Without the anchored reader (the reviewed bug) a rebuild at frame
+    /// 150 would restart at source[0] and play `pattern[0+k]`, not
+    /// `pattern[(50+k)%100]` — detectable here because the ramp is positional.
+    #[test]
+    fn mid_play_loop_rebuild_stays_in_phase() {
+        let p = tmp("loopanchored");
+        let sr = 48_000u32;
+        let period = 100u64;
+        write_ramp(&p, 1000, sr, period);
+        let resolve = resolver(&[("s0", p)]);
+        let mut c = clip("c0", "s0", 0, 1000);
+        c.src_len = 300;
+        c.loop_len = Some(100);
+        let track = make_track(&[
+            ArrangeOp::AddTrack { track: "t0".into() },
+            ArrangeOp::AddClip { track: "t0".into(), clip: c },
+        ]);
+
+        // Rebuild at transport frame 150 (a mid-play edit); render the next 150.
+        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, sr, 150).unwrap();
+        let out = render_node_from(&mut node, 150, sr, 150);
+        assert_eq!(node.underruns(), 0);
+        // out[k] is the timeline frame 150+k, clip offset (150+k)%300. Within the
+        // 100-frame loop region, that is source offset (150+k)%100 == (50+k)%100.
+        // A restart bug would instead play (0+k)%100.
+        for k in [0usize, 49, 50, 99, 100, 149] {
+            let src = (50 + k as u64) % 100;
+            let expected = (src % period.max(1)) as f32 / period.max(1) as f32;
+            assert!(
+                (out[k] - expected).abs() < 1e-6,
+                "frame {k} (timeline {}) must be source[{}], got {} want {}",
+                150 + k as u64,
+                src,
+                out[k],
+                expected
+            );
+        }
     }
 
     #[test]
@@ -420,7 +485,7 @@ mod tests {
             ArrangeOp::AddTrack { track: "t0".into() },
             ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", "s0", 0, 1000) },
         ]);
-        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, sr).unwrap();
+        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, sr, 0).unwrap();
         let out = render_node(&mut node, 1000, sr);
         assert!(out[100..].iter().all(|s| *s == 0.0), "beyond EOF must be silence");
     }
@@ -439,7 +504,7 @@ mod tests {
             ArrangeOp::AddTrack { track: "t0".into() },
             ArrangeOp::AddClip { track: "t0".into(), clip: c },
         ]);
-        let err = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, 48_000)
+        let err = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, 48_000, 0)
             .err()
             .expect("a rate-mismatched source must be refused");
         assert!(err.contains("44100") && err.contains("Hz"), "error names the mismatch: {err}");

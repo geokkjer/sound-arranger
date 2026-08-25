@@ -72,16 +72,31 @@ impl FilePlayer {
     /// total (so a baked loop with `clip.len == r * times` wraps). `Some(0)` or
     /// `None` reads `clip.len` contiguous frames once. Control side only.
     pub fn start_looped(clip: ClipRef, loop_len: Option<u64>, ring_capacity: usize) -> Result<Self, String> {
-        let ring = Arc::new(Spsc::new(ring_capacity));
+        Self::start_looped_anchored(clip, loop_len, ring_capacity, 0)
+    }
+
+    /// Start the reader at a mid-clip offset. `off0` is frames already consumed
+    /// of the clip (an arranger node rebuilt at the current transport frame),
+    /// so the reader produces the *remaining* `clip.len - off0` frames starting
+    /// at the source position `clip.start + (off0 % region_len)` — the phase the
+    /// transport is at. A looped clip's first cycle is `region_len - phase`
+    /// frames (the current cycle's tail) before it wraps back to `clip.start`,
+    /// which keeps a mid-clip loop in phase instead of "walking" the region.
+    /// Control side only.
+    pub fn start_looped_anchored(clip: ClipRef, loop_len: Option<u64>, ring_capacity: usize, off0: u64) -> Result<Self, String> {
+        let region_len = loop_len.filter(|r| *r > 0).unwrap_or(clip.len);
+        let phase = if region_len == 0 { 0 } else { off0 % region_len };
+        let start = clip.start.checked_add(phase).ok_or("clip start overflows with loop phase")?;
+        let want = clip.len.saturating_sub(off0);
+        let looping = loop_len.is_some_and(|r| r > 0);
+
+        let ring = Arc::new(Spsc::new(ring_capacity.max(1)));
         let stop = Arc::new(AtomicBool::new(false));
         let eof = Arc::new(AtomicBool::new(false));
         let produced = Arc::new(AtomicU64::new(0));
 
         let mut reader = WavReader::open(&clip.path)?;
-        reader.seek_frames(clip.start)?;
-        let want = clip.len;
-        let region = loop_len.filter(|r| *r > 0).unwrap_or(want);
-        let looping = loop_len.is_some_and(|r| r > 0);
+        reader.seek_frames(start)?;
         let (ring2, stop2, eof2, produced2) = (ring.clone(), stop.clone(), eof.clone(), produced.clone());
 
         let handle = std::thread::Builder::new()
@@ -89,12 +104,19 @@ impl FilePlayer {
             .spawn(move || {
                 let mut buf = [0.0f32; 1024];
                 let mut remaining = want;
-                let mut produced_in_loop = 0u64;
+                let mut produced_in_cycle = 0u64;
+                // The first cycle is the tail of the current (mid-clip) cycle:
+                // `region_len - phase` frames, then full `region_len` cycles.
+                let mut cycle_len = if looping && region_len > 0 {
+                    (region_len - phase).max(1)
+                } else {
+                    want
+                };
                 while remaining > 0 {
                     if stop2.load(Ordering::Acquire) {
                         return;
                     }
-                    let budget = (region - produced_in_loop).min(remaining);
+                    let budget = (cycle_len - produced_in_cycle).min(remaining);
                     let want_now = buf.len().min(budget as usize);
                     let n = reader.read_into(&mut buf[..want_now]);
                     if n == 0 {
@@ -118,9 +140,10 @@ impl FilePlayer {
                         }
                     }
                     remaining -= n as u64;
-                    produced_in_loop += n as u64;
-                    if produced_in_loop >= region && looping {
-                        produced_in_loop = 0;
+                    produced_in_cycle += n as u64;
+                    if looping && produced_in_cycle >= cycle_len {
+                        produced_in_cycle = 0;
+                        cycle_len = region_len.max(1);
                         if reader.seek_frames(clip.start).is_err() {
                             break; // seek failure: stop rather than loop forever
                         }
@@ -158,7 +181,9 @@ impl FilePlayer {
         self.produced.load(Ordering::Relaxed)
     }
 
-    /// Frames the clip is supposed to deliver (clip.len).
+    /// Frames the clip is supposed to deliver. For an anchored player this is
+    /// the *remaining* count (`clip.len - off0`); a plain player delivers the
+    /// whole region (`clip.len`).
     pub fn expected(&self) -> u64 {
         self.expected
     }
@@ -417,6 +442,49 @@ mod tests {
         w.finalize().unwrap();
     }
 
+    /// A **position-revealing** float WAV: sample k = (k % period) / period. A
+    /// reader that produces the wrong source region (a mid-clip rebuild starting
+    /// at source[0]) is detectable because each offset has a distinct value.
+    fn write_ramp(path: &Path, frames: u64, sr: u32, period: u64) {
+        let mut w = WavWriter::create_float(path, sr, 1).unwrap();
+        let mut buf = vec![0.0f32; 2048];
+        let mut i = 0u64;
+        while i < frames {
+            let n = buf.len().min((frames - i) as usize);
+            for (k, s) in buf[..n].iter_mut().enumerate() {
+                *s = ((i + k as u64) % period.max(1)) as f32 / period.max(1) as f32;
+            }
+            w.write(&buf[..n]).unwrap();
+            i += n as u64;
+        }
+        w.finalize().unwrap();
+    }
+
+    /// The value the ring contains for `k`-th production of an anchored reader.
+    fn ramp_at(frames: u64, period: u64) -> f32 {
+        (frames % period.max(1)) as f32 / period.max(1) as f32
+    }
+
+    /// Drain `count` samples from a FilePlayer's ring (test helper; the reader
+    /// thread fills it as we pop).
+    fn drain(player: &FilePlayer, count: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; count];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for s in out.iter_mut() {
+            loop {
+                if let Some(v) = player.ring().try_pop() {
+                    *s = v;
+                    break;
+                }
+                if std::time::Instant::now() > deadline {
+                    panic!("reader did not deliver in time");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        out
+    }
+
     fn block<'a>(sr: u32, frame: u64, tempo: &'a engine::TempoMap) -> RenderBlock<'a> {
         RenderBlock { frame, sample_rate: sr, tempo }
     }
@@ -463,6 +531,68 @@ mod tests {
         }
         assert!(out[frames as usize..].iter().all(|s| *s == 0.0), "tail must be silence");
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An anchored (rebuilt-mid-clip) reader must produce the *remaining* region
+    /// of the clip starting at `start + off0`, not the clip's beginning — the
+    /// critical bug the review found (a rebuild at transport frame F had started
+    /// every reader at source[0], playing the wrong region and tripping the debug
+    /// assert on clips longer than the ring).
+    #[test]
+    fn anchored_reader_continues_from_off0_not_the_start() {
+        let path = tmp("anchored");
+        let sr = 48_000u32;
+        let len = 8000u64;
+        let period = 257u64;
+        write_ramp(&path, len, sr, period);
+
+        let clip = ClipRef { path: path.clone(), start: 0, len };
+        let off0 = 4000u64;
+        let player = FilePlayer::start_looped_anchored(clip, None, DEFAULT_RING_CAPACITY, off0).unwrap();
+        // The reader must deliver `len - off0` frames, each equal to the source
+        // value at `off0 + k` (NOT at `k`).
+        let got = drain(&player, (len - off0) as usize);
+        for (k, &v) in got.iter().enumerate() {
+            let want = ramp_at(off0 + k as u64, period);
+            assert_eq!(v, want, "frame {k} must be source[{off0}+{k}], got {v} want {want}");
+        }
+        // The reader's own `expected` is the remaining count, so it reports done
+        // exactly when the tail is consumed — not sooner (which would wrongly
+        // treat a long clip still playing as silence).
+        assert_eq!(player.expected(), len - off0);
+        // After the tail, the ring runs dry (silence, not an underrun): eof is set.
+        assert!(player.eof(), "the remaining region must be all the reader produces");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A looped anchored reader must stay **in phase**: off0 frames into the
+    /// clip lands mid-cycle, the first cycle is the current cycle's tail, and the
+    /// wrap-back is to the clip's true source region start (not the offset start,
+    /// which would "walk" the region each cycle).
+    #[test]
+    fn anchored_loop_wraps_to_the_true_region_start() {
+        let path = tmp("anchoredloop");
+        let sr = 48_000u32;
+        let period = 64u64;
+        let region = 1000u64;
+        let times = 8u64;
+        let len = region * times; // 8000, loop reads `region` then wraps
+        write_ramp(&path, len.max(region + region), sr, period); // enough for a loop
+
+        let clip = ClipRef { path: path.clone(), start: 0, len };
+        // off0 = 2500 is 2 full region-cycles (2000) + 500 into the third, so it
+        // starts at source[500] and the first cycle is 500 frames (region - phase).
+        let off0 = 2500u64;
+        let player = FilePlayer::start_looped_anchored(clip, Some(region), DEFAULT_RING_CAPACITY, off0).unwrap();
+        let got = drain(&player, (len - off0) as usize);
+        for (k, &v) in got.iter().enumerate() {
+            let src = (off0 + k as u64) % region; // wraps within the region
+            let want = ramp_at(src, period);
+            assert_eq!(v, want, "frame {k} must be source[{off0}+{k}] wrapped to [{src}], got {v} want {want}");
+        }
+        assert_eq!(player.expected(), len - off0);
+        assert!(player.eof(), "the looped remainder must be all the reader produces");
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -383,30 +383,47 @@ impl HostSession {
         if !self.arrange_dirty {
             return Ok(());
         }
-        self.arrange_dirty = false;
         let Some(resolver) = self.pool_resolver.clone() else { return Ok(()) };
         let Some(editor) = &self.editor else { return Ok(()) };
         let timeline = editor.snapshot()?;
         let channels = self.mixer_channels.unwrap_or(4);
+        let from_frame = self.engine.clock.frame();
 
-        // Retire every previously-wired arranger node. This is the fix for the
-        // ghost: a track that was removed (or whose clips changed) must not keep
-        // a stale node in the graph.
+        // **Validate before mutating** (the engine's own OpHandler contract: an
+        // `Err` means nothing changed). Two read-only steps must precede any
+        // teardown: (a) the mixer must be present — materialize scheduled mounts
+        // and resolve it by *name*, not by `graph.out_node` (the bus points at
+        // whatever audio node was mounted last; if the mixer was unmounted and
+        // some other node claimed the bus, `out_node` would be misleading), and
+        // (b) every new reader must build fine (missing source, rate mismatch,
+        // too many tracks) — this is the fallible part. Only when both succeed
+        // do we tear down the old wiring, so a failed reconcile never leaves a
+        // partial arrangement behind and the dirty flag survives for a clean
+        // retry.
+        self.engine.flush_scheduled();
+        let mixer = self
+            .engine
+            .node_of("mixer")
+            .ok_or("arrange requires the mixer to be mounted (mount mixer channels=N)")?;
+
+        let mut built: Vec<(String, usize, media::ArrangerNode)> = Vec::new();
+        for (ti, track) in timeline.tracks.iter().enumerate() {
+            if ti >= channels {
+                return Err(format!("track '{}' has no mixer channel ch{ti} (channels={channels})", track.id));
+            }
+            let node = media::ArrangerNode::new(track.clone(), &resolver, media::DEFAULT_RING_CAPACITY, self.engine.clock.sample_rate, from_frame)?;
+            built.push((track.id.clone(), ti, node));
+        }
+
+        // All validated — now commit (this phase cannot fail: `insert_before`
+        // has a live pivot and `connect` is forward-ordered with `ch0..ch7`
+        // declared). Retire the previous wiring, then place each new node.
         let old_nodes: Vec<engine::NodeId> = self.wired_tracks.drain().map(|(_, id)| id).collect();
         for id in old_nodes {
             self.engine.graph.remove_node(id);
         }
 
-        // Materialize the mixer (the bus must exist as the insert pivot), then
-        // build one fresh ArrangerNode per current track *before* it.
-        self.engine.flush_scheduled();
-        let mixer = self.engine.graph.out_node.ok_or("arrange requires the mixer to be mounted")?;
-
-        for (ti, track) in timeline.tracks.iter().enumerate() {
-            if ti >= channels {
-                return Err(format!("track '{}' has no mixer channel ch{ti} (channels={channels})", track.id));
-            }
-            let node = media::ArrangerNode::new(track.clone(), &resolver, media::DEFAULT_RING_CAPACITY, self.engine.clock.sample_rate)?;
+        for (tid, ti, node) in built {
             let id = self.engine.graph.insert_before(
                 mixer,
                 engine::NodeKind::Opaque(Box::new(node)),
@@ -416,8 +433,9 @@ impl HostSession {
                 .graph
                 .connect(id, "audio", mixer, &format!("ch{ti}"))
                 .map_err(|e| format!("arranger→mixer cord: {e}"))?;
-            self.wired_tracks.insert(track.id.clone(), id);
+            self.wired_tracks.insert(tid, id);
         }
+        self.arrange_dirty = false;
         Ok(())
     }
 

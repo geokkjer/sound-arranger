@@ -604,6 +604,13 @@ impl Engine {
             .collect()
     }
 
+    /// The primary node a mounted plugin owns (its `apply` registered it). A
+    /// host resolves a plugin by name rather than assuming the master-bus node
+    /// is the mixer — the bus only points at the mixer while the mixer is mounted.
+    pub fn node_of(&self, plugin: &'static str) -> Option<NodeId> {
+        self.node_of.get(plugin).copied()
+    }
+
     /// Plugin names providing an `Out` port of the given kind — the dropdown
     /// wants names, not node ids.
     pub fn provider_names_of(&self, kind: SignalKind) -> Vec<&'static str> {

@@ -52,14 +52,17 @@ naive test passed a *vacuous* silent bounce).
   mixer (audio, not silence) — byte-identically on replay. A refused `Arrange` (no `set_pool`)
   is fail-loud and never logged. `arrangement()` exposes the value.
 - The arranger is wired by **reconcile-on-dirty** (2026-08-25): on each render after an edit,
-  `wire_arranger` tears down and rebuilds one `ArrangerNode` per current track, each inserted
-  *before* the mixer (a new `Graph::insert_before` so `arranger → mixer` stays a forward cord),
-  mapped to `ch{track_index}`. This fixes the `RemoveTrack` **ghost** (a removed track's node
-  was never retired, so it kept playing) and makes edits to an already-wired track reach audio
-  (a `SetClipGain` is no longer silently ignored) — see the [reconcile note](.agents/notes/implemented/feature/2026-08-25-arranger-reconcile-on-dirty.md).
-- 5 host arrangement tests: build value + replay identity, refuse-without-pool, the byte-identical
-  non-silent arrangement bounce, removed-track-does-not-ghost, and edit-to-a-wired-track-reaches-audio.
-  18 workspace suites green, clippy clean.
+  `wire_arranger` builds every new node (validating before mutating), tears down the old ones,
+  and re-inserts one `ArrangerNode` per current track *before* the mixer (a new
+  `Graph::insert_before` keeps `arranger → mixer` a forward cord), mapped to `ch{track_index}`.
+  Readers are positioned at the **current transport frame**, so a mid-play edit continues the clip
+  rather than restarting it. This fixes the `RemoveTrack` **ghost** (a removed track's node is
+  retired) and makes edits to an already-wired track reach audio — see the [reconcile note](.agents/notes/implemented/feature/2026-08-25-arranger-reconcile-on-dirty.md).
+- 10 host arrangement tests (in `arranger_commands.rs`): build value + replay identity,
+  refuse-without-pool, byte-identical non-silent arrangement bounce, removed-track-does-not-ghost,
+  edit-continues-the-clip (ramp source, asserts the correct region plays),
+  edit-then-rewire-replays-byte-identically, bounce-over-budget, mixer-channel refusals, and the
+  text-format parse + byte-identical-bounce pair. 18 workspace suites green, clippy clean.
 - **Deferred**: the shared-state `ArrangerNode` + mixer-last re-application (the *dynamic-edit*
   architecture — a reconcile that reuses readers rather than rebuilding them, needed for live
   edit-while-playing where re-warming on every edit is too heavy); `render()` panics on a bad

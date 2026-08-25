@@ -32,6 +32,30 @@ fn write_source(dir: &Path, stem: &str, frames: u64) {
     w.finalize().unwrap();
 }
 
+/// A **position-revealing** source: sample k = (k % period) / period, so a
+/// reader that starts at the wrong source offset (a mid-play rebuild restarting
+/// at source[0]) is detectable — a constant source hides it. `period` sets the
+/// ramp length.
+fn write_ramp(dir: &Path, stem: &str, frames: u64, period: u64) {
+    let mut w = WavWriter::create_float(&dir.join(format!("{stem}.wav")), SR, 1).unwrap();
+    let mut buf = vec![0.0f32; 4096];
+    let mut i = 0u64;
+    while i < frames {
+        let n = buf.len().min((frames - i) as usize);
+        for (k, s) in buf[..n].iter_mut().enumerate() {
+            *s = ((i + k as u64) % period.max(1)) as f32 / period.max(1) as f32;
+        }
+        w.write(&buf[..n]).unwrap();
+        i += n as u64;
+    }
+    w.finalize().unwrap();
+}
+
+/// The ramp source value at absolute frame `f` (a `write_ramp`-derived ramp).
+fn source_value(f: u64, period: u64) -> f32 {
+    (f % period.max(1)) as f32 / period.max(1) as f32
+}
+
 /// A long source so a removed track's clip is still playing when we re-render:
 /// t0 spans [0, 8000), t1 spans [0, 1000). After a first render of 4000 frames
 /// (t0+t1 then t0 alone), `RemoveTrack t0`, then a second render of the *next*
@@ -41,7 +65,7 @@ fn write_source(dir: &Path, stem: &str, frames: u64) {
 #[test]
 fn removed_track_does_not_ghost_audio_on_rewire() {
     let pool = tmp_dir("ghost");
-    write_source(&pool, "s1", 8000);
+    write_ramp(&pool, "s1", 8000, 257);
     let out_dir = tmp_dir("ghostout");
     let a = out_dir.join("a.wav");
 
@@ -85,59 +109,111 @@ fn removed_track_does_not_ghost_audio_on_rewire() {
     let _ = std::fs::remove_dir_all(&out_dir);
 }
 
-/// An edit to an already-wired track (its gain) must reach audio on the next
-/// render. With the add-only wiring, the `ArrangerNode` held a snapshot of the
-/// track's clips, so a `SetClipGain` was silently ignored. Here we render the
-/// same clip, edit the *already-wired* track's gain, then render again — the
-/// lifted gain must appear in the second render.
+/// A mid-play **edit** must not restart a clip from its source start. We render
+/// 4000 frames of a ramp-valued clip, then change the already-wired track's clip
+/// gain and render the next 4000 frames. The second render's sample at frame
+/// `4000 + k` must equal `source[4000 + k] * gain` — i.e. the `k`-th source
+/// frame *after* the transport position, NOT the clip's beginning. With the
+/// restart bug the rebuilt reader starts at source[0], so it plays
+/// `source[k]` (or panics in debug on a clip > ring capacity).
 #[test]
-fn edit_to_a_wired_track_reaches_audio_on_rewire() {
-    let pool = tmp_dir("editaudio");
-    write_source(&pool, "s1", 8000);
-    let out_dir = tmp_dir("editaudioout");
+fn edit_to_a_wired_track_continues_the_clip_not_restarts_it() {
+    let pool = tmp_dir("editcontinue");
+    let period = 257u64;
+    write_ramp(&pool, "s1", 8000, period);
+    let out_dir = tmp_dir("editcontinueout");
 
-    // Each run writes its own first/second bounce so nothing collides.
+    // build, render [0,4000), edit gain to g, render [4000,8000).
     let script = |gain: f32, tag: &str| -> Vec<HostCommand> {
-        let first = out_dir.join(format!("{tag}-a.wav"));
-        let second = out_dir.join(format!("{tag}-b.wav"));
         let mut s = vec![
             HostCommand::Mount { plugin: "mixer", params: vec![("channels", 2.0)], at_frame: Some(0) },
             HostCommand::Pool { dir: pool.clone() },
         ];
         s.push(HostCommand::Arrange { op: ArrangeOp::AddTrack { track: "t0".into() }, at_frame: Some(0) });
         s.push(HostCommand::Arrange { op: ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", 0, 8000) }, at_frame: Some(0) });
-        s.push(HostCommand::Bounce { frames: 4000, path: first });
-        // Edit the *already-wired* track's gain, then render the same frames.
+        s.push(HostCommand::Bounce { frames: 4000, path: out_dir.join(format!("{tag}-a.wav")) });
         s.push(HostCommand::Arrange { op: ArrangeOp::SetClipGain { track: "t0".into(), clip: "c0".into(), gain }, at_frame: Some(4000) });
-        s.push(HostCommand::Bounce { frames: 4000, path: second });
+        s.push(HostCommand::Bounce { frames: 4000, path: out_dir.join(format!("{tag}-b.wav")) });
         s
     };
 
-    // control: gain 0.5 → second render is 0.5 * source (0.5) = 0.25.
-    let _ = run_script(&script(0.5, "ctl")).unwrap();
-    let mut r = media::WavReader::open(&out_dir.join("ctl-b.wav")).unwrap();
-    let mut control = vec![0.0f32; r.total_frames() as usize];
-    let n = r.read_into(&mut control);
-    assert!((control[n / 2] - 0.25).abs() < 1e-3, "gain 0.5 must halve the audio: got {}", control[n / 2]);
+    let _ = run_script(&script(1.0, "r")).unwrap();
 
-    // raised gain 1.0 → second render is 1.0 * source (0.5) = 0.5, louder.
-    let _ = run_script(&script(1.0, "loud")).unwrap();
-    let mut r = media::WavReader::open(&out_dir.join("loud-b.wav")).unwrap();
-    let mut loud = vec![0.0f32; r.total_frames() as usize];
-    let n = r.read_into(&mut loud);
-    assert!((loud[n / 2] - 0.5).abs() < 1e-3, "gain 1.0 must play the source: got {}", loud[n / 2]);
+    // The second render's frame `4000 + k` (mid-block, away from the 0.0 ramp
+    // zero-crossing) must be source[4000 + k] * 1.0 — i.e. the source region
+    // *after* the first render, not the clip start.
+    let mut r = media::WavReader::open(&out_dir.join("r-b.wav")).unwrap();
+    let mut audio = vec![0.0f32; r.total_frames() as usize];
+    let n = r.read_into(&mut audio);
+    assert!(n > 500, "second render must fill the buffer (got {n})");
+    for &f in &[4000u64 + 257, 4000 + 513, 4000 + 1024] {
+        let expected = source_value(f, period) * 1.0;
+        let got = audio[(f - 4000) as usize];
+        assert!(
+            (got - expected).abs() < 1e-4,
+            "frame {f} must play source region {f} (got {got}, want {expected}) — a restart would play source[{}]",
+            f % period
+        );
+    }
+
+    // And the gain reaches audio: g=0.5 halves the region, so the same frame is
+    // half as loud as the g=1.0 run (16-bit bounce clips >1.0, so we compare a
+    // halving rather than a doubling).
+    let _ = run_script(&script(0.5, "h")).unwrap();
+    let mut r = media::WavReader::open(&out_dir.join("h-b.wav")).unwrap();
+    let mut half = vec![0.0f32; r.total_frames() as usize];
+    let _n = r.read_into(&mut half);
+    let f = 4000 + 513;
     assert!(
-        loud[n / 2].abs() > control[n / 2].abs() * 1.5,
-        "raising the wired track's gain must raise the render: {} vs {}",
-        loud[n / 2],
-        control[n / 2]
+        (half[(f - 4000) as usize] - 0.5 * audio[(f - 4000) as usize]).abs() < 1e-4,
+        "gain 0.5 must halve the wired track's region ({} vs {})",
+        half[(f - 4000) as usize],
+        audio[(f - 4000) as usize]
     );
 
     let _ = std::fs::remove_dir_all(&pool);
     let _ = std::fs::remove_dir_all(&out_dir);
 }
 
-fn clip(id: &str, at: u64, len: u64) -> Clip {    Clip {
+/// A bounce → edit → re-bounce session must be **byte-identical** across two
+/// fresh runs (the reconcile is a deterministic function of the value), and the
+/// re-render path — the one that the single-bounce replay tests never touch —
+/// is the change under test.
+#[test]
+fn edit_then_rewire_replays_byte_identically() {
+    let pool = tmp_dir("replayedit");
+    write_ramp(&pool, "s1", 8000, 257);
+    let out_dir = tmp_dir("replayeditout");
+
+    let script = |out: &Path, tag: &str| -> Vec<HostCommand> {
+        let mut s = vec![
+            HostCommand::Mount { plugin: "mixer", params: vec![("channels", 2.0)], at_frame: Some(0) },
+            HostCommand::Pool { dir: pool.clone() },
+        ];
+        s.push(HostCommand::Arrange { op: ArrangeOp::AddTrack { track: "t0".into() }, at_frame: Some(0) });
+        s.push(HostCommand::Arrange { op: ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", 0, 8000) }, at_frame: Some(0) });
+        s.push(HostCommand::Bounce { frames: 4000, path: out_dir.join(format!("{tag}-a.wav")) });
+        s.push(HostCommand::Arrange { op: ArrangeOp::SetClipGain { track: "t0".into(), clip: "c0".into(), gain: 0.7 }, at_frame: Some(4000) });
+        s.push(HostCommand::Bounce { frames: 4000, path: out.to_path_buf() });
+        s
+    };
+
+    let a = out_dir.join("a-b.wav");
+    let b = out_dir.join("b-b.wav");
+    let _ = run_script(&script(&a, "a")).unwrap();
+    let _ = run_script(&script(&b, "b")).unwrap();
+    let fa = std::fs::read(&a).unwrap();
+    let fb = std::fs::read(&b).unwrap();
+    // The rewire path must be deterministic across fresh sessions.
+    assert!(fa.len() > 44, "second bounce must be written");
+    assert_eq!(fa, fb, "edit + rewire must replay byte-identically");
+
+    let _ = std::fs::remove_dir_all(&pool);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+fn clip(id: &str, at: u64, len: u64) -> Clip {
+    Clip {
         id: id.into(),
         source: "s1".into(),
         src_start: 0,
