@@ -51,10 +51,17 @@ naive test passed a *vacuous* silent bounce).
 - The host builds an arrangement as logged commands, and `Bounce` renders it through the
   mixer (audio, not silence) — byte-identically on replay. A refused `Arrange` (no `set_pool`)
   is fail-loud and never logged. `arrangement()` exposes the value.
-- 3 host tests: build value + replay identity, refuse-without-pool, and the byte-identical
-  non-silent arrangement bounce. 17 workspace suites green, clippy clean.
-- **Deferred**: live-edit re-wiring (an edit after a bounce is silent — needs the shared-state
-  `ArrangerNode` + mixer-last re-application, the dynamic-edit architecture); `render()`
-  panics on a bad script via `.expect` (make it `Result`); `parse_script` text for
-  `arrange`/`pool`; the drain/EOF phase for tailed effects (a separate proposed note — the
-  arranger's clips are finite).
+- The arranger is wired by **reconcile-on-dirty** (2026-08-25): on each render after an edit,
+  `wire_arranger` tears down and rebuilds one `ArrangerNode` per current track, each inserted
+  *before* the mixer (a new `Graph::insert_before` so `arranger → mixer` stays a forward cord),
+  mapped to `ch{track_index}`. This fixes the `RemoveTrack` **ghost** (a removed track's node
+  was never retired, so it kept playing) and makes edits to an already-wired track reach audio
+  (a `SetClipGain` is no longer silently ignored) — see the [reconcile note](.agents/notes/implemented/feature/2026-08-25-arranger-reconcile-on-dirty.md).
+- 5 host arrangement tests: build value + replay identity, refuse-without-pool, the byte-identical
+  non-silent arrangement bounce, removed-track-does-not-ghost, and edit-to-a-wired-track-reaches-audio.
+  18 workspace suites green, clippy clean.
+- **Deferred**: the shared-state `ArrangerNode` + mixer-last re-application (the *dynamic-edit*
+  architecture — a reconcile that reuses readers rather than rebuilding them, needed for live
+  edit-while-playing where re-warming on every edit is too heavy); `render()` panics on a bad
+  script via `.expect` (make it `Result`); `parse_script` text for `arrange`/`pool`; the
+  drain/EOF phase for tailed effects (a separate proposed note — the arranger's clips are finite).

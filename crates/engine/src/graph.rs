@@ -732,6 +732,57 @@ impl Graph {
         Ok(())
     }
 
+    /// Insert a node immediately before `pivot` in the topological order,
+    /// shifting `pivot` and every later node (and their cord indices) up by one.
+    /// Like [`add_node`](Self::add_node) but at a chosen position — the one way
+    /// to add a node that must precede an existing node (e.g. an arranger source
+    /// before the mixer, which is the last node) while satisfying the graph's
+    /// forward-order `connect` rule. Does not claim the master bus (mirrors
+    /// `add_node`'s fallback: only when `out_node` is still `None`).
+    pub fn insert_before(&mut self, pivot: NodeId, kind: NodeKind, ports: Vec<Port>) -> Result<NodeId, String> {
+        let idx = self.index_of(pivot).ok_or("insert_before: unknown pivot node")?;
+        let audio_in_ports: Vec<usize> = ports
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.direction == Direction::In && p.kind == SignalKind::Audio)
+            .map(|(i, _)| i)
+            .collect();
+        let audio_out_ports = ports
+            .iter()
+            .filter(|p| p.direction == Direction::Out && p.kind == SignalKind::Audio)
+            .count();
+        assert!(audio_in_ports.len() <= MAX_AUDIO_INS, "node declares {} audio inputs (max {MAX_AUDIO_INS})", audio_in_ports.len());
+        assert!(audio_out_ports <= 1, "node declares {audio_out_ports} audio outputs (max 1 in Phase 1)");
+        let id = NodeId(self.next_id);
+        self.next_id += 1;
+        self.nodes.insert(idx, Node { id, kind, ports });
+        self.audio_out.insert(idx, vec![0.0; BLOCK]);
+        self.control_out.insert(idx, 0.0);
+        self.triggers_out.insert(idx, EventBuf::new());
+        self.notes_out.insert(idx, EventBuf::new());
+        self.triggers_in.insert(idx, EventBuf::new());
+        self.notes_in.insert(idx, EventBuf::new());
+        self.audio_ins.insert(idx, audio_in_ports.iter().map(|_| vec![0.0; BLOCK]).collect());
+        self.audio_in_ports.insert(idx, audio_in_ports);
+        self.cum.insert(idx, 0);
+        self.delays.insert(idx, RingDelay::with_capacity(MAX_PDC));
+        // Nodes at/after the insertion point shifted up by one; re-index cords.
+        for cord in self.cords.iter_mut() {
+            if cord.from.0 >= idx {
+                cord.from.0 += 1;
+            }
+            if cord.to.0 >= idx {
+                cord.to.0 += 1;
+            }
+        }
+        // The master-bus fallback: only claim it if no node has yet (the mixer
+        // claims it on mount; an inserted arranger source must not steal it).
+        if self.out_node.is_none() && audio_out_ports == 1 {
+            self.out_node = Some(id);
+        }
+        Ok(id)
+    }
+
     pub fn remove_node(&mut self, id: NodeId) -> Option<Node> {
         let idx = self.index_of(id)?;
         if self.out_node == Some(id) {
@@ -967,5 +1018,66 @@ mod tests {
         // forward-order enforced
         let err = g.connect(delay, "audio", sine, "audio").unwrap_err();
         assert!(err.contains("forward"), "got: {err}");
+    }
+
+    #[test]
+    fn insert_before_lets_a_new_source_precede_the_sink() {
+        let mut g = Graph::new();
+        // a sink first (the mixer's role in the arranger wiring)
+        let sink = g.add_node(
+            NodeKind::Opaque(Box::new(TestDelay { len: 0 })),
+            vec![
+                Port { name: "audio", direction: Direction::In, kind: SignalKind::Audio },
+                Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio },
+            ],
+        );
+        g.set_out(sink);
+        // a source inserted *before* the sink — must satisfy forward order.
+        let src = g.insert_before(
+            sink,
+            NodeKind::Sine(Sine::new(440.0)),
+            vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio }],
+        ).unwrap();
+        assert_eq!(src, NodeId(1), "inserted node is a fresh id");
+        // the inserted source precedes the sink in the topological order.
+        g.connect(src, "audio", sink, "audio").unwrap();
+        // out_node must still be the sink (the mixer may never be stolen).
+        assert_eq!(g.out_node, Some(sink));
+
+        let mut out = [0.0f32; 64];
+        let block = RenderBlock { frame: 0, sample_rate: 48_000, tempo: &tempo() };
+        g.render(&mut out, block);
+        assert!(
+            out[..32].iter().any(|s| s.abs() > 1e-6),
+            "the inserted source must reach the sink"
+        );
+    }
+
+    #[test]
+    fn insert_before_reindexes_cords_after_the_insertion_point() {
+        let mut g = Graph::new();
+        let a = g.add_node(
+            NodeKind::Sine(Sine::new(440.0)),
+            vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio }],
+        );
+        let b = g.add_node(
+            NodeKind::Opaque(Box::new(TestDelay { len: 0 })),
+            vec![
+                Port { name: "audio", direction: Direction::In, kind: SignalKind::Audio },
+                Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio },
+            ],
+        );
+        // a cord a -> b establishes b as the later node.
+        g.connect(a, "audio", b, "audio").unwrap();
+        // insert a node BEFORE a (index 0); a's index and the a->b cord must
+        // both shift up by one without breaking the connect.
+        let x = g.insert_before(
+            a,
+            NodeKind::Sine(Sine::new(220.0)),
+            vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio }],
+        ).unwrap();
+        assert_eq!(x, NodeId(2), "inserted node is a fresh id");
+        // the pre-existing a->b cord is still forward-ordered after the shift.
+        g.connect(a, "audio", b, "audio").unwrap();
     }
 }

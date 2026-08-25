@@ -32,8 +32,112 @@ fn write_source(dir: &Path, stem: &str, frames: u64) {
     w.finalize().unwrap();
 }
 
-fn clip(id: &str, at: u64, len: u64) -> Clip {
-    Clip {
+/// A long source so a removed track's clip is still playing when we re-render:
+/// t0 spans [0, 8000), t1 spans [0, 1000). After a first render of 4000 frames
+/// (t0+t1 then t0 alone), `RemoveTrack t0`, then a second render of the *next*
+/// 4000 frames. With the ghost-playback bug, t0's `ArrangerNode` stays mounted
+/// and its clip (spanning into [4000,8000)) keeps playing — the second render
+/// would be non-silent. Fixed: the node is retired, so it is silent.
+#[test]
+fn removed_track_does_not_ghost_audio_on_rewire() {
+    let pool = tmp_dir("ghost");
+    write_source(&pool, "s1", 8000);
+    let out_dir = tmp_dir("ghostout");
+    let a = out_dir.join("a.wav");
+
+    let script: Vec<HostCommand> = {
+        let mut s = vec![
+            HostCommand::Mount { plugin: "mixer", params: vec![("channels", 2.0)], at_frame: Some(0) },
+            HostCommand::Pool { dir: pool.clone() },
+        ];
+        s.push(HostCommand::Arrange { op: ArrangeOp::AddTrack { track: "t0".into() }, at_frame: Some(0) });
+        s.push(HostCommand::Arrange { op: ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", 0, 8000) }, at_frame: Some(0) });
+        s.push(HostCommand::Arrange { op: ArrangeOp::AddTrack { track: "t1".into() }, at_frame: Some(0) });
+        s.push(HostCommand::Arrange { op: ArrangeOp::AddClip { track: "t1".into(), clip: clip("c1", 0, 1000) }, at_frame: Some(0) });
+        s.push(HostCommand::Bounce { frames: 4000, path: a.clone() });
+        // remove t0, then render the *next* 4000 frames — t0's clip spans
+        // [0,8000), so it would still be playing here if its node were mounted.
+        s.push(HostCommand::Arrange { op: ArrangeOp::RemoveTrack { track: "t0".into() }, at_frame: Some(4000) });
+        s.push(HostCommand::Bounce { frames: 4000, path: out_dir.join("b.wav") });
+        s
+    };
+
+    let _ = run_script(&script).unwrap();
+
+    // The first render (frames 0..4000) must be non-silent (t0 is playing).
+    let mut r = media::WavReader::open(&a).unwrap();
+    let mut audio = vec![0.0f32; r.total_frames() as usize];
+    let n = r.read_into(&mut audio);
+    assert!(audio[..n].iter().any(|s| s.abs() > 1e-4), "t0 must be audible in the first render");
+
+    // The second render (frames 4000..8000) must be silent: t0 is gone and t1's
+    // clip ended at 1000. If t0's node ghost-plays, these frames are non-silent.
+    let b = out_dir.join("b.wav");
+    let mut r = media::WavReader::open(&b).unwrap();
+    let mut audio = vec![0.0f32; r.total_frames() as usize];
+    let n = r.read_into(&mut audio);
+    assert!(
+        audio[..n].iter().all(|s| s.abs() <= 1e-4),
+        "removed track must not ghost-play after a rewire (got non-silent frames)"
+    );
+
+    let _ = std::fs::remove_dir_all(&pool);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// An edit to an already-wired track (its gain) must reach audio on the next
+/// render. With the add-only wiring, the `ArrangerNode` held a snapshot of the
+/// track's clips, so a `SetClipGain` was silently ignored. Here we render the
+/// same clip, edit the *already-wired* track's gain, then render again — the
+/// lifted gain must appear in the second render.
+#[test]
+fn edit_to_a_wired_track_reaches_audio_on_rewire() {
+    let pool = tmp_dir("editaudio");
+    write_source(&pool, "s1", 8000);
+    let out_dir = tmp_dir("editaudioout");
+
+    // Each run writes its own first/second bounce so nothing collides.
+    let script = |gain: f32, tag: &str| -> Vec<HostCommand> {
+        let first = out_dir.join(format!("{tag}-a.wav"));
+        let second = out_dir.join(format!("{tag}-b.wav"));
+        let mut s = vec![
+            HostCommand::Mount { plugin: "mixer", params: vec![("channels", 2.0)], at_frame: Some(0) },
+            HostCommand::Pool { dir: pool.clone() },
+        ];
+        s.push(HostCommand::Arrange { op: ArrangeOp::AddTrack { track: "t0".into() }, at_frame: Some(0) });
+        s.push(HostCommand::Arrange { op: ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", 0, 8000) }, at_frame: Some(0) });
+        s.push(HostCommand::Bounce { frames: 4000, path: first });
+        // Edit the *already-wired* track's gain, then render the same frames.
+        s.push(HostCommand::Arrange { op: ArrangeOp::SetClipGain { track: "t0".into(), clip: "c0".into(), gain }, at_frame: Some(4000) });
+        s.push(HostCommand::Bounce { frames: 4000, path: second });
+        s
+    };
+
+    // control: gain 0.5 → second render is 0.5 * source (0.5) = 0.25.
+    let _ = run_script(&script(0.5, "ctl")).unwrap();
+    let mut r = media::WavReader::open(&out_dir.join("ctl-b.wav")).unwrap();
+    let mut control = vec![0.0f32; r.total_frames() as usize];
+    let n = r.read_into(&mut control);
+    assert!((control[n / 2] - 0.25).abs() < 1e-3, "gain 0.5 must halve the audio: got {}", control[n / 2]);
+
+    // raised gain 1.0 → second render is 1.0 * source (0.5) = 0.5, louder.
+    let _ = run_script(&script(1.0, "loud")).unwrap();
+    let mut r = media::WavReader::open(&out_dir.join("loud-b.wav")).unwrap();
+    let mut loud = vec![0.0f32; r.total_frames() as usize];
+    let n = r.read_into(&mut loud);
+    assert!((loud[n / 2] - 0.5).abs() < 1e-3, "gain 1.0 must play the source: got {}", loud[n / 2]);
+    assert!(
+        loud[n / 2].abs() > control[n / 2].abs() * 1.5,
+        "raising the wired track's gain must raise the render: {} vs {}",
+        loud[n / 2],
+        control[n / 2]
+    );
+
+    let _ = std::fs::remove_dir_all(&pool);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+fn clip(id: &str, at: u64, len: u64) -> Clip {    Clip {
         id: id.into(),
         source: "s1".into(),
         src_start: 0,

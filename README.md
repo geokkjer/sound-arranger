@@ -33,16 +33,17 @@ drain/EOF phase for tailed effects. The direction is locked
 | `crates/media` | The media engine (core-privileged, not a plugin): disk streaming, splice-during-playback, recording writer with crash recovery, **device-clock drift compensation wired into the capture**, multi-channel capture → **float-WAV media pool with live peak pyramids**, pool **enumeration + crash recovery** (finalize un-finalized takes, rebuild `.peaks`), the **clip editor's value + ACID ops + `ArrangerNode`** (renders a track from the value), and the **`ArrangeOp ↔ engine-command` codec**. | works, tested |
 | `crates/host` | The **Host API contract** (commands = logged events, events, values) + the **headless reference host**: `run_script` assembles the profile and bounces byte-identically — now including the **clip-arrangement commands** (`pool`/`arrange`) in the versioned **text format**, so the CLI smoke binary drives the clip editor end-to-end. The UI-as-plugin seam — a future Tauri shell implements the same contract, nothing else changes. | works, tested |
 
-139 tests across the workspace; the core's invariants (byte-identical replay, no-allocation
+143 tests across the workspace; the core's invariants (byte-identical replay, no-allocation
 render, sample-accurate lifecycle) are tested, and the streaming soak + real hardware capture
 run as `#[ignore]`d tests.
 
 **Honest gaps** (deliberate, pre-alpha): the graph is **mono** (stereo/pan is its own step);
 control-side mutations apply on the render call stack (the real control→render handoff is
 seeded by `flush_scheduled`, not finished); the recorder's `play`/`splice` media commands are
-not yet logged events (the **arrangement** ops *are*); **live-edit audio re-wiring** (an edit
-after a bounce requires the shared-state `ArrangerNode` reconcile — the host is build-then-
-bounce); the **drain/EOF phase** for tailed effects (reverb/delay/codec) is a proposed note;
+not yet logged events (the **arrangement** ops *are*); **live-edit-while-playing reader reuse**
+(edits after a bounce are rebuilt, so they reach audio and removed tracks no longer ghost, but
+each rebuild re-warms readers — the shared-state `ArrangerNode` reuse is still deferred); the
+**drain/EOF phase** for tailed effects (reverb/delay/codec) is a proposed note;
 MIDI/OSC are declared seams, not implementations; **no effects, no stereo, no UI**.
 
 ## Try it

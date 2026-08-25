@@ -360,11 +360,25 @@ impl HostSession {
         Ok(())
     }
 
-    /// Wire one `ArrangerNode` per track (from the arrangement value) into the
-    /// mixer. **Order matters:** the arranger nodes are added to the graph FIRST,
-    /// then the mixer is flushed (applied last, so `arranger → mixer` is a forward
-    /// cord under the graph's topological rule) — the candidate-play path only
-    /// works when the sources precede the sink. Control side.
+    /// Reconcile the arranger nodes against the current arrangement value.
+    ///
+    /// The reference host is **reconcile-on-dirty**, not add-only: an `Arrange`
+    /// op mutates the value eagerly, and the next render re-derives the graph
+    /// from that value. This is what makes edits reach audio instead of leaving
+    /// a stale node playing. Specifically it fixes the `RemoveTrack` ghost —
+    /// previously a wired track was never retired, so removing it left its
+    /// `ArrangerNode` mounted and audibly playing while the UI showed no track.
+    ///
+    /// **Order matters** (the graph's topological rule): the arranger source
+    /// nodes must precede the mixer. The mixer is the last node (it claims
+    /// `out_node`), so each rebuilt arranger node is `insert_before(mixer)`-ed,
+    /// keeping `arranger → mixer` a forward cord. `flush_scheduled` materializes
+    /// the mixer (and any pending mount) before the inserts, so the pivot exists.
+    ///
+    /// Channels map to **track index** (`ch{ti}`), the same stable mapping as a
+    /// fresh arrangement, so a removed track also re-numbers its successors.
+    /// Control side only — readers are warmed here; the render path never touches
+    /// this.
     fn wire_arranger(&mut self) -> Result<(), String> {
         if !self.arrange_dirty {
             return Ok(());
@@ -374,31 +388,35 @@ impl HostSession {
         let Some(editor) = &self.editor else { return Ok(()) };
         let timeline = editor.snapshot()?;
         let channels = self.mixer_channels.unwrap_or(4);
-        // add the arranger source nodes before the mixer is applied
-        let mut pending: Vec<(String, engine::NodeId, usize)> = Vec::new();
+
+        // Retire every previously-wired arranger node. This is the fix for the
+        // ghost: a track that was removed (or whose clips changed) must not keep
+        // a stale node in the graph.
+        let old_nodes: Vec<engine::NodeId> = self.wired_tracks.drain().map(|(_, id)| id).collect();
+        for id in old_nodes {
+            self.engine.graph.remove_node(id);
+        }
+
+        // Materialize the mixer (the bus must exist as the insert pivot), then
+        // build one fresh ArrangerNode per current track *before* it.
+        self.engine.flush_scheduled();
+        let mixer = self.engine.graph.out_node.ok_or("arrange requires the mixer to be mounted")?;
+
         for (ti, track) in timeline.tracks.iter().enumerate() {
-            if self.wired_tracks.contains_key(&track.id) {
-                continue;
-            }
             if ti >= channels {
                 return Err(format!("track '{}' has no mixer channel ch{ti} (channels={channels})", track.id));
             }
             let node = media::ArrangerNode::new(track.clone(), &resolver, media::DEFAULT_RING_CAPACITY, self.engine.clock.sample_rate)?;
-            let id = self.engine.graph.add_node(
+            let id = self.engine.graph.insert_before(
+                mixer,
                 engine::NodeKind::Opaque(Box::new(node)),
                 vec![engine::Port { name: "audio", direction: engine::Direction::Out, kind: engine::SignalKind::Audio }],
-            );
-            pending.push((track.id.clone(), id, ti));
-        }
-        // now apply the mixer (it was scheduled by the Mount command) as the last node
-        self.engine.flush_scheduled();
-        let mixer = self.engine.graph.out_node.ok_or("arrange requires the mixer to be mounted")?;
-        for (tid, id, ti) in &pending {
+            )?;
             self.engine
                 .graph
-                .connect(*id, "audio", mixer, &format!("ch{ti}"))
+                .connect(id, "audio", mixer, &format!("ch{ti}"))
                 .map_err(|e| format!("arranger→mixer cord: {e}"))?;
-            self.wired_tracks.insert(tid.clone(), *id);
+            self.wired_tracks.insert(track.id.clone(), id);
         }
         Ok(())
     }
