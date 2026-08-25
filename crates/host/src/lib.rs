@@ -536,6 +536,9 @@ pub fn run_script(script: &[HostCommand]) -> Result<HostSession, String> {
 /// unmount tone @3000
 /// play /abs/clip.wav ch0 @0
 /// splice 4000 /abs/clip2.wav 512
+/// pool /data/takes                           # the media pool dir
+/// arrange add_track t0 @0                    # the clip editor (P1.3.4)
+/// arrange add_clip t0 c0 s1 0 4000 0 0 0 1.0 @0
 /// bounce 6000 /abs/out.wav
 /// ```
 pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
@@ -630,10 +633,111 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
                 let path = PathBuf::from(word(&words, 2, at)?);
                 commands.push(HostCommand::Bounce { frames, path });
             }
+            "pool" => {
+                let dir = PathBuf::from(word(&words, 1, at)?);
+                commands.push(HostCommand::Pool { dir });
+            }
+            "arrange" => {
+                let op = parse_arrange(&words[1..], at)?;
+                commands.push(HostCommand::Arrange { op, at_frame });
+            }
             other => return Err(format!("line {at}: unknown command '{other}'")),
         }
     }
     Ok(commands)
+}
+
+/// Parse an `arrange` command's operands (everything after the `arrange`
+/// keyword) into an [`ArrangeOp`]. Grammar per op:
+///
+/// ```text
+/// arrange add_track t0 @0
+/// arrange add_clip t0 c0 s1 0 4000 0 0 0 1.0 [loop_len] @0
+/// arrange razor_split t0 c0 cL cR 3000 @0
+/// arrange trim t0 c0 start 500 @0
+/// arrange move_clip t0 c0 9000 @0
+/// arrange move_clip_to_track t0 c0 t1 50 @0
+/// arrange duplicate t0 c0 c1 @0
+/// arrange delete t0 c0 @0
+/// arrange set_clip_gain t0 c0 0.75 @0
+/// arrange set_clip_fade t0 c0 64 128 @0
+/// arrange loop_region t0 c0 3 @0
+/// ```
+fn parse_arrange(words: &[&str], at: usize) -> Result<media::ArrangeOp, String> {
+    let op = words.first().copied().ok_or_else(|| format!("line {at}: arrange needs an op"))?;
+    // helpers: operand i is `words[i]` — `words[0]` is the op name, so the first
+    // real operand (e.g. add_track's track) is `words[1]` = operand 1. Error
+    // messages number operands the way a script author counts them (`i`, not i+1).
+    let s = |i: usize| -> Result<String, String> {
+        words.get(i).copied().map(str::to_owned)
+            .ok_or_else(|| format!("line {at}: arrange {op} missing operand {i}"))
+    };
+    let u = |i: usize| -> Result<u64, String> {
+        s(i)?.parse().map_err(|_| format!("line {at}: arrange {op} operand {i} must be a frame/count"))
+    };
+    let i64 = |i: usize| -> Result<i64, String> {
+        s(i)?.parse().map_err(|_| format!("line {at}: arrange {op} operand {i} must be an integer"))
+    };
+    let f = |i: usize| -> Result<f32, String> {
+        let v: f32 = s(i)?.parse().map_err(|_| format!("line {at}: arrange {op} operand {i} must be a number"))?;
+        if !v.is_finite() {
+            return Err(format!("line {at}: arrange {op} operand {i} must be finite (a NaN/inf gain or count reaches the audio path)"));
+        }
+        Ok(v)
+    };
+    // strict arity: a wrong operand COUNT is a parse error (the wire schema must
+    // not silently accept trailing junk). `add_clip`'s `[loop_len]` is the one
+    // documented optional trailing operand.
+    let arity = |n: usize| -> Result<(), String> {
+        if words.len() != n {
+            return Err(format!("line {at}: arrange {op} expects {n} words (op + operands), got {}", words.len()));
+        }
+        Ok(())
+    };
+
+    match op {
+        "add_track" => { arity(2)?; Ok(media::ArrangeOp::AddTrack { track: s(1)? }) }
+        "remove_track" => { arity(2)?; Ok(media::ArrangeOp::RemoveTrack { track: s(1)? }) }
+        "add_clip" => {
+            // add_clip track c0 source src_start src_len at_frame fade_in fade_out gain [loop_len]
+            // operands (words[0]=op): track(1) id(2) source(3) src_start(4) src_len(5)
+            //                       at_frame(6) fade_in(7) fade_out(8) gain(9) loop_len(10)
+            if !(10..=11).contains(&words.len()) {
+                return Err(format!("line {at}: arrange add_clip expects 10 or 11 words (op + 9 operands + optional loop_len), got {}", words.len()));
+            }
+            let clip = media::Clip {
+                id: s(2)?,
+                source: s(3)?,
+                src_start: u(4)?,
+                src_len: u(5)?,
+                at_frame: u(6)?,
+                fade_in: u(7)?,
+                fade_out: u(8)?,
+                gain: f(9)?,
+                loop_len: words.get(10).map(|x| x.parse::<u64>()).transpose().map_err(|_| format!("line {at}: arrange add_clip loop_len must be a count"))?.filter(|v| *v != 0),
+            };
+            Ok(media::ArrangeOp::AddClip { track: s(1)?, clip })
+        }
+        "razor_split" => { arity(6)?; Ok(media::ArrangeOp::RazorSplit {
+            track: s(1)?, clip: s(2)?, new_left: s(3)?, new_right: s(4)?, at_frame: u(5)?,
+        }) }
+        "trim" => { arity(5)?; Ok(media::ArrangeOp::Trim {
+            track: s(1)?, clip: s(2)?,
+            edge: match s(3)?.as_str() { "start" => media::Edge::Start, "end" => media::Edge::End, other => return Err(format!("line {at}: arrange trim edge must be start|end, got '{other}'")) },
+            by_frames: i64(4)?,
+        }) }
+        "move_clip" => { arity(4)?; Ok(media::ArrangeOp::MoveClip { track: s(1)?, clip: s(2)?, at_frame: u(3)? }) }
+        "move_clip_to_track" => { arity(5)?; Ok(media::ArrangeOp::MoveClipToTrack { from: s(1)?, clip: s(2)?, to: s(3)?, at_frame: u(4)? }) }
+        "duplicate" => { arity(4)?; Ok(media::ArrangeOp::Duplicate { track: s(1)?, clip: s(2)?, new_id: s(3)? }) }
+        "delete" => { arity(3)?; Ok(media::ArrangeOp::Delete { track: s(1)?, clip: s(2)? }) }
+        "set_clip_gain" => { arity(4)?; Ok(media::ArrangeOp::SetClipGain { track: s(1)?, clip: s(2)?, gain: f(3)? }) }
+        "set_clip_fade" => { arity(5)?; Ok(media::ArrangeOp::SetClipFade { track: s(1)?, clip: s(2)?, fade_in: u(3)?, fade_out: u(4)? }) }
+        "loop_region" => { arity(4)?; Ok(media::ArrangeOp::LoopRegion {
+            track: s(1)?, clip: s(2)?,
+            times: u32::try_from(u(3)?).map_err(|_| format!("line {at}: arrange loop_region operand 3 must fit a u32 (times)"))?,
+        }) }
+        other => Err(format!("line {at}: unknown arrange op '{other}'")),
+    }
 }
 
 /// The `idx`-th word of a command line; a missing operand is a clean parse error

@@ -139,6 +139,81 @@ fn fractional_or_zero_mixer_channels_is_refused() {
 }
 
 #[test]
+fn text_format_pool_and_arrange_run_byte_identically() {
+    // the text form (the CLI smoke binary's wire schema) must drive the clip
+    // editor end-to-end: pool + arrange + bounce, byte-identical on replay.
+    let pool = tmp_dir("textpool");
+    write_source(&pool, "s1", 8000);
+    let out_dir = tmp_dir("textout");
+    let a = out_dir.join("a.wav");
+    let b = out_dir.join("b.wav");
+
+    let script = |out: &std::path::Path| format!(
+        "host v1\n\
+         mount mixer channels=2 @0\n\
+         pool {}\n\
+         arrange add_track t0 @0\n\
+         arrange add_clip t0 c0 s1 0 4000 0 0 0 1.0 @0\n\
+         arrange add_track t1 @0\n\
+         arrange add_clip t1 c1 s1 0 1500 500 64 128 1.0 @0\n\
+         bounce 6000 {}\n",
+        pool.display(), out.display()
+    );
+
+    let script_a = host::parse_script(&script(&a)).unwrap();
+    let sess = host::run_script(&script_a).unwrap();
+    let frames_a = std::fs::read(&a).unwrap();
+    // the arrangement plays (non-silent)
+    let mut r = media::WavReader::open(&a).unwrap();
+    let mut audio = vec![0.0f32; r.total_frames() as usize];
+    let n = r.read_into(&mut audio);
+    assert!(audio[..n].iter().any(|s| s.abs() > 1e-4), "must produce audio");
+    assert_eq!(sess.arrangement().tracks.len(), 2);
+
+    // replay byte-identically
+    let script_b = host::parse_script(&script(&b)).unwrap();
+    let _ = host::run_script(&script_b).unwrap();
+    let frames_b = std::fs::read(&b).unwrap();
+    assert_eq!(frames_a, frames_b, "text-format arrangement must replay byte-identically");
+
+    let _ = std::fs::remove_dir_all(&pool);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+#[test]
+fn text_format_arrange_ops_parse() {
+    // each arrange op's text grammar parses to the expected command (no silent
+    // leniency — the wire schema must be strict about operands).
+    for (line, _) in [
+        ("arrange add_track t0 @0", 0),
+        ("arrange remove_track t1 @0", 0),
+        ("arrange add_clip t0 c0 s1 0 4000 0 0 0 1.0 @0", 0),
+        ("arrange razor_split t0 c0 cL cR 3000 @0", 0),
+        ("arrange trim t0 c0 start 500 @0", 0),
+        ("arrange trim t0 c0 end -200 @0", 0),
+        ("arrange move_clip t0 c0 9000 @0", 0),
+        ("arrange move_clip_to_track t0 c0 t1 50 @0", 0),
+        ("arrange duplicate t0 c0 c1 @0", 0),
+        ("arrange delete t0 c0 @0", 0),
+        ("arrange set_clip_gain t0 c0 0.75 @0", 0),
+        ("arrange set_clip_fade t0 c0 64 128 @0", 0),
+        ("arrange loop_region t0 c0 3 @0", 0),
+    ] {
+        let cmds = host::parse_script(&format!("host v1\n{line}\n")).unwrap();
+        assert_eq!(cmds.len(), 1, "{line}");
+    }
+    // a malformed arrange line refuses, never panics
+    assert!(host::parse_script("host v1\narrange add_clip t0 c0\n").is_err());
+    assert!(host::parse_script("host v1\narrange nope_op t0\n").is_err());
+    // strict arity: trailing junk / too many operands refuse
+    assert!(host::parse_script("host v1\narrange add_track t1 junk\n").is_err());
+    // non-finite gain refuses (NaN reaches the audio path otherwise)
+    assert!(host::parse_script("host v1\narrange add_clip t0 c0 s1 0 4000 0 0 0 nan\n").is_err());
+    // loop_region times must fit u32 (no silent truncation)
+    assert!(host::parse_script("host v1\narrange loop_region t0 c0 4294967296\n").is_err());
+}
+
+#[test]
 fn arrangement_bounces_audio_and_replays_byte_identically() {
     let pool = tmp_dir("audio");
     write_source(&pool, "s1", 8000);
