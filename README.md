@@ -8,11 +8,14 @@ the product an **assembled profile**. Rust (engine core + media engine + host), 
 > **Working title.** The repo name names the *first profile*, not the platform; a rename
 > ("audio" / "sound") is an open question — see RESEARCH.md §14.
 
-**Status: pre-alpha.** The audio core works and is tested; there is **no UI yet**. What
-exists today: the minimal core, the media engine (disk streaming, recording, splicing,
-multi-channel capture), the soft mixer, and a **headless reference host** that proves the
-UI-as-plugin contract. What doesn't exist yet: the Tauri/Vue shell, the clip editor, stereo,
-effects, MIDI/OSC implementations, CLAP hosting. The direction is locked
+**Status: pre-alpha.** The audio core works and is tested; there is **no UI yet**. What exists
+today: the minimal core, the media engine (disk streaming, recording, splicing, multi-channel
+capture), the soft mixer, **the clip editor (P1.3 — value, ACID ops, arranger node, media pool
+with crash recovery, the engine's closed-core message dispatch, the logged-command codec, host
+wiring, and a text-format that drives it from the CLI)**, and a **headless reference host**
+that proves the UI-as-plugin contract end-to-end. What doesn't exist yet: the Tauri/Vue shell,
+live-edit audio re-wiring, stereo/pan, effects, MIDI/OSC implementations, CLAP hosting, and the
+drain/EOF phase for tailed effects. The direction is locked
 ([umbrella-first note](.agents/notes/proposed/architecture/2026-08-15-umbrella-first-product-direction.md)):
 
 - **Profile #1 — the clip arranger ("sound-arranger"):** record long live jams, then cut,
@@ -26,18 +29,21 @@ effects, MIDI/OSC implementations, CLAP hosting. The direction is locked
 
 | Crate | What it is | Status |
 |---|---|---|
-| `crates/engine` | The minimal core: clock (tempo map + sample-accurate scheduler), patch-bay graph interpreter (typed ports, PDC), session event log, context plumbing — plus plugins: euclidean, scale, tone, **soft mixer** (gain/mute/solo, master fader, meters). Std-only, zero dependencies. | works, tested |
-| `crates/media` | The media engine (core-privileged, not a plugin): disk streaming, splice-during-playback, recording writer with crash recovery, device-clock drift compensation, multi-channel capture → **float-WAV media pool with live peak pyramids**, cpal device path. | works, tested |
-| `crates/host` | The **Host API contract** (commands = logged events, events, values) + the **headless reference host**: `run_script` assembles the profile and bounces byte-identically; a CLI smoke binary. The UI-as-plugin seam — a future Tauri shell implements the same contract, nothing else changes. | works, tested |
+| `crates/engine` | The minimal core: clock (tempo map + sample-accurate scheduler), patch-bay graph interpreter (typed ports, PDC), session event log, context plumbing — plus plugins: euclidean, scale, tone, **soft mixer** (gain/mute/solo, master fader, meters). Std-only. It also carries the **closed-core plugin-message dispatch** (`Event::Arrangement` + `arrange_logged`): profile-level ops are logged as commands the core understands without knowing them. | works, tested |
+| `crates/media` | The media engine (core-privileged, not a plugin): disk streaming, splice-during-playback, recording writer with crash recovery, **device-clock drift compensation wired into the capture**, multi-channel capture → **float-WAV media pool with live peak pyramids**, pool **enumeration + crash recovery** (finalize un-finalized takes, rebuild `.peaks`), the **clip editor's value + ACID ops + `ArrangerNode`** (renders a track from the value), and the **`ArrangeOp ↔ engine-command` codec**. | works, tested |
+| `crates/host` | The **Host API contract** (commands = logged events, events, values) + the **headless reference host**: `run_script` assembles the profile and bounces byte-identically — now including the **clip-arrangement commands** (`pool`/`arrange`) in the versioned **text format**, so the CLI smoke binary drives the clip editor end-to-end. The UI-as-plugin seam — a future Tauri shell implements the same contract, nothing else changes. | works, tested |
 
-85 tests across the workspace; the core's invariants (byte-identical replay, no-allocation
-render, sample-accurate lifecycle) are tested, and the 25-minute streaming soak + real
-hardware capture run as `#[ignore]`d tests.
+139 tests across the workspace; the core's invariants (byte-identical replay, no-allocation
+render, sample-accurate lifecycle) are tested, and the streaming soak + real hardware capture
+run as `#[ignore]`d tests.
 
 **Honest gaps** (deliberate, pre-alpha): the graph is **mono** (stereo/pan is its own step);
 control-side mutations apply on the render call stack (the real control→render handoff is
-seeded by `flush_scheduled`, not finished); media commands (play/splice) are not yet logged
-events (P1.3 merges them); MIDI/OSC are declared seams, not implementations.
+seeded by `flush_scheduled`, not finished); the recorder's `play`/`splice` media commands are
+not yet logged events (the **arrangement** ops *are*); **live-edit audio re-wiring** (an edit
+after a bounce requires the shared-state `ArrangerNode` reconcile — the host is build-then-
+bounce); the **drain/EOF phase** for tailed effects (reverb/delay/codec) is a proposed note;
+MIDI/OSC are declared seams, not implementations; **no effects, no stereo, no UI**.
 
 ## Try it
 
@@ -51,10 +57,15 @@ cargo test -p media --release -- --ignored soak   # 25-minute stream+record+spli
 ```
 
 The headless smoke binary speaks a versioned command script — the same contract a future
-Tauri shell sends:
+Tauri shell sends. It now drives the clip arrangement too:
 
 ```sh
+# a simple tone from the synth chain:
 printf 'host v1\nmount mixer channels=4 @0\nbounce 512 /tmp/out.wav\n' | cargo run -p host
+
+# a clip arrangement from a pool source (the clip editor):
+#   pool <dir>s1.wav must exist; then arrange clips on tracks and bounce.
+printf 'host v1\nmount mixer channels=2 @0\npool /data/takes\narrange add_track t0 @0\narrange add_clip t0 c0 s1 0 48000 0 0 0 1.0 @0\nbounce 48000 /tmp/out.wav\n' | cargo run -p host
 ```
 
 ## Documentation map
