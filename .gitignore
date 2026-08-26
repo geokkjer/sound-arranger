@@ -13,3 +13,6 @@ src-tauri/target/
 
 # local research downloads (cordiverse/paper preprint + reading companions)
 .research/
+
+# M-VAVE FM-1 firmware update image (large, not source)
+research/gear/*.fwsc
