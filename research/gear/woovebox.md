@@ -1,6 +1,6 @@
 # Gear — Woovebox (what's exposed, and the BLE-MIDI story)
 
-> **Status: research/characterization + a resolved diagnosis (2026-08-26).** The Woovebox is present (BLE-connected, `WOOVEBOX-FA8E`). This records what's exposed and *why the web tool shows "not connected"* — a Linux BlueZ build issue, not a device problem.
+> **Status: research/characterization + a resolved diagnosis; role decided (2026-08-26).** The Woovebox is present (BLE-connected, `WOOVEBOX-FA8E`). **Role in this context (decided): an audio source through the Notepad-12FX** as part of the dawless jamming rig — **not** wired into the arranger as a MIDI source for now. The BLE-MIDI "not connected" finding is recorded for completeness/curiosity, not a to-do.
 > **Device:** Pocket Animal Audio **Woovebox** (micro music workstation / groovebox; OG 2023, SE, Pro — all firmware 2.0). **No USB data** — over USB it's **charging only**. Its real computer interface is **Bluetooth LE MIDI**.
 
 ## TL;DR
@@ -50,10 +50,10 @@ Woovebox (BLE peripheral, connected) ──BlueZ──▶ [no midi plugin] ─�
 
 ## Project relevance — sound-arranger
 
-- **Role:** the Woovebox is a **groovebox** (16-part synth, 16×16×16×16 sequencer, sampler, drum machine). For the arranger it's two things:
-  - a **MIDI source** (notes/CC) — via BLE MIDI **once the ALSA port exists** (the fix above), into the engine's `midir`/control seam; and/or
-  - an **audio source** — its **line out → Notepad-12FX** (USB is charging-only, so audio must be analog).
-- **Caveats for a performance tool:** BLE MIDI **latency/reliability** varies with the OS Bluetooth stack (the Woovebox docs are candid about this). For stable use prefer the **3.5 mm TRS MIDI** (into a USB-MIDI interface) or a **WIDI Bud**; BLE is fine for control but a risk for tight sequencing. Only **one BLE connection** at a time, and battery-saver must be off.
+- **Decided role:** an **audio source through the Notepad-12FX** (line out → mixer), captured like any instrument in the dawless jamming rig. **Not** integrated as a MIDI source into the arranger for now.
+- **Why it's easy:** USB is charging-only, so audio is analog out into the mixer; the arranger treats it as another mono/stereo source → clip. There's no USB-audio or BLE work needed in the engine.
+- **MIDI (possible later, not now):** the Woovebox is a **groovebox** (16-part synth, 16×16×16×16 sequencer, sampler). If the owner eventually wants it as a MIDI source, the path exists — via BLE **once an ALSA MIDI port is created** (the `--enable-midi` fix above, or a WIDI Bud / USB-MIDI interface), into the engine's `midir`/control seam. Documented but not scheduled.
+- **Caveats (if MIDI is ever used):** BLE MIDI **latency/reliability** varies with the OS Bluetooth stack; for stable use prefer the **3.5 mm TRS MIDI** (into a USB-MIDI interface) or a **WIDI Bud**. Only **one BLE connection** at a time, and battery-saver must be off.
 
 ## Caveats / gotchas
 
