@@ -140,7 +140,7 @@ scripts/capture-ep133-usb.sh --play          # also send a 1 kHz test tone to th
 scripts/capture-ep133-usb.sh --dry-run       # preview commands without executing
 ```
 
-It writes a timestamped bundle under `.research/ep133-capture-*/` (gitignored) — `00_manifest.txt` summarises what it found and the resolved device / ALSA card / MIDI-port strings, plus a `00_run.log` of every command and its exit status. Requirements: `lsusb`, `udevadm`, `alsa-utils` (`amidi`/`aplay`/`arecord`); no sudo if your user is in the `audio` group. To capture audio, play pads on the EP-133 while it runs. (See the [capture-tooling note](../../.agents/notes/implemented/process/2026-08-25-ep133-usb-capture-tool.md).)
+It writes a timestamped bundle under `.research/<vendor>-capture-*/` (gitignored; the EP-133 defaults to `2367-capture-*`) — `00_manifest.txt` summarises what it found and the resolved device / ALSA card / MIDI-port strings, plus a `00_run.log` of every command and its exit status. Requirements: `lsusb`, `udevadm`, `alsa-utils` (`amidi`/`aplay`/`arecord`); no sudo if your user is in the `audio` group. To capture audio, play pads on the EP-133 while it runs. (See the [capture-tooling note](../../.agents/notes/implemented/process/2026-08-25-ep133-usb-capture-tool.md).)
 
 ## Sources
 

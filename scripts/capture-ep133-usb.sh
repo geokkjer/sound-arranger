@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
-# Capture the Teenage Engineering EP-133 K.O. II's USB surface for later analysis.
+# Capture a class-compliant USB MIDI/Audio device's USB surface for later analysis.
 #
-# This runs on the HOST (the machine the EP-133 is attached to) — NOT inside the
+# This runs on the HOST (the machine the device is attached to) — NOT inside the
 # agent sandbox, which has no /dev/snd or /dev/bus/usb. It dumps descriptors,
 # ALSA state, raw MIDI/SysEx and (optionally) a stereo audio capture into a
 # timestamped directory under .research/ so the results can be read back later.
 #
 # Usage:
 #   scripts/capture-ep133-usb.sh [--out-dir DIR] [--seconds N] [--play] [--dry-run]
+#                                [--vendor VID] [--card-id CARD_ID]
 #
-#   --out-dir DIR   Write into DIR (default: .research/ep133-capture-<timestamp>)
-#   --seconds N     Live-capture duration in seconds (default 6)
-#   --play          Also send a short test tone to the device's USB-audio OUT
-#   --dry-run       Print the commands that would run; do not execute
-#   -h, --help      Show this help
+# Device selection (defaults target the Teenage Engineering EP-133 K.O. II):
+#   --vendor VID     USB vendor id, e.g. 2367 (EP-133) or 0944 (Korg NTS-3)
+#   --card-id ID     ALSA card id, e.g. EP133 or kit (NTS-3)
+#   --out-dir DIR    Write into DIR (default: .research/<vendor>-capture-<timestamp>)
+#   --seconds N      Live-capture duration in seconds (default 6)
+#   --play           Also send a short test tone to the device's USB-audio OUT
+#   --dry-run        Print the commands that would run; do not execute
+#   -h, --help       Show this help
 #
 # Produces (in the out dir):
 #   00_manifest.txt  summary + how to use it + detected device/card/port strings
@@ -83,6 +87,8 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --out-dir) OUT_DIR="${2:?--out-dir requires a path}"; shift 2 ;;
     --seconds) SECONDS_CAPTURE="${2:-$SECONDS_DEFAULT}"; shift 2 ;;
+    --vendor)  VENDOR="${2:?--vendor requires an id}"; shift 2 ;;
+    --card-id) CARD_ID="${2:?--card-id requires an id}"; shift 2 ;;
     --play)    DO_PLAY=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage ;;
@@ -105,7 +111,7 @@ done
 # ---------------------------------------------------------------------------
 TS="$(date '+%Y%m%d-%H%M%S')"
 if [ -z "$OUT_DIR" ]; then
-  OUT_DIR=".research/ep133-capture-${TS}"
+  OUT_DIR=".research/${VENDOR}-capture-${TS}"
 fi
 mkdir -p "$OUT_DIR"
 OUT_DIR="$(cd "$OUT_DIR" && pwd)"

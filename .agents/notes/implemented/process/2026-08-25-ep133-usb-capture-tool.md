@@ -8,7 +8,7 @@ The sound-arranger agent needs raw capture of the attached Teenage Engineering E
 
 ## Decision
 
-Provide a **host-side capture script**, [`scripts/capture-ep133-usb.sh`](../../../../scripts/capture-ep133-usb.sh), that the owner runs on the machine the EP-133 is attached to. It is read-only observation (no device writes), writes everything into a timestamped directory under **`.research/`** (already gitignored), which the sandbox can then read. It captures: USB descriptors (`lsusb -v` for every `2367:*` PID), udev/sysfs interface summary, ALSA state (`/proc/asound/cards`, `amidi -l`, `aplay -l`, `arecord -l`, `/proc/asound/card*`), a bounded raw MIDI/SysEx dump (`amidi -p <port> -d`), and a stereo 16-bit/48 kHz capture (`arecord -D hw:C,0`), plus an optional playback probe (`--play`). It auto-detects the ALSA card by `/sys/class/sound/card*/id == EP133` and the MIDI port from `amidi -l` (falling back to `hw:C,M`), logs every command + exit status, and produces a `00_manifest.txt` line-up. `--dry-run` prints without executing.
+Provide a **host-side capture script**, [`scripts/capture-ep133-usb.sh`](../../../../scripts/capture-ep133-usb.sh), that the owner runs on the machine the device is attached to. It is read-only observation (no device writes), writes everything into a timestamped directory under **`.research/`** (already gitignored), which the sandbox can then read. It captures: USB descriptors (`lsusb -v` for every matched `VID:*` PID), udev/sysfs interface summary, ALSA state (`/proc/asound/cards`, `amidi -l`, `aplay -l`, `arecord -l`, `/proc/asound/card*`), a bounded raw MIDI/SysEx dump (`amidi -p <port> -d`), and (for audio-class devices) a stereo 16-bit/48 kHz capture (`arecord -D hw:C,0`), plus an optional playback probe (`--play`). It auto-detects the ALSA card by `/sys/class/sound/card*/id` and the MIDI port from `amidi -l` (falling back to `hw:C,M`), logs every command + exit status, and produces a `00_manifest.txt` line-up. `--dry-run` prints without executing. It is device-agnostic: `--vendor`/`--card-id` select the target (defaults: `2367`/`EP133` for the EP-133; the Korg NTS-3 is `0944`/`kit`).
 
 ## Alternatives considered
 
@@ -18,5 +18,5 @@ Provide a **host-side capture script**, [`scripts/capture-ep133-usb.sh`](../../.
 
 ## Consequences
 
-- The script must be run on the host as a user in the `audio` group; outputs land in `.research/ep133-capture-<timestamp>/`.
-- The agent reads the results back through the workspace bind. This keeps live capture out of the sandbox while still producing analysable data for the gear research and future engine work (MIDI/sysex protocol; the EP-133 as a stereo USB audio source on OS 2.5.1).
+- The script must be run on the host as a user in the `audio` group; outputs land in `.research/<vendor>-capture-<timestamp>/`.
+- The agent reads the results back through the workspace bind. This keeps live capture out of the sandbox while still producing analysable data for the gear research and future engine work (MIDI/sysex protocol; the EP-133 as a stereo USB audio source on OS 2.5.1; the NTS-3 as a MIDI control surface).
