@@ -70,6 +70,15 @@ The NTS-3 is an **effects unit** — audio goes in/out through its **analog jack
 - **Installed version on this unit:** `bcdDevice` is `1.00`, which suggests it is **behind v1.4** — but `bcdDevice` is not authoritative for the Korg OS version, so **confirm on the device**: the NTS-3 shows its version on the touchpad display (check the manual's procedure, typically on boot), or read it from KORG KONTROL Editor.
 - If you want v1.4: the **Windows updater + KORG USB-MIDI Driver** is the supported path. On Linux the official updater won't run; use a Windows machine/VM (or the owner's Windows box). Back up any custom effects (via KONTROL Editor) before an update.
 
+## SDK scope — can it update firmware from Linux?
+
+The NTS-3 is a **Nu:Tekt programmable** device with an open **logueSDK** (v2.0.0 for NTS-3, ARM Cortex-M7, min firmware ≥ v1.0.0). **The SDK is *not* a firmware tool** — it builds **user units** (custom oscillators/effects) as ELF shared objects, and KORG's [`logue-cli`](https://github.com/korginc/logue-sdk/tree/main/tools/logue-cli) loads them into the device's user-program slots. Its documented commands are **`check`, `probe`, `load`, `clear`** — **there is no `update`/`firmware`/flash command.** So:
+
+- ✅ **From Linux, the SDK works for its purpose.** `logue-cli` has a Linux binary (`get_logue_cli_linux.sh`) and talks to the device over **USB MIDI** (card 1 `[kit]`); you can build and **load custom kaoss effects** from Linux (the [`schollz/logue`](https://github.com/schollz/logue) Docker/local workflow is a worked example).
+- ❌ **The SDK is *not* how you update the OS firmware.** The `.VSB` OS image is flashed by KORG's **`kmupdate.exe`** (Windows) via the **KORG USB-MIDI Driver**. From Linux that needs a **Windows machine/VM** (Wine is unlikely to work: the updater needs the KORG USB-MIDI *kernel* driver, which Wine doesn't provide), or re-implementing the updater's undocumented bootloader protocol — unsupported and risky.
+
+**Do you need the update?** The SDK only needs **≥ v1.0.0** on the NTS-3 (this unit's `bcdDevice 1.00` satisfies that), so SDK use isn't blocked. v1.4 buys *reduced noise when switching programs* and the *logue-SDK raw-input bug fix* — worth doing only if you hit those. To confirm the installed version, see the device display or KORG KONTROL Editor.
+
 ## Relevance to sound-arranger
 
 - **Control surface:** the NTS-3's XY pad → MIDI CC is a great source of continuous automation/control for the engine (`ctx` control parameters), driven in real time by hand — a natural fit for the `midir` input seam (Phase 5 / Phase 8) and for recording CC as automation.
@@ -90,6 +99,8 @@ The NTS-3 is an **effects unit** — audio goes in/out through its **analog jack
 - KORG, System Updater v1.4 download (Windows, requires KORG USB-MIDI Driver): [korg.com/jp/support/download/software/0/934/5235](https://www.korg.com/jp/support/download/software/0/934/5235/)
 - KORG UK updates blog, "Software Updates for Nautilus, Kross 2, and NTS-3 KAOSS" (v1.4 note): [korg.co.uk](https://www.korg.co.uk/blogs/updates/software-updates-for-nautilus-kross-2-and-nts-3-kaoss)
 - KORG KONTROL Editor (v2.5.1) + NTS-3 editor/librarian: [korg.com/es/products/dj/nts_3/editor.php](https://www.korg.com/es/products/dj/nts_3/editor.php)
-- `korginc/logue-sdk` (open SDK to build custom oscillators/effects): [github.com/korginc/logue-sdk](https://github.com/korginc/logue-sdk)
+- `korginc/logue-sdk` (open SDK to build custom oscillators/effects; NTS-3 = SDK v2.0.0, ARM Cortex-M7, min firmware ≥ v1.0.0): [github.com/korginc/logue-sdk](https://github.com/korginc/logue-sdk)
+- `logue-cli` (KORG tool; commands `check`/`probe`/`load`/`clear` for *user units*, Linux binary — no firmware command): [github.com/korginc/logue-sdk/tree/main/tools/logue-cli](https://github.com/korginc/logue-sdk/tree/main/tools/logue-cli)
+- `schollz/logue` (Linux/Docker workflow to build and load logue units): [github.com/schollz/logue](https://github.com/schollz/logue)
 - NTS-3 manual (36 pp; MIDI implementation chart): [manualzz.com](https://manualzz.com/doc/html/78842392/korg-nts-3-kaoss-pad-kit-bedienungsanleitung)
 - Community: NTS-3 as a MIDI controller (XY → CC): [KVR / Bitwig forum](https://www.kvraudio.com/forum/viewtopic.php?f=259&t=618949) · [Elektronauts thread](https://www.elektronauts.com/t/korg-nts-3-kaoss-pad/207108/)
