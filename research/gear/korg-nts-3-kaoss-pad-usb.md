@@ -1,6 +1,6 @@
 # Gear — Korg NTS-3 kaoss pad kit (what's exposed over USB)
 
-> **Status: research/characterization.** The unit is on the bus; this records exactly what the USB interface presents. Nothing is decision-locked yet.
+> **Status: research/characterization; role in sound-arranger decided (2026-08-25).** The unit is on the bus; this records what the USB interface presents. **Role (decided): a USB-MIDI XY→CC control surface and/or an outboard hardware FX in the mixer chain** — audio via its analog jacks into the Notepad-12FX, MIDI as a CC source in `ctx`. **Not** a dedicated USB-audio integration, and (for now) firmware v1.4 and the `logue`-SDK are **deferred** until the relevant bugs matter.
 > **Device:** KORG `0944:0153` NTS-3 kaoss pad kit · bcdDevice `1.00` · bcdUSB **1.10 Full Speed (12 Mb/s)** · **no serial number** (`iSerial 0`) · **1 configuration, 1 interface.**
 
 ## TL;DR
