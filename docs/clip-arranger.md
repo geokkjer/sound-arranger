@@ -1,6 +1,6 @@
 # The clip arranger — an arrangement is data
 
-> 🕒 Last verified against commit `ad1959c` (2026-08-27). If the code has moved on,
+> 🕒 Last verified against commit `97cc411` (2026-08-27). If the code has moved on,
 > trust the code and move this line forward.
 
 **What this is.** The engine ([`architecture-explainer.md`](architecture-explainer.md)) is a

@@ -1,6 +1,6 @@
 # Learn Rust with sound-arranger
 
-> 🕒 Last verified against commit `a04288d` (2026-08-27). If the code has moved on,
+> 🕒 Last verified against commit `97cc411` (2026-08-27). If the code has moved on,
 > trust the code and move this line forward.
 
 A mini course that teaches Rust by reading and modifying *this* codebase. You

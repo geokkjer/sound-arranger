@@ -1,6 +1,6 @@
 # First session — make sound in fifteen minutes
 
-> 🕒 Last verified against commit `a04288d` (2026-08-27). If the code has moved on,
+> 🕒 Last verified against commit `97cc411` (2026-08-27). If the code has moved on,
 > trust the code and move this line forward.
 
 You don't need to understand Rust, audio programming, or the architecture to do

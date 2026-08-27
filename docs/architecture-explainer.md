@@ -1,6 +1,6 @@
 # sound-arranger: from architecture up
 
-> 🕒 Last verified against commit `ad1959c` (2026-08-27). If the code has moved on,
+> 🕒 Last verified against commit `97cc411` (2026-08-27). If the code has moved on,
 > trust the code and move this line forward.
 
 > A plain-English (mostly) tour of the Rust code, for a developer with roughly six
@@ -883,13 +883,14 @@ exist yet — its mount applies on the *first render*. So the cord from player �
 mixer channel is **deferred** into `pending_cords` and wired on the first render:
 
 ```rust
-pub fn render(&mut self, frames: usize) -> Vec<f32> {
-    if !self.pending_cords.is_empty() {
-        self.engine.render(BLOCK);   // applies the scheduled mixer mount
-        let mixer = self.engine.graph.out_node.expect("the mixer claims the master bus");
-        // wire each pending player → mixer channel now that the mixer exists
+pub fn render(&mut self, frames: usize) -> Result<Vec<f32>, String> {
+    // bound the buffer so a malformed `bounce` cannot OOM
+    if frames.saturating_mul(std::mem::size_of::<f32>()) > Self::MAX_BOUNCE_BYTES {
+        return Err("bounce exceeds the byte budget".into());
     }
-    self.engine.render(frames)
+    self.wire_pending()?;   // deferred player→mixer cords, once the mixer node exists
+    self.wire_arranger()?;  // reconcile the arranger nodes against the arrangement value
+    Ok(self.engine.render(frames))
 }
 ```
 
