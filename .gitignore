@@ -14,5 +14,11 @@ src-tauri/target/
 # local research downloads (cordiverse/paper preprint + reading companions)
 .research/
 
+# pi-harness scratch home (a writable copy of creds for running the GLM/Kimi
+# loop inside the DSH sandbox; never commit — delete after the run) — see the
+# co-work routing note:
+# .agents/notes/implemented/process/2026-08-27-model-co-work-routing.md
+.pi-home/
+
 # M-VAVE FM-1 firmware update image (large, not source)
 research/gear/*.fwsc
