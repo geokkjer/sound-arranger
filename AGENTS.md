@@ -10,3 +10,4 @@ sound-arranger (working title) — an audio platform built on a minimal core (cl
 - **`.agents/notes/archived/` is frozen.** Never edit it; the pre-commit hook enforces this.
 - **`RESEARCH.md` holds working research; notes own decisions.** When a decision locks, graduate it into a note, and link from research to the note instead of restating it.
 - **The pre-commit hook runs `node scripts/verify-agent-notes.mjs`.** Node comes from the devenv shell; on a machine without node the hook warns and skips rather than blocking the commit.
+- **External-model work is attributed** ([note](.agents/notes/implemented/process/2026-08-27-agent-attribution-convention.md)): a note/doc a model authored carries an `Authored with <model> · <harness>, <date>` footer; commits carry an `Assisted-by:` trailer. External reviews go verbatim under `research/architecture/` with a disposition header instead.

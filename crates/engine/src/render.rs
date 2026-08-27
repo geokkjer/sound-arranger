@@ -10,7 +10,12 @@
 //!   (sample-accurate lifecycle; a refused mutation is never logged);
 //! - rendering is a pure function of the log: `same log ⇒ byte-identical bounce`
 //!   (determinism is tested, including mid-session changes and patches);
-//! - the render loop never allocates (enforced by a counting-allocator test).
+//! - the render loop never allocates (enforced by a counting-allocator test);
+//! - **nothing logged is ever silently dropped** — an arrangement op that
+//!   reaches the render stack is parked for the control side (`flush_scheduled`
+//!   drains it), never discarded; the live run and a replay of the same log
+//!   therefore cannot diverge on skipped work (see the control→render handoff
+//!   decision note, 2026-08-27).
 
 use std::collections::HashMap;
 
@@ -79,6 +84,10 @@ pub struct Engine {
     scheduled: std::collections::HashSet<&'static str>,
     /// registered plugin-message handlers, keyed by op (closed-core dispatch).
     op_handlers: HashMap<&'static str, OpHandler>,
+    /// Arrangement ops that reached the render stack (a host that rendered
+    /// without flushing) — parked for the control side; `flush_scheduled`
+    /// applies them FIFO before the due queue. Nothing logged is dropped.
+    parked: Vec<SchedEvent>,
 }
 
 impl Engine {
@@ -104,6 +113,7 @@ impl Engine {
             disposers: HashMap::new(),
             scheduled: std::collections::HashSet::new(),
             op_handlers: HashMap::new(),
+            parked: Vec::new(),
         }
     }
 
@@ -649,10 +659,16 @@ impl Engine {
     }
 
     /// Apply every scheduled event due at the current frame **without
-    /// rendering audio** — the control→render handoff's seed (the reference
-    /// host materializes scheduled mounts before wiring cords; kimi review
-    /// finding 5: no discarded block).
+    /// rendering audio** — the control→render handoff's current mechanism.
+    /// Parked arrangement ops (they reached the render stack because a host
+    /// rendered without flushing) apply FIRST, in scheduler order, then the due
+    /// queue. Both phases run here, on the control side, never on the render
+    /// stack (the reference host materializes scheduled mounts before wiring
+    /// cords; kimi review finding 5: no discarded block).
     pub fn flush_scheduled(&mut self) {
+        for event in std::mem::take(&mut self.parked) {
+            self.apply_event(event);
+        }
         while let Some(frame) = self.scheduler.peek_frame() {
             if frame > self.clock.frame() {
                 break;
@@ -688,10 +704,19 @@ impl Engine {
                             // Arrangement ops apply on the CONTROL side
                             // (flush_scheduled), never on the render stack: a
                             // media handler reconciles readers (threads, file
-                            // I/O), which must not run on the audio thread. A
-                            // host that reaches one here failed to flush before
-                            // rendering — fail loud in debug (the op stays
-                            // logged; replay reproduces the same skip).
+                            // I/O), which must not run on the audio thread.
+                            // A host that reaches one here failed to flush
+                            // before rendering — PARK the op (never drop it):
+                            // it stays pending for the next flush_scheduled,
+                            // so nothing logged is ever lost and live/replay
+                            // cannot diverge (previously this path dropped
+                            // the op in release while replay would still
+                            // apply it). The debug assert keeps the contract
+                            // violation loud in development.
+                            let SchedEvent::Arrangement { .. } = &event else {
+                                unreachable!("matched above");
+                            };
+                            self.parked.push(event);
                             debug_assert!(false, "an arrangement op reached the render stack; flush_scheduled before rendering");
                             continue;
                         }
