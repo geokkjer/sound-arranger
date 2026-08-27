@@ -27,13 +27,13 @@ fn render_tolerating_violation(e: &mut Engine) -> Vec<f32> {
     let result = catch_unwind(AssertUnwindSafe(|| e.render(512)));
     match result {
         Ok(out) => out,
-        Err(_) => {
-            assert!(
-                cfg!(debug_assertions),
-                "the parking tripwire must never panic in a release build"
-            );
+        #[cfg(debug_assertions)]
+        Err(_payload) => {
+            drop(_payload); // the expected tripwire unwind — tolerate it
             Vec::new()
         }
+        #[cfg(not(debug_assertions))]
+        Err(_) => panic!("the parking tripwire must never panic in a release build"),
     }
 }
 
