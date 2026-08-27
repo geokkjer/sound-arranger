@@ -825,6 +825,9 @@ pub fn summarize(session: &HostSession) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only used by the debug-gated poisoning test; gate the import so release
+    // clippy (-D warnings) doesn't flag them as unused.
+    #[cfg(debug_assertions)]
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     /// No `Arrange` command has run, so there is no editor: `arrangement()` is
