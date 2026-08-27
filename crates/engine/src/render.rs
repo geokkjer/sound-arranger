@@ -10,7 +10,9 @@
 //!   (sample-accurate lifecycle; a refused mutation is never logged);
 //! - rendering is a pure function of the log: `same log ⇒ byte-identical bounce`
 //!   (determinism is tested, including mid-session changes and patches);
-//! - the render loop never allocates (enforced by a counting-allocator test);
+//! - the render loop never allocates on contract-abiding paths (enforced by a
+//!   counting-allocator test); the only allocation is the misuse-only `parked`
+//!   push when an arrangement op reaches the render stack;
 //! - **nothing logged is ever silently dropped** — an arrangement op that
 //!   reaches the render stack is parked for the control side (`flush_scheduled`
 //!   drains it), never discarded; the live run and a replay of the same log
@@ -713,9 +715,6 @@ impl Engine {
                             // the op in release while replay would still
                             // apply it). The debug assert keeps the contract
                             // violation loud in development.
-                            let SchedEvent::Arrangement { .. } = &event else {
-                                unreachable!("matched above");
-                            };
                             self.parked.push(event);
                             debug_assert!(false, "an arrangement op reached the render stack; flush_scheduled before rendering");
                             continue;
