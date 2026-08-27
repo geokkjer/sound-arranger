@@ -1,5 +1,8 @@
 # Learn Rust with sound-arranger
 
+> 🕒 Last verified against commit `a04288d` (2026-08-27). If the code has moved on,
+> trust the code and move this line forward.
+
 A mini course that teaches Rust by reading and modifying *this* codebase. You
 said you want to understand the AI-written Rust here — so instead of toy
 examples, every lesson takes a real file, explains it line by line at the level
@@ -8,6 +11,8 @@ or something shaped like it.
 
 Pair it with [the architecture explainer](../architecture-explainer.md), which
 covers the *audio engineering* why; this course covers the *Rust language* how.
+If you haven't operated anything yet, do [the first-session tour](../FIRST_SESSION.md)
+first — fifteen minutes, no prerequisites.
 
 ## What you need
 
@@ -22,7 +27,8 @@ Verify your setup works:
 
 ```sh
 cargo test -p engine        # runs the core tests, ~a second
-cargo run -p host -- --help # the headless binary builds
+printf 'host v1\nbounce 4800 /tmp/faucet.wav\n' | cargo run -p host
+                            # the headless binary bounces a silent WAV from stdin
 ```
 
 ## How to work through it

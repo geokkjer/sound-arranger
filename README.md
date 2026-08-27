@@ -72,14 +72,22 @@ printf 'host v1\nmount mixer channels=2 @0\npool /data/takes\narrange add_track 
 
 ## Documentation map
 
+**New here?** Read in this order: first operate something
+([docs/FIRST_SESSION.md](docs/FIRST_SESSION.md) — fifteen minutes, no
+prerequisites), then learn the language through the codebase
+([docs/rust-course/](docs/rust-course/README.md)), then learn why it is shaped
+that way ([docs/architecture-explainer.md](docs/architecture-explainer.md)).
+Only then do the research and decision records make sense.
+
 - [RESEARCH.md](RESEARCH.md) — working research & architecture (verified crate versions,
   licensing matrix, latency notes, plugin-architecture research, DAW prior art)
 - [.agents/notes/](.agents/notes/README.md) — decision records (Agent Notes); standing
   orders in [AGENTS.md](AGENTS.md)
-- [docs/architecture-explainer.md](docs/architecture-explainer.md) — a plain-English tour of
-  the code, top-down
 - [docs/audio-latency.md](docs/audio-latency.md) — Linux kernel/userspace latency tuning
 - [research/](research/) — dated research inputs (gear notes, external reviews)
+
+Docs that explain the code carry a `Last verified against commit …` banner; if
+the code has moved on, trust the code and move the line forward.
 
 The surrounding ecosystem (composition-theory corpus, jam rig, sibling projects) is indexed
 by the [`~/Projects/music`](../music/README.md) symlink view.

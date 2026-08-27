@@ -1,10 +1,15 @@
 # sound-arranger: from architecture up
 
+> 🕒 Last verified against commit `a04288d` (2026-08-27). If the code has moved on,
+> trust the code and move this line forward.
+
 > A plain-English (mostly) tour of the Rust code, for a developer with roughly six
 > months of Rust under their belt. It assumes you are comfortable with ownership,
 > `Result`, `Option`, and trait objects, but it doesn't assume you know audio
 > programming — so it stops to explain *why* certain decisions look the way they do,
-> and it points out the Rust idioms as they pass by.
+> and it points out the Rust idioms as they pass by. If you're newer than that,
+> take [the course](rust-course/README.md) first, and operate something before
+> either: [FIRST_SESSION.md](FIRST_SESSION.md).
 
 **What this is.** A companion to the terse module docs and the decision notes in
 `.agents/notes/`. It walks top-down: the shape of the whole system, then the core
@@ -42,18 +47,18 @@ Everything the product *does* is a plugin mounted onto those four. A profile —
 like the clip-arranger — is just a named assembly of plugins plus a thin shell
 (the host).
 
-### 1.2 Three crates, three layers
+### 1.2 Four crates, four layers
 
-The workspace (`Cargo.toml`) has three members, and the layering is strict:
+The workspace (`Cargo.toml`) has four members, and the layering is strict:
 
 ```
-crates/engine    crates/media     crates/host
- (the core)     (streaming/I-O)   (the headless shell)
-     ^                ^                 ^
-     |                | depends on      | depends on
-     | depends on     | engine          | engine + media
-     +--- std only ----+                |
-                        std + cpal      |
+crates/engine    crates/media     crates/host      crates/shell
+ (the core)     (streaming/I-O)   (headless shell)   (Tauri+Vue)
+     ^                ^                 ^                 ^
+     |                | depends on      | depends on      | will depend on
+     | depends on     | engine          | engine + media  | host (same
+     +--- std only ----+                |                 |  contract)
+                        std + cpal       |
 ```
 
 - **`engine`** — the minimal core. **Std-only.** No `cpal`, no Tauri, no I/O of
@@ -67,10 +72,13 @@ crates/engine    crates/media     crates/host
   assemble the profile, render, and bounce — with **no frontend at all**. A future
   Tauri shell implements the *same* contract; swapping shells swaps one transport
   adapter.
+- **`shell`** — the Tauri v2 + Vue scaffold for that future graphical shell, as of
+  this writing a frame (design tokens in place, IPC wiring not started). It exists
+  so the frontend work has a home, not because anything depends on it yet.
 
 The dependency direction is the whole point: `engine` and `media` must never
 depend on `tauri`. The UI is a plugin, not the substrate (the
-[UI-as-plugin note](.agents/notes/proposed/architecture/2026-08-18-ui-as-plugin-host-api-and-headless-reference.md)
+[UI-as-plugin note](.agents/notes/implemented/architecture/2026-08-18-ui-as-plugin-host-api-and-headless-reference.md)
 owns that decision).
 
 ### 1.3 Two governing invariants
@@ -467,6 +475,17 @@ the next sub-chunk, and so on. The effect is *sample-accurate* lifecycle: a
 `SetParam` at frame 17,000 takes effect between frames 17,000 and 17,001, not at
 the 512-frame boundary. The `debug_assert_eq!(written, out.len())` at the end
 verifies the splitting arithmetic always covers the whole block.
+
+One event kind deliberately does **not** apply here: arrangement ops run
+control-side handlers (threads, file I/O), which must never execute on the
+render path. If a host renders without flushing them off the queue first, the
+render loop **parks** the op instead of dropping it — the next
+`flush_scheduled()` applies parked ops FIFO before the due queue — so nothing
+logged can ever be silently lost and live/replay cannot diverge (a bug of
+exactly that shape existed until the control→render handoff note fixed it;
+[`implemented/architecture/2026-08-27-control-render-handoff-parked-ops.md`](.agents/notes/implemented/architecture/2026-08-27-control-render-handoff-parked-ops.md)
+owns the contract). The practical rule while the host is single-owner: *call
+`flush_scheduled()` before rendering*.
 
 > **Rustism — `debug_assert!` for "cheap in dev, gone in release":**
 > The codebase is littered with `debug_assert!` — invariants that are checked in
@@ -1048,9 +1067,9 @@ considered, and the code is candid about its edges.
 
 - Slower to a visible product: you get a CLI before you get a window. For a
   hobby project that might *feel* like a detour, even if it's the right one.
-- The Host API is still **proposed** (the note is under `proposed/`), and the
-  media commands (`Play`/`Splice`/`Bounce`) are not yet folded into the core log
-  — so there are two command vocabularies until P1.3.
+- The media commands (`Play`/`Splice`/`Bounce`) are not yet folded into the core
+  log — there are two command vocabularies until they merge (the arrangement ops
+  already go through the logged dispatch envelope, §4.1).
 
 ### Decision: hand-rolled std-only WAV and SPSC ring
 
@@ -1091,10 +1110,11 @@ Beyond the per-decision cons above, a few systemic risks worth naming:
    determinism rests on a parallel command seam and matched discipline, not one
    log. A subtle divergence there would be *very* hard to debug.
 5. **Stated-present-tense discipline.** This codebase lives by the rule that
-   shipped notes describe *reality*, and the docs here are written against the
-   code as it stands. The README still says "Status: pre-code" even though spikes
-   have shipped — the docs and the code are, by the project's own standard,
-   slightly out of step, and that's a real (if mundane) drift to watch.
+   shipped notes describe *reality*, and docs written against an older commit go
+   quietly wrong — this document itself drifted within days (it said "three
+   crates" the week the fourth landed). The standing mitigation is the
+   `Last verified against commit …` banner at the top of each explainer doc plus
+   the notes-tree verifier; if you find drift, trust the code and move the line.
 
 ---
 
@@ -1117,7 +1137,7 @@ If you want to go deeper, in a sensible order:
 5. **The decision notes** — start with
    [`minimal-core`](.agents/notes/proposed/architecture/2026-08-15-minimal-core-clock-graph-session-log.md)
    and
-   [`ui-as-plugin`](.agents/notes/proposed/architecture/2026-08-18-ui-as-plugin-host-api-and-headless-reference.md),
+   [`ui-as-plugin`](.agents/notes/implemented/architecture/2026-08-18-ui-as-plugin-host-api-and-headless-reference.md),
    then the `implemented/` notes for what actually shipped and why.
 
 And if you internalize only two things, make them these:
@@ -1127,3 +1147,8 @@ And if you internalize only two things, make them these:
 2. **The render path never allocates or blocks, and rendering is a pure function
    of the log** — those two rules explain every `unsafe`, every `EventBuf`, every
    `debug_assert`, and every `Arc<AtomicU64>` in the codebase.
+
+---
+
+*Authored by an earlier GLM-5.3 Flash · ZCode session; drift-corrected against
+commit `a04288d` with GLM-5.3 Flash · ZCode, 2026-08-27.*
