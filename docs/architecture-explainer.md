@@ -1,6 +1,6 @@
 # sound-arranger: from architecture up
 
-> 🕒 Last verified against commit `a04288d` (2026-08-27). If the code has moved on,
+> 🕒 Last verified against commit `ad1959c` (2026-08-27). If the code has moved on,
 > trust the code and move this line forward.
 
 > A plain-English (mostly) tour of the Rust code, for a developer with roughly six

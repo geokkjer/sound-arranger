@@ -24,6 +24,7 @@ Three changes, same commit:
 ## Consequences
 
 - A newcomer has one unambiguous entry point; docs audibly state their own age.
+- The map now also links the **product-side** explainer ([`docs/clip-arranger.md`](../../docs/clip-arranger.md)) and the UI design docs ([`docs/design/`](../../docs/design/)), both added 2026-08-27. The clip-arranger substrate was the explanation gap the v1 tour deferred (the `pool`/`arrange` recorded-clip route was pushed off in Alternatives) — it is now an explainer, not a tour.
 - The banner rule adds one maintenance duty per doc-touch — accepted, small.
 - The tour depends on script syntax and output wording (`host: bounced …`, exit codes); if those change, FIRST_SESSION is the canary, which is fine — it exists to be rerun.
 - Side finding worth keeping: parameter lengths are frame-valued (`note_len`, `blip_len` are `u32` sample frames); the tour documents this because even its author bounced silence on the first attempt.

@@ -79,6 +79,11 @@ prerequisites), then learn the language through the codebase
 that way ([docs/architecture-explainer.md](docs/architecture-explainer.md)).
 Only then do the research and decision records make sense.
 
+- [docs/clip-arranger.md](docs/clip-arranger.md) — the *product* side: the arrangement value,
+  the ACID editing ops, the render node, the media pool, and the host wiring that makes edits
+  reach audio.
+- [docs/design/](docs/design/) — the Tauri/Vue UI design: `ui-plan.md` (interaction spec),
+  `design-system.md` (token contract), `mocks/` (live mockups).
 - [RESEARCH.md](RESEARCH.md) — working research & architecture (verified crate versions,
   licensing matrix, latency notes, plugin-architecture research, DAW prior art)
 - [.agents/notes/](.agents/notes/README.md) — decision records (Agent Notes); standing
