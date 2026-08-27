@@ -253,7 +253,7 @@ fn arrange_commands_build_the_logged_value_and_replay_identically() {
 
     // live: the Arrange commands build the arrangement value.
     let sess = run_script(&script).unwrap();
-    let value = sess.arrangement();
+    let value = sess.arrangement().expect("the live arrangement must snapshot");
     assert_eq!(value.tracks.len(), 2, "two tracks built by the arrange commands");
     assert_eq!(value.tracks[0].clips.len(), 1, "t0 has one clip");
     assert_eq!(value.tracks[0].clips[0].src_len, 4000);
@@ -262,7 +262,11 @@ fn arrange_commands_build_the_logged_value_and_replay_identically() {
 
     // replay: a fresh host, same script, identical value (byte-identical log reconstructs it).
     let sess2 = run_script(&script).unwrap();
-    assert_eq!(value, sess2.arrangement(), "replay must reconstruct the identical value");
+    assert_eq!(
+        value,
+        sess2.arrangement().expect("the replayed arrangement must snapshot"),
+        "replay must reconstruct the identical value"
+    );
 
     let _ = std::fs::remove_dir_all(&pool);
 }
@@ -348,7 +352,10 @@ fn text_format_pool_and_arrange_run_byte_identically() {
     let mut audio = vec![0.0f32; r.total_frames() as usize];
     let n = r.read_into(&mut audio);
     assert!(audio[..n].iter().any(|s| s.abs() > 1e-4), "must produce audio");
-    assert_eq!(sess.arrangement().tracks.len(), 2);
+    assert_eq!(
+        sess.arrangement().expect("the text-format arrangement must snapshot").tracks.len(),
+        2
+    );
 
     // replay byte-identically
     let script_b = host::parse_script(&script(&b)).unwrap();
@@ -418,7 +425,7 @@ fn arrangement_bounces_audio_and_replays_byte_identically() {
     let mut audio = vec![0.0f32; r.total_frames() as usize];
     let n = r.read_into(&mut audio);
     assert!(audio[..n].iter().any(|s| s.abs() > 1e-4), "the arrangement must produce audio");
-    assert_eq!(sess.arrangement().tracks.len(), 2);
+    assert_eq!(sess.arrangement().expect("the arrangement must snapshot").tracks.len(), 2);
 
     // replay: a fresh host, same script → byte-identical bounce.
     let _ = run_script(&script(&b)).unwrap();

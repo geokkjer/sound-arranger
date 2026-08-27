@@ -98,8 +98,9 @@ pub enum HostCommand {
         clip: ClipRef,
         crossfade: u32,
     },
-    /// Record the master into the pool (declared for the device path; the
-    /// reference host without a device refuses with a clear error).
+    /// Capture device input into a take (declared for the device path; the
+    /// device input path is not wired into the reference host — its refusal
+    /// names the gap).
     Record {
         take_id: String,
     },
@@ -309,7 +310,7 @@ impl HostSession {
                 Ok(())
             }
             HostCommand::Record { .. } => {
-                Err("recording the input requires a device — the reference host bounces the master instead (see Bounce)".into())
+                Err("recording requires a device — the device input path exists in media::devices (open_input) but is not wired into the host; the reference host renders offline via Bounce".into())
             }
             HostCommand::Arrange { op, .. } => {
                 self.ensure_editor()?;
@@ -467,14 +468,17 @@ impl HostSession {
         self.media_commands
     }
 
-    /// The clip editor's arrangement value (read-only snapshot). Empty when no
-    /// arrangement has been built. The value is a pure reconstruction of the
-    /// logged `Arrange` commands (byte-identically replayable).
-    pub fn arrangement(&self) -> media::Timeline {
-        self.editor
-            .as_ref()
-            .and_then(|e| e.snapshot().ok()) // poison → empty (fail-safe read)
-            .unwrap_or_default()
+    /// The clip editor's arrangement value (read-only snapshot). `Ok(default)`
+    /// when no arrangement has been built (the legitimate empty case); a
+    /// snapshot error (a poisoned timeline) is **propagated** — a shell must
+    /// see "could not build the arrangement", never a silent empty value. The
+    /// value is a pure reconstruction of the logged `Arrange` commands
+    /// (byte-identically replayable).
+    pub fn arrangement(&self) -> Result<media::Timeline, String> {
+        match &self.editor {
+            None => Ok(media::Timeline::default()),
+            Some(e) => e.snapshot(),
+        }
     }
 
     pub fn underruns(&self) -> u64 {
@@ -816,4 +820,90 @@ pub fn summarize(session: &HostSession) -> String {
         session.deferred(),
         session.engine_ref().graph.out_node,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    /// No `Arrange` command has run, so there is no editor: `arrangement()` is
+    /// `Ok(default)` — the legitimate "nothing built yet" case, never an error.
+    #[test]
+    fn arrangement_without_an_editor_is_ok_default() {
+        let session = HostSession::new();
+        assert_eq!(
+            session.arrangement().expect("no editor must be Ok, never Err"),
+            media::Timeline::default(),
+            "no editor → the default (empty) timeline"
+        );
+    }
+
+    /// An editor whose `snapshot()` errors must surface as `Err` — never a
+    /// silent empty `Timeline` (the fail-loud rule this accessor exists for).
+    ///
+    /// The error is induced the way it realistically occurs: a panic while the
+    /// editor holds its timeline lock. `SetClipFade` with `fade_in + fade_out`
+    /// overflowing `u64` trips the debug overflow check inside the op apply,
+    /// *under the lock* — the poisoned mutex is exactly what `snapshot()` maps
+    /// to `Err`. The panic is contained with `catch_unwind` so the session (and
+    /// its now-poisoned editor) survives to be read. Gated on
+    /// `debug_assertions` because the mechanism is an overflow check (release
+    /// builds have no reachable poison path through the public API).
+    #[test]
+    #[cfg(debug_assertions)]
+    fn arrangement_propagates_an_errored_snapshot_instead_of_an_empty_value() {
+        let mut session = HostSession::new();
+        session.ensure_editor().expect("the editor registers its op handlers");
+        let editor = session.editor.as_mut().expect("ensure_editor built the editor");
+
+        // A valid track + clip so the overflowing SetClipFade reaches the
+        // overflow add (an absent clip would refuse before it).
+        let mut engine = Engine::new(48_000, 120.0, 4);
+        editor.register(&mut engine).expect("register op handlers");
+        editor
+            .apply(&mut engine, &media::ArrangeOp::AddTrack { track: "t0".into() })
+            .expect("add track");
+        editor
+            .apply(
+                &mut engine,
+                &media::ArrangeOp::AddClip {
+                    track: "t0".into(),
+                    clip: media::Clip {
+                        id: "c0".into(),
+                        source: "s1".into(),
+                        src_start: 0,
+                        src_len: 4000,
+                        at_frame: 0,
+                        fade_in: 0,
+                        fade_out: 0,
+                        gain: 1.0,
+                        loop_len: None,
+                    },
+                },
+            )
+            .expect("add clip");
+
+        // Poison: the overflow panics while the editor holds the timeline lock.
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            let _ = editor.apply(
+                &mut engine,
+                &media::ArrangeOp::SetClipFade {
+                    track: "t0".into(),
+                    clip: "c0".into(),
+                    fade_in: u64::MAX,
+                    fade_out: 1,
+                },
+            );
+        }))
+        .is_err();
+        assert!(poisoned, "the overflowing SetClipFade must panic (overflow check) to poison the lock");
+
+        // The session survived the contained panic; its snapshot now errors and
+        // arrangement() must propagate that Err — never Ok(empty).
+        let err = session
+            .arrangement()
+            .expect_err("a poisoned editor must Err, not return an empty Timeline");
+        assert!(err.contains("poison"), "the error is the snapshot poison, got: {err}");
+    }
 }
