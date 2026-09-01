@@ -77,7 +77,9 @@ printf 'host v1\nmount mixer channels=2 @0\npool /data/takes\narrange add_track 
 prerequisites), then learn the language through the codebase
 ([docs/rust-course/](docs/rust-course/README.md)), then learn why it is shaped
 that way ([docs/architecture-explainer.md](docs/architecture-explainer.md)).
-Only then do the research and decision records make sense.
+Only then do the research and decision records make sense. To build on the
+engine — e.g. design your own soft-synth voices on fundsp — read
+[docs/soft-synth-fundsp.md](docs/soft-synth-fundsp.md) as a follow-on.
 
 - [docs/clip-arranger.md](docs/clip-arranger.md) — the *product* side: the arrangement value,
   the ACID editing ops, the render node, the media pool, and the host wiring that makes edits
@@ -89,6 +91,8 @@ Only then do the research and decision records make sense.
 - [.agents/notes/](.agents/notes/README.md) — decision records (Agent Notes); standing
   orders in [AGENTS.md](AGENTS.md)
 - [docs/audio-latency.md](docs/audio-latency.md) — Linux kernel/userspace latency tuning
+- [docs/soft-synth-fundsp.md](docs/soft-synth-fundsp.md) — building native soft-synth
+  voices on fundsp: the opaque-tier design, the feature flag, and the release-mode gotcha.
 - [research/](research/) — dated research inputs (gear notes, external reviews)
 
 Docs that explain the code carry a `Last verified against commit …` banner; if

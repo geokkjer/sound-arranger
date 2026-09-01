@@ -4,3 +4,21 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "sound-arranger minimal core — clock, graph interpreter, session log, context plumbing (Phase 0 Spike A)"
+
+[features]
+# fundsp is an OPTIONAL building-block DSP source for our own soft-synth voices
+# (see the native-soft-synth note). The minimal core stays lean without it: the
+# fundsp-backed `plugins::fundsp_synth` and its tests are gated on this feature
+# and only compiled when it is enabled. Enable with: cargo test -p engine --features fundsp
+fundsp = ["dep:fundsp"]
+
+[dependencies]
+# fundsp is the per-sample DSP *block* source for our own soft-synth voices
+# (native-soft-synth note). We use only two primitives today — `sine()`
+# (frequency-input oscillator) and `lowpass_hz` (state-variable filter). We do
+# NOT adopt fundsp's graph as our patch model (our patch is a loggable value).
+# `default-features = false` + `features = ["std"]` keeps out `symphonia`
+# (files) and `fft-convolver` (fft) which we do not use; a version bump must
+# not silently re-enable them. Optional + feature-gated so the minimal core
+# stays dep-lean by default (`cargo test -p engine`).
+fundsp = { version = "0.23", optional = true, default-features = false, features = ["std"] }

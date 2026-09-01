@@ -8,6 +8,8 @@ pub mod euclidean;
 pub mod mixer;
 pub mod scale;
 pub mod tone;
+#[cfg(feature = "fundsp")]
+pub mod fundsp_synth;
 
 use std::ops::Range;
 
