@@ -558,10 +558,22 @@ impl Engine {
         match event {
             SchedEvent::Unmount { plugin } => self.apply_unmount(plugin),
             SchedEvent::Mount { plugin, params } => {
-                debug_assert!(
-                    self.apply_mount(plugin, &params).is_ok(),
-                    "scheduled mount must apply (log was validated)"
-                );
+                // `apply_mount` must run in BOTH builds. The previous
+                // `debug_assert!(self.apply_mount(...).is_ok(), ...)` form is a
+                // *no-op in release* (debug_assert! never evaluates its
+                // argument), so no scheduled mount was ever applied there and
+                // the engine rendered silence on every mounted path — a
+                // release-only bug. Now always applied. Like the sibling arms,
+                // an `apply` failure is a log-order error (the mount was
+                // validated against a registered plugin at schedule time) that
+                // is debug-asserted and skipped in release, where replay
+                // reproduces the same state. `apply` is the one step
+                // `validate_mount` can't dry-run (it calls `inject()`, not
+                // `apply`), so "a scheduled mount must apply" is enforced by
+                // tests, not the type system.
+                if let Err(e) = self.apply_mount(plugin, &params) {
+                    debug_assert!(false, "scheduled mount must apply (log was validated): {e}");
+                }
             }
             SchedEvent::Patch {
                 from_plugin,
