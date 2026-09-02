@@ -139,7 +139,58 @@ Autechre are almost a **reference implementation of the sound-arranger thesis**,
 6. **The input/jam layer and the interop thread.** Their DIY/hardware-hacking ethos, "engineering being beautiful," and "use the studio as an instrument" align with the open/interoperable direction of the [input/jam-layer note](.agents/notes/proposed/architecture/2026-09-01-input-jam-layer-device-registry-io.md) — instruments-as-authorable, connected, non-black-box systems (the counterweight to a closed Synclavier-style silo).
 7. **Taste as the only authorship.** A strong reminder that no matter how generative the system, the *product* is a curated/edited selection. The arranger's value is in making that curation fast, reversible, and legible — the whole point.
 
-## 9. Sources
+## 9. How this maps to our platform (and the next generative layer: LLMs)
+
+The working-out of §8, in response to the question "does this map to an eurorack setup and to our modular plugin software, and where do LLMs fit?" The answer: **the software mirror** of Autechre's thinking is close to exact, and it fixes the one thing their hardware/DAW era could only do clumsily.
+
+### 9.1 The four-part decomposition
+
+| Autechre | Physical realization | Our architecture |
+|---|---|---|
+| "Rewire the studio per track; connectivity is the point" | Patch cables / patchbay / Shure Auxpander | **patch-bay as a loggable, diffable value** (nodes/edges/params) |
+| "Write the instrument" (the Max patch / algorithm) | Hardware patching + custom builder | **generator plugins** (rhythm/pitch/improv) as values in the session log |
+| "Play the system" (faders + ears) | Knobs / faders / CV | **control-surface / input-jam-layer** abstraction steering the graph in real time |
+| "Isolate the good sections; 3–4 generations down the line" | Manual tape/DAW edit | **the arranger** (record long, cut/paste/rearrange) |
+
+So the **software is the software-mirror of the studio-as-instrument**, but with the *record and the recall* added. Autechre's Max patch is already data (they version it — "define everything before you can even start"), but their audio pipeline is a DAW. Here the patch *and* the output are one serializable, replayable, undoable value.
+
+### 9.2 The Eurorack mapping — division of labour
+
+Eurorack *is* the technique Booth describes for *Confield*: CV/clock driving a sequencer's step-position, one sequencer cross-driving another, S&H, clock dividers, chaotic-but-bounded function generators. It's a physical realization of exactly the generative practice.
+
+Its strengths: tactile, immediate, sound, CV at audio rate, bounded-unpredictability that's musical. Its limits — the ones the software fixes:
+- **No recall / replay / undo.** A patch is ephemeral; you can't "pull apart how it works" or store-and-replay it, and you can't reuse material "generations down the line."
+- **Manual rewiring per track.** Great for feel; terrible for versioning and reuse.
+- **No arranger.** You can't cut/paste/rearrange a physical patch's output as values.
+
+Clean division: **Eurorack gives the feel and the sound; the software gives the record and the arrangement.** A patch-bay-as-value is what lets the software mirror the wiring without re-patching a wall of cables.
+
+### 9.3 The generative phase: live-playing vs algorithms is a false dichotomy
+
+Autechre merge them — a generative system (algorithms) that they **steer live** (faders + ears): *"how we play the system dictates how the system responds."* Nothing is fully autonomous, nothing is purely played.
+
+So the design principle: **one patch, two modes over the same graph.**
+- **Algorithm mode** — the system evolves under its own rules (recursive, chaotic-but-deterministic); you record long runs.
+- **Live mode** — you steer the system in real time (control surface → params / CV); it runs and you navigate it.
+
+Because both are just events/values in the session log, both capture identically and the arranger works on the result either way. That's the real differentiator over a physical rig: the *same graph* serves generative autonomy, live performance, and post-hoc editing — no re-patching, no loss of the record.
+
+### 9.4 The next generative layer: LLMs
+
+Autechre's algorithms generate *material*; an **LLM can generate the instrument and the curation.** Two distinct roles worth keeping separate:
+
+1. **Instrument / process author.** The LLM writes or refactors *the generative patch / graph / generator config* from an intent — a code/config generator producing an artifact you then run.
+2. **Curator / sectioner.** The LLM reads the **session log** (what was generated) and proposes selections, edits, structural suggestions, naming — the "which of these three hours is the good bit?" role, the closest analogue to "isolate the good sections."
+
+**The crucial rule:** an LLM in this pipeline must emit a **deterministic, diffable artifact** — a patch, a generator config, a sequence, an edit-list — **not a non-reproducible note/audio stream.** Reason: it preserves the two values Autechre keep insisting on. They reject randomness because pure RNG is unrepeatable and uncuratable ("irritating") — you can't learn from it, steer it, or apply taste to it. An LLM *sampling* the whole track collapses into that same problem. But an LLM emitting a fixed patch/config preserves "define everything before you can even start," byte-identical replay, versioning, and — most importantly — **keeps the human as the taste authority.** Booth's line ("you can't treat software like it's got a personality or taste") is the guardrail: the LLM contributes structure and intent; you contribute taste. Exactly how Autechre hold authorship over their own algorithms.
+
+### 9.5 Grounding
+
+Same discipline as the [input/jam-layer note](.agents/notes/proposed/architecture/2026-09-01-input-jam-layer-device-registry-io.md) and the Daisy Seed avenue: **if/when, as a plugin — not on the critical path.** Concretely, an **LLM co-composer is a plugin that reads the session log** (context plumbing) and proposes operations; the patch-bay + generators + arranger + control-surface must exist first. The taste/selection layer stays human — the whole Autechre lesson and the whole point of the arranger.
+
+**Layered vision:** physical gear/Eurorack (feel + sound) → the modular plugin software (record + patch-as-value + arranger) → an LLM co-composer (design the instrument + help curate), emitting deterministic artifacts and deferring taste to the human.
+
+## 10. Sources
 
 - **Wikipedia: Autechre** — history, style, discography, Anti EP / "Flutter", Confield-as-Max-experiments, equipment, AE_LIVE, live. <https://en.wikipedia.org/wiki/Autechre>
 - **Sound On Sound, April 2004 ("Recording Electronica", Paul Tingen)** — the studio-as-instrument, no centrepiece, connectivity, Max/MSP mirrors hardware patching, the generative method (MIDI faders, home-made sequencers, analog sequencer stacking, "not random"), note-by-note vs generative, the gear list, DIY, collaboration. <https://web.archive.org/web/20150924120348/http://www.soundonsound.com/sos/apr04/articles/autechre.htm>
