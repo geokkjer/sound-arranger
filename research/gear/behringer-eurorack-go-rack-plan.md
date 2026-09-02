@@ -14,6 +14,8 @@
 
 Behringer **Eurorack GO** — **2 × 140 HP = 280 HP**, **3 A power supply**, **32 power connectors**. Ample room and power for a layered system. Confirm per-module power draw (per rail) on [ModularGrid](https://www.modulargrid.net) before loading; keep headroom on the 3A PSU.
 
+**Depth is the binding constraint, not HP.** The GO is a shallow, portable case: **top row ≤ 62 mm, lower row ≤ 40 mm** (the bottom deck is shallower). Rule of thumb: **deep modules up top, shallow ones down bottom** — sort every addition by depth before placing. Keep the top-row budget for the deep (complex-vco / DSP / function) modules and the bottom rows for utilities/VCA/CV. Depth per module is on ModularGrid.
+
 ## Build strategy (staged, no rush)
 
 ### Phase 1 — voices (mountable semi-modulars)
@@ -40,21 +42,26 @@ This is where the Autechre dynamics come from — modulation + randomness + sequ
 - Output mixing so the rack reaches the **Notepad-12FX** cleanly.
 - **CV/sync bridge to the computer** — the "software mirror" hook (the input/jam-layer seam): Expert Sleepers **ES-8 / ES-9** (DC-coupled audio interface) or a MIDI/CV module. The semi-modulars already take MIDI + CV in, so you can sequence from the computer/arranger today.
 
-## Planned first build ("get music going now")
+## Planned first build (as spec'd on ModularGrid — the "good start")
 
-A coherent, patchable, generative core (~60–90 HP), leaving room to grow:
+A complete monophonic voice + headphone + direct USB audio, one row (~60 HP of 280): **Victor (osc) → Surges (filter) → IDA (VCA; envelope from 140/Waves) → CU1A (out/USB)**.
 
-| # | Module | HP | ~price | Why |
-|---|---|---|---|---|
-| 1 | East Beast | rackable | ~$299 | east-coast voice + seq/arp + MIDI/CV |
-| 2 | West Pest | rackable | ~$259 | west-coast voice, contrast |
-| 3 | Behringer 182 (×2) | ~16 HP ea | ~$149 ea | cross-driven generative sequencing |
-| 4 | Behringer Abacus | ~14–18 HP | ~$200 | tuned-random (generative heart) |
-| 5 | Behringer 140 | ~24 HP | ~$100+ | dual env/LFO |
-| 6 | Behringer 150 | ~16 HP | ~$99 | noise / S&H / ring |
-| 7 | mult/attenuverter + mixer | ~8–16 HP | ~$60–150 | patch plumbing |
+| # | Module | Role |
+|---|---|---|
+| 1 | Behringer **Victor** | quad / vector-morphing oscillator (voice) |
+| 2 | Behringer **Surges** | "liquid" multimode filter |
+| 3 | Behringer **140** | dual envelope + LFO (envelope, plus modulation) |
+| 4 | Behringer **Waves** | function / "tidal" generator (extra envelope / modulation) |
+| 5 | Rides in the Storm **IDA** | discrete VCA (amplitude) |
+| 6 | Behringer **CU1A** | 2-in/2-out USB-C audio + headphone out — the **class-compliant USB-audio bridge to the arranger** |
 
-*Prices are approximate and region-vary — check [Thomann Norway](https://www.thomannmusic.no) for your price in NOK incl. VAT. HP is approximate — confirm on ModularGrid.*
+**As racked (Row 1): 60 HP, 255 mA +12 / 122 mA −12 / 0 mA +5, max depth 44 mm** — well within power (3A) and HP (280); the 44 mm module goes in the **top row** (≤62 mm).
+
+- **First sounding patch:** Victor → Surges → IDA → CU1A, with **140** (or **Waves**) driving the IDA as an envelope. CU1A gives you headphones *and* a direct USB-audio path into sound-arranger.
+- **CU1A note:** class-compliant USB audio (48 kHz, 2-in/2-out, powered over USB — **0 mA from the rack**, ~$79). Record the rack straight into the arranger over USB (like the FM-1). It's **AC-coupled (audio only)** — so it's the *audio* bridge, **not** the CV bridge; the **Expert Sleepers ES-9** (DC-coupled) is the CV/sync bridge for the software mirror (watchlist).
+- The **mountable semi-modulars** (East/West Beast, Mavis, 0-Coast) and the generative expansion (**182** sequencers, **Abacus**, **150**, **121/130**, utilities) remain the Phase 1/2 plan — watchlist below.
+
+*Prices/HP per module are on your ModularGrid; check [Thomann Norway](https://www.thomannmusic.no) for NOK incl. VAT.*
 
 ## Generative techniques to explore (once racked)
 
@@ -73,18 +80,25 @@ A coherent, patchable, generative core (~60–90 HP), leaving room to grow:
 
 ## Rack state — living log (update as you build)
 
-| Status | Module | HP | Power (+12/−12) | Price | Acquired | Notes |
+| Status | Module | HP/Dpth | Power (+12/−12) | Price | Acquired | Notes |
 |---|---|---|---|---|---|---|
 | planned | Behringer Eurorack GO case | 280 | — | — | — | 3A PSU, 32 connectors |
-| planned | Cre8audio East Beast | rackable | — | ~$299 | — | |
-| planned | Cre8audio West Pest | rackable | — | ~$259 | — | |
-| planned | Behringer 182 ×2 | ~16 HP ea | — | ~$149 ea | — | cross-driving |
-| planned | Behringer Abacus | ~14–18 HP | — | ~$200 | — | tuned random |
-| planned | Behringer 140 | ~24 HP | — | ~$100+ | — | dual env/LFO |
-| planned | Behringer 150 | ~16 HP | — | ~$99 | — | noise/S&H/ring |
-| planned | mult/mixer utilities | — | — | — | — | patch plumbing |
-| watchlist | Moog Mavis / 0-Coast (+0-CTRL) | 44 HP | — | ~$349 / ~$599 | — | splurge tier |
-| watchlist | Expert Sleepers ES-8/ES-9 | — | — | — | — | CV bridge (later) |
+| planned (first build) | Behringer **Victor** | — | — | — | — | quad/vector osc (voice) — deep → top row |
+| planned (first build) | Behringer **Surges** | — | — | — | — | liquid multimode filter |
+| planned (first build) | Behringer **140** | — | — | ~$100+ | — | dual env/LFO |
+| planned (first build) | Behringer **Waves** | — | — | — | — | function/tidal generator |
+| planned (first build) | Rides in the Storm **IDA** | — | — | — | — | discrete VCA |
+| planned (first build) | Behringer **CU1A** | 8 | 0 mA | ~$79 | — | headphone + class-compliant USB audio → arranger |
+| watchlist | Cre8audio East Beast | rackable | — | ~$299 | — | voice + seq/arp (semi-modular) |
+| watchlist | Cre8audio West Pest | rackable | — | ~$259 | — | west-coast voice |
+| watchlist | Moog Mavis / Make Noise 0-Coast (+0-CTRL) | 44 | — | ~$349 / ~$599 | — | splurge tier |
+| watchlist | Behringer 182 ×2 | ~16 ea | — | ~$149 ea | — | cross-driven sequencing |
+| watchlist | Behringer Abacus | ~14–18 | — | ~$200 | — | tuned random |
+| watchlist | Behringer 150 | ~16 | — | ~$99 | — | noise/S&H/ring |
+| watchlist | Behringer 121 VCF / 130 VCA / mixer / mult | — | — | — | — | processing + utilities |
+| watchlist | Expert Sleepers **ES-9** | — | — | — | — | **DC-coupled** CV/sync bridge (software mirror) |
+
+*Fill per-module HP/depth/power from your ModularGrid and mark `Acquired` when it ships.*
 
 ---
 
