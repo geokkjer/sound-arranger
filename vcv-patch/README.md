@@ -24,7 +24,8 @@ The monophonic voice maps cleanly between software and the planned hardware:
 ## Naming & saving
 
 - Save as `vcv-patch/<date>-<voice-or-concept>.vcv` (e.g. `2026-09-01-vektor-venom-aestus-monovoice.vcv`). Use a name that says what the patch *is*, not just its chain.
-- **Watch the file size with imported waveforms.** Vektor embeds imported `.wav` into the patch JSON (8 KB per waveform; the module warns it can blow past VCV Rack's ~100 KB JSON recommendation). Prefer the built-in ROM waveforms and keep the patch JSON lean.
+- **The `.vcv` is small and versionable.** VCV Rack 2 saves patches as a **zstd-compressed tar** (`patch.json` + `modules/`), so a committed `.vcv` is a few KB even with imported waveforms. The ~100 KB warning applies to the *uncompressed* `patch.json` (Vektor embeds each imported `.wav` at ~8 KB) — prefer the built-in ROM waveforms and keep the patch lean.
+- **Inspect a patch without opening Rack:** `scripts/vcv-patch-info.sh [file.vcv]` decompresses the zstd tar and prints the version, module list, and cable graph — handy for correlating a patch with the CPU logger and for seeing what's in it without launching Rack.
 
 ## Measuring how much your machine can run
 
