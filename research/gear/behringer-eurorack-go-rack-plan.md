@@ -16,6 +16,12 @@ Behringer **Eurorack GO** — **2 × 140 HP = 280 HP**, **3 A power supply**, **
 
 **Depth is the binding constraint, not HP.** The GO is a shallow, portable case: **top row ≤ 62 mm, lower row ≤ 40 mm** (the bottom deck is shallower). Rule of thumb: **deep modules up top, shallow ones down bottom** — sort every addition by depth before placing. Keep the top-row budget for the deep (complex-vco / DSP / function) modules and the bottom rows for utilities/VCA/CV. Depth per module is on ModularGrid.
 
+## Software sandbox (VCV Rack)
+
+Before buying, prototype in software. The planned voices are modelled as VCV Rack patches in [`vcv-patch/`](../../vcv-patch/README.md) — the **software mirror** of this rack (and of the "software as instrument" thesis). The reference monophonic voice maps Vektor ↔ Victor (osc), Venom ↔ Surges (filter), Aestus/Tides ↔ Waves (modulator), ADSR ↔ 140 (env), VCA ↔ IDA, Audio ↔ CU1A.
+
+Measure how much your machine can run with [`scripts/log-vcv-usage.sh`](../../scripts/log-vcv-usage.sh) (samples a running Rack's CPU%/RSS to `vcv-patch/.usage/`); Rack is CPU-bound, so that's the metric to watch.
+
 ## Build strategy (staged, no rush)
 
 ### Phase 1 — voices (mountable semi-modulars)

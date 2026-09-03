@@ -22,3 +22,6 @@ src-tauri/target/
 
 # M-VAVE FM-1 firmware update image (large, not source)
 research/gear/*.fwsc
+
+# transient VCV Rack CPU/RAM usage logs (regenerated on demand)
+vcv-patch/.usage/
