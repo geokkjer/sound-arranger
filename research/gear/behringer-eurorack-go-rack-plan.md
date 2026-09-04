@@ -35,7 +35,7 @@ Complete, patchable voices that **mount in the case** (Eurorack power + 1V/oct +
 | Make Noise **0-Coast** | West/east hybrid (linear FM + lowpass gate) | ~$599 | rackable | the "complex"/lo-fi class (the "0-Coast" line); **0-CTRL** (~$299) is its touchpad/pressure sequencer |
 
 ### Phase 2 — the generative / modulation backbone (Behringer modules, cheap)
-This is where the Autechre dynamics come from — modulation + randomness + sequencing, *not* another voice.
+This is where the Autechre dynamics come from — modulation + randomness + sequencing, *not* another voice. **This is the steering direction:** the rack evolves through **semi-random modulation** (S&H, tuned random, cross-driving), *not* by driving it from external MIDI-CV. So Phase 2 beats Phase 3 for the "self-evolving" goal.
 
 - **182 ×~2** — 16-step analog sequencers. **Buy two** for the cross-driving technique ("one sequencer drives the other's step position").
 - **Abacus** — Behringer's tuned-random "music computer" (Mutable Instruments **Marbles** clone): random-but-musical, **steerable** CV/trigger. The heart of "not random but controlled."
@@ -50,7 +50,7 @@ This is where the Autechre dynamics come from — modulation + randomness + sequ
 
 ## Planned first build (as spec'd on ModularGrid — the "good start")
 
-A complete monophonic voice + headphone + direct USB audio, one row (~60 HP of 280): **Victor (osc) → Surges (filter) → IDA (VCA; envelope from 140/Waves) → CU1A (out/USB)**.
+A complete monophonic voice + headphone + direct USB audio, one row (~60 HP of 280): **Victor (osc) → Surges (filter) → IDA (VCA; envelope from 140/Waves) → CU1A (out/USB)**. Add a **second, self-contained voice** for layering/detuning: the **Behringer 110** (VCO/VCF/VCA in one module) — the drone's "build a stack of timbres" feedstock.
 
 | # | Module | Role |
 |---|---|---|
@@ -60,10 +60,11 @@ A complete monophonic voice + headphone + direct USB audio, one row (~60 HP of 2
 | 4 | Behringer **Waves** | function / "tidal" generator (extra envelope / modulation) |
 | 5 | Rides in the Storm **IDA** | discrete VCA (amplitude) |
 | 6 | Behringer **CU1A** | 2-in/2-out USB-C audio + headphone out — the **class-compliant USB-audio bridge to the arranger** |
+| 7 | Behringer **110** | self-contained **VCO/VCF/VCA** voice — a second, detunable timbre to layer against Victor (drone depth) |
 
-**As racked (Row 1): 60 HP, 255 mA +12 / 122 mA −12 / 0 mA +5, max depth 44 mm** — well within power (3A) and HP (280); the 44 mm module goes in the **top row** (≤62 mm).
+**As racked (Row 1): 76 HP, 335 mA +12 / 172 mA −12 / 0 mA +5, max depth 46 mm** — well within power (3A) and HP (280); the 44–46 mm modules go in the **top row** (≤62 mm).
 
-- **First sounding patch:** Victor → Surges → IDA → CU1A, with **140** (or **Waves**) driving the IDA as an envelope. CU1A gives you headphones *and* a direct USB-audio path into sound-arranger.
+- **First sounding patch:** Victor → Surges → IDA → CU1A, with **140** (or **Waves**) driving the IDA as an envelope, and the **110** layered behind as a second, detunable voice. CU1A gives you headphones *and* a direct USB-audio path into sound-arranger.
 - **CU1A note:** class-compliant USB audio (48 kHz, 2-in/2-out, powered over USB — **0 mA from the rack**, ~$79). Record the rack straight into the arranger over USB (like the FM-1). It's **AC-coupled (audio only)** — so it's the *audio* bridge, **not** the CV bridge; the **Expert Sleepers ES-9** (DC-coupled) is the CV/sync bridge for the software mirror (watchlist).
 - The **mountable semi-modulars** (East/West Beast, Mavis, 0-Coast) and the generative expansion (**182** sequencers, **Abacus**, **150**, **121/130**, utilities) remain the Phase 1/2 plan — watchlist below.
 
@@ -95,6 +96,7 @@ A complete monophonic voice + headphone + direct USB audio, one row (~60 HP of 2
 | planned (first build) | Behringer **Waves** | — | — | — | — | function/tidal generator |
 | planned (first build) | Rides in the Storm **IDA** | — | — | — | — | discrete VCA |
 | planned (first build) | Behringer **CU1A** | 8 | 0 mA | ~$79 | — | headphone + class-compliant USB audio → arranger |
+| planned (first build) | Behringer **110** | 16 | 80/+12 · 50/−12 | ~€110 | — | self-contained VCO/VCF/VCA — second voice, 46 mm → top row |
 | watchlist | Cre8audio East Beast | rackable | — | ~$299 | — | voice + seq/arp (semi-modular) |
 | watchlist | Cre8audio West Pest | rackable | — | ~$259 | — | west-coast voice |
 | watchlist | Moog Mavis / Make Noise 0-Coast (+0-CTRL) | 44 | — | ~$349 / ~$599 | — | splurge tier |
