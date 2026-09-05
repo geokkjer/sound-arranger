@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use host::{HostCommand, run_script};
+use host::{HostCommand, HostSession, run_script};
 use media::{ArrangeOp, Clip, WavWriter};
 
 const SR: u32 = 48_000;
@@ -435,6 +435,45 @@ fn arrangement_bounces_audio_and_replays_byte_identically() {
     let _ = run_script(&script(&b)).unwrap();
     let frames_b = std::fs::read(&b).unwrap();
     assert_eq!(frames_a, frames_b, "replay must bounce byte-identically");
+
+    let _ = std::fs::remove_dir_all(&pool);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// The incremental session API (`HostSession::new` + `execute`) applies edits
+/// one command at a time onto a *persistent* session — the live path a UI uses.
+/// After building an arrangement and bouncing, the session reports the exact
+/// value a fresh `run_script` of the same log would reconstruct.
+#[test]
+fn incremental_session_applies_edits_and_reports_arrangement() {
+    let pool = tmp_dir("incr");
+    write_ramp(&pool, "s1", 8000, 257);
+    let out_dir = tmp_dir("incrout");
+    let out = out_dir.join("i.wav");
+
+    let mut s = HostSession::new();
+    s.set_pool(&pool).unwrap();
+    s.execute(&HostCommand::Mount { plugin: "mixer", params: vec![("channels", 2.0)], at_frame: Some(0) }).unwrap();
+    s.execute(&HostCommand::Pool { dir: pool.clone() }).unwrap();
+    s.execute(&HostCommand::Arrange { op: ArrangeOp::AddTrack { track: "t0".into() }, at_frame: Some(0) }).unwrap();
+    s.execute(&HostCommand::Arrange { op: ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", 0, 4000) }, at_frame: Some(0) }).unwrap();
+    s.execute(&HostCommand::Bounce { frames: 4000, path: out.clone() }).unwrap();
+
+    let timeline = s.arrangement().expect("a persisted session has a value");
+    assert_eq!(timeline.tracks.len(), 1, "one track from the incremental AddTrack");
+    assert_eq!(timeline.tracks[0].clips.len(), 1, "one clip from the incremental AddClip");
+    assert_eq!(timeline.tracks[0].clips[0].id, "c0");
+    assert_eq!(s.underruns(), 0, "no underruns on a clean incremental bounce");
+
+    let mut r = media::WavReader::open(&out).unwrap();
+    let mut audio = vec![0.0f32; r.total_frames() as usize];
+    let n = r.read_into(&mut audio);
+    assert!(audio[..n].iter().any(|s| s.abs() > 1e-4), "the incremental session renders audio");
+
+    // A refused op (bad pool dir) fails the session without breaking it.
+    let bad = s.execute(&HostCommand::Pool { dir: PathBuf::from("/no/such/pool") });
+    assert!(bad.is_err(), "a bad Pool is refused, never a panic");
+    assert_eq!(s.arrangement().unwrap().tracks.len(), 1, "a refused op changes nothing");
 
     let _ = std::fs::remove_dir_all(&pool);
     let _ = std::fs::remove_dir_all(&out_dir);

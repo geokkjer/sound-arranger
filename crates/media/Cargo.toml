@@ -8,3 +8,4 @@ description = "sound-arranger media engine — disk streaming, recording writer,
 [dependencies]
 engine = { path = "../engine" }
 cpal = "0.18.2"
+serde = { version = "1", features = ["derive"] }

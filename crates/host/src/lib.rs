@@ -167,7 +167,10 @@ pub struct HostSession {
 }
 
 impl HostSession {
-    fn new() -> Self {
+    /// Create a live host session. The reference host's one-shot path is
+    /// [`run_script`]; this is the persistent form a UI holds and edits
+    /// incrementally via [`execute`](Self::execute).
+    pub fn new() -> Self {
         let mut engine = Engine::new(48_000, 120.0, 4);
         engine.register_factory("euclidean", plugins::euclidean_factory, plugins::euclidean::EUCLIDEAN_PORTS, &[]);
         engine.register_factory("scale", plugins::scale_factory, plugins::scale::SCALE_PORTS, &[]);
@@ -529,6 +532,24 @@ impl std::fmt::Debug for HostSession {
 pub fn run_script(script: &[HostCommand]) -> Result<HostSession, String> {
     let mut session = HostSession::new();
     for cmd in script {
+        session.process(cmd)?;
+    }
+    Ok(session)
+}
+
+impl HostSession {
+    /// Apply a single command onto this persistent session — the incremental
+    /// form of [`run_script`], for a live UI that edits one op at a time. A
+    /// refused op returns `Err` and changes nothing; the session stays usable.
+    pub fn execute(&mut self, cmd: &HostCommand) -> Result<(), String> {
+        self.process(cmd)
+    }
+
+    /// Process one command exactly as the host contract does: validate the
+    /// mixer mount, render up to the command's absolute frame, then `apply`.
+    /// Shared by [`run_script`] and [`execute`] so the live path can never
+    /// diverge from the one-shot path.
+    fn process(&mut self, cmd: &HostCommand) -> Result<(), String> {
         if let HostCommand::Mount { plugin: "mixer", params, .. } = cmd {
             // The mixer's channel count is the contract's own state. A fraction
             // (e.g. channels=4.5) must be refused, not silently truncated (the
@@ -547,19 +568,18 @@ pub fn run_script(script: &[HostCommand]) -> Result<HostSession, String> {
             if channels > MIXER_CHANNELS_MAX {
                 return Err(format!("mixer channels {channels} exceeds the max {MIXER_CHANNELS_MAX}"));
             }
-            session.mixer_channels = Some(channels);
+            self.mixer_channels = Some(channels);
         }
         if let Some(frame) = cmd.at_frame() {
-            let now = session.engine.clock.frame();
+            let now = self.engine.clock.frame();
             if frame > now {
                 // The pre-render wiring can fail (a later command after the
                 // mixer was unmounted); a clean Err, never a panic in a host.
-                session.render((frame - now) as usize)?;
+                self.render((frame - now) as usize)?;
             }
         }
-        session.apply(cmd)?;
+        self.apply(cmd)
     }
-    Ok(session)
 }
 
 // ---------------------------------------------------------------- text form

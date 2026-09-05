@@ -22,8 +22,17 @@ pub struct ScriptOutcome {
     pub deferred: u64,
     pub event_count: usize,
     pub media_commands: usize,
-    pub arrangement_tracks: usize,
+    /// The full arrangement value (tracks/clips with their frames), so the
+    /// frontend can draw the timeline canvas without a second round-trip.
+    pub arrangement: Option<media::Timeline>,
     pub bounce_written: bool,
+}
+
+impl ScriptOutcome {
+    /// The number of tracks in the arrangement (a convenience for CLI fallback).
+    pub fn arrangement_tracks(&self) -> usize {
+        self.arrangement.as_ref().map(|t| t.tracks.len()).unwrap_or(0)
+    }
 }
 
 /// Parse and run a versioned host script, returning the session diagnostics.
@@ -32,10 +41,7 @@ pub struct ScriptOutcome {
 pub fn exec_host_script(script_text: &str) -> Result<ScriptOutcome, String> {
     let commands = host::parse_script(script_text)?;
     let session = host::run_script(&commands)?;
-    let arrangement_tracks = session
-        .arrangement()
-        .map(|t| t.tracks.len())
-        .unwrap_or(0);
+    let arrangement = session.arrangement().ok();
     let bounce_written = commands
         .iter()
         .rev()
@@ -46,7 +52,7 @@ pub fn exec_host_script(script_text: &str) -> Result<ScriptOutcome, String> {
         deferred: session.deferred(),
         event_count: session.event_count(),
         media_commands: session.media_command_count(),
-        arrangement_tracks,
+        arrangement,
         bounce_written,
     })
 }
@@ -83,7 +89,7 @@ mod tests {
         assert!(outcome.bounce_written, "a Bounce command was in the script");
         assert_eq!(outcome.underruns, 0, "no underruns on a clean tone bounce");
         assert_eq!(outcome.event_count, 1, "one logged engine event (the mount)");
-        assert_eq!(outcome.arrangement_tracks, 0, "no arrangement in this script");
+        assert!(outcome.arrangement_tracks() == 0, "no arrangement in this script");
         assert_eq!(outcome.media_commands, 1, "one media command (the bounce)");
         assert!(outcome.summary.contains("underruns: 0"));
         let _ = std::fs::remove_file(&wav);

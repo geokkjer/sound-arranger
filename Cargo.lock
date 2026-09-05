@@ -1989,6 +1989,7 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "engine",
+ "serde",
 ]
 
 [[package]]
@@ -3230,6 +3231,7 @@ name = "sound-arranger-shell"
 version = "0.1.0"
 dependencies = [
  "host",
+ "media",
  "serde",
  "serde_json",
  "tauri",

@@ -24,6 +24,8 @@
 //! overflowing, and `src_len <= i64::MAX` (so signed trim arithmetic never wraps).
 //! A refused op returns `Err` and — per the engine contract — is never logged.
 
+use serde::{Deserialize, Serialize};
+
 /// Absolute frame on the timeline (samples).
 pub type Frame = u64;
 
@@ -33,7 +35,7 @@ pub type Frame = u64;
 pub type Id = String;
 
 /// Which edge of a clip a `Trim` adjusts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Edge {
     /// The clip's `at_frame`/`src_start` edge.
     Start,
@@ -42,7 +44,7 @@ pub enum Edge {
 }
 
 /// A clip: a bounded region of a pool source, placed on a track.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Clip {
     pub id: Id,
     /// Content-hash id of the immutable float-WAV source (the media pool).
@@ -90,14 +92,14 @@ impl Clip {
 }
 
 /// A track: a named lane holding layered clips (sorted by `at_frame`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Track {
     pub id: Id,
     pub clips: Vec<Clip>,
 }
 
 /// The arrangement value: the whole timeline of tracks.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Timeline {
     pub tracks: Vec<Track>,
 }

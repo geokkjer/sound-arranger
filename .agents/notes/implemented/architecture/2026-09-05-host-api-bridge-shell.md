@@ -30,11 +30,20 @@ The shell owns a live `host::HostSession` behind Tauri commands. Shipped:
   `main.rs` calls `sound_arranger_shell_lib::run()` without the bin/lib
   same-name self-reference ambiguity.
 
+- **The arrangement value is serializable** (`crates/media/src/timeline.rs`):
+  `Timeline`/`Track`/`Clip`/`Edge` derive `Serialize`/`Deserialize` (media gained
+  the `serde` dep), so the value can cross the IPC boundary as JSON for the
+  canvas.
+- **`ScriptOutcome` carries the full arrangement** (the shell's bridge): the
+  `run_host_script` command returns `arrangement: Option<media::Timeline>` in
+  addition to the diagnostics, so the frontend can draw the timeline in one
+  round-trip.
+
 The versioned text format is the shell's wire schema — the same contract the CLI
 smoke binary drives, so a script that bounces byte-identically on the CLI behaves
-the same here. This is the transport layer only: it makes the engine reachable so
-the `ui-plugin`s (timeline canvas, source pool, mixer) can be built on top (the
-next step), not those views themselves.
+the same here. This is the transport layer: it makes the engine reachable and
+returns the arrangement value, so the `ui-plugin`s (timeline canvas, source pool,
+mixer) can be built on top (the next step), not those views themselves.
 
 ## Consequences
 
@@ -43,12 +52,15 @@ next step), not those views themselves.
   `cargo test` cases (a tone+bounce script runs with 0 underruns and one logged
   engine event; a script missing the `host v1` header is refused cleanly).
 - `cargo test --workspace` stays green; the shell crate has no clippy warnings.
-- A live (incremental) session API — mount/patch/arrange/render as separate
-  commands with events/values streaming to the UI — is still not exposed; the
-  current command is one-shot (run a full script). `HostSession` accessors exist
-  (`arrangement()`, `meters()`, `providers()`, `render()`) but `HostSession::new`
-  is private, so the shell currently goes through the script contract. Exposing an
-  incremental session is the next sub-step for the canvas/transport.
+- A live **incremental session API** is now exposed on the host crate:
+  `HostSession::new()` is public, `HostSession::execute(&HostCommand)` applies one
+  command onto a persistent session (advancing to its frame, validating the mixer
+  mount — the exact per-command logic `run_script` uses, shared via
+  `process`), and `arrangement()` returns the serializable value. A host test
+  (`incremental_session_applies_edits_and_reports_arrangement`) builds and bounces
+  an arrangement edit-by-edit and verifies a refused op changes nothing. This is
+  the live path the frontend will use; the canvas/pool/mixer `ui-plugin`s are the
+  next sub-step.
 
 ## Alternatives considered
 
