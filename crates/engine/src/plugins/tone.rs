@@ -8,8 +8,8 @@ use super::{Disposer, DisposerCtx, ParamDef, Plugin, PluginApi};
 use crate::graph::{Direction, NodeId, NodeKind, Port, SignalKind, ToneGen};
 
 pub const TONE_PORTS: &[Port] = &[
-    Port { name: "note", direction: Direction::In, kind: SignalKind::Note },
-    Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio },
+    Port { name: "note", direction: Direction::In, kind: SignalKind::Note , channels: 1 },
+    Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio , channels: 1 },
 ];
 
 /// The tone's runtime parameter surface (the logged `SetParam` namespace).

@@ -58,9 +58,14 @@ pub use wav::{WavReader, WavWriter};
 
 /// Bounce: render `frames` of the engine's master out and write it to a
 /// 16-bit WAV (16-bit at bounce/export; the media pool keeps float sources).
+/// The channel count follows the master (the mixer's stereo out → a 2-channel
+/// WAV); a mono master still writes mono.
 pub fn bounce(e: &mut engine::Engine, frames: usize, path: &Path) -> Result<(), String> {
+    // `render` flushes scheduled mounts first, which may change the master's
+    // channel count (e.g. a scheduled mixer mount); read the width afterwards.
     let out = e.render(frames);
-    let mut w = wav::WavWriter::create(path, e.clock.sample_rate, 1)?;
+    let channels = e.graph.out_channels().max(1);
+    let mut w = wav::WavWriter::create(path, e.clock.sample_rate, channels as u16)?;
     w.write(&out)?;
     w.finalize()?;
     Ok(())

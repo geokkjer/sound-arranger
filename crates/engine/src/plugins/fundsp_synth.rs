@@ -20,8 +20,8 @@ use crate::graph::{
 use fundsp::prelude32::*;
 
 pub const FUNDSP_PORTS: &[Port] = &[
-    Port { name: "note", direction: Direction::In, kind: SignalKind::Note },
-    Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio },
+    Port { name: "note", direction: Direction::In, kind: SignalKind::Note , channels: 1 },
+    Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio , channels: 1 },
 ];
 
 /// Runtime parameter surface (the logged `SetParam` namespace). These are the

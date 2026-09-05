@@ -15,6 +15,13 @@ use engine::*;
 
 const SR: u32 = 48_000;
 
+/// The master is now the mixer's stereo bus; de-interleave to the L channel for
+/// frame-aligned mono assertions (a center-panned mono source appears on both
+/// channels, so L carries the signal).
+fn l(buf: &[f32]) -> Vec<f32> {
+    buf.chunks_exact(2).map(|p| p[0]).collect()
+}
+
 fn engine() -> Engine {
     let mut e = Engine::new(SR, 120.0, 4);
     e.register_factory("euclidean", plugins::euclidean_factory, plugins::euclidean::EUCLIDEAN_PORTS, &[]);
@@ -60,7 +67,7 @@ fn chain_trigger_is_sample_accurate() {
     e.patch(("scale", "note"), ("tone", "note")).unwrap();
     e.mount("mixer", &[]).unwrap();
     e.patch(("tone", "audio"), ("mixer", "ch0")).unwrap();
-    let out = e.render(7000);
+    let out = l(&e.render(7000));
 
     assert_eq!(out[5999], 0.0);
     assert_eq!(out[6000], 0.0, "onset sample is sin(0)");
@@ -84,7 +91,7 @@ fn scale_changes_pitch() {
         e.patch(("scale", "note"), ("tone", "note")).unwrap();
         e.mount("mixer", &[]).unwrap();
         e.patch(("tone", "audio"), ("mixer", "ch0")).unwrap();
-        let out = e.render(7000);
+        let out = l(&e.render(7000));
         // count sign changes in the blip window (6001..6800)
         let window = &out[6001..6800];
         let mut n = 0usize;
@@ -144,15 +151,15 @@ fn patching_is_logged_and_replayable() {
 fn replay_is_exact_for_mid_session_tempo_change() {
     let mut e1 = engine();
     mount_chain(&mut e1);
-    let first = e1.render(2 * 48_000);
+    let first = l(&e1.render(2 * 48_000));
     e1.set_tempo(240.0, 4).unwrap();
     e1.schedule_unmount("euclidean", 3 * 48_000);
-    let second = e1.render(2 * 48_000);
+    let second = l(&e1.render(2 * 48_000));
     let log = e1.log.clone();
 
     let mut e2 = engine();
     e2.replay_from(&log).unwrap();
-    let b = e2.render(4 * 48_000);
+    let b = l(&e2.render(4 * 48_000));
 
     assert_eq!(&b[..2 * 48_000], &first[..], "pre-change segment must match");
     assert_eq!(&b[2 * 48_000..], &second[..], "post-change segment must match");
@@ -160,18 +167,23 @@ fn replay_is_exact_for_mid_session_tempo_change() {
 }
 
 /// Replay reproduces mid-session mounts under the patched chain (silence
-/// before the mount frame).
+/// before the mount frame). The chain (including the stereo mixer, which must
+/// be mounted last for the graph's forward-order rule) mounts at frame 48000,
+/// so the master's channel count changes there. A fixed-size render buffer can
+/// hold only one width per call, so the replay is rendered in two calls at the
+/// mount frame — the channel change lands on a render-call boundary.
 #[test]
 fn replay_is_exact_for_mid_session_mount() {
     let mut e1 = engine();
     let _quiet = e1.render(48_000);
     mount_chain(&mut e1);
-    let after = e1.render(48_000);
+    let after = l(&e1.render(48_000));
     let log = e1.log.clone();
 
     let mut e2 = engine();
     e2.replay_from(&log).unwrap();
-    let b = e2.render(96_000);
+    let mut b = e2.render(48_000); // 0..48000: mono silence (no master yet)
+    b.extend(l(&e2.render(48_000))); // 48000..96000: chain (stereo mixer) mounted
 
     assert!(b[..48_000].iter().all(|s| *s == 0.0), "silence before the mount frame");
     assert_eq!(&b[48_000..], &after[..], "audio after the mount frame must match");
@@ -201,7 +213,7 @@ fn unmount_is_sample_accurate() {
     e.schedule_unmount("euclidean", at);
     e.schedule_unmount("scale", at);
     e.schedule_unmount("tone", at);
-    let out = e.render((at + 64) as usize);
+    let out = l(&e.render((at + 64) as usize));
 
     assert!(out[..at as usize].iter().any(|s| *s != 0.0), "sound before the unmount");
     assert!(out[(at - 1) as usize] != 0.0, "a blip is still decaying at the boundary");
@@ -217,7 +229,7 @@ fn unmount_removes_contribution() {
     e.schedule_unmount("euclidean", bar);
     e.schedule_unmount("scale", bar);
     e.schedule_unmount("tone", bar);
-    let out = e.render(bar as usize + 4096);
+    let out = l(&e.render(bar as usize + 4096));
     assert!(out[..bar as usize].iter().any(|s| *s != 0.0));
     assert!(out[bar as usize..].iter().all(|s| *s == 0.0));
 }
@@ -322,7 +334,7 @@ fn tempo_change_moves_triggers() {
     e.mount("mixer", &[]).unwrap();
     e.patch(("tone", "audio"), ("mixer", "ch0")).unwrap();
     e.set_tempo(240.0, 4).unwrap();
-    let out = e.render(5000);
+    let out = l(&e.render(5000));
     assert_eq!(out[2999], 0.0);
     assert!(out[3001] > 0.0, "pulse must land at frame 3000 under 240bpm");
 }
@@ -358,7 +370,7 @@ fn providers_of_lists_external_sources() {
             &[]
         }
         fn ports(&self) -> &'static [Port] {
-            &[Port { name: "triggers", direction: Direction::Out, kind: SignalKind::Trigger }]
+            &[Port { name: "triggers", direction: Direction::Out, kind: SignalKind::Trigger, channels: 1 }]
         }
         fn apply(&mut self, api: &mut PluginApi) -> Result<(NodeId, Disposer), String> {
             let node = api.graph.add_node(NodeKind::Opaque(Box::new(FakeOscNode)), self.ports().to_vec());
@@ -368,7 +380,7 @@ fn providers_of_lists_external_sources() {
         }
     }
     let osc_factory: PluginFactory = |_| Ok(Box::new(FakeOsc));
-    let osc_ports: &'static [Port] = &[Port { name: "triggers", direction: Direction::Out, kind: SignalKind::Trigger }];
+    let osc_ports: &'static [Port] = &[Port { name: "triggers", direction: Direction::Out, kind: SignalKind::Trigger, channels: 1 }];
 
     let mut e = engine();
     e.register_factory("fakeosc", osc_factory, osc_ports, &[]);
@@ -419,7 +431,7 @@ fn fan_in_merges_events_sorted() {
             &[]
         }
         fn ports(&self) -> &'static [Port] {
-            &[Port { name: "triggers", direction: Direction::Out, kind: SignalKind::Trigger }]
+            &[Port { name: "triggers", direction: Direction::Out, kind: SignalKind::Trigger, channels: 1 }]
         }
         fn apply(&mut self, api: &mut PluginApi) -> Result<(NodeId, Disposer), String> {
             let node = api.graph.add_node(NodeKind::Opaque(Box::new(FakeOscNode)), self.ports().to_vec());
@@ -429,7 +441,7 @@ fn fan_in_merges_events_sorted() {
         }
     }
     let osc_factory: PluginFactory = |_| Ok(Box::new(FakeOsc));
-    let osc_ports: &'static [Port] = &[Port { name: "triggers", direction: Direction::Out, kind: SignalKind::Trigger }];
+    let osc_ports: &'static [Port] = &[Port { name: "triggers", direction: Direction::Out, kind: SignalKind::Trigger, channels: 1 }];
 
     let mut e = engine();
     e.register_factory("fakeosc", osc_factory, osc_ports, &[]);
@@ -449,7 +461,7 @@ fn fan_in_merges_events_sorted() {
     e.mount("mixer", &[]).unwrap();
     e.patch(("tone", "audio"), ("mixer", "ch0")).unwrap();
 
-    let out = e.render(7000);
+    let out = l(&e.render(7000));
     assert!(out[101] > 0.0, "fakeosc blip must fire at frame 101 (offset 100)");
     assert_eq!(out[5999], 0.0);
     assert!(out[6001] > 0.0, "euclidean blip must still fire at 6001 — sorted merge");
@@ -490,13 +502,13 @@ fn render_path_does_not_allocate_with_latency() {
     let mut e = Engine::new(SR, 120.0, 4);
     let sine = e.graph.add_node(
         NodeKind::Sine(Sine::new(440.0)),
-        vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio }],
+        vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio, channels: 1 }],
     );
     let delay = e.graph.add_node(
         NodeKind::Opaque(Box::new(TestDelay)),
         vec![
-            Port { name: "audio", direction: Direction::In, kind: SignalKind::Audio },
-            Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio },
+            Port { name: "audio", direction: Direction::In, kind: SignalKind::Audio, channels: 1 },
+            Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio, channels: 1 },
         ],
     );
     e.graph.connect(sine, "audio", delay, "audio").unwrap();
@@ -523,7 +535,7 @@ fn provider_names_and_osc_seam() {
     e.register_factory(
         "fakeosc",
         |_| Ok(Box::new(ProviderNamesFakeOsc)),
-        &[Port { name: "triggers", direction: Direction::Out, kind: SignalKind::Trigger }],
+        &[Port { name: "triggers", direction: Direction::Out, kind: SignalKind::Trigger, channels: 1 }],
         &[],
     );
     e.mount("euclidean", &[]).unwrap();
@@ -545,7 +557,7 @@ impl Plugin for ProviderNamesFakeOsc {
         &[]
     }
     fn ports(&self) -> &'static [Port] {
-        &[Port { name: "triggers", direction: Direction::Out, kind: SignalKind::Trigger }]
+        &[Port { name: "triggers", direction: Direction::Out, kind: SignalKind::Trigger, channels: 1 }]
     }
     fn apply(&mut self, api: &mut PluginApi) -> Result<(NodeId, Disposer), String> {
         let node = api.graph.add_node(NodeKind::Opaque(Box::new(SeamOscNode)), self.ports().to_vec());

@@ -11,6 +11,8 @@ use host::{HostCommand, run_script};
 use media::{ArrangeOp, Clip, WavWriter};
 
 const SR: u32 = 48_000;
+/// The equal-power center-pan gain each mono mixer channel sees (`pan = 0`).
+const CENTER: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
 fn tmp_dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("host-arranger-{name}-{}", std::process::id()));
@@ -147,7 +149,9 @@ fn edit_to_a_wired_track_continues_the_clip_not_restarts_it() {
     let n = r.read_into(&mut audio);
     assert!(n > 500, "second render must fill the buffer (got {n})");
     for &f in &[4000u64 + 257, 4000 + 513, 4000 + 1024] {
-        let expected = source_value(f, period) * 1.0;
+        // The mono source is center-panned (a single channel on ch0), so the
+        // stereo bounce's channel 0 carries source_value * √2/2.
+        let expected = source_value(f, period) * CENTER;
         let got = audio[(f - 4000) as usize];
         assert!(
             (got - expected).abs() < 1e-4,

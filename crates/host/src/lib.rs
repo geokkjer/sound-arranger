@@ -285,7 +285,7 @@ impl HostSession {
                 let deferred = node.deferred_counter();
                 let id = self.engine.graph.add_node(
                     NodeKind::Opaque(Box::new(node)),
-                    vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio }],
+                    vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio , channels: 1 }],
                 );
                 self.player_mailbox = Some(mailbox);
                 self.player_underruns = Some(underruns);
@@ -330,7 +330,8 @@ impl HostSession {
             }
             HostCommand::Bounce { frames, path } => {
                 let out = self.render(*frames)?; // wires (pending + arranger) then renders
-                let mut w = media::WavWriter::create(path, self.engine.clock.sample_rate, 1)?;
+                let channels = self.engine.graph.out_channels().max(1) as u16;
+                let mut w = media::WavWriter::create(path, self.engine.clock.sample_rate, channels)?;
                 w.write(&out)?;
                 w.finalize()?;
                 self.media_commands += 1;
@@ -428,7 +429,7 @@ impl HostSession {
             let id = self.engine.graph.insert_before(
                 mixer,
                 engine::NodeKind::Opaque(Box::new(node)),
-                vec![engine::Port { name: "audio", direction: engine::Direction::Out, kind: engine::SignalKind::Audio }],
+                vec![engine::Port { name: "audio", direction: engine::Direction::Out, kind: engine::SignalKind::Audio , channels: 1 }],
             )?;
             self.engine
                 .graph

@@ -40,7 +40,7 @@ drain/EOF phase for tailed effects. The direction is locked
 
 | Crate | What it is | Status |
 |---|---|---|
-| `crates/engine` | The minimal core: clock (tempo map + sample-accurate scheduler), patch-bay graph interpreter (typed ports, PDC), session event log, context plumbing — plus plugins: euclidean, scale, tone, **soft mixer** (gain/mute/solo, master fader, meters). Std-only. It also carries the **closed-core plugin-message dispatch** (`Event::Arrangement` + `arrange_logged`): profile-level ops are logged as commands the core understands without knowing them. | works, tested |
+| `crates/engine` | The minimal core: clock (tempo map + sample-accurate scheduler), patch-bay graph interpreter (typed ports, PDC), session event log, context plumbing — plus plugins: euclidean, scale, tone, **soft mixer** (gain/pan/mute/solo, stereo master fader, meters). Audio ports are **channel-aware** (mono default; the mixer's master is stereo). Std-only. It also carries the **closed-core plugin-message dispatch** (`Event::Arrangement` + `arrange_logged`): profile-level ops are logged as commands the core understands without knowing them. | works, tested |
 | `crates/media` | The media engine (core-privileged, not a plugin): disk streaming, splice-during-playback, recording writer with crash recovery, **device-clock drift compensation wired into the capture**, multi-channel capture → **float-WAV media pool with live peak pyramids**, pool **enumeration + crash recovery** (finalize un-finalized takes, rebuild `.peaks`), the **clip editor's value + ACID ops + `ArrangerNode`** (renders a track from the value), and the **`ArrangeOp ↔ engine-command` codec**. | works, tested |
 | `crates/host` | The **Host API contract** (commands = logged events, events, values) + the **headless reference host**: `run_script` assembles the profile and bounces byte-identically — now including the **clip-arrangement commands** (`pool`/`arrange`) in the versioned **text format**, so the CLI smoke binary drives the clip editor end-to-end. The UI-as-plugin seam — a future Tauri shell implements the same contract, nothing else changes. | works, tested |
 | `plugins/` | **Sidecar plugins** (placeholder): VST3/CLAP builds of core capabilities and the CDP / offline-process sidecar (`OfflineProcess`). Not engine crates — thin wrappers that expose a capability to a plug-in API. See [plugins/README.md](plugins/README.md). | placeholder |
@@ -49,7 +49,9 @@ drain/EOF phase for tailed effects. The direction is locked
 render, sample-accurate lifecycle) are tested, and the streaming soak + real hardware capture
 run as `#[ignore]`d tests.
 
-**Honest gaps** (deliberate, pre-alpha): the graph is **mono** (stereo/pan is its own step);
+**Honest gaps** (deliberate, pre-alpha): the master is **stereo** (the mixer pans mono channels
+into L/R and the bounce is 2-channel) but stereo *sources/clips* are still forthcoming — a
+genuine stereo take/clip is the next sub-step, using the per-port channel-count seam;
 control-side mutations apply on the render call stack (the real control→render handoff is
 seeded by `flush_scheduled`, not finished); the recorder's `play`/`splice` media commands are
 not yet logged events (the **arrangement** ops *are*); **live-edit-while-playing reader reuse**
@@ -57,7 +59,7 @@ not yet logged events (the **arrangement** ops *are*); **live-edit-while-playing
 reach audio and removed tracks no longer ghost — but each rebuild re-warms readers, and the
 shared-state `ArrangerNode` reuse is still deferred); the
 **drain/EOF phase** for tailed effects (reverb/delay/codec) is a proposed note;
-MIDI/OSC are declared seams, not implementations; **no effects, no stereo, no UI**.
+MIDI/OSC are declared seams, not implementations; **no effects, no stereo-clips, no UI**.
 
 ## Try it
 

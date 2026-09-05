@@ -136,11 +136,38 @@ pub enum Direction {
 }
 
 /// A named, typed port on a node — the patch-bay surface.
+///
+/// `channels` is meaningful only for `SignalKind::Audio`: 1 = mono (the
+/// default and every node today except the mixer's master), 2 = stereo. The
+/// graph sizes a node's audio scalars by the channel count so a single typed
+/// stereo port carries L/R. Control/trigger/note ports keep `channels = 1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Port {
     pub name: &'static str,
     pub direction: Direction,
     pub kind: SignalKind,
+    pub channels: u16,
+}
+
+impl Port {
+    /// A mono audio port (the `channels` field default).
+    pub fn audio(name: &'static str, direction: Direction) -> Self {
+        Port { name, direction, kind: SignalKind::Audio, channels: 1 }
+    }
+
+    /// A stereo audio port (the master bus once the mixer is the sink).
+    pub fn stereo_audio(name: &'static str, direction: Direction) -> Self {
+        Port { name, direction, kind: SignalKind::Audio, channels: 2 }
+    }
+
+    /// The number of audio channels this port carries (1 for non-audio).
+    pub fn channels(&self) -> usize {
+        if self.kind == SignalKind::Audio {
+            self.channels.max(1) as usize
+        } else {
+            1
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -164,6 +191,10 @@ pub struct NodeIO<'a> {
     /// per audio-In port, in port order; meaningful up to `audio_in_count`
     pub audio_ins: [&'a [f32]; MAX_AUDIO_INS],
     pub audio_in_count: usize,
+    /// the node's audio output channel count (1 mono, 2 stereo) — the length
+    /// of the `out_audio` slice a node receives is `channels * frames`. A node
+    /// must write its audio for `channels` interleaved channels.
+    pub audio_out_channels: usize,
     pub control_in: f32,
     pub triggers_in: &'a [Trigger],
     pub notes_in: &'a [NoteEvent],
@@ -596,8 +627,12 @@ struct PatchCord {
 pub struct Graph {
     nodes: Vec<Node>,
     cords: Vec<PatchCord>,
-    /// per-node audio output scratch (PDC-delayed).
+    /// per-node audio output scratch (PDC-delayed), sized `channels * BLOCK`
+    /// (channel-major; a mono node is `BLOCK`, the mixer's stereo master is
+    /// `2 * BLOCK`).
     audio_out: Vec<Vec<f32>>,
+    /// per-node audio output channel count (1 = mono, 2 = stereo).
+    audio_out_ch: Vec<usize>,
     /// per-node control output (one f32 per block).
     control_out: Vec<f32>,
     /// per-node trigger / note outputs (fixed capacity).
@@ -626,6 +661,7 @@ impl Graph {
             nodes: Vec::new(),
             cords: Vec::new(),
             audio_out: Vec::new(),
+            audio_out_ch: Vec::new(),
             control_out: Vec::new(),
             triggers_out: Vec::new(),
             notes_out: Vec::new(),
@@ -639,6 +675,16 @@ impl Graph {
             out_node: None,
             control_scratch: 0.0,
         }
+    }
+
+    /// The audio channel count of a node's (single) audio-out port — 1 mono,
+    /// 2 stereo. Non-audio nodes report 1.
+    fn node_out_channels(ports: &[Port]) -> usize {
+        ports
+            .iter()
+            .find(|p| p.direction == Direction::Out && p.kind == SignalKind::Audio)
+            .map(|p| p.channels())
+            .unwrap_or(1)
     }
 
     pub fn add_node(&mut self, kind: NodeKind, ports: Vec<Port>) -> NodeId {
@@ -658,8 +704,10 @@ impl Graph {
         // mixer's channels), at most one audio Out — enforced loudly.
         assert!(audio_in_ports.len() <= MAX_AUDIO_INS, "node declares {} audio inputs (max {MAX_AUDIO_INS})", audio_in_ports.len());
         assert!(audio_out_ports <= 1, "node declares {audio_out_ports} audio outputs (max 1 in Phase 1)");
+        let out_ch = Self::node_out_channels(&ports);
         self.nodes.push(Node { id, kind, ports });
-        self.audio_out.push(vec![0.0; BLOCK]);
+        self.audio_out.push(vec![0.0; out_ch * BLOCK]);
+        self.audio_out_ch.push(out_ch);
         self.control_out.push(0.0);
         self.triggers_out.push(EventBuf::new());
         self.notes_out.push(EventBuf::new());
@@ -753,10 +801,12 @@ impl Graph {
             .count();
         assert!(audio_in_ports.len() <= MAX_AUDIO_INS, "node declares {} audio inputs (max {MAX_AUDIO_INS})", audio_in_ports.len());
         assert!(audio_out_ports <= 1, "node declares {audio_out_ports} audio outputs (max 1 in Phase 1)");
+        let out_ch = Self::node_out_channels(&ports);
         let id = NodeId(self.next_id);
         self.next_id += 1;
         self.nodes.insert(idx, Node { id, kind, ports });
-        self.audio_out.insert(idx, vec![0.0; BLOCK]);
+        self.audio_out.insert(idx, vec![0.0; out_ch * BLOCK]);
+        self.audio_out_ch.insert(idx, out_ch);
         self.control_out.insert(idx, 0.0);
         self.triggers_out.insert(idx, EventBuf::new());
         self.notes_out.insert(idx, EventBuf::new());
@@ -798,6 +848,7 @@ impl Graph {
             }
         }
         self.audio_out.remove(idx);
+        self.audio_out_ch.remove(idx);
         self.control_out.remove(idx);
         self.triggers_out.remove(idx);
         self.notes_out.remove(idx);
@@ -827,17 +878,30 @@ impl Graph {
         self.nodes.iter().position(|node| node.id == id)
     }
 
-    /// Render one block into `out`. Allocation-free: every buffer is
-    /// preallocated or fixed-capacity; audio paths are PDC-aligned.
+    /// The master output channel count (from the bus owner), 1 mono.
+    pub fn out_channels(&self) -> usize {
+        self.out_node
+            .and_then(|id| self.index_of(id))
+            .map(|i| self.audio_out_ch[i])
+            .unwrap_or(1)
+    }
+
+    /// Render one block into `out` (interleaved `channels * frames` samples).
+    /// Allocation-free: every buffer is preallocated or fixed-capacity; audio
+    /// paths are PDC-aligned.
     pub fn render(&mut self, out: &mut [f32], block: RenderBlock) {
-        let len = out.len();
+        let channels = self.out_channels();
+        // Frame count in this chunk. The master output is interleaved, so
+        // `out.len() == channels * frames`. Node buffers are always mono (or
+        // the node's own channel count) and use `frames`, never `out.len()`.
+        let frames = out.len() / channels.max(1);
         for i in 0..self.nodes.len() {
             self.triggers_out[i].clear();
             self.notes_out[i].clear();
             self.triggers_in[i].clear();
             self.notes_in[i].clear();
             for port in self.audio_ins[i].iter_mut() {
-                port[..len].fill(0.0);
+                port[..frames].fill(0.0);
             }
         }
 
@@ -862,8 +926,13 @@ impl Graph {
             for cord in self.cords.iter().filter(|c| c.to.0 == i) {
                 match cord.kind {
                     SignalKind::Audio => {
-                        let src = &self.audio_out[cord.from.0][..len];
-                        let dst = &mut self.audio_ins[i][cord.to.1][..len];
+                        // Step-1 mono: every producer/consumer audio port is
+                        // 1 channel, so fan-in sums the flat frame slice. A
+                        // stereo connection (a stereo source into a stereo
+                        // consumer) is deferred with the stereo-clip step; the
+                        // per-port channel count is the seam.
+                        let src = &self.audio_out[cord.from.0][..frames];
+                        let dst = &mut self.audio_ins[i][cord.to.1][..frames];
                         for (acc, s) in dst.iter_mut().zip(src) {
                             *acc += *s;
                         }
@@ -892,19 +961,21 @@ impl Graph {
             let mut io_ins = [&[][..]; MAX_AUDIO_INS];
             let count = self.audio_in_ports[i].len().min(MAX_AUDIO_INS);
             for (k, _) in self.audio_in_ports[i].iter().enumerate().take(count) {
-                io_ins[k] = &self.audio_ins[i][k][..len];
+                io_ins[k] = &self.audio_ins[i][k][..frames];
             }
+            let out_ch = self.audio_out_ch[i];
             let io = NodeIO {
                 audio_in: io_ins[0],
                 audio_ins: io_ins,
                 audio_in_count: count,
+                audio_out_channels: out_ch,
                 control_in: self.control_scratch,
                 triggers_in: self.triggers_in[i].as_slice(),
                 notes_in: self.notes_in[i].as_slice(),
             };
 
             let (audio_before, audio_after) = self.audio_out.split_at_mut(i);
-            let out_audio = &mut audio_after[0][..len];
+            let out_audio = &mut audio_after[0][..out_ch * frames];
             self.nodes[i].kind.render(
                 &io,
                 out_audio,
@@ -929,7 +1000,9 @@ impl Graph {
         }
 
         match self.out_node.and_then(|id| self.index_of(id)) {
-            Some(i) => out.copy_from_slice(&self.audio_out[i][..len]),
+            // `out` is interleaved `channels * frames`; the bus owner's buffer
+            // holds the same channel-major layout, so a straight copy works.
+            Some(i) => out.copy_from_slice(&self.audio_out[i][..out.len()]),
             None => out.fill(0.0),
         }
     }
@@ -979,13 +1052,13 @@ mod tests {
         let mut g = Graph::new();
         let sine = g.add_node(
             NodeKind::Sine(Sine::new(440.0)),
-            vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio }],
+            vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio , channels: 1 }],
         );
         let delay = g.add_node(
             NodeKind::Opaque(Box::new(TestDelay { len: 3 })),
             vec![
-                Port { name: "audio", direction: Direction::In, kind: SignalKind::Audio },
-                Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio },
+                Port { name: "audio", direction: Direction::In, kind: SignalKind::Audio , channels: 1 },
+                Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio , channels: 1 },
             ],
         );
         g.connect(sine, "audio", delay, "audio").unwrap();
@@ -1007,11 +1080,11 @@ mod tests {
         let mut g = Graph::new();
         let sine = g.add_node(
             NodeKind::Sine(Sine::new(440.0)),
-            vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio }],
+            vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio , channels: 1 }],
         );
         let delay = g.add_node(
             NodeKind::Opaque(Box::new(TestDelay { len: 0 })),
-            vec![Port { name: "audio", direction: Direction::In, kind: SignalKind::Audio }],
+            vec![Port { name: "audio", direction: Direction::In, kind: SignalKind::Audio , channels: 1 }],
         );
         let err = g.connect(sine, "audio", delay, "nope").unwrap_err();
         assert!(err.contains("no port 'nope'"), "got: {err}");
@@ -1027,8 +1100,8 @@ mod tests {
         let sink = g.add_node(
             NodeKind::Opaque(Box::new(TestDelay { len: 0 })),
             vec![
-                Port { name: "audio", direction: Direction::In, kind: SignalKind::Audio },
-                Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio },
+                Port { name: "audio", direction: Direction::In, kind: SignalKind::Audio , channels: 1 },
+                Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio , channels: 1 },
             ],
         );
         g.set_out(sink);
@@ -1036,7 +1109,7 @@ mod tests {
         let src = g.insert_before(
             sink,
             NodeKind::Sine(Sine::new(440.0)),
-            vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio }],
+            vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio , channels: 1 }],
         ).unwrap();
         assert_eq!(src, NodeId(1), "inserted node is a fresh id");
         // the inserted source precedes the sink in the topological order.
@@ -1058,13 +1131,13 @@ mod tests {
         let mut g = Graph::new();
         let a = g.add_node(
             NodeKind::Sine(Sine::new(440.0)),
-            vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio }],
+            vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio , channels: 1 }],
         );
         let b = g.add_node(
             NodeKind::Opaque(Box::new(TestDelay { len: 0 })),
             vec![
-                Port { name: "audio", direction: Direction::In, kind: SignalKind::Audio },
-                Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio },
+                Port { name: "audio", direction: Direction::In, kind: SignalKind::Audio , channels: 1 },
+                Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio , channels: 1 },
             ],
         );
         // a cord a -> b establishes b as the later node.
@@ -1074,7 +1147,7 @@ mod tests {
         let x = g.insert_before(
             a,
             NodeKind::Sine(Sine::new(220.0)),
-            vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio }],
+            vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio , channels: 1 }],
         ).unwrap();
         assert_eq!(x, NodeId(2), "inserted node is a fresh id");
         // the pre-existing a->b cord is still forward-ordered after the shift.

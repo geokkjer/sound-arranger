@@ -85,7 +85,7 @@ fn rig_with_player(clip: ClipRef) -> Rig {
     let deferred = node.deferred_counter();
     let player_id = e.graph.add_node(
         NodeKind::Opaque(Box::new(node)),
-        vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio }],
+        vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio, channels: 1 }],
     );
     e.graph.set_out(player_id);
     Rig { e, player_id, mbox, underruns, deferred, recorder: None }
@@ -108,7 +108,7 @@ fn add_recorder(rig: &mut Rig, path: &Path) -> Arc<WavRecorder> {
     let rec = Arc::new(WavRecorder::start(path, SR).unwrap());
     let id = rig.e.graph.add_node(
         NodeKind::Opaque(Box::new(RecordNode::new(rec.clone()))),
-        vec![Port { name: "audio", direction: Direction::In, kind: SignalKind::Audio }],
+        vec![Port { name: "audio", direction: Direction::In, kind: SignalKind::Audio, channels: 1 }],
     );
     rig.e.graph.connect(rig.player_id, "audio", id, "audio").unwrap();
     rig.recorder = Some(rec.clone());

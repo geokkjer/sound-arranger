@@ -13,6 +13,7 @@ pub const EUCLIDEAN_PORTS: &[Port] = &[Port {
     name: "triggers",
     direction: Direction::Out,
     kind: SignalKind::Trigger,
+    channels: 1,
 }];
 
 /// Maximally-even pulse placement: a pulse at `floor(i * steps / pulses)`,

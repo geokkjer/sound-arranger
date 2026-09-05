@@ -27,15 +27,15 @@ pub const MIXER_CHANNELS: usize = 4;
 /// [`MIXER_CHANNELS_MAX`]) + the master audio output. Patches to channels
 /// beyond the mounted `channels` count are accepted but ignored (documented).
 pub const MIXER_PORTS: &[Port] = &[
-    Port { name: "ch0", direction: Direction::In, kind: SignalKind::Audio },
-    Port { name: "ch1", direction: Direction::In, kind: SignalKind::Audio },
-    Port { name: "ch2", direction: Direction::In, kind: SignalKind::Audio },
-    Port { name: "ch3", direction: Direction::In, kind: SignalKind::Audio },
-    Port { name: "ch4", direction: Direction::In, kind: SignalKind::Audio },
-    Port { name: "ch5", direction: Direction::In, kind: SignalKind::Audio },
-    Port { name: "ch6", direction: Direction::In, kind: SignalKind::Audio },
-    Port { name: "ch7", direction: Direction::In, kind: SignalKind::Audio },
-    Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio },
+    Port { name: "ch0", direction: Direction::In, kind: SignalKind::Audio , channels: 1 },
+    Port { name: "ch1", direction: Direction::In, kind: SignalKind::Audio , channels: 1 },
+    Port { name: "ch2", direction: Direction::In, kind: SignalKind::Audio , channels: 1 },
+    Port { name: "ch3", direction: Direction::In, kind: SignalKind::Audio , channels: 1 },
+    Port { name: "ch4", direction: Direction::In, kind: SignalKind::Audio , channels: 1 },
+    Port { name: "ch5", direction: Direction::In, kind: SignalKind::Audio , channels: 1 },
+    Port { name: "ch6", direction: Direction::In, kind: SignalKind::Audio , channels: 1 },
+    Port { name: "ch7", direction: Direction::In, kind: SignalKind::Audio , channels: 1 },
+    Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio , channels: 2 },
 ];
 
 /// The mixer's declared runtime parameter surface — the logged `SetParam`
@@ -44,27 +44,35 @@ pub const MIXER_PARAMS: &[ParamDef] = &[
     ParamDef { name: "ch0.gain", min: 0.0, max: 2.0 },
     ParamDef { name: "ch0.mute", min: 0.0, max: 1.0 },
     ParamDef { name: "ch0.solo", min: 0.0, max: 1.0 },
+    ParamDef { name: "ch0.pan", min: -1.0, max: 1.0 },
     ParamDef { name: "ch1.gain", min: 0.0, max: 2.0 },
     ParamDef { name: "ch1.mute", min: 0.0, max: 1.0 },
     ParamDef { name: "ch1.solo", min: 0.0, max: 1.0 },
+    ParamDef { name: "ch1.pan", min: -1.0, max: 1.0 },
     ParamDef { name: "ch2.gain", min: 0.0, max: 2.0 },
     ParamDef { name: "ch2.mute", min: 0.0, max: 1.0 },
     ParamDef { name: "ch2.solo", min: 0.0, max: 1.0 },
+    ParamDef { name: "ch2.pan", min: -1.0, max: 1.0 },
     ParamDef { name: "ch3.gain", min: 0.0, max: 2.0 },
     ParamDef { name: "ch3.mute", min: 0.0, max: 1.0 },
     ParamDef { name: "ch3.solo", min: 0.0, max: 1.0 },
+    ParamDef { name: "ch3.pan", min: -1.0, max: 1.0 },
     ParamDef { name: "ch4.gain", min: 0.0, max: 2.0 },
     ParamDef { name: "ch4.mute", min: 0.0, max: 1.0 },
     ParamDef { name: "ch4.solo", min: 0.0, max: 1.0 },
+    ParamDef { name: "ch4.pan", min: -1.0, max: 1.0 },
     ParamDef { name: "ch5.gain", min: 0.0, max: 2.0 },
     ParamDef { name: "ch5.mute", min: 0.0, max: 1.0 },
     ParamDef { name: "ch5.solo", min: 0.0, max: 1.0 },
+    ParamDef { name: "ch5.pan", min: -1.0, max: 1.0 },
     ParamDef { name: "ch6.gain", min: 0.0, max: 2.0 },
     ParamDef { name: "ch6.mute", min: 0.0, max: 1.0 },
     ParamDef { name: "ch6.solo", min: 0.0, max: 1.0 },
+    ParamDef { name: "ch6.pan", min: -1.0, max: 1.0 },
     ParamDef { name: "ch7.gain", min: 0.0, max: 2.0 },
     ParamDef { name: "ch7.mute", min: 0.0, max: 1.0 },
     ParamDef { name: "ch7.solo", min: 0.0, max: 1.0 },
+    ParamDef { name: "ch7.pan", min: -1.0, max: 1.0 },
     ParamDef { name: "master.gain", min: 0.0, max: 2.0 },
 ];
 
@@ -100,6 +108,7 @@ impl Default for MeterBank {
 pub struct MixerNode {
     channels: usize,
     gains: [f32; MIXER_CHANNELS_MAX],
+    pans: [f32; MIXER_CHANNELS_MAX],
     mutes: [bool; MIXER_CHANNELS_MAX],
     solos: [bool; MIXER_CHANNELS_MAX],
     master_gain: f32,
@@ -119,6 +128,7 @@ impl MixerNode {
         MixerNode {
             channels: channels.clamp(1, MIXER_CHANNELS_MAX),
             gains: [1.0; MIXER_CHANNELS_MAX],
+            pans: [0.0; MIXER_CHANNELS_MAX],
             mutes: [false; MIXER_CHANNELS_MAX],
             solos: [false; MIXER_CHANNELS_MAX],
             master_gain: 1.0,
@@ -135,7 +145,7 @@ impl MixerNode {
     }
 
     fn set_param(&mut self, name: &str, value: f32) {
-        // "ch{i}.gain" | "ch{i}.mute" | "ch{i}.solo" | "master.gain"
+        // "ch{i}.gain" | "ch{i}.pan" | "ch{i}.mute" | "ch{i}.solo" | "master.gain"
         if let Some(rest) = name.strip_prefix("ch") {
             let Some((idx, attr)) = rest.split_once('.') else {
                 debug_assert!(false, "mixer: malformed param '{name}'");
@@ -151,6 +161,7 @@ impl MixerNode {
             }
             match attr {
                 "gain" => self.gains[i] = value,
+                "pan" => self.pans[i] = value.clamp(-1.0, 1.0),
                 "mute" => self.mutes[i] = value != 0.0,
                 "solo" => self.solos[i] = value != 0.0,
                 other => debug_assert!(false, "mixer: unknown channel attr '{other}'"),
@@ -183,11 +194,15 @@ impl AudioNode for MixerNode {
         _notes: &mut EventBuf<NoteEvent, CAP_EVENTS>,
         _block: RenderBlock,
     ) {
+        // Stereo master: `out` is interleaved L,R. Each channel input is mono,
+        // panned with an equal-power law before summation.
+        debug_assert_eq!(io.audio_out_channels, 2, "mixer must be the stereo master");
         let n = io.audio_in_count.min(self.channels);
         let any_solo = self.solos[..n].iter().any(|&s| s);
         let mut peaks = [0.0f32; MIXER_CHANNELS_MAX + 1];
-        for (i, sample) in out.iter_mut().enumerate() {
-            let mut sum = 0.0f32;
+        for (i, sample) in out.chunks_exact_mut(2).enumerate() {
+            let mut sl = 0.0f32;
+            let mut sr = 0.0f32;
             for (ch, channel_in) in io.audio_ins[..n].iter().enumerate() {
                 let v = channel_in.get(i).copied().unwrap_or(0.0);
                 // Channel meter: post-gain, pre-mute/solo — a muted channel
@@ -195,10 +210,21 @@ impl AudioNode for MixerNode {
                 let g = v * self.gains[ch];
                 peaks[ch] = peaks[ch].max(g.abs());
                 let audible = !self.mutes[ch] && (!any_solo || self.solos[ch]);
-                sum += g * if audible { 1.0 } else { 0.0 };
+                if audible {
+                    // Equal-power pan: `-1` hard left, `0` center (√2/2 each),
+                    // `+1` hard right.
+                    let a = (self.pans[ch] + 1.0) * std::f32::consts::FRAC_PI_4;
+                    let (pl, pr) = (a.cos(), a.sin());
+                    sl += g * pl;
+                    sr += g * pr;
+                }
             }
-            *sample = sum * self.master_gain;
-            peaks[MIXER_CHANNELS_MAX] = peaks[MIXER_CHANNELS_MAX].max(sample.abs());
+            let l = sl * self.master_gain;
+            let r = sr * self.master_gain;
+            sample[0] = l;
+            sample[1] = r;
+            let full = l.abs().max(r.abs());
+            peaks[MIXER_CHANNELS_MAX] = peaks[MIXER_CHANNELS_MAX].max(full);
         }
         for (k, p) in peaks.iter().enumerate() {
             self.meters.0[k].store(p.to_bits(), Ordering::Relaxed);

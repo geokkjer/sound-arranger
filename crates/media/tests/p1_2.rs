@@ -18,6 +18,8 @@ use media::*;
 const SR: u32 = 48_000;
 const CHANNELS: usize = 4;
 const FREQS: [f32; 4] = [440.0, 660.0, 880.0, 220.0];
+/// Equal-power center-pan gain each mono mixer channel sees (`pan = 0`).
+const CENTER: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
 fn engine() -> Engine {
     let mut e = Engine::new(SR, 120.0, 4);
@@ -73,7 +75,7 @@ fn capture_into_adaptable_mixer_and_pool() {
         underruns.push(node.underrun_counter());
         capture_ids.push(e.graph.add_node(
             NodeKind::Opaque(Box::new(node)),
-            vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio }],
+            vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio, channels: 1 }],
         ));
     }
     // The adaptable mixer (channels = the device's 4) claims the bus.
@@ -110,7 +112,8 @@ fn capture_into_adaptable_mixer_and_pool() {
         }
         // let the demux deliver the batch before the consumer pops it
         std::thread::sleep(Duration::from_micros(200));
-        let mut block = [0.0f32; BLOCK];
+        // The master is now the stereo mixer bus; render a stereo block.
+        let mut block = [0.0f32; BLOCK * 2];
         e.render_into(&mut block);
         out.extend_from_slice(&block);
         std::thread::sleep(Duration::from_micros(300)); // ~10× real time, below the sustained rate
@@ -126,16 +129,18 @@ fn capture_into_adaptable_mixer_and_pool() {
         }
     }
 
-    // The master equals the sum of the four channel sines (fresh device for
-    // the expected signal).
+    // The master equals the center-panned sum of the four channel sines (fresh
+    // device for the expected signal). Each channel is center-panned, so the L
+    // channel carries the sum scaled by √2/2; the stereo master interleaves L,R.
     let mut expect_phase = [0.0f64; CHANNELS];
-    for (i, s) in out.iter().enumerate() {
+    for (i, s) in out.chunks_exact(2).map(|p| p[0]).enumerate() {
         let mut expected = 0.0f32;
         for k in 0..CHANNELS {
             expected += (TAU * expect_phase[k]).sin() as f32 * 0.5;
             expect_phase[k] += FREQS[k] as f64 / SR as f64;
         }
-        assert!((*s - expected).abs() < 1e-5, "sample {i}: {s} vs {expected}");
+        let expected = expected * CENTER;
+        assert!((s - expected).abs() < 1e-5, "sample {i}: {s} vs {expected}");
     }
 
     cap.stop().unwrap();
@@ -296,7 +301,7 @@ fn capture_to_mixer_render_path_does_not_allocate() {
     for k in 0..CHANNELS {
         let id = e.graph.add_node(
             NodeKind::Opaque(Box::new(CaptureNode::new(cap.channel_ring(k)))),
-            vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio }],
+            vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio, channels: 1 }],
         );
         capture_ids.push(id);
     }

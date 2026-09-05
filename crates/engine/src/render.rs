@@ -658,16 +658,29 @@ impl Engine {
         names
     }
 
-    /// Render `frames` samples into a fresh buffer.
+    /// Flush scheduling events due at the current frame so the master's channel
+    /// count is stable for the whole render call. Without this, a scheduled
+    /// mixer mount (frame 0) would only take effect mid-`render`, so the frame
+    /// count would be silently halved by the stereo master.
+    fn channels_for_render(&mut self) -> usize {
+        self.flush_scheduled();
+        self.graph.out_channels().max(1)
+    }
+
+    /// Render `frames` samples (frames * channels, interleaved) into a fresh
+    /// buffer. The channel count is the graph's master out (1 mono, 2 stereo).
     pub fn render(&mut self, frames: usize) -> Vec<f32> {
-        let mut out = vec![0.0f32; frames];
+        let ch = self.channels_for_render();
+        let mut out = vec![0.0f32; frames * ch];
         self.render_into(&mut out);
         out
     }
 
     /// Render into a caller-provided buffer, in fixed-size blocks.
     pub fn render_into(&mut self, out: &mut [f32]) {
-        for chunk in out.chunks_mut(BLOCK) {
+        let ch = self.channels_for_render();
+        let block_samples = BLOCK * ch;
+        for chunk in out.chunks_mut(block_samples) {
             self.render_block(chunk);
         }
     }
@@ -694,16 +707,21 @@ impl Engine {
 
     /// Render one block, interleaving the scheduling queue: events are applied
     /// at their exact absolute frame by splitting the block around them.
+    /// `out` holds `channels * frames` interleaved samples (one BLOCK of frames
+    /// per call from `render_into`).
     fn render_block(&mut self, out: &mut [f32]) {
-        let f1 = self.clock.frame() + out.len() as u64;
+        let ch = self.graph.out_channels().max(1);
+        let frames = out.len() / ch;
+        let f1 = self.clock.frame() + frames as u64;
         let mut pos = self.clock.frame();
         let mut written = 0usize;
         loop {
             let next = self.scheduler.peek_frame().filter(|f| *f < f1).unwrap_or(f1);
             if next > pos {
-                let len = (next - pos) as usize;
-                self.render_chunk(&mut out[written..written + len], pos);
-                written += len;
+                let flen = (next - pos) as usize;
+                let slen = flen * ch;
+                self.render_chunk(&mut out[written..written + slen], pos);
+                written += slen;
                 pos = next;
             }
             if next == f1 {
@@ -740,7 +758,8 @@ impl Engine {
         debug_assert_eq!(written, out.len());
     }
 
-    /// Render one contiguous chunk. The render path allocates nothing.
+    /// Render one contiguous chunk. The render path allocates nothing. The
+    /// clock advances by FRAMES (not samples) — `out` is interleaved.
     fn render_chunk(&mut self, out: &mut [f32], f0: u64) {
         let Engine { clock, graph, .. } = self;
         let block = RenderBlock {
@@ -749,6 +768,6 @@ impl Engine {
             tempo: &clock.tempo_map,
         };
         graph.render(out, block);
-        clock.advance(out.len() as u64);
+        clock.advance((out.len() as u64) / graph.out_channels().max(1) as u64);
     }
 }

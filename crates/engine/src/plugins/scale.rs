@@ -6,8 +6,8 @@ use super::{Disposer, DisposerCtx, Plugin, PluginApi};
 use crate::graph::{Direction, NodeId, NodeKind, Port, ScaleGen, SignalKind};
 
 pub const SCALE_PORTS: &[Port] = &[
-    Port { name: "trigger", direction: Direction::In, kind: SignalKind::Trigger },
-    Port { name: "note", direction: Direction::Out, kind: SignalKind::Note },
+    Port { name: "trigger", direction: Direction::In, kind: SignalKind::Trigger , channels: 1 },
+    Port { name: "note", direction: Direction::Out, kind: SignalKind::Note , channels: 1 },
 ];
 
 /// Configurable scale plugin: root (semitones from A4) + degree offsets.

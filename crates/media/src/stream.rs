@@ -510,6 +510,7 @@ mod tests {
                 audio_in: &[],
                 audio_ins: [&[][..]; engine::MAX_AUDIO_INS],
                 audio_in_count: 0,
+                audio_out_channels: 1,
                 control_in: 0.0,
                 triggers_in: &[],
                 notes_in: &[],
