@@ -167,6 +167,12 @@ pub enum ArrangeOp {
         clip: Id,
         times: u32,
     },
+    ChopClip {
+        track: Id,
+        clip: Id,
+        times: u32,
+        prefix: Id,
+    },
 }
 
 /// `base + delta` with sign handling; `None` when the result is negative or
@@ -407,6 +413,53 @@ impl Timeline {
                 c.src_len = src_len;
                 Ok(())
             }
+            ArrangeOp::ChopClip { track, clip, times, prefix } => {
+                if *times == 0 {
+                    return Err("chop times must be >= 1".into());
+                }
+                let (ti, ci) = self.locate(track, clip).ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
+                let c = self.tracks[ti].clips[ci].clone();
+                if c.loop_len.is_some() {
+                    return Err("cannot chop a looped clip (loop phase is not representable)".into());
+                }
+                let times_f = *times as Frame;
+                if times_f > c.src_len {
+                    return Err(format!("chop {} times exceeds src_len {}", times_f, c.src_len));
+                }
+                // Split the source region into `times` contiguous equal (within 1
+                // frame) pieces. Piece ids are a pure function of `prefix` + index,
+                // so replay reproduces them deterministically with no randomness.
+                let base = c.src_len / times_f;
+                let rem = c.src_len % times_f;
+                let mut pieces = Vec::new();
+                let mut src_at = c.src_start;
+                let mut at = c.at_frame;
+                let mut seen = std::collections::HashSet::new();
+                for i in 0..times_f {
+                    let pid = format!("{prefix}.{i}");
+                    if self.clip_id_exists(&pid) || !seen.insert(pid.clone()) {
+                        return Err(format!("chop derived id '{pid}' already exists or repeats"));
+                    }
+                    let slen = base + if i < rem { 1 } else { 0 };
+                    pieces.push(Clip {
+                        id: pid,
+                        source: c.source.clone(),
+                        src_start: src_at,
+                        src_len: slen,
+                        at_frame: at,
+                        fade_in: 0,
+                        fade_out: 0,
+                        gain: c.gain,
+                        loop_len: None,
+                    });
+                    src_at += slen;
+                    at += slen;
+                }
+                self.tracks[ti].clips.remove(ci);
+                self.tracks[ti].clips.extend(pieces);
+                self.sort_track(ti);
+                Ok(())
+            }
         }
     }
 }
@@ -633,5 +686,49 @@ mod tests {
             b = b.apply(op).unwrap();
         }
         assert_eq!(a, b);
+    }
+
+    #[test]
+            fn chop_splits_a_clip_into_contiguous_pieces() {
+        let mut t = Timeline::new();
+        t = t.apply(&ArrangeOp::AddTrack { track: "t0".into() }).unwrap();
+        t = t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", 0, 4000) }).unwrap();
+
+        t = t.apply(&ArrangeOp::ChopClip { track: "t0".into(), clip: "c0".into(), times: 4, prefix: "slice".into() }).unwrap();
+        let track = &t.tracks[0];
+        assert_eq!(track.clips.len(), 4, "chop 4 produces four pieces");
+        assert_eq!(track.clips[0].id, "slice.0");
+        assert_eq!(track.clips[3].id, "slice.3");
+        // contiguous equal (within 1 frame) coverage of the original [0, 4000) span.
+        for (i, c) in track.clips.iter().enumerate() {
+            assert_eq!(c.at_frame, (i as Frame) * 1000, "piece {i} start frame");
+            assert_eq!(c.src_len, 1000, "piece {i} length");
+            assert_eq!(c.src_start, (i as Frame) * 1000, "piece {i} source start");
+            assert_eq!(c.gain, 1.0, "chop preserves the clip gain");
+        }
+        assert_eq!(track.clips.last().unwrap().end(), 4000, "pieces tile the original span");
+    }
+
+    #[test]
+    fn chop_refuses_bad_inputs_and_a_looped_clip() {
+        let mut t = Timeline::new();
+        t = t.apply(&ArrangeOp::AddTrack { track: "t0".into() }).unwrap();
+        t = t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", 0, 4000) }).unwrap();
+
+        // times = 0
+        assert!(t.apply(&ArrangeOp::ChopClip { track: "t0".into(), clip: "c0".into(), times: 0, prefix: "p".into() }).is_err());
+        // more slices than frames
+        assert!(t.apply(&ArrangeOp::ChopClip { track: "t0".into(), clip: "c0".into(), times: 4001, prefix: "p".into() }).is_err());
+
+        // a looped clip is not representable
+        let mut t = Timeline::new();
+        t = t.apply(&ArrangeOp::AddTrack { track: "t0".into() }).unwrap();
+        let mut lc = clip("c0", 0, 4000);
+        lc.loop_len = Some(1000);
+        t = t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: lc }).unwrap();
+        assert!(t.apply(&ArrangeOp::ChopClip { track: "t0".into(), clip: "c0".into(), times: 2, prefix: "p".into() }).is_err());
+
+        // an unknown track / clip is refused
+        assert!(t.apply(&ArrangeOp::ChopClip { track: "nope".into(), clip: "c0".into(), times: 2, prefix: "p".into() }).is_err());
     }
 }

@@ -723,6 +723,7 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
 /// arrange set_clip_gain t0 c0 0.75 @0
 /// arrange set_clip_fade t0 c0 64 128 @0
 /// arrange loop_region t0 c0 3 @0
+/// arrange chop t0 c0 4 pre @0    # split c0 into 4 contiguous pieces (ids pre.0..pre.3)
 /// ```
 fn parse_arrange(words: &[&str], at: usize) -> Result<media::ArrangeOp, String> {
     let op = words.first().copied().ok_or_else(|| format!("line {at}: arrange needs an op"))?;
@@ -796,6 +797,11 @@ fn parse_arrange(words: &[&str], at: usize) -> Result<media::ArrangeOp, String> 
         "loop_region" => { arity(4)?; Ok(media::ArrangeOp::LoopRegion {
             track: s(1)?, clip: s(2)?,
             times: u32::try_from(u(3)?).map_err(|_| format!("line {at}: arrange loop_region operand 3 must fit a u32 (times)"))?,
+        }) }
+        "chop" => { arity(5)?; Ok(media::ArrangeOp::ChopClip {
+            track: s(1)?, clip: s(2)?,
+            times: u32::try_from(u(3)?).map_err(|_| format!("line {at}: arrange chop operand 3 must fit a u32 (times)"))?,
+            prefix: s(4)?,
         }) }
         other => Err(format!("line {at}: unknown arrange op '{other}'")),
     }

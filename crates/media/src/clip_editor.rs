@@ -159,6 +159,15 @@ pub fn encode_op(i: &mut Interner, op: &ArrangeOp) -> (&'static str, Vec<(&'stat
                 ("times", Value::U32(*times)),
             ],
         ),
+        ArrangeOp::ChopClip { track, clip, times, prefix } => (
+            "ChopClip",
+            vec![
+                ("track", Value::Str(i.intern(track))),
+                ("clip", Value::Str(i.intern(clip))),
+                ("times", Value::U32(*times)),
+                ("prefix", Value::Str(i.intern(prefix))),
+            ],
+        ),
     }
 }
 
@@ -270,6 +279,15 @@ pub fn decode_op(op: &str, fields: &[(&'static str, Value)]) -> Result<ArrangeOp
                 other => return Err(format!("field 'times' must be U32, got {other:?}")),
             },
         }),
+        "ChopClip" => Ok(ArrangeOp::ChopClip {
+            track: str_field(fields, "track")?,
+            clip: str_field(fields, "clip")?,
+            times: match field(fields, "times")? {
+                Value::U32(t) => *t,
+                other => return Err(format!("field 'times' must be U32, got {other:?}")),
+            },
+            prefix: str_field(fields, "prefix")?,
+        }),
         other => Err(format!("unknown arrangement op '{other}'")),
     }
 }
@@ -296,6 +314,7 @@ pub fn register_handlers(engine: &mut Engine, timeline: Arc<Mutex<Timeline>>) ->
 pub const ALL_OPS: &[&str] = &[
     "AddTrack", "RemoveTrack", "AddClip", "RazorSplit", "Trim", "MoveClip",
     "MoveClipToTrack", "Duplicate", "Delete", "SetClipGain", "SetClipFade", "LoopRegion",
+    "ChopClip",
 ];
 
 /// The clip-editor engine seam: owns the interner and the shared `Timeline`, and

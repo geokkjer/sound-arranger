@@ -66,6 +66,7 @@ the editor: there is no `timeline.mutate()` kitchen sink — there is a fixed se
 | `Delete` | remove a clip |
 | `SetClipGain` / `SetClipFade` | set the clip's gain / fade |
 | `LoopRegion` | bake a loop (repeat the region `times`) |
+| `ChopClip` | slice a clip into `times` contiguous pieces (ids derived from a `prefix`) — the auto-slice / chop verb |
 
 Crucially, **every entity-creating op carries the id it creates** (`new_left`, `new_right`,
 `new_id`, `track`, `clip`, ...), so *all* ids are logged and deterministic. The whole model

@@ -478,3 +478,35 @@ fn incremental_session_applies_edits_and_reports_arrangement() {
     let _ = std::fs::remove_dir_all(&pool);
     let _ = std::fs::remove_dir_all(&out_dir);
 }
+
+/// The `chop` text-format op splits a clip into N contiguous pieces, and the
+/// resulting value is a pure reconstruction (the arrangement reports 4 pieces
+/// tiling the original span, and the bounce renders audio).
+#[test]
+fn chop_text_format_splits_a_clip_and_renders() {
+    let pool = tmp_dir("chop");
+    write_ramp(&pool, "s1", 8000, 257);
+    let out_dir = tmp_dir("chopout");
+    let out = out_dir.join("c.wav");
+
+    let script_text = format!(
+        "host v1\nmount mixer channels=2 @0\npool {}\narrange add_track t0 @0\narrange add_clip t0 c0 s1 0 4000 0 0 0 1.0 @0\narrange chop t0 c0 4 pre @0\nbounce 4000 {}\n",
+        pool.display(), out.display()
+    );
+    let cmds = host::parse_script(&script_text).expect("script parses");
+    let sess = host::run_script(&cmds).unwrap();
+
+    let timeline = sess.arrangement().expect("the arrangement must snapshot");
+    assert_eq!(timeline.tracks[0].clips.len(), 4, "chop 4 -> four pieces");
+    assert_eq!(timeline.tracks[0].clips[0].id, "pre.0");
+    assert_eq!(timeline.tracks[0].clips[3].id, "pre.3");
+    assert_eq!(timeline.tracks[0].clips.last().unwrap().end(), 4000);
+
+    let mut r = media::WavReader::open(&out).unwrap();
+    let mut audio = vec![0.0f32; r.total_frames() as usize];
+    let n = r.read_into(&mut audio);
+    assert!(audio[..n].iter().any(|s| s.abs() > 1e-4), "chopped pieces render audio");
+
+    let _ = std::fs::remove_dir_all(&pool);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
