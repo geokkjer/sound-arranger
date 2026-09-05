@@ -3229,6 +3229,7 @@ dependencies = [
 name = "sound-arranger-shell"
 version = "0.1.0"
 dependencies = [
+ "host",
  "serde",
  "serde_json",
  "tauri",
