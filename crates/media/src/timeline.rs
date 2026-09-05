@@ -441,14 +441,17 @@ impl Timeline {
                         return Err(format!("chop derived id '{pid}' already exists or repeats"));
                     }
                     let slen = base + if i < rem { 1 } else { 0 };
+                    // Preserve the clip's outer fades on the first/last piece (as
+                    // RazorSplit does) so a chop doesn't silently remove audible
+                    // crossfades; interior seams are hard (a SetClipFade follows).
                     pieces.push(Clip {
                         id: pid,
                         source: c.source.clone(),
                         src_start: src_at,
                         src_len: slen,
                         at_frame: at,
-                        fade_in: 0,
-                        fade_out: 0,
+                        fade_in: if i == 0 { c.fade_in } else { 0 },
+                        fade_out: if i + 1 == times_f { c.fade_out } else { 0 },
                         gain: c.gain,
                         loop_len: None,
                     });

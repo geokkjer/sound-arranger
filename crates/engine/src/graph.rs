@@ -764,6 +764,17 @@ impl Graph {
         {
             return Err("connect: control inputs are single-driver in phase 1".into());
         }
+        // Audio cords must also match channel count. Until stereo *connections*
+        // are implemented, a stereo→mono (or mono→stereo) cord would silently sum
+        // the interleaved stereo buffer as mono — refuse loud instead (the
+        // per-port `channels` exists precisely to make this a checked seam).
+        if in_port.kind == SignalKind::Audio && out_port.channels() != in_port.channels() {
+            return Err(format!(
+                "connect: audio channel mismatch — '{from_port}' is {}ch, '{to_port}' is {}ch (stereo cords are not implemented yet)",
+                out_port.channels(),
+                in_port.channels()
+            ));
+        }
         let to_scratch = if in_port.kind == SignalKind::Audio {
             self.audio_in_ports[ti]
                 .iter()

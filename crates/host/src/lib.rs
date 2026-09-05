@@ -42,10 +42,10 @@ pub const HOST_PORTS: &[&str] = &[
 pub const HOST_PARAMS: &[&str] = &[
     "steps", "pulses", "rotation", "pulses_per_beat", "root", "note_len", "gain", "blip_len",
     "channels", "master.gain",
-    "ch0.gain", "ch0.mute", "ch0.solo", "ch1.gain", "ch1.mute", "ch1.solo",
-    "ch2.gain", "ch2.mute", "ch2.solo", "ch3.gain", "ch3.mute", "ch3.solo",
-    "ch4.gain", "ch4.mute", "ch4.solo", "ch5.gain", "ch5.mute", "ch5.solo",
-    "ch6.gain", "ch6.mute", "ch6.solo", "ch7.gain", "ch7.mute", "ch7.solo",
+    "ch0.gain", "ch0.mute", "ch0.solo", "ch0.pan", "ch1.gain", "ch1.mute", "ch1.solo", "ch1.pan",
+    "ch2.gain", "ch2.mute", "ch2.solo", "ch2.pan", "ch3.gain", "ch3.mute", "ch3.solo", "ch3.pan",
+    "ch4.gain", "ch4.mute", "ch4.solo", "ch4.pan", "ch5.gain", "ch5.mute", "ch5.solo", "ch5.pan",
+    "ch6.gain", "ch6.mute", "ch6.solo", "ch6.pan", "ch7.gain", "ch7.mute", "ch7.solo", "ch7.pan",
 ];
 
 fn in_list(list: &'static [&str], s: &str, what: &str) -> Result<&'static str, String> {
@@ -452,7 +452,11 @@ impl HostSession {
     /// first). A wiring failure (e.g. the mixer was unmounted after a `play`) is
     /// a clean `Err`, never a panic in a host.
     pub fn render(&mut self, frames: usize) -> Result<Vec<f32>, String> {
-        if frames.saturating_mul(std::mem::size_of::<f32>()) > Self::MAX_BOUNCE_BYTES {
+        // The master may be stereo (L/R), so a frame costs up to 2 * 4 bytes.
+        let budget = frames
+            .saturating_mul(std::mem::size_of::<f32>())
+            .saturating_mul(2);
+        if budget > Self::MAX_BOUNCE_BYTES {
             return Err(format!("bounce of {frames} frames exceeds the ~{:.0} MiB budget", Self::MAX_BOUNCE_BYTES / (1 << 20)));
         }
         self.wire_pending()?;
@@ -550,6 +554,7 @@ impl HostSession {
     /// Shared by [`run_script`] and [`execute`] so the live path can never
     /// diverge from the one-shot path.
     fn process(&mut self, cmd: &HostCommand) -> Result<(), String> {
+        let mut pending_mixer_channels = None;
         if let HostCommand::Mount { plugin: "mixer", params, .. } = cmd {
             // The mixer's channel count is the contract's own state. A fraction
             // (e.g. channels=4.5) must be refused, not silently truncated (the
@@ -568,7 +573,10 @@ impl HostSession {
             if channels > MIXER_CHANNELS_MAX {
                 return Err(format!("mixer channels {channels} exceeds the max {MIXER_CHANNELS_MAX}"));
             }
-            self.mixer_channels = Some(channels);
+            // Defer committing the channel count until apply succeeds: a refused
+            // re-mount must not overwrite the live mixer's channel count (a
+            // refused op changes nothing).
+            pending_mixer_channels = Some(channels);
         }
         if let Some(frame) = cmd.at_frame() {
             let now = self.engine.clock.frame();
@@ -578,7 +586,13 @@ impl HostSession {
                 self.render((frame - now) as usize)?;
             }
         }
-        self.apply(cmd)
+        let r = self.apply(cmd);
+        if r.is_ok() {
+            if let Some(ch) = pending_mixer_channels {
+                self.mixer_channels = Some(ch);
+            }
+        }
+        r
     }
 }
 

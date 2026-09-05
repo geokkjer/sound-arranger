@@ -455,3 +455,23 @@ fn mixer_adapts_to_channel_count() {
         assert!((*s - expected).abs() < 1e-6, "ch2 must be ignored: {s} vs {expected}");
     }
 }
+
+/// The GLM-5.3 review catch (#1): a logged mixer mount at a mid-session frame,
+/// replayed and rendered in ONE call, must advance the clock by exactly the
+/// requested frames. A mid-call master-width change used to split the frame
+/// count (replay clock 1536 vs live 2048), silently breaking byte-identical
+/// replay. Master-width changes are now parked at render-call boundaries.
+#[test]
+fn replay_across_mixer_mount_in_one_call_advances_the_clock_exactly() {
+    let mut e1 = engine();
+    let _ = e1.render(1024); // mono silence
+    e1.mount("mixer", &[]).unwrap(); // scheduled @1024
+    let _ = e1.render(1024); // stereo silence
+    assert_eq!(e1.clock.frame(), 2048, "live renders exactly 2048 frames");
+
+    let mut e2 = engine();
+    e2.replay_from(&e1.log).unwrap();
+    let out = e2.render(2048); // ONE call spanning the mount
+    assert_eq!(e2.clock.frame(), 2048, "replay in one call must advance exactly the requested frames (got {})", e2.clock.frame());
+    assert_eq!(out.len(), 2048, "the master is mono for the whole call (the width change is parked to the next boundary)");
+}

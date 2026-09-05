@@ -44,12 +44,16 @@ stereo master. Concretely, as shipped:
   mono source on a center-panned channel yields a stereo WAV whose channel 0
   carries `source * √2/2`.
 
-A mid-render *master* change is not supported: the output width changes
-mid-buffer, which a fixed-size render buffer cannot represent. The engine flushes
-due events at the start of each render call, so a channel change lands on a
-render-call boundary — verified by `replay_is_exact_for_mid_session_mount`
-(rendering in two calls at the mount frame). In practice the mixer is mounted
-before rendering.
+A mid-render *master-width* change is handled by **parking** it at a render-call
+boundary (`Engine::changes_master_width`; `render_block` parks a mixer
+Mount/Unmount the way arrangement ops are parked): a fixed-size output buffer
+cannot represent two channel widths in one call, so the width is constant per
+call and the change applies at the next `flush_scheduled`. This keeps the frame
+count exact — a replayed log rendered in one call across a mid-session mixer
+mount advances the clock by exactly the requested frames (regression test
+`replay_across_mixer_mount_in_one_call_advances_the_clock_exactly`). The width
+change taking effect at the call boundary, not its exact frame, is the documented
+trade-off.
 
 ## Consequences
 

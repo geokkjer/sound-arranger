@@ -667,6 +667,14 @@ impl Engine {
         self.graph.out_channels().max(1)
     }
 
+    /// Whether applying `event` mid-render would change the master bus width
+    /// (the channel count of the node owning the master out). Only the mixer is
+    /// a stereo master, so a mixer Mount/Unmount is exactly the class that a
+    /// fixed-width output buffer cannot represent mid-call.
+    fn changes_master_width(event: &SchedEvent) -> bool {
+        matches!(event, SchedEvent::Mount { plugin: "mixer", .. } | SchedEvent::Unmount { plugin: "mixer" })
+    }
+
     /// Render `frames` samples (frames * channels, interleaved) into a fresh
     /// buffer. The channel count is the graph's master out (1 mono, 2 stereo).
     pub fn render(&mut self, frames: usize) -> Vec<f32> {
@@ -747,6 +755,19 @@ impl Engine {
                             // violation loud in development.
                             self.parked.push(event);
                             debug_assert!(false, "an arrangement op reached the render stack; flush_scheduled before rendering");
+                            continue;
+                        }
+                        if Self::changes_master_width(&event) {
+                            // A master-*width* change (the mixer mounts/unmounts
+                            // and thus the bus owner's channel count changes)
+                            // cannot apply mid-call: the output buffer was sized
+                            // for the width at the call's start, so a mid-call
+                            // change would silently split the frame count
+                            // (replay would advance the clock wrong). PARK it —
+                            // it takes effect at the next flush (render-call
+                            // boundary), keeping the width constant per call and
+                            // render a pure function of (log, call boundaries).
+                            self.parked.push(event);
                             continue;
                         }
                         self.apply_event(event);
