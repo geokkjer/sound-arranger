@@ -5,6 +5,17 @@ interpreter · session event log · context plumbing — with every capability a
 the product an **assembled profile**. Rust (engine core + media engine + host), with Tauri v2
 + Vue 3 planned as the first graphical shell.
 
+## Scope (focused core)
+
+**The core is one thing: a *liquid* audio editor / sampler / arranger / mixer.** Record long
+live jams, then cut, splice, rearrange and mix them into a finished piece — clips-as-objects,
+with tape heritage (Macero, dub, musique concrète). This is the monorepo for that core **and
+its sidecar plugins** (`plugins/`): VST/CLAP builds and the CDP offline-process sidecar.
+
+Deliberately **out of scope** for this repo (kept as separate projects, indexed by the
+`~/Projects/music` view): the personal composition-theory corpus, the jam/recording rig, and
+the Tidal live-coding tool (`tidal-lsp`) — those are not on the clip-arranger path.
+
 > **Working title.** The repo name names the *first profile*, not the platform; a rename
 > ("audio" / "sound") is an open question — see RESEARCH.md §14.
 
@@ -32,6 +43,7 @@ drain/EOF phase for tailed effects. The direction is locked
 | `crates/engine` | The minimal core: clock (tempo map + sample-accurate scheduler), patch-bay graph interpreter (typed ports, PDC), session event log, context plumbing — plus plugins: euclidean, scale, tone, **soft mixer** (gain/mute/solo, master fader, meters). Std-only. It also carries the **closed-core plugin-message dispatch** (`Event::Arrangement` + `arrange_logged`): profile-level ops are logged as commands the core understands without knowing them. | works, tested |
 | `crates/media` | The media engine (core-privileged, not a plugin): disk streaming, splice-during-playback, recording writer with crash recovery, **device-clock drift compensation wired into the capture**, multi-channel capture → **float-WAV media pool with live peak pyramids**, pool **enumeration + crash recovery** (finalize un-finalized takes, rebuild `.peaks`), the **clip editor's value + ACID ops + `ArrangerNode`** (renders a track from the value), and the **`ArrangeOp ↔ engine-command` codec**. | works, tested |
 | `crates/host` | The **Host API contract** (commands = logged events, events, values) + the **headless reference host**: `run_script` assembles the profile and bounces byte-identically — now including the **clip-arrangement commands** (`pool`/`arrange`) in the versioned **text format**, so the CLI smoke binary drives the clip editor end-to-end. The UI-as-plugin seam — a future Tauri shell implements the same contract, nothing else changes. | works, tested |
+| `plugins/` | **Sidecar plugins** (placeholder): VST3/CLAP builds of core capabilities and the CDP / offline-process sidecar (`OfflineProcess`). Not engine crates — thin wrappers that expose a capability to a plug-in API. See [plugins/README.md](plugins/README.md). | placeholder |
 
 147 tests across the workspace; the core's invariants (byte-identical replay, no-allocation
 render, sample-accurate lifecycle) are tested, and the streaming soak + real hardware capture

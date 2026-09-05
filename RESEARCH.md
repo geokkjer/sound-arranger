@@ -14,7 +14,7 @@
 | **Direction** | **Umbrella-first** — the platform is the goal; profiles are the products; sound-arranger is profile #1 | [umbrella-first note](.agents/notes/proposed/architecture/2026-08-15-umbrella-first-product-direction.md) |
 | **App shell** | Tauri v2 + Vue 3 + TypeScript | Rust audio engine + web UI |
 | **Architecture** | **Minimal core (clock · graph interpreter · session log · context plumbing) + everything-else-as-plugin; the product is an assembled profile** | §11, §16.7, [minimal-core note](.agents/notes/proposed/architecture/2026-08-15-minimal-core-clock-graph-session-log.md) |
-| **UI library** | **Keep your `cdp-front` stack: `reka-ui` + shadcn-vue + Tailwind v4** | You already use it; headless primitives fit a bespoke DAW. Do **not** add Naive UI / PrimeVue |
+| **UI library** | **`reka-ui` + shadcn-vue + Tailwind v4** (the "cdp-front" stack — now a documented decision, not a repo) | Headless primitives fit a bespoke DAW. Do **not** add Naive UI / PrimeVue |
 | **Timeline rendering** | `<canvas>` 2D + precomputed waveform **peak pyramids** + viewport culling + offscreen clip caching | Fast and predictable; DOM-per-clip is a dead end |
 | **Audio I/O** | `cpal` (in **and** out) — ALSA/JACK on Linux, CoreAudio on macOS, WASAPI on Windows | Lowest latency; owns the device directly |
 | **Decode / encode** | `symphonia` (decode) · `hound` (WAV in/out) | Pure Rust |
@@ -57,7 +57,7 @@ The tool is a **clip-based visual arranger**, not a groovebox or MIDI sequencer.
 | Project | Role | How it relates |
 |---|---|---|
 | `pi5-daisy-synth-rig` | **The jam source** (Pi 5 + JUCE mixer + Daisy voices, USB interface, JACK) | In a **later phase** the arranger can record its output. Not part of the x86 prototype. |
-| `cdp-front` | Vue 3 + **reka-ui + shadcn-vue + Tailwind v4** frontend (a CDP wrapper) | **Reuse this exact frontend stack.** Its CDP-wrapping idea becomes the arranger's "offline process" tier (§6). |
+| `plugins/` (CDP sidecar) | **CDP / offline-process sidecar** (CDP8, PaulStretch, Csound offline, phase-vocoder) as `OfflineProcess` plugins | The former `cdp-front` **frontend** scaffold is dropped — no standalone frontend until the Tauri shell. CDP integration is now a **sidecar plugin** in [`plugins/`](plugins/), not a separate repo. Its UI *stack* decision (reka-ui + shadcn-vue + Tailwind v4) is captured in §17 and the [app-shell note](.agents/notes/proposed/architecture/2026-08-13-tauri-vue-rust-app-shell.md). |
 
 **Phase-1 capture hardware:** the [Soundcraft Notepad-12FX](research/gear/mixer-notepad-12fx.md) — 4-channel multitrack USB (2 mono + 1 stereo pair), class-compliant, routing protocol already reverse-engineered for a Rust `nusb` provider. The pi5 rig's own WAV recording is *that* project's Phase 2 — the arranger records the rig only once that exists.
 
@@ -89,13 +89,13 @@ Keep the arranger's **engine** as a standalone Rust crate (not Tauri-coupled), s
 ### 4.1 Stack
 
 - **Vue 3.5.x** (`vue@3.5.41`) + TypeScript, `<script setup>` SFCs.
-- **Vite** — reuse your `cdp-front` choice of `rolldown-vite` if you like it; Tauri v2 only calls your `dev`/`build` scripts.
+- **Vite** — `rolldown-vite` (the build tool prototyped in the dropped `cdp-front` scaffold) is fine if you like it; Tauri v2 only calls your `dev`/`build` scripts.
 - **Tauri v2** (`@tauri-apps/api/core`, not the v1 `tauri` module). Commands registered in `tauri::generate_handler![…]`; frontend uses `invoke()` / `listen()` / channels; permissions are **deny-by-default** via `src-tauri/capabilities/*.json`.
 - On x86 the webview is a non-issue: WebKitGTK (Linux), WKWebView (macOS), WebView2 (Windows) all handle a canvas timeline comfortably.
 
 ### 4.2 UI library — reuse what you have
 
-You asked for "a good UI library." The honest answer: **you already have it** in `cdp-front`:
+You asked for "a good UI library." The honest answer: **you already have one** — the `reka-ui` + shadcn-vue stack (prototyped in the now-dropped `cdp-front` scaffold, kept as a decision here):
 
 - **`reka-ui`** (`2.10.3`) — headless, accessible, Radix-UI primitives ported to Vue; unstyled, so the look is yours.
 - **shadcn-vue** on top — copy-in styled components (slider, menubar, sheet/sidebar, tooltip, dialog, context menu, select).
@@ -224,7 +224,7 @@ OfflineProcess { kind, params, input: Source }  →  job queue  →  new Source
 
 For the "PaulStretch sound," the clean paths are CDP8's own `.pvx` pvoc tools (LGPL) or your own `rustfft` phase-vocoder stretch (GPL-3.0) — not `ness_stretch` (unlicensed).
 
-> Your `cdp-front` project is a head start: its CDP-wrapping logic becomes the offline-process tier's UI, with the engine moved into Rust.
+> The CDP wrapping idea is the **offline-process tier** (§6) — now built as a `plugins/` **sidecar** (`OfflineProcess`), not as a separate frontend repo. The engine stays in Rust; no standalone frontend until the Tauri shell.
 
 ### Tier 3 — Rust audio plugin/DSP ecosystem (research, §10)
 
@@ -382,7 +382,7 @@ Dependency compatibility matrix (verified where marked):
 
 **Confirmed absent:** crate `paulstretch`.
 
-**Local prior art:** `~/Projects/cdp-front` (reka-ui + shadcn-vue + Tailwind v4 + rolldown-vite), `~/Projects/pi5-daisy-synth-rig` (Pi 5 + JUCE + Daisy + JACK + USB-MIDI), `~/faust-juce-writeup.md` §6.8–6.10, `~/Projects/Algorithmic composer` (bp4 porting plan — sound-object placement semantics: pivot/cover/gap/relocation, pre/post-roll; rational integer-ratio time with LCM-aware quantization; strong prior art for clip placement and auto-arrange, added 2026-08-15).
+**Local prior art:** the [Bol Processor (bp4) study — now folded into `research/prior-art/`](research/prior-art/) (sound-object placement semantics: pivot/cover/gap/relocation, pre/post-roll; rational integer-ratio time with LCM-aware quantization; strong prior art for clip placement and auto-arrange), `~/Projects/pi5-daisy-synth-rig` (Pi 5 + JUCE + Daisy + JACK + USB-MIDI), `~/faust-juce-writeup.md` §6.8–6.10. The audio-UI stack (reka-ui + shadcn-vue + Tailwind v4) is documented in §17 and the [app-shell note](.agents/notes/proposed/architecture/2026-08-13-tauri-vue-rust-app-shell.md) — the separate `cdp-front` scaffold was dropped (CDP is now a sidecar plugin).
 
 ---
 
