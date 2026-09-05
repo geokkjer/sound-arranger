@@ -98,9 +98,9 @@ FFmpeg's own history is the strongest argument for our direction: the format-neg
 
 1. **Media pool decode stays pure Rust (symphonia) in Phase 1; no libav in the realtime core.** In-process libav from Rust is a high-cost path (binding zoo: frozen `ffmpeg-next`, stale `rsmpeg`, single-maintainer `ez-ffmpeg`; FFI-safety risk; C toolchain; version treadmill).
 2. **Master export (Phase 4) and long-tail import (sculptor): an ffmpeg CLI sidecar as an `OfflineProcess` plugin** — the CDP8 pattern, zero linking, logged as an ordinary event. Already anticipated by RESEARCH §10's "FLAC/MP3 via a sidecar (ffmpeg/sox)".
-3. **Introduce a channel-layout type before `channels: 1..=8` hardens in the log schema** (AVChannelLayout-style: named channels, explicit order, "never make one up") — see the [channel-layout note](.agents/notes/proposed/feature/2026-08-20-channel-layout-typed-value.md).
+3. **Introduce a channel-layout type before `channels: 1..=8` hardens in the log schema** (AVChannelLayout-style: named channels, explicit order, "never make one up") — see the [channel-layout note](../../.agents/notes/proposed/feature/2026-08-20-channel-layout-typed-value.md).
 4. **Model encoder delay/priming explicitly in bounce** (`AV_CODEC_CAP_DELAY` awareness) so lossy export is sample-accurate at clip edges and decodes back onto the same frames.
-5. **Add an explicit drain/EOF phase to offline bounce and any stateful node** (the send/receive flush protocol) — see the [drain/EOF note](.agents/notes/proposed/feature/2026-08-20-drain-eof-phase.md).
+5. **Add an explicit drain/EOF phase to offline bounce and any stateful node** (the send/receive flush protocol) — see the [drain/EOF note](../../.agents/notes/proposed/feature/2026-08-20-drain-eof-phase.md).
 6. **Fuzz the media-pool import path from day one** (the 300-fuzzer lesson).
 7. **Explicit format negotiation for sample-rate/channel mismatches at patch time, logged** — or deliberate auto-insertion, designed and visible — never silent invented formats.
 

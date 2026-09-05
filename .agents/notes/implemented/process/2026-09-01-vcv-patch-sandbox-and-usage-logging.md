@@ -8,8 +8,8 @@ The Eurorack GO build is planned, not owned yet — and Behringer modules have a
 
 ## Decision
 
-- **`vcv-patch/`** holds the VCV Rack patches used to prototype planned hardware and explore generative patching. A `README.md` documents the software↔hardware mapping (Vektor↔Victor, Venom↔Surges, Aestus/Tides↔Waves, ADSR↔140, VCA↔IDA, Audio↔CU1A), the reference monophonic voice patch, the naming convention, and the caveat about the Vektor embedding imported `.wav` into the patch JSON.
-- **`scripts/log-vcv-usage.sh`** samples the CPU% and RSS of a running VCV Rack process (tree) and appends a CSV to `vcv-patch/.usage/` (gitignored). It reads `/proc/<pid>/stat` deltas so CPU% is a true per-interval rate (not a `ps` lifetime average), sums across the Rack process tree, handles the multi-threaded >100% case, and needs no deps beyond bash + pgrep + getconf/awk.
+- **`~/Projects/music/vcv-rack/`** (extracted out of this repo) holds the VCV Rack patches used to prototype planned hardware and explore generative patching. A `README.md` documents the software↔hardware mapping (Vektor↔Victor, Venom↔Surges, Aestus/Tides↔Waves, ADSR↔140, VCA↔IDA, Audio↔CU1A), the reference monophonic voice patch, the naming convention, and the caveat about the Vektor embedding imported `.wav` into the patch JSON.
+- **`scripts/log-vcv-usage.sh`** (moved with it) samples the CPU% and RSS of a running VCV Rack process (tree) and appends a CSV to `vcv-rack/.usage/` (gitignored). It reads `/proc/<pid>/stat` deltas so CPU% is a true per-interval rate (not a `ps` lifetime average), sums across the Rack process tree, handles the multi-threaded >100% case, and needs no deps beyond bash + pgrep + getconf/awk.
 - The rack plan links the software sandbox so the two stay in sync.
 
 ## Alternatives considered

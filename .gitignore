@@ -20,8 +20,8 @@ src-tauri/target/
 # .agents/notes/implemented/process/2026-08-27-model-co-work-routing.md
 .pi-home/
 
-# M-VAVE FM-1 firmware update image (large, not source)
-research/gear/*.fwsc
+# M-VAVE FM-1 firmware update image (large, not source) — moved to the studio project
+# (music-composition-theory/studio/instruments/m-vave-fm-1/); gear is software-separated.
 
-# transient VCV Rack CPU/RAM usage logs (regenerated on demand)
-vcv-patch/.usage/
+# transient VCV Rack CPU/RAM usage logs (regenerated on demand) — VCV Rack is its own
+# project (~/Projects/music/vcv-rack); its .usage/ is gitignored there.

@@ -4,7 +4,7 @@ Status: proposed
 
 ## Problem
 
-Prototyping the planned Eurorack build in VCV Rack (see [the rack plan](../../../../research/gear/behringer-eurorack-go-rack-plan.md) and the [vcv-patch sandbox](../../../../vcv-patch/README.md)) surfaced a clear split: **software wins on extensibility and interoperability; hardware wins on tactile UX** (turning knobs with a mouse is not a good "live" experience). And the audio engine is **CPU-bound** — a single machine's CPU/RAM is the ceiling, and the owner's machine is "upper-midrange." We need two things: (1) a way to use physical hardware as a *tactile* interface to the software, and (2) a way to **scale the DSP** past one machine's CPU/RAM when we hit that ceiling. Because the arranger **records long takes** and is *not* in the live-monitoring path, scaling is a different (more forgiving) problem than for a live performance tool.
+Prototyping the planned Eurorack build in VCV Rack (see [the rack plan](../../../../../music/music-composition-theory/studio/instruments/behringer-eurorack/research-note.md) and the [vcv-rack sandbox](../../../../../music/vcv-rack/README.md)) surfaced a clear split: **software wins on extensibility and interoperability; hardware wins on tactile UX** (turning knobs with a mouse is not a good "live" experience). And the audio engine is **CPU-bound** — a single machine's CPU/RAM is the ceiling, and the owner's machine is "upper-midrange." We need two things: (1) a way to use physical hardware as a *tactile* interface to the software, and (2) a way to **scale the DSP** past one machine's CPU/RAM when we hit that ceiling. Because the arranger **records long takes** and is *not* in the live-monitoring path, scaling is a different (more forgiving) problem than for a live performance tool.
 
 ## Proposal
 
@@ -34,7 +34,7 @@ Prototyping the planned Eurorack build in VCV Rack (see [the rack plan](../../..
 
 - **Cardinal is Rack-1 based and self-contained — a hard limit for the current patch.** The Rack 2 *engine* is open source, but **embedding Rack 2 as a VST3/CLAP plugin is a paid Pro feature**; Cardinal (a Rack-1 fork) is the free embed path. However, Cardinal per its own FAQ is "intentionally a fully self-contained plugin" — it **only runs the open-source modules bundled in its build**, and you can't add arbitrary VCV plugins without forking + rebuilding. So **your Rack-2 modules (e.g. the current patch) won't load in Cardinal at all** (Rack-2 API, and not bundled). To run Rack-2 modules embedded you'd **build a host from the open Rack-2 source** (large C++ effort) **or pay VCV Pro**. Practical line: plan vertical scaling around **Cardinal's bundled module set**, keep Rack 2 standalone as the authoring sandbox, and re-author the target voice against modules that actually exist in Cardinal before relying on it.
 - **Licensing:** Cardinal is GPLv2; embedding it as an opaque node via a CLAP host keeps it a separate in-process plugin (like the CDP8 sidecar pattern) — confirm no copyleft taint on the GPL-or-later app (§12).
-- **Multi-instance memory:** each Cardinal instance is a full synth, so vertical scaling costs **RAM**, not just CPU — measure with [log-vcv-usage.sh](../../../../scripts/log-vcv-usage.sh).
+- **Multi-instance memory:** each Cardinal instance is a full synth, so vertical scaling costs **RAM**, not just CPU — measure with [log-vcv-usage.sh](../../../../../music/vcv-rack/scripts/log-vcv-usage.sh).
 - **Complexity/deferral:** distributed is a real lift; keep it a later phase and don't let it inflate the critical path.
 
 ---
