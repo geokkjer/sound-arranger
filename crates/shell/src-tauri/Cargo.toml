@@ -4,6 +4,12 @@ version = "0.1.0"
 description = "Tauri v2 shell — the thin transport adapter over the Host API (docs/design/ui-plan.md)."
 edition = "2021"
 
+# The lib is the Host-API bridge; `_lib` avoids the bin/lib same-name
+# self-reference so `main.rs` can call `sound_arranger_shell_lib::run()`.
+[lib]
+name = "sound_arranger_shell_lib"
+path = "src/lib.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -11,3 +17,4 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+host = { path = "../../host" }
