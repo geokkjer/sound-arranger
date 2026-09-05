@@ -78,7 +78,7 @@ crates/engine    crates/media     crates/host      crates/shell
 
 The dependency direction is the whole point: `engine` and `media` must never
 depend on `tauri`. The UI is a plugin, not the substrate (the
-[UI-as-plugin note](.agents/notes/implemented/architecture/2026-08-18-ui-as-plugin-host-api-and-headless-reference.md)
+[UI-as-plugin note](../.agents/notes/implemented/architecture/2026-08-18-ui-as-plugin-host-api-and-headless-reference.md)
 owns that decision).
 
 ### 1.3 Two governing invariants
@@ -483,7 +483,7 @@ render loop **parks** the op instead of dropping it — the next
 `flush_scheduled()` applies parked ops FIFO before the due queue — so nothing
 logged can ever be silently lost and live/replay cannot diverge (a bug of
 exactly that shape existed until the control→render handoff note fixed it;
-[`implemented/architecture/2026-08-27-control-render-handoff-parked-ops.md`](.agents/notes/implemented/architecture/2026-08-27-control-render-handoff-parked-ops.md)
+[`implemented/architecture/2026-08-27-control-render-handoff-parked-ops.md`](../.agents/notes/implemented/architecture/2026-08-27-control-render-handoff-parked-ops.md)
 owns the contract). The practical rule while the host is single-owner: *call
 `flush_scheduled()` before rendering*.
 
@@ -1136,9 +1136,9 @@ If you want to go deeper, in a sensible order:
    whole product in miniature, and the best place to see the Host API contract
    exercised end to end.
 5. **The decision notes** — start with
-   [`minimal-core`](.agents/notes/proposed/architecture/2026-08-15-minimal-core-clock-graph-session-log.md)
+   [`minimal-core`](../.agents/notes/proposed/architecture/2026-08-15-minimal-core-clock-graph-session-log.md)
    and
-   [`ui-as-plugin`](.agents/notes/implemented/architecture/2026-08-18-ui-as-plugin-host-api-and-headless-reference.md),
+   [`ui-as-plugin`](../.agents/notes/implemented/architecture/2026-08-18-ui-as-plugin-host-api-and-headless-reference.md),
    then the `implemented/` notes for what actually shipped and why.
 
 And if you internalize only two things, make them these:

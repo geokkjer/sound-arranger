@@ -4,7 +4,7 @@ Status: proposed
 
 Design reviewed by kimi before any code (2026-08-24) — the must-fix/should-fix
 findings are integrated below and recorded in
-[research/architecture/2026-08-24-kimi-review-p1-3-design.md](../../../research/architecture/2026-08-24-kimi-review-p1-3-design.md).
+[research/architecture/2026-08-24-kimi-review-p1-3-design.md](../../../../research/architecture/2026-08-24-kimi-review-p1-3-design.md).
 Verdict on the central shape: sound.
 
 ## Problem
@@ -12,7 +12,7 @@ Verdict on the central shape: sound.
 Phase 1 has a mixer and a recorder, but **no arrangement**. The host's media path is an
 ad-hoc single-player: `HostCommand::Play { clip, channel }` starts one `FilePlayer`
 routed into a mixer channel, and `HostCommand::Splice` crossfades the playing clip to
-another (`PlaybackNode` + `SpliceCmd` in [`stream.rs`](crates/media/src/stream.rs)).
+another (`PlaybackNode` + `SpliceCmd` in [`stream.rs`](../../../../crates/media/src/stream.rs)).
 There is no *timeline value* — no notion of clips placed at frames on tracks, no ACID
 editing, no pool a UI can enumerate. The clip editor must make "record → cut/paste →
 rearrange into a piece" real, and it must do so as **logged commands** (the core rule:
@@ -149,7 +149,7 @@ The pool is a directory of content-hash float-WAV sources + `.peaks` sidecars
   `.wav`/`.peaks` pairs with frame counts, sample rate, and peak pyramid. Peaks rebuilt
   when missing.
 - **`Pool::recover()`**: rescan for un-finalized sources (a `.wav` whose header is still
-  placeholder — a crashed take) and call [`WavWriter::recover`](crates/media/src/wav.rs)
+  placeholder — a crashed take) and call [`WavWriter::recover`](../../../../crates/media/src/wav.rs)
   (patches the frame-aligned size, truncates a torn tail), then rebuild missing `.peaks`.
 - **Content-set semantics:** a recovered take's *content* changes (torn tail truncated),
   so it is **not** a silent repair under the same content-hash id. Recovery either (a)

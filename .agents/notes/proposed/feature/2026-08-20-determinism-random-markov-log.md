@@ -4,7 +4,7 @@ Status: proposed
 
 ## Problem
 
-The decoupled pitch/rhythm note's selection modes include `random` and `markov` (semi-random note-picking over a Markov chain), and `follow_pulse` holds a per-lane "last note" map. Each of these is *hidden mutable state* inside the assignment node. That collides head-on with the core's founding invariant — the [patch-bay note](2026-08-17-patch-bay-typed-signal-streams.md) is emphatic: *"Patching is logged … replay reproduces byte-identical output."* An unmanaged PRNG that draws from wall-clock state or a hidden incrementing counter will render differently on replay, silently corrupting the one property the session log and the "improv" auditable-replay story both depend on. This must be settled before any stochastic selection mode ships — otherwise it arrives as a quiet trickle of non-reproducible sessions.
+The decoupled pitch/rhythm note's selection modes include `random` and `markov` (semi-random note-picking over a Markov chain), and `follow_pulse` holds a per-lane "last note" map. Each of these is *hidden mutable state* inside the assignment node. That collides head-on with the core's founding invariant — the [patch-bay note](../../implemented/architecture/2026-08-17-patch-bay-typed-signal-streams.md) is emphatic: *"Patching is logged … replay reproduces byte-identical output."* An unmanaged PRNG that draws from wall-clock state or a hidden incrementing counter will render differently on replay, silently corrupting the one property the session log and the "improv" auditable-replay story both depend on. This must be settled before any stochastic selection mode ships — otherwise it arrives as a quiet trickle of non-reproducible sessions.
 
 ## Proposal
 

@@ -57,7 +57,7 @@ naive test passed a *vacuous* silent bounce).
   `Graph::insert_before` keeps `arranger → mixer` a forward cord), mapped to `ch{track_index}`.
   Readers are positioned at the **current transport frame**, so a mid-play edit continues the clip
   rather than restarting it. This fixes the `RemoveTrack` **ghost** (a removed track's node is
-  retired) and makes edits to an already-wired track reach audio — see the [reconcile note](.agents/notes/implemented/feature/2026-08-25-arranger-reconcile-on-dirty.md).
+  retired) and makes edits to an already-wired track reach audio — see the [reconcile note](2026-08-25-arranger-reconcile-on-dirty.md).
 - 10 host arrangement tests (in `arranger_commands.rs`): build value + replay identity,
   refuse-without-pool, byte-identical non-silent arrangement bounce, removed-track-does-not-ghost,
   edit-continues-the-clip (ramp source, asserts the correct region plays),

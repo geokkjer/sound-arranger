@@ -48,7 +48,7 @@ After this, `cargo test -p engine --release` fully passes (previously 5 failures
 
 - Release builds now apply scheduled mounts; the entire engine works in release, not just debug.
 - Byte-identical replay and determinism are unaffected: the mount applies at the same absolute frame; the only change is that release no longer skips it.
-- This is the enabling fix that let the native-soft-synth fundsp spike ([note](proposed/architecture/2026-08-30-native-soft-synth-building-blocks.md)) pass in release.
+- This is the enabling fix that let the native-soft-synth fundsp spike ([note](../../proposed/architecture/2026-08-30-native-soft-synth-building-blocks.md)) pass in release.
 - **Honest caveat** (independent review 2026-08-30): "a scheduled mount must apply" is *not* type-enforced. `validate_mount` dry-runs `inject()` but not `apply`, so a plugin whose `apply` returns `Err` (e.g. an op-handler collision) is a live release-silent path for such a plugin. Dead for today's plugins (mixer/tone/euclidean/scale/fundsp all return `Ok`), but if "must apply" is a hard contract, the fallibility belongs in `validate_mount` (a refused mount is then never logged) — a design change, since `apply` isn't dry-runnable today.
 
 *Authored with deepseek-v4-flash-vision-exp · DeepSeek Harness, 2026-08-30.*

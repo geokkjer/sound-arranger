@@ -1,6 +1,6 @@
 # Research: softsynth integration routes — CLAP hosting, external seams, and per-app embedding
 
-> **Date:** 2026-08-19. **Scope:** can existing C++ softsynths (Csound, SuperCollider, Cardinal/VCV Rack, Dexed) be used in sound-arranger "easily", or is integration per-app? The answer is a taxonomy of three routes, two of which are seams already designed. **Sources:** [FOSDEM 2026 — Modular in the DAW (Cardinal)](https://fosdem.org/2026/schedule/event/JYGFRE-modular-in-the-daw/), [Cardinal](https://cardinal.kx.studio/), [DISTRHO/Cardinal](https://github.com/DISTRHO/Cardinal), [Csound Debian COPYING (LGPL-2.1)](https://browse.dgit.debian.org/csound.git/commit/COPYING), our own [§16 plugin research](RESEARCH.md) and the [prior-art pass](2026-08-18-ardour-audacity-prior-art.md).
+> **Date:** 2026-08-19. **Scope:** can existing C++ softsynths (Csound, SuperCollider, Cardinal/VCV Rack, Dexed) be used in sound-arranger "easily", or is integration per-app? The answer is a taxonomy of three routes, two of which are seams already designed. **Sources:** [FOSDEM 2026 — Modular in the DAW (Cardinal)](https://fosdem.org/2026/schedule/event/JYGFRE-modular-in-the-daw/), [Cardinal](https://cardinal.kx.studio/), [DISTRHO/Cardinal](https://github.com/DISTRHO/Cardinal), [Csound Debian COPYING (LGPL-2.1)](https://browse.dgit.debian.org/csound.git/commit/COPYING), our own [§16 plugin research](../../RESEARCH.md) and the [prior-art pass](2026-08-18-ardour-audacity-prior-art.md).
 
 ## The deciding question
 

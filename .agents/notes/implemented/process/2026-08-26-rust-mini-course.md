@@ -12,7 +12,7 @@ Add **`docs/rust-course/`**: an eight-lesson mini course that teaches Rust *thro
 
 Lessons: 1 structs/ownership (`clock.rs`) · 2 enums/match/Option/Result (`log.rs`, `graph.rs`) · 3 traits/generics (`AudioNode`, `Plugin`) · 4 closures/disposers (`euclidean.rs`) · 5 lifetimes/disjoint borrows (`render.rs`) · 6 no-allocation render path (`EventBuf`, counting allocator) · 7 threads/atomics/unsafe (`media/src/ring.rs`) · 8 modules/errors/host (`host/src/lib.rs`) · 9 paradigms and design principles — Rust as multimodal (functional/OO/procedural per problem), with SOLID/KISS/DRY/YAGNI translated to this codebase's practice (open traits vs closed enums, trait contracts as LSP, three DI mechanisms). A README covers setup, ordering, and method; lesson 8 ends with an end-to-end script exercise through the headless host (verified: mount → patch → bounce runs).
 
-The course deliberately complements rather than restates [the architecture explainer](../../../docs/architecture-explainer.md): that document explains the audio-engineering *why*; this one teaches the Rust-language *how*, at a lower starting level.
+The course deliberately complements rather than restates [the architecture explainer](../../../../docs/architecture-explainer.md): that document explains the audio-engineering *why*; this one teaches the Rust-language *how*, at a lower starting level.
 
 ## Alternatives considered
 

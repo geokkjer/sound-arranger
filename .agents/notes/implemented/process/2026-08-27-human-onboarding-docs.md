@@ -10,7 +10,7 @@ The docs explaining the code to the project's one human (a novice Rust developer
 
 Three changes, same commit:
 
-1. **Reading order is explicit and front-loaded.** The README's Documentation map now leads with an ordered path for a newcomer: operate something ([`docs/FIRST_SESSION.md`](../../docs/FIRST_SESSION.md)) → learn Rust through the codebase ([`docs/rust-course/`](../../docs/rust-course/README.md)) → learn why ([`docs/architecture-explainer.md`](../../docs/architecture-explainer.md)) → only then RESEARCH.md and the notes. The course README and explainer cross-link accordingly.
+1. **Reading order is explicit and front-loaded.** The README's Documentation map now leads with an ordered path for a newcomer: operate something ([`docs/FIRST_SESSION.md`](../../../../docs/FIRST_SESSION.md)) → learn Rust through the codebase ([`docs/rust-course/`](../../../../docs/rust-course/README.md)) → learn why ([`docs/architecture-explainer.md`](../../../../docs/architecture-explainer.md)) → only then RESEARCH.md and the notes. The course README and explainer cross-link accordingly.
 2. **Freshness banners.** Explainer docs carry a banner line — `Last verified against commit <hash> (<date>). If the code has moved on, trust the code and move this line forward.` — added or advanced *when a doc is next actually touched or re-verified*, never retroactively (a banner claims verification that didn't happen). AGENTS.md carries the standing order.
 3. **FIRST_SESSION.md** — a verified-by-execution fifteen-minute tour: assemble the four-plugin profile (euclidean → scale → tone → mixer) as a host-CLI script, bounce a WAV, read the summary invariants, prove byte-identical determinism with `cmp`, break it three ways on purpose (parse-time refusal exit 2; use-before-mount refusal exit 1 with refused-not-logged semantics; the units trap where `note_len=0.25` truncates to zero frames and bounces silence). Every command in it was run before being written down.
 
@@ -24,7 +24,7 @@ Three changes, same commit:
 ## Consequences
 
 - A newcomer has one unambiguous entry point; docs audibly state their own age.
-- The map now also links the **product-side** explainer ([`docs/clip-arranger.md`](../../docs/clip-arranger.md)) and the UI design docs ([`docs/design/`](../../docs/design/)), both added 2026-08-27. The clip-arranger substrate was the explanation gap the v1 tour deferred (the `pool`/`arrange` recorded-clip route was pushed off in Alternatives) — it is now an explainer, not a tour.
+- The map now also links the **product-side** explainer ([`docs/clip-arranger.md`](../../../../docs/clip-arranger.md)) and the UI design docs ([`docs/design/`](../../../../docs/design/)), both added 2026-08-27. The clip-arranger substrate was the explanation gap the v1 tour deferred (the `pool`/`arrange` recorded-clip route was pushed off in Alternatives) — it is now an explainer, not a tour.
 - The banner rule adds one maintenance duty per doc-touch — accepted, small.
 - The tour depends on script syntax and output wording (`host: bounced …`, exit codes); if those change, FIRST_SESSION is the canary, which is fine — it exists to be rerun.
 - Side finding worth keeping: parameter lengths are frame-valued (`note_len`, `blip_len` are `u32` sample frames); the tour documents this because even its author bounced silence on the first attempt.

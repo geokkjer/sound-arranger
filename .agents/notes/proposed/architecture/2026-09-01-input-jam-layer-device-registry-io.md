@@ -4,7 +4,7 @@ Status: proposed
 
 ## Problem
 
-Between the physical gear and the platform core sits an awkward, messy zone — what the [Synclavier design-inspiration review](research/architecture/2026-09-01-synclavier-design-inspiration-and-modular-hardware.md) calls the **input/jam layer**. The core (clock · graph interpreter · session log · context) is clean; the gear on the other end of the cable is not. The paper cuts already hit by the user's own rig research are all *interoperability* wounds, not capability gaps:
+Between the physical gear and the platform core sits an awkward, messy zone — what the [Synclavier design-inspiration review](../../../../research/architecture/2026-09-01-synclavier-design-inspiration-and-modular-hardware.md) calls the **input/jam layer**. The core (clock · graph interpreter · session log · context) is clean; the gear on the other end of the cable is not. The paper cuts already hit by the user's own rig research are all *interoperability* wounds, not capability gaps:
 
 - **Firmware updaters are Windows/Mac-only** — KORG NTS-3 (Windows-only updater), M-Upgrade for the M-VAVE FM-1 (Windows/Mac). There is no Linux path and no open update story.
 - **Closed/undocumented protocols reach your own data** — the EP-133's structured filesystem is reachable only via its undocumented SysEx; the Soundcraft Notepad-12FX routing is a vendor-defined USB protocol (`nusb`); KORG KONTROL Editor owns the NTS-3's channel; the FM-1 flashes over USB-HID OTA.
@@ -12,7 +12,7 @@ Between the physical gear and the platform core sits an awkward, messy zone — 
 - **USB topology is unmodelled** — each device is a different combination (audio, MIDI, both, charging-only; class-compliant vs driver-bound) with no consistent answer to "what is this thing and what does it speak?"
 - **Vendor lock-in** — each manufacturer owns the only path in: the updater, the protocol, and the UI.
 
-The [Synclavier](research/architecture/2026-09-01-synclavier-design-inspiration-and-modular-hardware.md) is the apt counter-example — the ultimate closed system (proprietary everything, $25k–$200k, a terminal you couldn't script). The instinct here is the precise inverse: want **own** gear to be open, connected, recallable, scriptable across vendors. This note makes that instinct a first-class, but *bounded*, platform concern.
+The [Synclavier](../../../../research/architecture/2026-09-01-synclavier-design-inspiration-and-modular-hardware.md) is the apt counter-example — the ultimate closed system (proprietary everything, $25k–$200k, a terminal you couldn't script). The instinct here is the precise inverse: want **own** gear to be open, connected, recallable, scriptable across vendors. This note makes that instinct a first-class, but *bounded*, platform concern.
 
 ## Proposal
 
