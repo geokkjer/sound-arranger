@@ -2,7 +2,7 @@
 
 This folder holds **VCV Rack patch files (`.vcv`)** used to *prototype the planned hardware before buying* and to explore the generative / "studio as instrument" patching from the Autechre research. Each good patch here is a working model of a planned hardware configuration.
 
-> See the [Eurorack GO rack plan](../research/gear/behringer-eurorack-go-rack-plan.md) for the hardware this software is sandboxing. Patches are the **software mirror** of that rack — and of the input/jam-layer "software as instrument" thesis.
+> See the [Eurorack rack plan](../research/gear/behringer-eurorack-rack-plan.md) for the hardware this software is sandboxing. Patches are the **software mirror** of that rack — and of the input/jam-layer "software as instrument" thesis.
 
 ## First reference voice (the intended hardware build)
 
