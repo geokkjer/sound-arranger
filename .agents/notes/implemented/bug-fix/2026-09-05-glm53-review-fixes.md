@@ -39,17 +39,20 @@ the two that touch the recorder/arranger underrun paths are deferred (below).
   one-call renders stay frame-exact across a mid-session mixer mount.
 - `cargo test --workspace` is green.
 
-## Deferred (documented, not fixed here)
+## Also fixed
 
-- **#3 — `play` after any render breaks the session** (the player node is
-  appended to the topological order and so lands *after* the mixer; a cord
-  player→mixer then violates forward-order). The recorder/player path needs the
-  same `insert_before(mixer)` treatment `wire_arranger` uses. Not on the
-  clip-arranger core path; a follow-up.
-- **#5 — arranger underruns are counted but never surfaced.** The per-track
-  `ArrangerNode` underrun counters go into the graph and nothing reads them, so a
-  reader slip silently glitches a bounce at the host boundary. Needs threading
-  the counters out of the (re-wired) nodes. A follow-up.
+- **#3 — `play` after any render breaks the session.** `Play` placed the player
+  node with `add_node` (appended to the topological order), so once the mixer had
+  materialized (any render between mount and play) the player landed *after* it
+  and its cord was backward — every later render failed. `Play` now uses
+  `insert_before(mixer)` when the mixer is materialized, else `add_node` (the
+  mixer materializes later and lands after the player). Regression test
+  `play_after_a_render_does_not_break_the_session`.
+- **#5 — arranger underruns are surfaced.** `wire_arranger` now keeps each
+  track's `ArrangerNode` underrun counter (`ArrangerNode::underruns_arc`), and
+  `HostSession::underruns()` sums the player counter plus all arranger counters,
+  so a reader slip in the arranger is reported instead of silently glitching a
+  bounce.
 
 ## Alternatives considered
 

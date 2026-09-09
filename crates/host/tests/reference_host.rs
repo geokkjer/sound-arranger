@@ -325,3 +325,32 @@ fn smoke_binary_records_and_bounces() {
         let _ = std::fs::remove_file(p);
     }
 }
+
+/// GLM-5.3 review #3: `play` after any render must not break the session. The
+/// player node is placed BEFORE the mixer in topological order (insert_before),
+/// so a mixer materialized by an earlier bounce no longer makes the player's
+/// cord backward.
+#[test]
+fn play_after_a_render_does_not_break_the_session() {
+    let clip = tmp("clip");
+    write_tone(&clip, 440.0, 4096);
+    let out1 = tmp("b1");
+    let out2 = tmp("b2");
+
+    let script = vec![
+        HostCommand::Mount { plugin: "mixer", params: vec![("channels", 2.0)], at_frame: Some(0) },
+        HostCommand::Bounce { frames: 512, path: out1.clone() }, // materialize the mixer
+        HostCommand::Play { clip: media::ClipRef::whole(&clip).unwrap(), channel: 0, at_frame: Some(512) },
+        HostCommand::Bounce { frames: 512, path: out2.clone() }, // failed before the fix
+    ];
+    let sess = run_script(&script).expect("play after a render must not break the session");
+    assert_eq!(sess.underruns(), 0);
+    let mut r = WavReader::open(&out2).unwrap();
+    let mut audio = vec![0.0f32; r.total_frames() as usize];
+    let n = r.read_into(&mut audio);
+    assert!(audio[..n].iter().any(|s| s.abs() > 1e-4), "the post-play render must actually produce audio");
+
+    let _ = std::fs::remove_file(&clip);
+    let _ = std::fs::remove_file(&out1);
+    let _ = std::fs::remove_file(&out2);
+}

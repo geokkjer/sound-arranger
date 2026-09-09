@@ -151,6 +151,11 @@ pub struct HostSession {
     player_mailbox: Option<Mailbox>,
     player_underruns: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     player_deferred: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// per-track arranger underrun counters (one Arc per wired track). The
+    /// render path writes into the nodes' counters; the control side reads them
+    /// here, so a reader slip in the arranger is surfaced instead of silently
+    /// glitching the bounce. Rebuilt with every `wire_arranger`.
+    arranger_underruns: Vec<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     /// the mixer's mounted channel count (validated at Play apply).
     mixer_channels: Option<usize>,
     /// media commands applied (the log covers engine commands only until
@@ -182,6 +187,7 @@ impl HostSession {
             player_mailbox: None,
             player_underruns: None,
             player_deferred: None,
+            arranger_underruns: Vec::new(),
             mixer_channels: None,
             media_commands: 0,
             editor: None,
@@ -286,10 +292,19 @@ impl HostSession {
                 let node = PlaybackNode::new(Some(player), mailbox.clone());
                 let underruns = node.underrun_counter();
                 let deferred = node.deferred_counter();
-                let id = self.engine.graph.add_node(
-                    NodeKind::Opaque(Box::new(node)),
-                    vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio , channels: 1 }],
-                );
+                // Place the player BEFORE the mixer in topological order (the
+                // graph's forward-order rule): if the mixer is already
+                // materialized, insert_before(mixer); otherwise add (append) and
+                // the mixer materializes later and lands after the player. A
+                // player appended after a materialized mixer would make its cord
+                // backward — every later render fails.
+                let node = NodeKind::Opaque(Box::new(node));
+                let ports = vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio, channels: 1 }];
+                let id = match self.engine.graph.out_node {
+                    Some(mixer) => self.engine.graph.insert_before(mixer, node, ports)
+                        .map_err(|e| format!("play node: {e}"))?,
+                    None => self.engine.graph.add_node(node, ports),
+                };
                 self.player_mailbox = Some(mailbox);
                 self.player_underruns = Some(underruns);
                 self.player_deferred = Some(deferred);
@@ -411,12 +426,18 @@ impl HostSession {
             .node_of("mixer")
             .ok_or("arrange requires the mixer to be mounted (mount mixer channels=N)")?;
 
+        // A new wiring replaces the old nodes (and their counters); drop the
+        // previous counters now so underruns() reflects the current wiring.
+        self.arranger_underruns.clear();
         let mut built: Vec<(String, usize, media::ArrangerNode)> = Vec::new();
         for (ti, track) in timeline.tracks.iter().enumerate() {
             if ti >= channels {
                 return Err(format!("track '{}' has no mixer channel ch{ti} (channels={channels})", track.id));
             }
             let node = media::ArrangerNode::new(track.clone(), &resolver, media::DEFAULT_RING_CAPACITY, self.engine.clock.sample_rate, from_frame)?;
+            // Keep a handle to the node's underrun counter so the host can
+            // surface a reader slip even after the node is moved into the graph.
+            self.arranger_underruns.push(node.underruns_arc());
             built.push((track.id.clone(), ti, node));
         }
 
@@ -489,11 +510,21 @@ impl HostSession {
         }
     }
 
+    /// Total underruns across the player and every wired arranger track. A non-
+    /// zero value means a reader slipped somewhere on the render path and the
+    /// bounce is not exact — the summary surfaces it instead of hiding it.
     pub fn underruns(&self) -> u64 {
-        self.player_underruns
+        let player = self
+            .player_underruns
             .as_ref()
             .map(|u| u.load(Ordering::Relaxed))
-            .unwrap_or(0)
+            .unwrap_or(0);
+        let arrangers: u64 = self
+            .arranger_underruns
+            .iter()
+            .map(|u| u.load(Ordering::Relaxed))
+            .sum();
+        player + arrangers
     }
 
     /// Splices whose frame had passed when applied — 0 means the splice was

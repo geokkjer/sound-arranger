@@ -147,6 +147,13 @@ impl ArrangerNode {
         self.underruns.load(Ordering::Relaxed)
     }
 
+    /// A handle to the underrun counter so a host can keep reading it after the
+    /// node is moved into the graph (the render path writes, the control side
+    /// reads — no allocation, no blocking).
+    pub fn underruns_arc(&self) -> Arc<AtomicU64> {
+        self.underruns.clone()
+    }
+
     pub fn clips(&self) -> &[Clip] {
         &self.clips
     }
