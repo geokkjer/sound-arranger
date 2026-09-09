@@ -1,6 +1,8 @@
 <script setup lang="ts">
-// Core shell placeholder. A profile (a set of ui-plugins) will populate the
-// surface; until one loads the shell stays empty. See docs/design/ui-plan.md.
+// The clip-arranger profile surface: a timeline canvas ui-plugin in the hero
+// slot, backed by the Host-API bridge (run_host_script). Source pool + mixer
+// panels are the next ui-plugins.
+import TimelineCanvas from "./TimelineCanvas.vue";
 </script>
 
 <template>
@@ -8,7 +10,7 @@
     <header class="bar">
       <div class="brand">
         <span class="glyph" aria-hidden="true"></span>
-        <span>SOUND-<span class="muted">ARRANGER</span> <span class="muted">· core</span></span>
+        <span>SOUND-<span class="muted">ARRANGER</span> <span class="muted">· clip arranger</span></span>
       </div>
       <div class="spacer"></div>
       <button class="btn" disabled>PROFILE ▾</button>
@@ -16,15 +18,7 @@
     </header>
 
     <main class="surface">
-      <div class="empty">
-        <div class="ring" aria-hidden="true"></div>
-        <h1>Load a profile</h1>
-        <p>Profiles assemble plugins. The surface stays empty until one loads.</p>
-        <div>
-          <kbd>⌘</kbd><kbd>k</kbd> open profile &nbsp;·&nbsp;
-          <kbd>⌘</kbd><kbd>shift</kbd><kbd>p</kbd> command palette
-        </div>
-      </div>
+      <TimelineCanvas />
     </main>
   </div>
 </template>
