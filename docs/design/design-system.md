@@ -34,6 +34,16 @@ The design language is deliberately quiet: **flat surfaces, hairline borders, pr
   --ok:          #7fc9a0;  /* green — meter normal */
   --warn:        #d9a13f;  /* amber — meter near-clip */
 
+  /* per-track identity (cycle; reused across lane header, clips, mixer strip) */
+  --track-0: #4fa3ad;  /* teal */
+  --track-1: #5aa46a;  /* green */
+  --track-2: #d0723a;  /* orange */
+  --track-3: #b45c8c;  /* magenta */
+  --track-4: #8a6bb0;  /* violet */
+  --track-5: #c3a84a;  /* gold */
+  --track-6: #6d9a77;  /* sage */
+  --track-7: #9a6d7a;  /* rose */
+
   /* metrics */
   --bar-h: 44px;
   --ruler-h: 24px;
@@ -43,6 +53,8 @@ The design language is deliberately quiet: **flat surfaces, hairline borders, pr
 ```
 
 Apply the accent with **restraint**: it marks *selection/active* only. Idle chrome is monochrome. A muted single-hue state (blue for selection, amber for playhead, red for record) is the whole color language.
+
+Per-track identity is a **separate axis** from state: the `--track-N` hues are assigned per track and reused consistently across the lane header, that lane's timeline clips, the mixer strip, and the track header. They answer *which track* (a nominal identity), not *what state* — state stays the semantic colors above. The user can override a track's hue; we assign a distinct one from the palette when a track is created.
 
 ---
 
@@ -93,3 +105,4 @@ Apply the accent with **restraint**: it marks *selection/active* only. Idle chro
 | `--record` (red) | armed / recording | record button, armed channel |
 | `--ok` / `--warn` | meter level | mixer meters |
 | `--fg-mute` | disabled | inactive clip, rest text |
+| `--track-N` | per-track identity | lane header, timeline clips, mixer strip, track header |

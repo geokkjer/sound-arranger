@@ -1,6 +1,6 @@
 # The clip arranger — an arrangement is data
 
-> 🕒 Last verified against commit `97cc411` (2026-08-27). If the code has moved on,
+> 🕒 Last verified against commit `7c5a2e7` (2026-09-05). If the code has moved on,
 > trust the code and move this line forward.
 
 **What this is.** The engine ([`architecture-explainer.md`](architecture-explainer.md)) is a
@@ -9,7 +9,7 @@ what turns that core into a **sound-arranger**: the arrangement model, the ACID 
 the node that renders it, the media pool it reads from, and the host wiring that makes edits
 reach audio. If you've done the FIRST_SESSION tour, you've seen the synth chain
 (euclidean→scale→tone→mixer). This is the half that records, cuts, splices and rearranges
-*real* audio into a piece — the Macero/dub "the edit is the composition" half.
+*real* audio into a piece — the edit-as-composition half.
 
 > Read the [overview note](../.agents/notes/implemented/feature/2026-08-24-p1-3-0-timeline-value.md)
 > for why the model is *value-first*; this doc is the working explainer.
@@ -211,11 +211,13 @@ clip editor end-to-end with no GUI.
 - **Reader reuse is deferred.** After an edit the arrangement is rebuilt and readers re-warmed
   from the transport frame; the shared-state `ArrangerNode` reuse (reusing a reader across
   rebuilds without re-warming) is still deferred — see the README's honest gaps.
-- **No stereo / no effects / mono graph** — the substrate renders mono and has no effects
-  (the "sound sculptor" offline profile is separate and deferred).
+- **Mono inputs, stereo master, no effects** — the mixer pans mono channels into a stereo
+  master, but a genuine stereo *source* (a two-channel take/clip) is still forthcoming, and
+  there are no effects (the "sound sculptor" offline profile is separate and deferred).
 - **Underrun surfacing is a hard requirement.** A bounce with `underruns != 0` must be treated
   as an error, not a quiet glitch.
 
 ---
 
-*Authored with DeepSeek-v4-flash · DeepSeek Harness, 2026-08-27.*
+*Authored with DeepSeek-v4-flash · DeepSeek Harness, 2026-08-27; re-verified against
+`7c5a2e7` with DeepSeek-V4-Flash · DeepSeek Harness, 2026-09-05.*

@@ -1,6 +1,6 @@
 # First session — make sound in fifteen minutes
 
-> 🕒 Last verified against commit `97cc411` (2026-08-27). If the code has moved on,
+> 🕒 Last verified against commit `7c5a2e7` (2026-09-05). If the code has moved on,
 > trust the code and move this line forward.
 
 You don't need to understand Rust, audio programming, or the architecture to do
@@ -19,7 +19,7 @@ Enter the dev shell (Nix/devenv — see [../README.md](../README.md)), then prov
 the toolchain:
 
 ```sh
-cargo test -p engine          # ~55 core tests, should pass in about a second
+cargo test -p engine          # ~56 core tests, should pass in about a second
 ```
 
 ## Step 1 — assemble a profile from four plugins
@@ -138,9 +138,13 @@ print(sum(1 for i in range(44,len(d),4) if struct.unpack('<f',d[i:i+4])[0]!=0.0)
   in one real file of this repo.
 - Beyond this tour: the same script format speaks `pool` / `arrange ...`
   commands (cut-and-arrange clips from recorded WAVs — see
-  `crates/host/src/lib.rs`, function `parse_arrange`) and there are USB-capture
-  tools under `scripts/` for recording real hardware into the media pool.
+  `crates/host/src/lib.rs`, function `parse_arrange`), and the media engine's
+  multi-channel capture (real device I/O into the float-WAV pool) lives under
+  `crates/media/src/capture.rs` — its hardware tests run with
+  `cargo test -p media -- --ignored`. Gear-specific USB-capture tooling lives in
+  the separate studio project, not this repo.
 
 ---
 
-*Authored with GLM-5.3 Flash · ZCode, 2026-08-27.*
+*Authored with GLM-5.3 Flash · ZCode, 2026-08-27; re-verified against `7c5a2e7`
+with DeepSeek-V4-Flash · DeepSeek Harness, 2026-09-05.*

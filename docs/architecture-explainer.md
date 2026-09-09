@@ -1,6 +1,6 @@
 # sound-arranger: from architecture up
 
-> 🕒 Last verified against commit `97cc411` (2026-08-27). If the code has moved on,
+> 🕒 Last verified against commit `7c5a2e7` (2026-09-05). If the code has moved on,
 > trust the code and move this line forward.
 
 > A plain-English (mostly) tour of the Rust code, for a developer with roughly six
@@ -69,12 +69,16 @@ crates/engine    crates/media     crates/host      crates/shell
   as opaque nodes (more on that in §3).
 - **`host`** — a headless reference host. It defines the Host API contract
   (commands / events / values) and a CLI binary that runs a text script to
-  assemble the profile, render, and bounce — with **no frontend at all**. A future
-  Tauri shell implements the *same* contract; swapping shells swaps one transport
-  adapter.
-- **`shell`** — the Tauri v2 + Vue scaffold for that future graphical shell, as of
-  this writing a frame (design tokens in place, IPC wiring not started). It exists
-  so the frontend work has a home, not because anything depends on it yet.
+  assemble the profile, render, and bounce — with **no frontend at all** (the host
+  crate stays headless). The Tauri shell (`shell`) implements the *same*
+  contract; swapping shells swaps one transport adapter.
+- **`shell`** — the Tauri v2 + Vue scaffold for the graphical shell. As of this
+  writing it is a **bridge**: it owns a live `host::HostSession` over the engine
+  and exposes a single Tauri command (`run_host_script`) that runs the versioned
+  text format — the *same* contract the CLI smoke binary drives, so a script that
+  bounces byte-identically on the CLI behaves the same here. The Vue component is
+  still a stub (no product UI yet). It exists so the frontend work has a home and
+  to prove host↔shell wiring, not because anything in the core depends on it.
 
 The dependency direction is the whole point: `engine` and `media` must never
 depend on `tauri`. The UI is a plugin, not the substrate (the
@@ -211,6 +215,12 @@ cannot patch a knob into an audio input, the way you can't assign a `String` to 
 `u32`. The euclidean generator produces **triggers**, the scale plugin turns
 triggers into **notes**, the tone plugin turns notes into **audio**. That chain is
 the whole Spike A.5 demo, expressed as data.
+
+Audio ports also carry a **channel count** (`Port { channels: u16 }`, mono by
+default, stereo via `Port::stereo`). `connect` refuses a count mismatch, and the
+interpreter sizes each node's audio buffers by its port's channel count. Today the
+graph's audio *inputs* are mono channels and the *master* is stereo — this count
+is the seam a genuine stereo take/clip will land on, the moment one exists.
 
 > **Rustism — `enum` as a closed, total vocabulary:**
 > `SignalKind` and `Direction` are enums with a fixed set of variants. The
@@ -618,6 +628,11 @@ look because it exercises almost every idea in the project.
 - **Owns the master bus**: mounting the mixer calls `api.graph.set_out(node)`,
   which ends Spike A.5's "last audio provider wins" limitation on who owns the
   output.
+- **Per-channel pan into a stereo master**: each of the `1..=8` *mono* input
+  channels gets gain / mute / solo / `pan` (`ch{k}.pan`, −1..1), summed into a
+  stereo master bus (`channels: 2`). A pan is exactly the equal-power
+  `cos`/`sin` law from the splice, applied in miniature. (Two-channel *sources*
+  are the next sub-step — the graph's audio ports are already channel-aware.)
 - **Provides a service**: it shoves an `Arc<MeterBank>` under the `mixer.meters`
   context key, which the host later reads for the UI — without the UI needing to
   know how the mixer works.
@@ -788,7 +803,7 @@ out:
 This is the "the pool keeps 32-bit float, export is 16-bit" decision made
 concrete: `WavWriter::create` (16-bit, clamping and quantizing) vs
 `create_float` (32-bit float, lossless), and the reader transparently reads both
-and downmixes stereo to channel 0 (the Phase-0 graph is mono).
+and downmixes stereo to channel 0 (clips are mono today).
 
 > **Rustism — `Drop` for best-effort cleanup:**
 > ```rust
@@ -876,6 +891,15 @@ dispatches: engine commands call straight through (`engine.mount`, `engine.patch
 `engine.set_param`), and the media commands (`Play`, `Splice`, `Bounce`) do the
 profile-level wiring.
 
+Alongside the one-shot `run_script`, `HostSession` is also a **persistent, live
+session**: `execute(&HostCommand)` applies one command at a time (the form a UI
+needs for incremental editing) and shares the exact `process` path with
+`run_script`, so the live path can never diverge from the one-shot path. It also
+exposes a **serializable arrangement snapshot** (`arrangement() -> Timeline`) —
+the pure reconstruction of the logged `Arrange` ops — plus `meters()`, `providers()`,
+`underruns()` / `deferred()`. That is the "events the host renders, values the host
+interprets" half of the contract, made concrete for a shell.
+
 The one genuinely cagey part is **play wiring**, because of the forward-order rule
 (§3.6). A `Play` command adds a `PlaybackNode` to the graph *immediately* (players
 must come before the mixer in node index order), but the mixer's node doesn't
@@ -918,8 +942,8 @@ profile: *schedule the intent now, resolve the wiring when both ends exist.*
 `HostCommand::Patch`. It's a tiny recursive-descent parser over `split_whitespace`
 tokens, with `.split_once('=')` for `k=v` params and `host_name()` for
 interning. Keeping the parser a pure function `&str -> Result<Vec<HostCommand>>`
-(no I/O, no side effects) makes it trivially testable and lets both the CLI and a
-future Tauri command share it.
+(no I/O, no side effects) makes it trivially testable and lets both the CLI and the
+Tauri bridge command (`run_host_script`) share it.
 
 Then `main.rs` is a ~50-line headless smoke binary: read stdin-or-file → parse →
 run → report the bounce path and a `summarize()` of log events, underruns, and
@@ -1119,7 +1143,48 @@ Beyond the per-decision cons above, a few systemic risks worth naming:
 
 ---
 
-## 11. Where to look next
+## 11. The theory of the program — and the Naur debate, applied
+
+This architecture is a *theory of a program* in Peter Naur's 1985 sense
+([*Programming as Theory Building*](https://pages.cs.wisc.edu/~remzi/Naur.pdf)):
+the code, docs, and specs are by-products; the primary product is the mental model
+that makes them cohere, and that model is know-how (Ryle's sense), not rules. For
+this codebase the theory is one sentence — **a composition is a log; time, wiring,
+history, and capability are all plugins on a minimal core; render is a pure
+function of the log** — and the two governing invariants of §1.3 are its
+load-bearing walls. A full write-up lives in
+[`docs/theory-of-the-program.md`](theory-of-the-program.md).
+
+How the current debate bears on it:
+
+- **"The theory cannot be recovered"** is a *philosophical* claim, not a practical
+  one. You *can* build a working model of a codebase you didn't write (Goedecke is
+  right — and it's the only option in a large, high-turnover system). But you
+  cannot recover the *original* theory — the constraints, the rejected options,
+  the "why shaped this way and not that" — purely from the text. Those live in the
+  decisions you had to make, and they're exactly what this repo's notes and
+  banners try to externalize.
+- **"Theory is one value you can trade off"** underestimates it. Speed, deps,
+  accessibility, "keep it simple" aren't *opposed* to the theory — they're *part*
+  of it. Here, the no-alloc rule, the forward-order rule (which sacrifices feedback
+  delay — the dub staple), the dual command vocabulary, and the deferred voice
+  management are *the theory as it stands*, not failures to maintain it. A
+  modification that ignores them is a patch; one that extends them is grounded in
+  it.
+- **The project's own discipline refuses Naur's bleakest conclusion.** He says a
+  program dies when the team holding its theory dissolves. This repo externalizes
+  as much theory as can be: `## Alternatives considered` on every decision, notes
+  that state *shipped* reality in present tense, the `Last verified against a
+  commit` banner, and a model-co-work routing table. It is an experiment in
+  keeping one coherent theory alive across authors who turn over constantly.
+
+The practical lesson, at this scale: the codebase genuinely fits in one head, so
+Goedecke's "partial understanding is the best you can do" doesn't bite *yet* — and
+the infrastructure is already in place to keep it that way as it grows.
+
+---
+
+## 12. Where to look next
 
 If you want to go deeper, in a sensible order:
 
@@ -1152,4 +1217,5 @@ And if you internalize only two things, make them these:
 ---
 
 *Authored by an earlier GLM-5.3 Flash · ZCode session; drift-corrected against
-commit `a04288d` with GLM-5.3 Flash · ZCode, 2026-08-27.*
+commit `a04288d` with GLM-5.3 Flash · ZCode, 2026-08-27; re-verified against
+`7c5a2e7` with DeepSeek-V4-Flash · DeepSeek Harness, 2026-09-05.*

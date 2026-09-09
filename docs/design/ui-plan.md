@@ -4,6 +4,8 @@
 
 This document owns the *shape* and the *tradeoffs of the UI*. The visual/token contract lives in [`design-system.md`](design-system.md); the wireframes are in [`mocks/`](mocks/). The reference webview is **WebKitGTK 2.52.6** (`webkit2gtk-4.1`), i.e. Linux and the primary target.
 
+> **Revised 2026-09-09** against the Ableton Live prior-art review (the Arrangement view, not the Session grid). The source model (Project vs Library), the unified clip-as-loop model, and the relaxed CDP seam are owned by the [UI revision note](../../.agents/notes/proposed/architecture/2026-09-09-ui-revision-project-library-and-clip-model.md); the observations they come from are in the [prior-art study](../../research/architecture/2026-09-09-ableton-prior-art-ui.md).
+
 ---
 
 ## 0. The single governing constraint — the renderer
@@ -63,7 +65,7 @@ If a single interface had to be both a graph node and a DOM view, a headless bat
 - Slots: `fill` · `left` · `right` · `bottom`. Views declare the slots they can occupy and a default slot.
 - `fill` (the timeline) is the hero; the default profile puts it center and full width.
 - Reflow: resizing the window moves flex space between slots. `left`/`right`/`bottom` panels keep their width (user-settable in a range); `fill` absorbs the remainder. So wider windows yield **more timeline**, not more empty panels.
-- Only one primary `fill` view per profile at a time; secondary inspectors are `Overlay`s.
+- Only one primary `fill` view per profile at a time. Secondary content is of *two* kinds: a **persistent Detail View** (`bottom`) that is contextual on focus and collapses when nothing is focused, and transient `Overlay`s (marquee, splitter, hint). The Detail View is a real slot, not an overlay.
 
 ---
 
@@ -91,6 +93,8 @@ The timeline is a **fixed time-space viewed through a scrolling window**, so zoo
 - **Vertical tracks zoom with the timeline** — at the base (fit) zoom the tracks **fill the container height** (so they reach the end), and they grow taller as you zoom in; clips fill their own lane (never span multiple tracks). No separate row control — one unified zoom gesture. A vertical scrollbar appears only once the tracks outgrow the window.
 - **Snap = grid + clip edges, both on.** Snap targets are the nearest grid tick *and* the left/right edges of other clips (same lane, plus cross-lane alignment). A thin **snap guide** line renders at the snapped position; the threshold is in pixels (~8px) converted to seconds by `zoom`.
 - **Empty surface:** *click* places the playhead; *drag* is a **marquee** selection (a time × track rectangle that selects the clips it overlaps). Clip *drag* moves the clip with snap. This mirrors the actual canvas pointer model that the production implementation will use.
+- **Clip edge drag → `length` (resize).** Grabbing a clip's right edge changes how long it runs; the clip's **fill rule** decides what fills the new span — `loop` repeats the loop span, `trim` shows more/less of the source. Snap-aware. (The `stretch`/time-warp fill rule is a deferred, locked feature request; v1 ships `loop` + `trim`.)
+- **Loop-span drag → `loop_in`/`loop_out`.** A separate handle (the loop bracket) edits which part of the source loops, independent of the edge. Snap-aware.
 - **DOM in the prototype, canvas in production.** The mockup uses DOM clips purely so the interactions are cheap to prototype and read; the shipped timeline, snaps, peaks, and meters are Canvas 2D per the hybrid strategy.
 
 This is demonstrated live in [`mocks/arranger-profile.html`](mocks/arranger-profile.html) (data-driven clips in seconds, wheel/`+`/`−`/fit zoom around cursor, snap guide, marquee, click-to-place playhead, auto-fill + row-height, grid snap).
@@ -110,7 +114,7 @@ Desktop, keyboard+mouse only. No phone/tablet tier. Model = **density-aware scal
 ## 5. UX / workflow principles (the purpose: work effectively with different audio tools)
 
 1. **The surface is the work, not the decoration.** Default = focused, negative space, chrome on demand. High contrast between active/selected and idle.
-2. **The timeline is the hero.** The creative model is Macero — *the edit is the composition* — so cut/paste/rearrange are primary and everything else recedes.
+2. **The timeline is the hero.** The creative model is generative — *the edit is the composition*, and the "performance" is a running modular/system output (evolving patterns over drones or stretched audio), not a human jam — so cut/paste/rearrange are primary and everything else recedes.
 3. **Direct manipulation, no modal for the main gesture.** Drag/split/nudge clips with the primary tool. Dialogs are for secondary ops (import, plugin config). Keyboard first, mouse for precision.
 4. **Progressive disclosure.** A profile surfaces only the commands it needs. No global "everything" menu. The profile is the rig.
 5. **Undo/redo atomic and always visible.** Composition happens in the edit; undo is a first-class, always-on control. Not an afterthought.
@@ -122,30 +126,56 @@ Desktop, keyboard+mouse only. No phone/tablet tier. Model = **density-aware scal
 ## 6. Default profile — `sound-arranger`
 
 ```
-┌─────────┬────────────────────────────────────────────┬──────────────┐
-│ SOURCE   │ RULER     TIMELINE (canvas, fill)          │ MIXER        │
-│ (pool)   │            ⇢ clips ⇢ (drag/split/paste)    │  ch1..chN    │
-│ left     │                                             │  right       │
-│          │                                             │              │
-├─────────┤                                [INSPECTOR]  ├──────────────┤
-│ TRACKS   │ (bottom region: transport nudge, undo)     │ (resizable)  │
-│ layers   │                                             │              │
-└─────────┴────────────────────────────────────────────┴──────────────┘
+┌──────────┬──────────────────────────────────────────────┬──────────────┐
+│ SOURCE   │ TRACK · RULER ·  TIMELINE (canvas, fill)     │ MIXER        │
+│ POOL     │ lane  ▸▸▸▸▸  loop clips (edge + span handles)│  (toggle;    │
+│ Project  │ T1 ▸▸▸▸▸    loop/once, fill rule             │   resizable) │
+│ │        │ T2 ▸ ▸▸      snap·marquee·razor              │  ch1..chN    │
+│ Library  │                                             │  per-track   │
+│          │                                             │   color      │
+├──────────┴──────────────────────────────────────────────┴──────────────┤
+│ DETAIL VIEW  (contextual on focus: region · track effect-chain ·      │
+│               source editor) — collapses when nothing is focused       │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
-Views in this profile: **Source Pool** (`left`), **Timeline** (`fill`), **Mixer** (`right`, 8ch), **Track/Layer column** (`bottom`/`left`), **Clip Inspector** (`overlay`). Commands surfaced in the bar: transport (play/record), undo/redo, snap, zoom-fit, profile switch.
+**Top bar** (`~44px`, flat): brand · transport (play/record/stop) · tempo · undo/redo · snap/quantize · zoom-fit · profile switcher. Transport and undo/redo live **here**, not in the bottom slot.
+
+**Views in this profile:**
+
+- **Source Pool** (`left`) — two contexts: **Project** (this session's recorded/copied material) and **Library** (a referenced folder, default `~/Music/Samples`, overridable). Search, tag filters, in-place audition; drag items into the timeline, or *promote* a usable clip into the library. *(Project is self-contained (owns copies); Library is referenced/indexed.)*
+- **Timeline** (`fill`) — the hero. Lanes are tracks; clips are loops (see the clip model below).
+- **Mixer** (`right`) — toggleable + resizable. Track colors match the timeline lanes.
+- **Detail View** (`bottom`) — contextual on focus (region | track effect-chain | source editor); collapses when nothing is focused.
+
+### Clip model — everything is a loop
+
+A clip is one type: `source · loop_in · loop_out · fill_rule (loop|trim) · mode (loop|once) · length · gain · fades`. There is no "region" type — a region is a clip with `mode = once`.
+
+- **Edge drag → `length`.** What fills the span is the **fill rule**. (Time-warp/`stretch` is a deferred, locked feature request; v1 ships `loop` + `trim`.)
+- **Loop-span handles → `loop_in`/`loop_out`**, independent of the edge.
+- Sources carry **loop-point metadata** (`loop_in`/`loop_out`, `mode`, and later tempo/pitch) — a source-schema addition to schedule.
+
+### Source model — Project vs Library
+
+- **Library** — a referenced folder (default `$XDG_MUSIC_DIR/Samples`, user-overridable). Indexed, not copied.
+- **Project** — self-contained. Using a library item **copies** it into the project; promoting a clip **copies** it into the library. Each copy carries a **provenance association** (metadata, not a live reference), so a project never breaks.
+- Content-hash **dedup** is deferred (a locked lever); v1 uses plain copies.
 
 ---
 
 ## 7. Open questions
 
-- Split the Surface into a reusable primitive now, or keep it profile-defined until the second profile lands?
-- Does the Top Bar host transport, or does the timeline own its own mini-transport (per-record, Macero-style *drop-in*)? Proposing bar-level transport for v1, revisit for v2.
-- Skins/theme switching via user token override, or a single fixed theme for v1? (Proposing single theme, token-driven, to keep scope tight.)
+- **Comping / takes.** Ableton's Arrangement view shows multi-pass takes per track ("Take 4 / Take 2"), picked per section. Whether that fits our model better than cutting one long *run* is **deferred until we're producing music/sounds**; it's also in the frame for future compositional tools/algorithms. Not a v1 decision — recorded so it isn't lost.
+- **Warp/stretch timing.** `stretch` is locked as a feature request but unscheduled; the source tempo/pitch metadata and the stretch DSP are a real step. Decide when it lands.
+- **Split the Surface into a reusable primitive now, or keep it profile-defined until the second profile lands?**
+- **Skins/theme switching via user token override, or a single fixed theme for v1?** (Proposing single theme, token-driven, to keep scope tight.)
+- **Library indexing — resolved:** the browser **watches the library folder** for changes and re-indexes on change, so new/renamed/deleted files show up without a manual refresh. (This needs a filesystem watcher in the library browser, not index-on-open.)
 
 ## 8. Next steps
 
 1. Build the two `mocks/*.html` as living references and lock the palette (done in this revision to `design-system.md`).
-2. Scaffold the Vue shell: Top Bar + Surface slots + loader + registry + command/undo.
-3. Add the first `ui-plugin`s (Source Pool, Timeline, Mixer) as canvas + reka-ui hybrids.
+2. Scaffold the Vue shell: Top Bar (transport + undo/redo) + Surface slots + loader + registry + command/undo.
+3. Add the first `ui-plugin`s (Source Pool [Project | Library], Timeline, Mixer, Detail View) as canvas + reka-ui hybrids.
 4. Wire the `Bridge` to the Host API (`pool`/`peaks`/`meters()`/`providers_of`).
+5. Schedule the source-schema addition for **loop-point metadata** (and later tempo/pitch), and the timeline **edge-drag resize + loop-span handles**.

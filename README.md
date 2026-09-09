@@ -2,14 +2,17 @@
 
 An **audio platform where everything is a plugin**: a minimal core — clock · audio graph
 interpreter · session event log · context plumbing — with every capability as a plugin, and
-the product an **assembled profile**. Rust (engine core + media engine + host), with Tauri v2
-+ Vue 3 planned as the first graphical shell.
+the product an **assembled profile**. Rust (engine core + media engine + host), with a Tauri v2
++ Vue 3 shell wired to the Host API (a script-bridge command on the same versioned text format
+the CLI drives).
 
 ## Scope (focused core)
 
 **The core is one thing: a *liquid* audio editor / sampler / arranger / mixer.** Record long
-live jams, then cut, splice, rearrange and mix them into a finished piece — clips-as-objects,
-with tape heritage (Macero, dub, musique concrète). This is the monorepo for that core **and
+**generative runs** — a eurorack patch or algorithmic source unfolding evolving patterns over
+drones or stretched audio — then cut, splice, rearrange and mix them into a finished piece:
+clips-as-objects, with a tape/edit-as-composition heritage (musique concrète, dub, ACID). This
+is the monorepo for that core **and
 its sidecar plugins** (`plugins/`): VST/CLAP builds and the CDP offline-process sidecar.
 
 Deliberately **out of scope** for this repo (kept as separate projects, indexed by the
@@ -19,20 +22,26 @@ the Tidal live-coding tool (`tidal-lsp`) — those are not on the clip-arranger 
 > **Working title.** The repo name names the *first profile*, not the platform; a rename
 > ("audio" / "sound") is an open question — see RESEARCH.md §14.
 
-**Status: pre-alpha.** The audio core works and is tested; there is **no UI yet**. What exists
-today: the minimal core, the media engine (disk streaming, recording, splicing, multi-channel
-capture), the soft mixer, **the clip editor (P1.3 — value, ACID ops, arranger node, media pool
-with crash recovery, the engine's closed-core message dispatch, the logged-command codec, host
-wiring, and a text-format that drives it from the CLI)**, and a **headless reference host**
-that proves the UI-as-plugin contract end-to-end. What doesn't exist yet: the Tauri/Vue shell,
-live-edit audio re-wiring, stereo/pan, effects, MIDI/OSC implementations, CLAP hosting, and the
-drain/EOF phase for tailed effects. The direction is locked
+**Status: pre-alpha.** The audio core works and is tested; there is no product **UI** yet (the
+Tauri seed is wired to the Host API, but the Vue surface is empty). What exists today: the
+minimal core, the media engine (disk streaming, recording, splicing, multi-channel capture), the
+soft mixer (gain/pan/mute/solo + stereo master), **the clip editor (P1.3 — value, ACID ops,
+arranger node, media pool with crash recovery, the engine's closed-core message dispatch, the
+logged-command codec, host wiring, and a text-format that drives it from the CLI)**,
+a **headless reference host** that proves the UI-as-plugin contract end-to-end, and the
+**Tauri→Host script-bridge** (one command — proof of the shell wiring, not a product UI).
+What doesn't exist yet: a real UI surface, live-edit audio re-wiring, stereo *sources/clips*
+(the master is stereo and mono channels pan into it, but a genuine stereo take/clip is still
+forthcoming), effects, MIDI/OSC implementations, CLAP hosting, and the drain/EOF phase for
+tailed effects. The direction is locked
 ([umbrella-first note](.agents/notes/proposed/architecture/2026-08-15-umbrella-first-product-direction.md)):
 
-- **Profile #1 — the clip arranger ("sound-arranger"):** record long live jams, then cut,
-  splice, rearrange and mix them into a finished piece. ACID-style clips-as-objects with the
-  tape heritage (Macero, dub, musique concrète) as inspiration. Chosen first because it
-  stresses the substrate end-to-end: recording, editing, mixing, the realtime path.
+- **Profile #1 — the clip arranger ("sound-arranger"):** record long **generative runs**, then
+  cut, splice, rearrange and mix them into a finished piece. ACID-style clips-as-objects with a
+  tape/edit-as-composition heritage (musique concrète, dub, ACID) as inspiration, and a
+  generative/modular "performer" (a eurorack patch or algorithm) rather than a human jam.
+  Chosen first because it stresses the substrate end-to-end: recording, editing, mixing, the
+  realtime path.
 - **Deferred, own profile — "sound sculptor":** offline/non-realtime processing (CDP8,
   PaulStretch, Csound offline, phase-vocoder) as `OfflineProcess` plugins.
 
@@ -42,10 +51,11 @@ drain/EOF phase for tailed effects. The direction is locked
 |---|---|---|
 | `crates/engine` | The minimal core: clock (tempo map + sample-accurate scheduler), patch-bay graph interpreter (typed ports, PDC), session event log, context plumbing — plus plugins: euclidean, scale, tone, **soft mixer** (gain/pan/mute/solo, stereo master fader, meters). Audio ports are **channel-aware** (mono default; the mixer's master is stereo). Std-only. It also carries the **closed-core plugin-message dispatch** (`Event::Arrangement` + `arrange_logged`): profile-level ops are logged as commands the core understands without knowing them. | works, tested |
 | `crates/media` | The media engine (core-privileged, not a plugin): disk streaming, splice-during-playback, recording writer with crash recovery, **device-clock drift compensation wired into the capture**, multi-channel capture → **float-WAV media pool with live peak pyramids**, pool **enumeration + crash recovery** (finalize un-finalized takes, rebuild `.peaks`), the **clip editor's value + ACID ops + `ArrangerNode`** (renders a track from the value), and the **`ArrangeOp ↔ engine-command` codec**. | works, tested |
-| `crates/host` | The **Host API contract** (commands = logged events, events, values) + the **headless reference host**: `run_script` assembles the profile and bounces byte-identically — now including the **clip-arrangement commands** (`pool`/`arrange`) in the versioned **text format**, so the CLI smoke binary drives the clip editor end-to-end. The UI-as-plugin seam — a future Tauri shell implements the same contract, nothing else changes. | works, tested |
+| `crates/host` | The **Host API contract** (commands = logged events, events, values) + the **headless reference host**: `run_script` assembles the profile and bounces byte-identically — now including the **clip-arrangement commands** (`pool`/`arrange`) in the versioned **text format**, so the CLI smoke binary drives the clip editor end-to-end. It is also a **persistent live session** (`execute()` for incremental edits, `arrangement()` for a serializable snapshot a shell reads). The UI-as-plugin seam — the Tauri shell implements the same contract; swapping shells swaps only the transport adapter. | works, tested |
+| `crates/shell` | The Tauri v2 + Vue 3 shell (scaffold): a script-bridge command (`run_host_script`) that runs the Host API's versioned text format over a live `HostSession`. The Vue component is still a stub — it proves host↔shell wiring, not a product UI. | scaffold |
 | `plugins/` | **Sidecar plugins** (placeholder): VST3/CLAP builds of core capabilities and the CDP / offline-process sidecar (`OfflineProcess`). Not engine crates — thin wrappers that expose a capability to a plug-in API. See [plugins/README.md](plugins/README.md). | placeholder |
 
-147 tests across the workspace; the core's invariants (byte-identical replay, no-allocation
+161 tests across the workspace; the core's invariants (byte-identical replay, no-allocation
 render, sample-accurate lifecycle) are tested, and the streaming soak + real hardware capture
 run as `#[ignore]`d tests.
 
@@ -59,7 +69,8 @@ not yet logged events (the **arrangement** ops *are*); **live-edit-while-playing
 reach audio and removed tracks no longer ghost — but each rebuild re-warms readers, and the
 shared-state `ArrangerNode` reuse is still deferred); the
 **drain/EOF phase** for tailed effects (reverb/delay/codec) is a proposed note;
-MIDI/OSC are declared seams, not implementations; **no effects, no stereo-clips, no UI**.
+MIDI/OSC are declared seams, not implementations; **no effects, no stereo *sources/clips*, and
+no product UI surface** yet (the shell bridge runs a script but draws nothing).
 
 ## Try it
 
@@ -72,8 +83,8 @@ cargo test -p media -- --ignored
 cargo test -p media --release -- --ignored soak   # 25-minute stream+record+splice+bounce
 ```
 
-The headless smoke binary speaks a versioned command script — the same contract a future
-Tauri shell sends. It now drives the clip arrangement too:
+The headless smoke binary speaks the same versioned command script the Tauri shell bridge runs
+(the contract a UI sends — the log is the command list). It drives the clip arrangement too:
 
 ```sh
 # a simple tone from the synth chain:
@@ -90,7 +101,10 @@ printf 'host v1\nmount mixer channels=2 @0\npool /data/takes\narrange add_track 
 ([docs/FIRST_SESSION.md](docs/FIRST_SESSION.md) — fifteen minutes, no
 prerequisites), then learn the language through the codebase
 ([docs/rust-course/](docs/rust-course/README.md)), then learn why it is shaped
-that way ([docs/architecture-explainer.md](docs/architecture-explainer.md)).
+that way ([docs/architecture-explainer.md](docs/architecture-explainer.md)),
+then read the *theory* that makes the whole thing one program
+([docs/theory-of-the-program.md](docs/theory-of-the-program.md) — the what/why;
+the explainer is the how).
 Only then do the research and decision records make sense. To build on the
 engine — e.g. design your own soft-synth voices on fundsp — read
 [docs/soft-synth-fundsp.md](docs/soft-synth-fundsp.md) as a follow-on.
@@ -98,6 +112,9 @@ engine — e.g. design your own soft-synth voices on fundsp — read
 - [docs/clip-arranger.md](docs/clip-arranger.md) — the *product* side: the arrangement value,
   the ACID editing ops, the render node, the media pool, and the host wiring that makes edits
   reach audio.
+- [docs/theory-of-the-program.md](docs/theory-of-the-program.md) — the *theory* of the program,
+  in Peter Naur's sense (1985): why the whole thing coheres, and how the "understand the
+  codebase" debate applies here.
 - [docs/design/](docs/design/) — the Tauri/Vue UI design: `ui-plan.md` (interaction spec),
   `design-system.md` (token contract), `mocks/` (live mockups).
 - [RESEARCH.md](RESEARCH.md) — working research & architecture (verified crate versions,
