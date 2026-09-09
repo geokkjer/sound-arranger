@@ -1,8 +1,14 @@
 <script setup lang="ts">
-// The clip-arranger profile surface: a timeline canvas ui-plugin in the hero
-// slot, backed by the Host-API bridge (run_host_script). Source pool + mixer
-// panels are the next ui-plugins.
+// The clip-arranger profile surface: a timeline canvas ui-plugin (hero/fill) and
+// a mixer panel (right), both backed by the Host-API bridge. The bridge's meter
+// snapshot is lifted from the canvas and fed to the mixer. Source/pool and
+// interactive editing are the next ui-plugins.
+import { ref } from "vue";
 import TimelineCanvas from "./TimelineCanvas.vue";
+import MixerPanel from "./MixerPanel.vue";
+
+interface MixerMeters { channels: number[]; master: number; }
+const meters = ref<MixerMeters | null>(null);
 </script>
 
 <template>
@@ -18,7 +24,12 @@ import TimelineCanvas from "./TimelineCanvas.vue";
     </header>
 
     <main class="surface">
-      <TimelineCanvas />
+      <div class="fill">
+        <TimelineCanvas @meters="meters = $event" />
+      </div>
+      <aside class="right">
+        <MixerPanel :meters="meters" />
+      </aside>
     </main>
   </div>
 </template>

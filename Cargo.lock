@@ -3230,6 +3230,7 @@ dependencies = [
 name = "sound-arranger-shell"
 version = "0.1.0"
 dependencies = [
+ "engine",
  "host",
  "media",
  "serde",

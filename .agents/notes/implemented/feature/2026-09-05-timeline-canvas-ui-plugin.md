@@ -21,10 +21,18 @@ timeline canvas that draws the arrangement value.
   `run_host_script` (Tauri `invoke`, arg `scriptText` → Rust `script_text`) with a
   script box, and draws the returned `arrangement` when it has tracks. A demo
   arrangement is the fallback when the host produces none (headless/no-pool).
-- **`crates/shell/src/App.vue`** — the surface now hosts `TimelineCanvas`.
-- `@tauri-apps/api/core` (the `invoke` source) is already a dependency; no new
-  deps. The bridge's `ScriptOutcome.arrangement` (a serialized `media::Timeline`)
-  is the data contract — no second round-trip.
+- **`crates/shell/src/App.vue`** — the surface hosts `TimelineCanvas` (hero/fill)
+  and a `MixerPanel` (right), and lifts the bridge's meter snapshot from the
+  canvas.
+- **`crates/shell/src/MixerPanel.vue`** — a second ui-plugin: a strip per channel
+  plus a live meter bar, driven by `ScriptOutcome.mixer_meters` (per-channel
+  post-gain/pre-mute peaks + the master). The bridge gained `mixer_meters`
+  (reading `HostSession::meters()`), so the panel reflects the engine without a
+  second round-trip.
+- `@tauri-apps/api/core` (the `invoke` source) was already a dependency; the
+  shell now depends on `engine` directly for `MIXER_CHANNELS_MAX`. The bridge's
+  `ScriptOutcome.arrangement` (a serialized `media::Timeline`) and
+  `mixer_meters` are the data contract.
 
 ## Consequences
 

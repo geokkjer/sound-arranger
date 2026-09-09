@@ -36,6 +36,12 @@ const hostScript = ref(
 );
 const status = ref("drawing demo arrangement");
 
+// The bridge's meter snapshot, emitted to the shell so the mixer panel can draw.
+interface MixerMeters { channels: number[]; master: number; }
+const emit = defineEmits<{
+  (e: "meters", meters: MixerMeters | null): void;
+}>();
+
 // A demo arrangement (frames = samples at 48 kHz) so the canvas is meaningful
 // without a pool. 48000 frames = 1 second.
 const demo: Timeline = {
@@ -116,9 +122,10 @@ function resize() {
 async function loadFromHost() {
   try {
     status.value = "running host script…";
-    const outcome = await invoke<{ arrangement: Timeline | null }>("run_host_script", {
+    const outcome = await invoke<{ arrangement: Timeline | null; mixer_meters: MixerMeters | null }>("run_host_script", {
       scriptText: hostScript.value,
     });
+    emit("meters", outcome.mixer_meters);
     if (outcome.arrangement && outcome.arrangement.tracks.length > 0) {
       status.value = `loaded ${outcome.arrangement.tracks.length} track(s) from the engine`;
       draw(outcome.arrangement);
@@ -128,6 +135,7 @@ async function loadFromHost() {
     }
   } catch (e) {
     status.value = String(e);
+    emit("meters", null);
     draw(demo);
   }
 }

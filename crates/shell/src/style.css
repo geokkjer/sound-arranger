@@ -124,9 +124,22 @@ body {
 .surface {
   flex: 1;
   display: flex;
-  align-items: center;
-  justify-content: center;
+  align-items: stretch;
+  justify-content: flex-start;
+  min-height: 0;
   background: var(--surface);
+}
+.fill {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+.right {
+  width: 200px;
+  flex-shrink: 0;
+  border-left: 1px solid var(--line);
+  min-height: 0;
 }
 .empty {
   text-align: center;

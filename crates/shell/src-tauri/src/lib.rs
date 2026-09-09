@@ -13,6 +13,14 @@
 
 use serde::Serialize;
 
+/// The mixer meter snapshot: per-channel peaks (post-gain, pre-mute/solo) plus
+/// the master peak (post-master-gain, max of L/R). Drawn by the mixer panel.
+#[derive(Debug, Clone, Serialize)]
+pub struct MixerMeters {
+    pub channels: Vec<f32>,
+    pub master: f32,
+}
+
 /// A runnable outcome the frontend can show: a one-shot script's diagnostics plus
 /// a summary of the resulting session.
 #[derive(Debug, Clone, Serialize)]
@@ -25,6 +33,8 @@ pub struct ScriptOutcome {
     /// The full arrangement value (tracks/clips with their frames), so the
     /// frontend can draw the timeline canvas without a second round-trip.
     pub arrangement: Option<media::Timeline>,
+    /// The mixer's meter peaks, if a mixer was mounted (drives the mixer panel).
+    pub mixer_meters: Option<MixerMeters>,
     pub bounce_written: bool,
 }
 
@@ -42,6 +52,10 @@ pub fn exec_host_script(script_text: &str) -> Result<ScriptOutcome, String> {
     let commands = host::parse_script(script_text)?;
     let session = host::run_script(&commands)?;
     let arrangement = session.arrangement().ok();
+    let mixer_meters = session.meters().map(|bank| MixerMeters {
+        channels: (0..engine::MIXER_CHANNELS_MAX).map(|k| bank.channel_peak(k)).collect(),
+        master: bank.master_peak(),
+    });
     let bounce_written = commands
         .iter()
         .rev()
@@ -53,6 +67,7 @@ pub fn exec_host_script(script_text: &str) -> Result<ScriptOutcome, String> {
         event_count: session.event_count(),
         media_commands: session.media_command_count(),
         arrangement,
+        mixer_meters,
         bounce_written,
     })
 }
@@ -90,6 +105,11 @@ mod tests {
         assert_eq!(outcome.underruns, 0, "no underruns on a clean tone bounce");
         assert_eq!(outcome.event_count, 1, "one logged engine event (the mount)");
         assert!(outcome.arrangement_tracks() == 0, "no arrangement in this script");
+        // The mixer was mounted, so the meter snapshot is present (drives the
+        // mixer panel); a silent bounce reports a 0 peak.
+        let meters = outcome.mixer_meters.as_ref().expect("meters present after a mixer mount");
+        assert_eq!(meters.channels.len(), engine::MIXER_CHANNELS_MAX);
+        assert!(meters.master <= 0.0, "no source -> silent master meter");
         assert_eq!(outcome.media_commands, 1, "one media command (the bounce)");
         assert!(outcome.summary.contains("underruns: 0"));
         let _ = std::fs::remove_file(&wav);
