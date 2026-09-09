@@ -411,6 +411,7 @@ mod tests {
         roundtrip(&ArrangeOp::SetClipGain { track: "t0".into(), clip: "c0".into(), gain: 0.75 });
         roundtrip(&ArrangeOp::SetClipFade { track: "t0".into(), clip: "c0".into(), fade_in: 16, fade_out: 0 });
         roundtrip(&ArrangeOp::LoopRegion { track: "t0".into(), clip: "c0".into(), times: 3 });
+        roundtrip(&ArrangeOp::ChopClip { track: "t0".into(), clip: "c0".into(), times: 4, prefix: "slice".into() });
     }
 
     #[test]

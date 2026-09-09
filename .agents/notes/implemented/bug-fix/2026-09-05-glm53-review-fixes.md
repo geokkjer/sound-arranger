@@ -37,6 +37,9 @@ the two that touch the recorder/arranger underrun paths are deferred (below).
 - The three confirmed bugs are closed: `set_param mixer ch0.pan …` works from the
   text format, a refused mixer mount leaves state untouched, and replayed
   one-call renders stay frame-exact across a mid-session mixer mount.
+- The review's test gaps are closed: `ChopClip` is in the op round-trip test, and
+  the pan law is asserted at hard left/right plus the `[-1, 1]` clamp (not just
+  center).
 - `cargo test --workspace` is green.
 
 ## Also fixed

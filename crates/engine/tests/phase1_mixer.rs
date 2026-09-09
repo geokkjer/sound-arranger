@@ -475,3 +475,40 @@ fn replay_across_mixer_mount_in_one_call_advances_the_clock_exactly() {
     assert_eq!(e2.clock.frame(), 2048, "replay in one call must advance exactly the requested frames (got {})", e2.clock.frame());
     assert_eq!(out.len(), 2048, "the master is mono for the whole call (the width change is parked to the next boundary)");
 }
+
+/// The GLM-5.3 review test-gap: pan is asserted only at center. Verify the
+/// equal-power law at hard left (-1 → L only), hard right (+1 → R only), and
+/// that a channel's pan is clamped to [-1, 1].
+#[test]
+fn pan_law_is_equal_power_and_hard_left_right() {
+    let tempo = TempoMap::new(SR, 120.0, 4);
+    let render = |g: &mut Graph| -> Vec<f32> {
+        let mut out = vec![0.0f32; BLOCK * 2];
+        g.render(&mut out, RenderBlock { frame: 0, sample_rate: SR, tempo: &tempo });
+        out
+    };
+    let frame_of = |samples: &[f32], i: usize| (samples[2 * i], samples[2 * i + 1]);
+
+    // hard left: only L carries the mono channel. Zero ch1 so it doesn't
+    // contribute to R (node_rig routes two sines into ch0/ch1).
+    let (mut g, _s0, _s1, mixer, _m) = node_rig();
+    g.set_param(mixer, "ch1.gain", 0.0);
+    g.set_param(mixer, "ch0.pan", -1.0);
+    let out = render(&mut g);
+    let (l, r) = frame_of(&out, 100);
+    assert!(l.abs() > 1e-3, "hard-left L must carry the signal (got {l})");
+    assert!(r.abs() < 1e-6, "hard-left R must be silent (got {r})");
+
+    // hard right: only R.
+    g.set_param(mixer, "ch0.pan", 1.0);
+    let out = render(&mut g);
+    let (l, r) = frame_of(&out, 100);
+    assert!(l.abs() < 1e-6, "hard-right L must be silent (got {l})");
+    assert!(r.abs() > 1e-3, "hard-right R must carry the signal (got {r})");
+
+    // clamp: an out-of-range pan is clamped to the [-1, 1] law, not the raw value.
+    g.set_param(mixer, "ch0.pan", 3.0);
+    let out = render(&mut g);
+    let (l, r) = frame_of(&out, 100);
+    assert!(l.abs() < 1e-6 && r.abs() > 1e-3, "pan 3.0 clamps to hard right");
+}
