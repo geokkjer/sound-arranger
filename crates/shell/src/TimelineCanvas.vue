@@ -10,43 +10,19 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { onMounted, onUnmounted, ref } from "vue";
+import { bridgeState, type MixerMeters, type PoolSource, type Timeline } from "./bridge";
 
-// The arrangement value as serialized by `media::Timeline` (serde, snake_case).
-interface Clip {
-  id: string;
-  source: string;
-  src_start: number;
-  src_len: number;
-  at_frame: number;
-  fade_in: number;
-  fade_out: number;
-  gain: number;
-  loop_len: number | null;
-}
-interface Track {
-  id: string;
-  clips: Clip[];
-}
-interface Timeline {
-  tracks: Track[];
-}
+// The arrangement value as serialized by `media::Timeline` (serde, snake_case);
+// shared against the bridge types in src/bridge.ts.
 
 const hostScript = ref(
   "host v1\nmount mixer channels=4 @0\narrange add_track t0 @0\narrange add_track t1 @0",
 );
 const status = ref("drawing demo arrangement");
 
-// The bridge's meter snapshot + pool listing, emitted to the shell so the mixer
-// and source-pool panels can draw without a second round-trip.
-interface MixerMeters { channels: number[]; master: number; }
-interface PoolSource {
-  id: string; wav: string; peaks: string; frames: number; sample_rate: number;
-  peaks_missing: boolean; finalized: boolean;
-}
-const emit = defineEmits<{
-  (e: "meters", meters: MixerMeters | null): void;
-  (e: "sources", sources: PoolSource[] | null): void;
-}>();
+// The bridge's meter snapshot + pool listing are written to the shared bridge
+// state (src/bridge.ts) so the mixer and source-pool panels draw without a
+// second round-trip and without prop-drilling through the slot renderer.
 
 // A demo arrangement (frames = samples at 48 kHz) so the canvas is meaningful
 // without a pool. 48000 frames = 1 second.
@@ -131,19 +107,24 @@ async function loadFromHost() {
     const outcome = await invoke<{ arrangement: Timeline | null; mixer_meters: MixerMeters | null; pool_sources: PoolSource[] | null }>("run_host_script", {
       scriptText: hostScript.value,
     });
-    emit("meters", outcome.mixer_meters);
-    emit("sources", outcome.pool_sources);
+    bridgeState.meters = outcome.mixer_meters;
+    bridgeState.sources = outcome.pool_sources ?? [];
+    bridgeState.arrangement = outcome.arrangement;
     if (outcome.arrangement && outcome.arrangement.tracks.length > 0) {
       status.value = `loaded ${outcome.arrangement.tracks.length} track(s) from the engine`;
+      bridgeState.status = `loaded ${outcome.arrangement.tracks.length} track(s)`;
       draw(outcome.arrangement);
     } else {
       status.value = "host produced no arrangement (add a `pool <dir>` + arrange add_clip) — showing demo";
+      bridgeState.status = "no arrangement — showing demo";
       draw(demo);
     }
   } catch (e) {
     status.value = String(e);
-    emit("meters", null);
-    emit("sources", null);
+    bridgeState.status = String(e);
+    bridgeState.meters = null;
+    bridgeState.sources = [];
+    bridgeState.arrangement = null;
     draw(demo);
   }
 }

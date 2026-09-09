@@ -2,21 +2,13 @@
 // The mixer panel ui-plugin: strips per channel (gain/mute/solo/pan are set via
 // the host script for now) and a live meter bank drawn from the bridge's
 // ScriptOutcome.mixer_meters (per-channel post-gain/pre-mute peaks + the master).
-// Meter level is clamped to [-60 dB, 0] and rendered as a simple bar.
-import { computed, type PropType } from "vue";
+// Reads the shared bridge state (src/bridge.ts).
+import { computed } from "vue";
+import { bridgeState, meterFill } from "./bridge";
 
-interface MixerMeters {
-  channels: number[];
-  master: number;
-}
-
-const props = defineProps({
-  meters: { type: Object as PropType<MixerMeters | null>, default: null },
-});
-
-const level = (p: number) => Math.min(1, Math.max(0, (20 * Math.log10(Math.max(p, 1e-9)) + 60) / 60));
+const meters = computed(() => bridgeState.meters);
 const strips = computed(() => {
-  const ch = props.meters?.channels ?? [];
+  const ch = meters.value?.channels ?? [];
   return Array.from({ length: Math.max(2, ch.length) }, (_, i) => i);
 });
 </script>
@@ -30,7 +22,7 @@ const strips = computed(() => {
         <div class="mx-meter">
           <div
             class="mx-bar"
-            :style="{ height: `${(level(meters?.channels[i] ?? 0) * 100).toFixed(1)}%` }"
+            :style="{ height: `${(meterFill(meters?.channels[i] ?? 0) * 100).toFixed(1)}%` }"
           ></div>
         </div>
       </div>
@@ -40,7 +32,7 @@ const strips = computed(() => {
       <div class="mx-meter">
         <div
           class="mx-bar mx-bar--master"
-          :style="{ height: `${(level(meters?.master ?? 0) * 100).toFixed(1)}%` }"
+          :style="{ height: `${(meterFill(meters?.master ?? 0) * 100).toFixed(1)}%` }"
         ></div>
       </div>
     </div>

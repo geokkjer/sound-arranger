@@ -1,15 +1,13 @@
 <script setup lang="ts">
 // The source-pool ui-plugin: lists the media pool's take/loop sources (id, frame
 // count, sample rate, peaks state) so you can see what's available to place on
-// the timeline. Dragging a source onto a track is the next interactivity step.
-import { type PropType } from "vue";
+// the timeline. Reads the shared bridge state (src/bridge.ts). Dragging a source
+// onto a track is the next interactivity step; Project | Library contexts are a
+// planned follow-up per the revised ui-plan.
+import { computed } from "vue";
+import { bridgeState, type PoolSource } from "./bridge";
 
-interface PoolSource {
-  id: string; frames: number; sample_rate: number; peaks_missing: boolean; finalized: boolean;
-}
-defineProps({
-  sources: { type: Array as PropType<PoolSource[]>, default: () => [] },
-});
+const sources = computed<PoolSource[]>(() => bridgeState.sources);
 </script>
 
 <template>
