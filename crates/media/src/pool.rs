@@ -12,11 +12,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::peaks::{PeakBuilder, PeakFile};
 use crate::wav::{WavReader, WavWriter};
 
 /// A pool source: a float-WAV + its `.peaks` sidecar (or a note it's missing).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolSource {
     /// The id clips reference (the `.wav` file stem, e.g. `take-1.ch0`).
     pub id: String,

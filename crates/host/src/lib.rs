@@ -165,6 +165,8 @@ pub struct HostSession {
     editor: Option<media::ClipEditor>,
     /// resolves a pool source id (stem) to its `.wav` path, set by `set_pool`.
     pool_resolver: Option<media::PoolResolver>,
+    /// the pool directory (set by `set_pool`), used to list sources for the UI.
+    pool_dir: Option<PathBuf>,
     /// track id → the arranger node mounted for it (avoids re-wiring on a rebuild).
     wired_tracks: std::collections::HashMap<String, engine::NodeId>,
     /// the arrangement value changed since last wiring (re-wire before render).
@@ -192,6 +194,7 @@ impl HostSession {
             media_commands: 0,
             editor: None,
             pool_resolver: None,
+            pool_dir: None,
             wired_tracks: std::collections::HashMap::new(),
             arrange_dirty: false,
         }
@@ -202,12 +205,22 @@ impl HostSession {
     pub fn set_pool(&mut self, pool_dir: impl Into<PathBuf>) -> Result<(), String> {
         let dir: PathBuf = pool_dir.into();
         media::Pool::open(&dir)?; // validate it exists as a directory
+        let resolver_dir = dir.clone();
         let resolver: media::PoolResolver = std::sync::Arc::new(move |id| {
-            let p = dir.join(format!("{id}.wav"));
+            let p = resolver_dir.join(format!("{id}.wav"));
             p.is_file().then_some(p)
         });
         self.pool_resolver = Some(resolver);
+        self.pool_dir = Some(dir);
         Ok(())
+    }
+
+    /// The pool source listing (id, frame count, sample rate, peaks), for the
+    /// source-pool panel. `None` when no pool is set.
+    pub fn pool_sources(&self) -> Option<Vec<media::PoolSource>> {
+        let dir = self.pool_dir.as_ref()?;
+        let pool = media::Pool::open(dir).ok()?;
+        Some(pool.list().ok()?.sources)
     }
 
     /// Ensure the clip editor exists and its op handlers are registered.

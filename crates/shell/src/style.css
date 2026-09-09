@@ -135,6 +135,12 @@ body {
   min-height: 0;
   display: flex;
 }
+.left {
+  width: 220px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--line);
+  min-height: 0;
+}
 .right {
   width: 200px;
   flex-shrink: 0;

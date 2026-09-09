@@ -29,6 +29,11 @@ timeline canvas that draws the arrangement value.
   post-gain/pre-mute peaks + the master). The bridge gained `mixer_meters`
   (reading `HostSession::meters()`), so the panel reflects the engine without a
   second round-trip.
+- **`crates/shell/src/SourcePool.vue`** — a third ui-plugin: the pool's take/loop
+  sources (id, frames, sample rate, peaks state). The bridge gained
+  `pool_sources` (`HostSession::pool_sources()` → `media::Pool::list`; `PoolSource`
+  is now `Serialize`), so the source pool lists what's available to place. The
+  profile surface is now source pool (left) · timeline (fill) · mixer (right).
 - `@tauri-apps/api/core` (the `invoke` source) was already a dependency; the
   shell now depends on `engine` directly for `MIXER_CHANNELS_MAX`. The bridge's
   `ScriptOutcome.arrangement` (a serialized `media::Timeline`) and

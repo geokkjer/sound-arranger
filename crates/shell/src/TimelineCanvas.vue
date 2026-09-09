@@ -36,10 +36,16 @@ const hostScript = ref(
 );
 const status = ref("drawing demo arrangement");
 
-// The bridge's meter snapshot, emitted to the shell so the mixer panel can draw.
+// The bridge's meter snapshot + pool listing, emitted to the shell so the mixer
+// and source-pool panels can draw without a second round-trip.
 interface MixerMeters { channels: number[]; master: number; }
+interface PoolSource {
+  id: string; wav: string; peaks: string; frames: number; sample_rate: number;
+  peaks_missing: boolean; finalized: boolean;
+}
 const emit = defineEmits<{
   (e: "meters", meters: MixerMeters | null): void;
+  (e: "sources", sources: PoolSource[] | null): void;
 }>();
 
 // A demo arrangement (frames = samples at 48 kHz) so the canvas is meaningful
@@ -122,10 +128,11 @@ function resize() {
 async function loadFromHost() {
   try {
     status.value = "running host script…";
-    const outcome = await invoke<{ arrangement: Timeline | null; mixer_meters: MixerMeters | null }>("run_host_script", {
+    const outcome = await invoke<{ arrangement: Timeline | null; mixer_meters: MixerMeters | null; pool_sources: PoolSource[] | null }>("run_host_script", {
       scriptText: hostScript.value,
     });
     emit("meters", outcome.mixer_meters);
+    emit("sources", outcome.pool_sources);
     if (outcome.arrangement && outcome.arrangement.tracks.length > 0) {
       status.value = `loaded ${outcome.arrangement.tracks.length} track(s) from the engine`;
       draw(outcome.arrangement);
@@ -136,6 +143,7 @@ async function loadFromHost() {
   } catch (e) {
     status.value = String(e);
     emit("meters", null);
+    emit("sources", null);
     draw(demo);
   }
 }

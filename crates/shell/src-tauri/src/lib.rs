@@ -35,6 +35,9 @@ pub struct ScriptOutcome {
     pub arrangement: Option<media::Timeline>,
     /// The mixer's meter peaks, if a mixer was mounted (drives the mixer panel).
     pub mixer_meters: Option<MixerMeters>,
+    /// The media pool source listing, if a pool was set (drives the source-pool
+    /// panel). Each source carries its id, frames, sample rate, peaks state.
+    pub pool_sources: Option<Vec<media::PoolSource>>,
     pub bounce_written: bool,
 }
 
@@ -68,6 +71,7 @@ pub fn exec_host_script(script_text: &str) -> Result<ScriptOutcome, String> {
         media_commands: session.media_command_count(),
         arrangement,
         mixer_meters,
+        pool_sources: session.pool_sources(),
         bounce_written,
     })
 }
@@ -110,6 +114,7 @@ mod tests {
         let meters = outcome.mixer_meters.as_ref().expect("meters present after a mixer mount");
         assert_eq!(meters.channels.len(), engine::MIXER_CHANNELS_MAX);
         assert!(meters.master <= 0.0, "no source -> silent master meter");
+        assert!(outcome.pool_sources.is_none(), "no `pool` command -> no source listing");
         assert_eq!(outcome.media_commands, 1, "one media command (the bounce)");
         assert!(outcome.summary.contains("underruns: 0"));
         let _ = std::fs::remove_file(&wav);
