@@ -24,6 +24,16 @@
   --playhead: #e5b567;
   --record: #e06a76;
 
+  /* per-track identity (cycle; reused across lane header, clips, mixer strip) */
+  --track-0: #4fa3ad;  /* teal */
+  --track-1: #5aa46a;  /* green */
+  --track-2: #d0723a;  /* orange */
+  --track-3: #b45c8c;  /* magenta */
+  --track-4: #8a6bb0;  /* violet */
+  --track-5: #c3a84a;  /* gold */
+  --track-6: #6d9a77;  /* sage */
+  --track-7: #9a6d7a;  /* rose */
+
   --bar-h: 44px;
   --radius: 5px;
   --radius-sm: 3px;

@@ -44,6 +44,10 @@ let lastTime = 0;
 
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n));
 
+// Per-track identity colors (mirror the --track-N tokens in style.css). A track
+// keeps one hue across its lane swatch, its clips (and, later, its mixer strip).
+const TRACK_COLORS = ["#4fa3ad", "#5aa46a", "#d0723a", "#b45c8c", "#8a6bb0", "#c3a84a", "#6d9a77", "#9a6d7a"];
+
 function draw(tl: Timeline) {
   const c = canvas.value;
   if (!c) return;
@@ -71,12 +75,15 @@ function draw(tl: Timeline) {
     ctx.fillStyle = "#6b7280";
     ctx.font = "11px ui-monospace, monospace";
     ctx.fillText(track.id, 8, y + 14);
+    // per-track color: a 3px swatch at the lane's left edge (the header color).
+    const trackColor = TRACK_COLORS[ti % TRACK_COLORS.length];
+    ctx.fillStyle = trackColor;
+    ctx.fillRect(0, y, 3, laneH - 4);
     // clips
     for (const clip of track.clips) {
       const x = clip.at_frame * pxPerFrame;
       const wpx = clip.src_len * pxPerFrame;
-      const hue = clip.source === "s2" ? 210 : clip.source === "s3" ? 280 : 170;
-      ctx.fillStyle = `hsla(${hue}, 60%, 55%, 0.85)`;
+      ctx.fillStyle = trackColor;
       ctx.fillRect(x, y + 4, Math.max(2, wpx), laneH - 12);
       ctx.strokeStyle = "rgba(255,255,255,0.35)";
       ctx.strokeRect(x, y + 4, Math.max(2, wpx), laneH - 12);
