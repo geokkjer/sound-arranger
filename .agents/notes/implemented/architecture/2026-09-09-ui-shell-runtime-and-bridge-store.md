@@ -61,11 +61,13 @@ The three existing panels were refactored onto the store: `TimelineCanvas` write
 
 - The shell is now **data-driven**: the profile list decides which view occupies which slot.
 - Cross-view bridge state lives in one place; panels no longer need re-wiring when slots change.
-- The revised profile's **bottom Detail View** and **toggleable mixer** are represented.
+- The revised profile's **bottom Detail View**, **toggleable mixer**, **per-track colors**, and the
+  **Source Pool PROJECT | LIBRARY contexts** (with search) are represented; the library context is a
+  placeholder until the folder watcher + drag-in land.
 - Transport/undo/record are on-screen but not wired (documented in `Surface.vue`); the host-script
   runner stays in the timeline canvas as scaffolding until the bridge grows live commands.
 - Not yet: Command/Overlay/Bridge/Preference contributions, live transport, selection → Detail View
-  focus, per-track colors (next commit), resizable panels, drag-to-timeline.
+  focus, resizable panels, drag-to-timeline, the library folder watcher.
 - Build stays green (`vue-tsc --noEmit` + `vite build`), 31 modules.
 
 ## Attribution
