@@ -95,6 +95,12 @@ function slotView(slot: SurfaceSlot) {
         <button class="btn" title="redo" disabled>⟳</button>
         <button class="btn btn--icon" title="snap on/off" :class="{ 'is-active': true }">⌗</button>
         <button class="btn" title="zoom to fit (the whole arrangement)" @click="fitTimeline">FIT</button>
+        <button
+          class="btn btn--icon"
+          :class="{ 'is-active': timelineView.follow }"
+          title="follow the playhead while playing"
+          @click="timelineView.follow = !timelineView.follow"
+        >⇥</button>
         <span class="zoom" title="timeline zoom">{{ zoomPxPerSec }} px/s</span>
       </div>
 

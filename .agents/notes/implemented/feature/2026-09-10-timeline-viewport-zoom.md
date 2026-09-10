@@ -55,8 +55,9 @@ never a relayout.
 - A long arrangement is now navigable: zoom into a cut, pan along it, and the ruler re-scales.
 - The snap grid / clips-snap-to-ticks work in `ui-plan` §3 now has its step function in place (the
   ruler's), though snapping itself is not wired (no draggable clips yet).
-- `follow` is in the state but not yet applied — transport follow (auto-scroll with the playhead) is
-  the next small unit on top of this.
+- **Transport follow** is applied on top: while the transport runs and `follow` is on (the default),
+  the canvas calls `followPlayhead(frame)`, which parks the playhead at the left margin once it passes
+  the right margin (or sits behind the view). The top bar has a toggle (`⇥`).
 - No frontend test runner exists, so this maths is verified by typecheck/build and in use rather than
   by unit tests. A `vitest` setup would let us pin `zoomAt`/`clampView`/`followPlayhead` (worth it if
   the viewport grows more logic).

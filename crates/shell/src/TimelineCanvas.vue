@@ -19,6 +19,7 @@ import {
   clampView,
   fitTimeline,
   fitZoom,
+  followPlayhead,
   frameAt,
   panBy,
   timelineView as view,
@@ -287,8 +288,15 @@ async function loadFromHost() {
   }
 }
 
-// Redraw the playhead whenever the polled position changes.
-watch(() => bridgeState.position.frame, () => draw());
+// Redraw the playhead whenever the polled position changes; while the transport
+// runs, follow it (auto-scroll) when the user has follow on.
+watch(
+  () => bridgeState.position.frame,
+  (frame) => {
+    if (bridgeState.position.playing) followPlayhead(frame);
+    draw();
+  },
+);
 // Redraw when the shell changes the view (FIT, follow), not for width/duration
 // (draw sets those — watching them would loop).
 watch(() => [view.zoom, view.t0, view.vScroll], () => draw());
