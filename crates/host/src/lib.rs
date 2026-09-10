@@ -631,6 +631,12 @@ impl HostSession {
         self.engine.clock.sample_rate
     }
 
+    /// The master bus channel count (1 mono until the mixer mounts, then 2). The
+    /// live pump converts the rendered master to the output ring's stereo layout.
+    pub fn master_channels(&self) -> usize {
+        self.engine.graph.out_channels().max(1)
+    }
+
     /// The mixer's mounted channel count, if a mixer is mounted (what the shell
     /// draws strips for).
     pub fn mixer_channels(&self) -> Option<usize> {

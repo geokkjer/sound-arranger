@@ -1,5 +1,5 @@
 //! The live host runtime — a host thread (actor) that owns a [`HostSession`] and
-//! pumps it in time.
+//! pumps it in time, into a real audio output when one is available.
 //!
 //! [`HostSession`] is `!Send`: the engine holds `Box<dyn FnOnce>`/`Box<dyn FnMut>`
 //! disposers + op handlers and a `Box<dyn Any>` context, so the session cannot be
@@ -8,24 +8,29 @@
 //! the session is *constructed on its own thread*, commands arrive over an `mpsc`
 //! channel ([`HostCommand`] is `Send`), and a real-time pump advances the clock
 //! while the transport runs. The shell polls a shared, `Send + Sync`
-//! [`Snapshot`] (position + meters) and never touches the session.
+//! [`Snapshot`] (position + meters + audio) and never touches the session.
 //!
-//! This is deliberately **host-crate only** (the review's "live runtime, still no
-//! Tauri"): it is exercised headless by the tests below, and the Tauri bridge is a
-//! thin adapter over [`HostHandle`]. Device audio output is a separate, later step
-//! — the pump renders into the void today, but it is the same pump.
+//! Audio: [`HostHandle::spawn_with_audio`] opens the default output device
+//! (negotiated to the session rate — see `media::devices`) and the pump fills a
+//! stereo ring the device callback drains, so the pump is paced by the **device**
+//! clock rather than the wall clock. The cpal stream is `!Send`, so it is created
+//! and kept alive here, on the actor thread. [`HostHandle::spawn`] stays silent
+//! (headless tests, and the fallback when no device is available).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use engine::MIXER_CHANNELS_MAX;
+use media::devices::OutputHandle;
+use media::Spsc;
 
 use crate::{HostCommand, HostSession};
 
-/// The published state a shell reads: transport position + the mixer meters.
-/// Updated by the pump and by command handling; cheap to clone.
+/// The published state a shell reads: transport position + the mixer meters +
+/// the audio state. Updated by the pump and by command handling; cheap to clone.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub frame: u64,
@@ -39,9 +44,32 @@ pub struct Snapshot {
     /// The mixer's mounted channel count (0 when no mixer is mounted).
     pub channel_count: usize,
     pub master: f32,
+    /// The audio output's state: `None` when the host runs silent (no device was
+    /// requested), otherwise the negotiated rate/layout and the played counters.
+    pub audio: Option<AudioStatus>,
     /// The last error the pump hit while rendering (a wiring failure) — recorded
     /// so the shell surfaces it instead of a silently moving, silent playhead.
     pub last_error: Option<String>,
+}
+
+/// The audio output's negotiated state and counters.
+#[derive(Debug, Clone, Default)]
+pub struct AudioStatus {
+    /// The device's actual sample rate.
+    pub sample_rate: u32,
+    /// The device's channel count.
+    pub channels: u16,
+    /// The rate the host asked for (the session rate).
+    pub requested_rate: u32,
+    /// True when the device could not run at `requested_rate` — the shell must
+    /// surface this (a mismatch plays at the wrong speed).
+    pub rate_mismatch: bool,
+    /// Source frames the device filled with silence because the ring was empty.
+    pub underruns: u64,
+    /// Source frames the pump could not push because the ring was full.
+    pub drops: u64,
+    /// Why audio is unavailable, when it could not be opened at all.
+    pub error: Option<String>,
 }
 
 impl Default for Snapshot {
@@ -55,6 +83,7 @@ impl Default for Snapshot {
             channels: [0.0; MIXER_CHANNELS_MAX],
             channel_count: 0,
             master: 0.0,
+            audio: None,
             last_error: None,
         }
     }
@@ -88,6 +117,24 @@ enum Request {
     Shutdown,
 }
 
+/// The actor thread's audio state. The cpal stream is `!Send`, so it lives here
+/// and only here.
+enum AudioState {
+    /// Silent: audio was not requested (headless tests).
+    Off,
+    /// Audio was requested but the device could not be opened.
+    Failed(String),
+    /// A live output stream and the ring the pump fills.
+    Open(Audio),
+}
+
+struct Audio {
+    handle: OutputHandle,
+    ring: Arc<Spsc<f32>>,
+    /// Source frames the pump could not push (ring full).
+    drops: Arc<AtomicU64>,
+}
+
 /// A `Send + Sync` handle to the live host thread.
 pub struct HostHandle {
     tx: Mutex<Sender<Request>>,
@@ -96,13 +143,25 @@ pub struct HostHandle {
 }
 
 impl HostHandle {
-    /// Spawn the host thread. The session is created **inside** the thread, so
-    /// nothing `!Send` crosses the thread boundary.
+    /// Spawn the host thread **silent** (no device): the headless form, used by
+    /// tests and as a fallback.
     pub fn spawn() -> Self {
+        Self::spawn_inner(false)
+    }
+
+    /// Spawn the host thread with a real audio output: it opens the default
+    /// output device, negotiated to the session rate, and the pump feeds it. If
+    /// the device cannot be opened, playback stays silent and the reason is
+    /// published in [`Snapshot::audio`] (never a hard failure).
+    pub fn spawn_with_audio() -> Self {
+        Self::spawn_inner(true)
+    }
+
+    fn spawn_inner(want_audio: bool) -> Self {
         let (tx, rx) = mpsc::channel();
         let shared = Arc::new(Mutex::new(Snapshot::default()));
         let pump_shared = Arc::clone(&shared);
-        let join = std::thread::spawn(move || run(HostSession::new(), rx, pump_shared));
+        let join = std::thread::spawn(move || run(HostSession::new(), rx, pump_shared, want_audio));
         HostHandle {
             tx: Mutex::new(tx),
             shared,
@@ -139,7 +198,7 @@ impl HostHandle {
             .map_err(|_| "host actor exited".to_string())?
     }
 
-    /// The latest published snapshot (position + meters).
+    /// The latest published snapshot (position + meters + audio).
     pub fn snapshot(&self) -> Snapshot {
         self.shared.lock().map(|s| s.clone()).unwrap_or_default()
     }
@@ -166,17 +225,37 @@ impl Drop for HostHandle {
 /// The pump tick: how long the actor waits for a command before checking the
 /// transport. ~4 ms keeps the playhead smooth without burning a core.
 const TICK: Duration = Duration::from_millis(4);
-/// The largest catch-up burst in one tick — caps the cost of catching up after a
-/// stall.
+/// The largest catch-up burst in one tick for the **silent** (wall-clock) pump.
 const MAX_CHUNK: usize = 4096;
+/// The output ring's capacity in samples (a power of two). ~0.34 s of stereo at
+/// 48 kHz — enough to absorb scheduler jitter, small enough to stay responsive.
+const AUDIO_RING_SAMPLES: usize = 1 << 15;
+/// The output ring's channel count (the master is mono or stereo; the ring is
+/// always stereo, so the device can map it to whatever it has).
+const OUTPUT_CHANNELS: u16 = 2;
+/// Frames rendered per audio chunk.
+const AUDIO_CHUNK_FRAMES: usize = 1024;
 
-/// The actor loop: drain commands, then (while playing) render the frames the
-/// wall clock says are due, and publish the snapshot.
-fn run(mut session: HostSession, rx: Receiver<Request>, shared: Arc<Mutex<Snapshot>>) {
+/// The actor loop: drain commands, then (while playing) render — into the device
+/// ring when audio is open (device-paced), else to the wall clock — and publish.
+fn run(mut session: HostSession, rx: Receiver<Request>, shared: Arc<Mutex<Snapshot>>, want_audio: bool) {
     let rate = session.sample_rate() as f64;
-    // Wall-clock anchor for the playing clock: (wall, frame) at play/last change.
+    // Wall-clock anchor for the silent pump: (wall, frame) at play/last change.
     let mut anchor: Option<(Instant, u64)> = None;
-    publish(&session, &shared);
+    let audio = if want_audio {
+        match open_audio(&session) {
+            Ok(a) => AudioState::Open(a),
+            Err(e) => AudioState::Failed(e),
+        }
+    } else {
+        AudioState::Off
+    };
+    // Start stopped: the stream is paused until the transport plays, so an idle
+    // host does not rack up underruns on an empty ring.
+    if let AudioState::Open(a) = &audio {
+        let _ = a.handle.pause();
+    }
+    publish(&session, &shared, &audio);
     loop {
         match rx.recv_timeout(TICK) {
             Ok(Request::Command(cmd, reply)) => {
@@ -188,12 +267,27 @@ fn run(mut session: HostSession, rx: Receiver<Request>, shared: Arc<Mutex<Snapsh
                         | HostCommand::TransportStop
                         | HostCommand::TransportSeek { .. }
                 );
+                let is_play = matches!(cmd, HostCommand::TransportPlay);
+                let is_stop = matches!(cmd, HostCommand::TransportStop);
                 let r = session.execute(&cmd);
                 if reanchor {
                     anchor = None;
                 }
+                if r.is_ok()
+                    && let AudioState::Open(a) = &audio
+                {
+                    if is_play {
+                        let _ = a.handle.play();
+                    }
+                    if is_stop {
+                        let _ = a.handle.pause();
+                        // Drop the tail so the next play starts from the new
+                        // position instead of replaying buffered audio.
+                        while a.ring.try_pop().is_some() {}
+                    }
+                }
                 let _ = reply.send(r);
-                publish(&session, &shared);
+                publish(&session, &shared, &audio);
             }
             Ok(Request::Load(commands, reply)) => {
                 let mut fresh = HostSession::new();
@@ -207,32 +301,97 @@ fn run(mut session: HostSession, rx: Receiver<Request>, shared: Arc<Mutex<Snapsh
                 let outcome = applied.map(|()| build_outcome(&fresh));
                 session = fresh;
                 anchor = None;
+                // A load is a fresh, stopped session: clear any buffered audio.
+                if let AudioState::Open(a) = &audio {
+                    let _ = a.handle.pause();
+                    while a.ring.try_pop().is_some() {}
+                }
                 let _ = reply.send(outcome);
-                publish(&session, &shared);
+                publish(&session, &shared, &audio);
             }
             Ok(Request::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
         }
 
         if session.is_playing() {
-            let (wall0, frame0) = *anchor
-                .get_or_insert_with(|| (Instant::now(), session.position().frame));
-            let target = frame0 + (wall0.elapsed().as_secs_f64() * rate) as u64;
-            let now = session.position().frame;
-            if target > now {
-                let want = (target - now).min(MAX_CHUNK as u64) as usize;
-                if let Err(e) = session.render(want) {
-                    // A wiring failure must not silently yield a moving, silent
-                    // playhead: record it and stop the transport.
-                    let _ = session.execute(&HostCommand::TransportStop);
-                    anchor = None;
-                    if let Ok(mut s) = shared.lock() {
-                        s.last_error = Some(e);
+            match &audio {
+                AudioState::Open(a) => {
+                    if let Err(e) = fill_audio(&mut session, &a.ring, &a.drops) {
+                        let _ = session.execute(&HostCommand::TransportStop);
+                        let _ = a.handle.pause();
+                        anchor = None;
+                        if let Ok(mut s) = shared.lock() {
+                            s.last_error = Some(e);
+                        }
+                    }
+                }
+                _ => {
+                    let (wall0, frame0) = *anchor
+                        .get_or_insert_with(|| (Instant::now(), session.position().frame));
+                    let target = frame0 + (wall0.elapsed().as_secs_f64() * rate) as u64;
+                    let now = session.position().frame;
+                    if target > now {
+                        let want = (target - now).min(MAX_CHUNK as u64) as usize;
+                        if let Err(e) = session.render(want) {
+                            // A wiring failure must not silently yield a moving,
+                            // silent playhead: record it and stop the transport.
+                            let _ = session.execute(&HostCommand::TransportStop);
+                            anchor = None;
+                            if let Ok(mut s) = shared.lock() {
+                                s.last_error = Some(e);
+                            }
+                        }
                     }
                 }
             }
-            publish(&session, &shared);
+            publish(&session, &shared, &audio);
         }
+    }
+    if let AudioState::Open(a) = &audio {
+        let _ = a.handle.pause();
+    }
+}
+
+/// Open the default output device, negotiated to the session rate.
+fn open_audio(session: &HostSession) -> Result<Audio, String> {
+    let ring = Arc::new(Spsc::new(AUDIO_RING_SAMPLES));
+    let handle = media::devices::open_output(Arc::clone(&ring), OUTPUT_CHANNELS, session.sample_rate())?;
+    Ok(Audio {
+        handle,
+        ring,
+        drops: Arc::new(AtomicU64::new(0)),
+    })
+}
+
+/// Keep the output ring about half full. The device callback drains it, so this
+/// paces the pump to the **device** clock — the ring's free space is the timing
+/// signal, not the wall clock.
+fn fill_audio(session: &mut HostSession, ring: &Spsc<f32>, drops: &AtomicU64) -> Result<(), String> {
+    let target = ring.capacity() / 2;
+    while session.is_playing() && ring.len() < target {
+        let samples = session.render(AUDIO_CHUNK_FRAMES)?;
+        push_stereo(ring, &samples, session.master_channels(), drops);
+    }
+    Ok(())
+}
+
+/// Push a rendered master block into the stereo output ring: a mono master is
+/// duplicated, a stereo one passes through, extra channels are dropped. A whole
+/// frame is pushed or none is, so L/R never swap on a full ring.
+fn push_stereo(ring: &Spsc<f32>, samples: &[f32], master_channels: usize, drops: &AtomicU64) {
+    let ch = master_channels.max(1);
+    for frame in samples.chunks(ch) {
+        if ring.len() + OUTPUT_CHANNELS as usize > ring.capacity() {
+            drops.fetch_add(1, Ordering::Relaxed);
+            return; // never leave a half frame in the ring
+        }
+        let (l, r) = match frame {
+            [] => (0.0, 0.0),
+            [m] => (*m, *m),
+            [l, r, ..] => (*l, *r),
+        };
+        let _ = ring.try_push(l);
+        let _ = ring.try_push(r);
     }
 }
 
@@ -250,8 +409,9 @@ fn build_outcome(session: &HostSession) -> HostOutcome {
     }
 }
 
-/// Publish the session's current position + meters into the shared snapshot.
-fn publish(session: &HostSession, shared: &Mutex<Snapshot>) {
+/// Publish the session's current position + meters + audio state into the shared
+/// snapshot.
+fn publish(session: &HostSession, shared: &Mutex<Snapshot>, audio: &AudioState) {
     let p = session.position();
     let Ok(mut s) = shared.lock() else { return };
     s.frame = p.frame;
@@ -272,6 +432,22 @@ fn publish(session: &HostSession, shared: &Mutex<Snapshot>) {
             s.master = 0.0;
         }
     }
+    s.audio = match audio {
+        AudioState::Off => None,
+        AudioState::Failed(e) => Some(AudioStatus {
+            error: Some(e.clone()),
+            ..AudioStatus::default()
+        }),
+        AudioState::Open(a) => Some(AudioStatus {
+            sample_rate: a.handle.sample_rate,
+            channels: a.handle.channels,
+            requested_rate: a.handle.requested_rate,
+            rate_mismatch: a.handle.rate_mismatch,
+            underruns: a.handle.underruns.load(Ordering::Relaxed),
+            drops: a.drops.load(Ordering::Relaxed),
+            error: None,
+        }),
+    };
 }
 
 #[cfg(test)]
@@ -282,7 +458,9 @@ mod tests {
     #[test]
     fn live_host_plays_advances_and_stops() {
         let host = HostHandle::spawn();
-        assert!(!host.snapshot().playing, "a fresh host is stopped");
+        let s = host.snapshot();
+        assert!(!s.playing, "a fresh host is stopped");
+        assert!(s.audio.is_none(), "spawn() is the silent form");
 
         host.execute(HostCommand::TransportPlay).expect("play");
         std::thread::sleep(Duration::from_millis(150));
@@ -340,6 +518,28 @@ mod tests {
         let second = host.load(&script).expect("re-load starts a fresh session");
         assert_eq!(second.mixer_channels, Some(2));
         assert!(second.summary.contains("underruns: 0"));
+        host.shutdown();
+    }
+
+    /// `spawn_with_audio` always publishes an audio status — `Open` with a real
+    /// device, `Failed` (with the reason) without one — never a panic. Ignored by
+    /// default: it opens real hardware.
+    #[test]
+    #[ignore = "opens real audio hardware; run: cargo test -p host -- --ignored audio"]
+    fn live_host_with_audio_publishes_a_status() {
+        let host = HostHandle::spawn_with_audio();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let audio = loop {
+            if let Some(a) = host.snapshot().audio {
+                break a;
+            }
+            assert!(Instant::now() < deadline, "no audio status published within 5 s");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        eprintln!(
+            "audio: {} Hz requested {} Hz, {} ch, mismatch={} — {:?}",
+            audio.sample_rate, audio.requested_rate, audio.channels, audio.rate_mismatch, audio.error
+        );
         host.shutdown();
     }
 }

@@ -46,6 +46,20 @@ pub struct OutputHandle {
     pub underruns: Arc<AtomicU64>,
 }
 
+impl OutputHandle {
+    /// Start (or resume) the stream. The cpal trait is used here so callers never
+    /// need cpal in scope (this module isolates the API, per its own contract).
+    pub fn play(&self) -> Result<(), String> {
+        self.stream.play().map_err(|e| format!("play output: {e}"))
+    }
+
+    /// Pause the stream — the callback stops, so an idle host does not accrue
+    /// underruns on an empty ring.
+    pub fn pause(&self) -> Result<(), String> {
+        self.stream.pause().map_err(|e| format!("pause output: {e}"))
+    }
+}
+
 /// An open input stream plus the device's actual sample rate and a shared
 /// source-ring overrun counter: the callback drops samples when the ring is
 /// full, and every drop is counted here — a dropped take sample must never be

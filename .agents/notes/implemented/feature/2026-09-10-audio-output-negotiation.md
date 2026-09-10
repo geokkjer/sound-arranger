@@ -1,4 +1,4 @@
-# Agent Note: negotiated stereo audio output (rate, frame mapping, underrun count)
+# Agent Note: audio output — negotiated device stream and a device-paced pump
 
 Status: implemented
 
@@ -28,7 +28,15 @@ The shell was **silent**: the live pump rendered the engine master into the void
   (never silently dropping a channel). A **partial source frame is never consumed**, so L/R stay
   aligned across a starve.
 - **Counters.** Every starved frame increments `OutputHandle::underruns`; the mirror of the input
-  path's `overruns`. `OutputHandle` also carries the `sample_rate`, `channels`, and `requested_rate`.
+  path's `overruns`. `OutputHandle` also carries the `sample_rate`, `channels`, and `requested_rate`,
+  and exposes `play()`/`pause()` so callers never need cpal in scope.
+- **The live pump feeds it (`host::live`).** `HostHandle::spawn_with_audio` opens the device inside the
+  actor thread (the cpal `Stream` is `!Send`, so it stays there) and the pump fills a stereo ring to
+  ~half full; the callback draining it is the timing signal, so the pump is paced by the **device**
+  clock, not the wall clock. The stream is **paused while stopped** (so an idle host accrues no
+  underruns) and its ring is drained on stop/load (no stale tail replays). `spawn()` stays silent for
+  tests. `Snapshot::audio` publishes the negotiated rate, `rate_mismatch`, `underruns`, `drops`, and
+  an `error` when the device cannot be opened at all — silent, never a hard failure.
 
 Tests: mono duplication, stereo passthrough, stereo→mono downmix, empty-ring silence counting
 underruns, partial-frame starvation keeping alignment, zero-channel degradation, and range selection.
@@ -49,7 +57,7 @@ underruns, partial-frame starvation keeping alignment, zero-channel degradation,
 - The device path is stereo-capable and **clock-honest**: it either runs at the session rate or says
   it could not.
 - The counters are what the live runtime and the shell will surface (next unit).
-- The pump still renders into the void until `host::live` feeds this ring — the next step.
+- The shell can surface the audio state (`Snapshot::audio`) — the bridge/shell wiring is the next step.
 
 ## Attribution
 
