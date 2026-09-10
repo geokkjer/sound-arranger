@@ -60,10 +60,31 @@ impl Default for Snapshot {
     }
 }
 
+/// A point-in-time summary of the session — the on-demand values a shell reads
+/// after loading a script (arrangement, pool listing, diagnostics). Built on the
+/// actor thread from the live session.
+#[derive(Debug, Clone)]
+pub struct HostOutcome {
+    pub summary: String,
+    pub underruns: u64,
+    pub deferred: u64,
+    pub event_count: usize,
+    pub media_commands: usize,
+    /// The arrangement value; `Err` if the snapshot errors (a poisoned timeline)
+    /// — never a silent empty value.
+    pub arrangement: Result<media::Timeline, String>,
+    pub pool_sources: Option<Vec<media::PoolSource>>,
+    pub mixer_channels: Option<usize>,
+}
+
 /// A message to the host thread. `HostCommand` is `Send`, so the request is too.
 enum Request {
     /// Apply a command; the result is sent back on the reply channel.
     Command(HostCommand, Sender<Result<(), String>>),
+    /// Replace the session with a fresh one and apply `commands`, returning the
+    /// resulting outcome — the live equivalent of `run_script`, leaving the
+    /// session resident for transport.
+    Load(Vec<HostCommand>, Sender<Result<HostOutcome, String>>),
     Shutdown,
 }
 
@@ -96,6 +117,22 @@ impl HostHandle {
             .lock()
             .map_err(|_| "host actor poisoned".to_string())?
             .send(Request::Command(cmd, reply_tx))
+            .map_err(|_| "host actor exited".to_string())?;
+        reply_rx
+            .recv()
+            .map_err(|_| "host actor exited".to_string())?
+    }
+
+    /// Replace the live session with a fresh one and apply `commands`, returning
+    /// the resulting outcome. The live equivalent of `run_script`: each run loads
+    /// a fresh session (so re-running a script does not double-mount), and the
+    /// session stays resident for transport afterwards.
+    pub fn load(&self, commands: &[HostCommand]) -> Result<HostOutcome, String> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .lock()
+            .map_err(|_| "host actor poisoned".to_string())?
+            .send(Request::Load(commands.to_vec(), reply_tx))
             .map_err(|_| "host actor exited".to_string())?;
         reply_rx
             .recv()
@@ -158,6 +195,21 @@ fn run(mut session: HostSession, rx: Receiver<Request>, shared: Arc<Mutex<Snapsh
                 let _ = reply.send(r);
                 publish(&session, &shared);
             }
+            Ok(Request::Load(commands, reply)) => {
+                let mut fresh = HostSession::new();
+                let mut applied = Ok(());
+                for cmd in &commands {
+                    if let Err(e) = fresh.execute(cmd) {
+                        applied = Err(e);
+                        break;
+                    }
+                }
+                let outcome = applied.map(|()| build_outcome(&fresh));
+                session = fresh;
+                anchor = None;
+                let _ = reply.send(outcome);
+                publish(&session, &shared);
+            }
             Ok(Request::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
         }
@@ -181,6 +233,20 @@ fn run(mut session: HostSession, rx: Receiver<Request>, shared: Arc<Mutex<Snapsh
             }
             publish(&session, &shared);
         }
+    }
+}
+
+/// Build the on-demand outcome the shell reads after loading a script.
+fn build_outcome(session: &HostSession) -> HostOutcome {
+    HostOutcome {
+        summary: crate::summarize(session),
+        underruns: session.underruns(),
+        deferred: session.deferred(),
+        event_count: session.event_count(),
+        media_commands: session.media_command_count(),
+        arrangement: session.arrangement(),
+        pool_sources: session.pool_sources(),
+        mixer_channels: session.mixer_channels(),
     }
 }
 
@@ -260,6 +326,20 @@ mod tests {
         assert!(err.contains("tone"), "the refusal names the plugin: {err}");
         host.execute(HostCommand::TransportStop).expect("host still usable");
 
+        host.shutdown();
+    }
+
+    /// `load` replaces the session, so re-running the same script does not
+    /// double-mount — the live equivalent of the stateless `run_script`.
+    #[test]
+    fn live_host_loads_a_script_and_reloads_cleanly() {
+        let host = HostHandle::spawn();
+        let script = crate::parse_script("host v1\nmount mixer channels=2 @0\n").expect("parse");
+        let first = host.load(&script).expect("first load");
+        assert_eq!(first.mixer_channels, Some(2), "the mixer channel count is reported");
+        let second = host.load(&script).expect("re-load starts a fresh session");
+        assert_eq!(second.mixer_channels, Some(2));
+        assert!(second.summary.contains("underruns: 0"));
         host.shutdown();
     }
 }
