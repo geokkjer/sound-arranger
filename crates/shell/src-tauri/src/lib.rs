@@ -14,7 +14,7 @@
 //! are the live, high-frequency controls, not script text.
 
 use serde::Serialize;
-use tauri::State;
+use tauri::{Manager, State};
 
 use host::live::{HostHandle, HostOutcome, Snapshot};
 use host::HostCommand;
@@ -171,10 +171,33 @@ fn transport_state(host: State<'_, HostHandle>) -> TransportState {
     to_transport_state(&host.snapshot())
 }
 
+/// Whether the native title bar should be **dropped** on this session.
+///
+/// The shell draws its own top bar, so server-side decorations are redundant
+/// chrome — and on a Wayland *tiling* compositor they look out of place. Detect
+/// the tiling compositors we know and drop them; keep decorations on a floating
+/// desktop so the window can still be moved and resized. (A user preference can
+/// replace this later; the ui-plan's `Preference` contribution is the home.)
+fn prefer_undecorated() -> bool {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase();
+    std::env::var_os("NIRI_SOCKET").is_some()                     // niri
+        || std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() // Hyprland
+        || std::env::var_os("SWAYSOCK").is_some()                 // sway
+        || desktop.contains("niri")
+}
+
 /// Build and run the Tauri application with a live host session.
 pub fn run() {
     tauri::Builder::default()
         .manage(HostHandle::spawn())
+        .setup(|app| {
+            // The window is created undecorated (tauri.conf.json); restore the
+            // native title bar on a floating desktop.
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.set_decorations(!prefer_undecorated());
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             run_host_script,
             transport_play,
