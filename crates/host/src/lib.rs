@@ -85,6 +85,18 @@ pub enum HostCommand {
         plugin: &'static str,
         at_frame: Option<u64>,
     },
+    /// Transport: start the clock running from the current position. The offline
+    /// reference host only records this state; a shell's live runtime reads it
+    /// and pumps blocks while it is set.
+    TransportPlay,
+    /// Transport: halt at the current position (the clock does not move while
+    /// stopped; nothing renders).
+    TransportStop,
+    /// Transport: move the playhead to an absolute frame. v1 is **rebuild +
+    /// render-to-target** (see `seek_to`): correct by construction over the
+    /// deterministic log, O(target) because the core clock only advances by
+    /// rendering. Intended for seek-while-stopped.
+    TransportSeek { frame: u64 },
     /// Play a clip into mixer channel `channel` at the current frame (the
     /// profile's monitoring wiring — the player node routes into the mixer).
     Play {
@@ -139,6 +151,35 @@ impl HostCommand {
             _ => None,
         }
     }
+
+    /// Whether this command defines *state* — replayed to rebuild a session on a
+    /// seek (see `seek_to`). Actions (the transport ops, `Bounce`, and the
+    /// one-shot player path `Play`/`Splice`/`Record`) are not state.
+    fn is_state(&self) -> bool {
+        matches!(
+            self,
+            HostCommand::Mount { .. }
+                | HostCommand::Patch { .. }
+                | HostCommand::SetParam { .. }
+                | HostCommand::SetTempo { .. }
+                | HostCommand::Unmount { .. }
+                | HostCommand::Arrange { .. }
+                | HostCommand::Pool { .. }
+        )
+    }
+}
+
+/// The transport position — the value a shell reads to draw the playhead and the
+/// time readout. `frame` is the core clock's absolute position; musical time
+/// (`beat`, `bpm`) is derived through the tempo map (the log's time-basis rule:
+/// tempo edits never move stored positions).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Position {
+    pub frame: u64,
+    pub seconds: f64,
+    pub beat: f64,
+    pub bpm: f64,
+    pub playing: bool,
 }
 
 /// The assembled profile: the engine, the registered factories, the media
@@ -171,6 +212,12 @@ pub struct HostSession {
     wired_tracks: std::collections::HashMap<String, engine::NodeId>,
     /// the arrangement value changed since last wiring (re-wire before render).
     arrange_dirty: bool,
+    /// Whether the transport is running. The live runtime reads this; the
+    /// offline reference host only records it (`Bounce` renders regardless).
+    playing: bool,
+    /// The **state** commands applied so far, in order — replayed by `seek_to`
+    /// to rebuild the session at a target frame. Actions are not recorded.
+    history: Vec<HostCommand>,
 }
 
 impl HostSession {
@@ -197,6 +244,8 @@ impl HostSession {
             pool_dir: None,
             wired_tracks: std::collections::HashMap::new(),
             arrange_dirty: false,
+            playing: false,
+            history: Vec::new(),
         }
     }
 
@@ -288,6 +337,15 @@ impl HostSession {
                 }
                 r
             }
+            HostCommand::TransportPlay => {
+                self.playing = true;
+                Ok(())
+            }
+            HostCommand::TransportStop => {
+                self.playing = false;
+                Ok(())
+            }
+            HostCommand::TransportSeek { frame } => self.seek_to(*frame),
             HostCommand::Play { clip, channel, .. } => {
                 let channels = self.mixer_channels.ok_or(
                     "play requires the mixer to be mounted first (mount mixer channels=N)",
@@ -560,6 +618,24 @@ impl HostSession {
     pub fn providers(&self, kind: engine::SignalKind) -> Vec<&'static str> {
         self.engine.provider_names_of(kind)
     }
+
+    /// Whether the transport is running.
+    pub fn is_playing(&self) -> bool {
+        self.playing
+    }
+
+    /// The transport position (frame + derived musical time + playing). A shell
+    /// polls this to draw the playhead; reading it never renders.
+    pub fn position(&self) -> Position {
+        let frame = self.engine.clock.frame();
+        Position {
+            frame,
+            seconds: self.engine.clock.seconds(),
+            beat: self.engine.clock.beat(),
+            bpm: self.engine.clock.tempo_map.tempo_at(frame),
+            playing: self.playing,
+        }
+    }
 }
 
 impl std::fmt::Debug for HostSession {
@@ -591,6 +667,36 @@ impl HostSession {
     /// refused op returns `Err` and changes nothing; the session stays usable.
     pub fn execute(&mut self, cmd: &HostCommand) -> Result<(), String> {
         self.process(cmd)
+    }
+
+    /// Render forward to an absolute frame in chunks, so a long seek does not
+    /// trip the single-bounce budget. A no-op when already at or past `frame`.
+    pub fn render_to(&mut self, frame: u64) -> Result<(), String> {
+        const CHUNK_FRAMES: u64 = 48_000; // 1 s at 48 kHz
+        while self.engine.clock.frame() < frame {
+            let want = (frame - self.engine.clock.frame()).min(CHUNK_FRAMES) as usize;
+            self.render(want)?;
+        }
+        Ok(())
+    }
+
+    /// Seek to an absolute frame by **rebuilding** the session: replay the
+    /// recorded state commands onto a fresh session (the same deterministic path
+    /// `run_script` uses) and render forward to the target. v1 semantics —
+    /// correct by construction, O(target), because the core clock only advances
+    /// by rendering. The transport's playing state is preserved; a refused
+    /// replay leaves the original session untouched.
+    fn seek_to(&mut self, frame: u64) -> Result<(), String> {
+        let history = self.history.clone();
+        let playing = self.playing;
+        let mut rebuilt = HostSession::new();
+        for cmd in &history {
+            rebuilt.process(cmd)?;
+        }
+        rebuilt.render_to(frame)?;
+        rebuilt.playing = playing;
+        *self = rebuilt;
+        Ok(())
     }
 
     /// Process one command exactly as the host contract does: validate the
@@ -635,6 +741,11 @@ impl HostSession {
             if let Some(ch) = pending_mixer_channels {
                 self.mixer_channels = Some(ch);
             }
+            // Record state commands so a later seek can rebuild the session
+            // deterministically (actions are not state).
+            if cmd.is_state() {
+                self.history.push(cmd.clone());
+            }
         }
         r
     }
@@ -653,6 +764,9 @@ impl HostSession {
 /// set_param mixer ch0.gain 0.5 @2000
 /// set_tempo 240 4 @0
 /// unmount tone @3000
+/// transport play                              # live transport (state only here)
+/// transport seek 96000                        # rebuild + render to the frame
+/// transport stop
 /// play /abs/clip.wav ch0 @0
 /// splice 4000 /abs/clip2.wav 512
 /// pool /data/takes                           # the media pool dir
@@ -732,6 +846,24 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
             "unmount" => {
                 let plugin = in_list(HOST_PLUGINS, word(&words, 1, at)?, "plugin")?;
                 commands.push(HostCommand::Unmount { plugin, at_frame });
+            }
+            "transport" => {
+                let what = word(&words, 1, at)?;
+                match what {
+                    "play" => commands.push(HostCommand::TransportPlay),
+                    "stop" => commands.push(HostCommand::TransportStop),
+                    "seek" => {
+                        let frame = word(&words, 2, at)?
+                            .parse::<u64>()
+                            .map_err(|_| format!("line {at}: transport seek needs a frame"))?;
+                        commands.push(HostCommand::TransportSeek { frame });
+                    }
+                    other => {
+                        return Err(format!(
+                            "line {at}: unknown transport '{other}' (want play|stop|seek)"
+                        ))
+                    }
+                }
             }
             "play" => {
                 let clip = ClipRef { path: PathBuf::from(word(&words, 1, at)?), start: 0, len: 0 };
@@ -993,5 +1125,77 @@ mod tests {
             .arrangement()
             .expect_err("a poisoned editor must Err, not return an empty Timeline");
         assert!(err.contains("poison"), "the error is the snapshot poison, got: {err}");
+    }
+
+    /// Transport play/stop toggles the playing flag; the offline host records
+    /// the state (a live runtime pumps; the reference host renders via Bounce).
+    #[test]
+    fn transport_play_stop_toggles_playing() {
+        let mut s = HostSession::new();
+        assert!(!s.is_playing(), "a fresh session is stopped");
+        assert_eq!(s.position().frame, 0);
+        s.execute(&HostCommand::TransportPlay).expect("play");
+        assert!(s.is_playing());
+        s.execute(&HostCommand::TransportStop).expect("stop");
+        assert!(!s.is_playing());
+        assert!(!s.position().playing);
+    }
+
+    /// Forward seek renders to the target frame (the core clock only advances by
+    /// rendering) and the position reports the tempo-derived musical time.
+    #[test]
+    fn transport_seek_forward_renders_to_target() {
+        let mut s = HostSession::new();
+        s.execute(&HostCommand::TransportSeek { frame: 4_800 }).expect("seek");
+        let p = s.position();
+        assert_eq!(p.frame, 4_800, "seek forward renders to the target");
+        assert!((p.seconds - 0.1).abs() < 1e-9, "4800 frames @48k = 0.1 s");
+        assert!((p.beat - 0.2).abs() < 1e-6, "120 bpm, 0.1 s = 0.2 beats");
+        assert!((p.bpm - 120.0).abs() < 1e-9, "the tempo map reports 120 bpm");
+    }
+
+    /// Backward seek rebuilds from the state-command history (the core clock
+    /// cannot run backwards) and the arrangement value survives the rebuild.
+    #[test]
+    fn transport_seek_backward_rebuilds_and_preserves_state() {
+        let pool = std::env::temp_dir().join(format!("host-seek-pool-{}", std::process::id()));
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        let mut s = HostSession::new();
+        s.execute(&HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 2.0)],
+            at_frame: Some(0),
+        })
+        .expect("mount mixer");
+        s.execute(&HostCommand::Pool { dir: pool.clone() }).expect("pool");
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::AddTrack { track: "t0".into() },
+            at_frame: Some(0),
+        })
+        .expect("add track");
+
+        s.execute(&HostCommand::TransportSeek { frame: 9_600 }).expect("seek forward");
+        assert_eq!(s.position().frame, 9_600);
+        s.execute(&HostCommand::TransportSeek { frame: 1_000 }).expect("seek backward");
+        assert_eq!(s.position().frame, 1_000, "backward seek rebuilds to the target");
+        assert_eq!(
+            s.arrangement().expect("arrangement").tracks.len(),
+            1,
+            "the arrangement state survives the rebuild"
+        );
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// The transport text grammar parses play / seek / stop.
+    #[test]
+    fn transport_lines_parse() {
+        let cmds = parse_script("host v1\ntransport play\ntransport seek 4800\ntransport stop\n")
+            .expect("transport lines parse");
+        assert!(matches!(&cmds[0], HostCommand::TransportPlay));
+        assert!(matches!(&cmds[2], HostCommand::TransportStop));
+        match &cmds[1] {
+            HostCommand::TransportSeek { frame } => assert_eq!(*frame, 4_800),
+            other => panic!("expected a seek, got {other:?}"),
+        }
     }
 }
