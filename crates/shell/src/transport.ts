@@ -13,6 +13,7 @@ interface WireTransportState {
   master: number;
   last_error: string | null;
   audio: AudioInfo | null;
+  edit: { can_undo: boolean; can_redo: boolean };
 }
 
 /** Poll the host once and fold the result into the shared bridge state. */
@@ -23,6 +24,8 @@ export async function pollTransport(): Promise<void> {
   bridgeState.meters = { channels: st.channels, master: st.master };
   bridgeState.lastError = st.last_error;
   bridgeState.audio = st.audio;
+  bridgeState.canUndo = st.edit.can_undo;
+  bridgeState.canRedo = st.edit.can_redo;
 }
 
 /**

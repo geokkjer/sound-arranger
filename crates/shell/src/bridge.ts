@@ -83,6 +83,9 @@ export const bridgeState = reactive({
   audio: null as AudioInfo | null,
   /** the pump's last unrecoverable error, if any (surfaced in the top bar). */
   lastError: null as string | null,
+  /** whether the arrangement has an edit to undo / redo (the ⟲/⟳ buttons). */
+  canUndo: false,
+  canRedo: false,
 });
 
 /** [dB → 0..1] meter fill, clamped to [-60, 0] dB (matches the mixer panel). */

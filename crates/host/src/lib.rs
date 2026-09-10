@@ -99,6 +99,13 @@ pub enum HostCommand {
     /// deterministic log, O(target) because the core clock only advances by
     /// rendering. Intended for seek-while-stopped.
     TransportSeek { frame: u64 },
+    /// Undo the most recent **arrangement** edit: drop it from the state history
+    /// and rebuild to the current position, so the playhead and the graph state
+    /// do not jump. A no-op when there is nothing to undo.
+    Undo,
+    /// Redo the most recently undone edit (re-inserted at its original history
+    /// position, so the reconstruction is faithful). Cleared by a new edit.
+    Redo,
     /// Play a clip into mixer channel `channel` at the current frame (the
     /// profile's monitoring wiring — the player node routes into the mixer).
     Play {
@@ -220,6 +227,9 @@ pub struct HostSession {
     /// The **state** commands applied so far, in order — replayed by `seek_to`
     /// to rebuild the session at a target frame. Actions are not recorded.
     history: Vec<HostCommand>,
+    /// The edits undone since the last edit, each with the history position it
+    /// came from, so a redo reconstructs the same session. Cleared by a new edit.
+    redo: Vec<(usize, HostCommand)>,
 }
 
 impl HostSession {
@@ -248,6 +258,7 @@ impl HostSession {
             arrange_dirty: false,
             playing: false,
             history: Vec::new(),
+            redo: Vec::new(),
         }
     }
 
@@ -348,6 +359,8 @@ impl HostSession {
                 Ok(())
             }
             HostCommand::TransportSeek { frame } => self.seek_to(*frame),
+            HostCommand::Undo => self.undo().map(|_| ()),
+            HostCommand::Redo => self.redo().map(|_| ()),
             HostCommand::Play { clip, channel, .. } => {
                 let channels = self.mixer_channels.ok_or(
                     "play requires the mixer to be mounted first (mount mixer channels=N)",
@@ -706,7 +719,15 @@ impl HostSession {
     /// by rendering. The transport's playing state is preserved; a refused
     /// replay leaves the original session untouched.
     fn seek_to(&mut self, frame: u64) -> Result<(), String> {
+        self.replay_to(frame)
+    }
+
+    /// Rebuild the session from its state-command history and render back to
+    /// `frame` — the deterministic reconstruction `seek_to` and undo/redo share.
+    /// The transport's playing state and the redo stack survive the rebuild.
+    fn replay_to(&mut self, frame: u64) -> Result<(), String> {
         let history = self.history.clone();
+        let redo = std::mem::take(&mut self.redo);
         let playing = self.playing;
         let mut rebuilt = HostSession::new();
         for cmd in &history {
@@ -714,8 +735,52 @@ impl HostSession {
         }
         rebuilt.render_to(frame)?;
         rebuilt.playing = playing;
+        rebuilt.redo = redo;
         *self = rebuilt;
         Ok(())
+    }
+
+    /// Undo the most recent **arrangement** edit: drop it from the state history
+    /// and rebuild **to the current position**, so the playhead does not jump and
+    /// the pool/mounts survive. `Ok(false)` when there is nothing to undo.
+    ///
+    /// Only `Arrange` ops are undoable — a `Mount`/`Pool`/`SetTempo` is session
+    /// setup, not an edit, and undoing one would tear down the graph under the UI.
+    pub fn undo(&mut self) -> Result<bool, String> {
+        let Some(pos) = self
+            .history
+            .iter()
+            .rposition(|c| matches!(c, HostCommand::Arrange { .. }))
+        else {
+            return Ok(false);
+        };
+        let undone = self.history.remove(pos);
+        self.redo.push((pos, undone));
+        self.replay_to(self.engine.clock.frame())?;
+        Ok(true)
+    }
+
+    /// Redo the most recently undone edit, re-inserted at its original history
+    /// position so the reconstruction is faithful. `Ok(false)` when nothing is
+    /// undone.
+    pub fn redo(&mut self) -> Result<bool, String> {
+        let Some((pos, cmd)) = self.redo.pop() else {
+            return Ok(false);
+        };
+        let at = pos.min(self.history.len());
+        self.history.insert(at, cmd);
+        self.replay_to(self.engine.clock.frame())?;
+        Ok(true)
+    }
+
+    /// Whether there is an arrangement edit to undo — the shell's `⟲` button.
+    pub fn can_undo(&self) -> bool {
+        self.history.iter().any(|c| matches!(c, HostCommand::Arrange { .. }))
+    }
+
+    /// Whether there is an undone edit to redo — the shell's `⟳` button.
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
     }
 
     /// Process one command exactly as the host contract does: validate the
@@ -761,9 +826,11 @@ impl HostSession {
                 self.mixer_channels = Some(ch);
             }
             // Record state commands so a later seek can rebuild the session
-            // deterministically (actions are not state).
+            // deterministically (actions are not state). A new state change also
+            // makes any undone branch unreachable, so the redo stack clears.
             if cmd.is_state() {
                 self.history.push(cmd.clone());
+                self.redo.clear();
             }
         }
         r
@@ -884,6 +951,8 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
                     }
                 }
             }
+            "undo" => commands.push(HostCommand::Undo),
+            "redo" => commands.push(HostCommand::Redo),
             "play" => {
                 let clip = ClipRef { path: PathBuf::from(word(&words, 1, at)?), start: 0, len: 0 };
                 let channel = channel_of(word(&words, 2, at)?, at)?;
@@ -1251,6 +1320,120 @@ mod tests {
 
         assert!(parse_arrange_line("").is_err(), "an empty line is refused");
         assert!(parse_arrange_line("arrange nonsense t0").is_err(), "an unknown op is refused");
+    }
+
+    // ---- undo/redo fixtures ----
+    /// A short mono float-WAV take, so an arrangement can actually wire a reader
+    /// (a render — which `seek_to`/undo do — opens every clip's source).
+    fn write_take(dir: &std::path::Path, id: &str, frames: usize) {
+        let path = dir.join(format!("{id}.wav"));
+        let mut w = media::WavWriter::create(&path, 48_000, 1).expect("wav writer");
+        w.write(&vec![0.0f32; frames]).expect("write take");
+        w.finalize().expect("finalize take");
+    }
+
+    fn add_clip(id: &str, at: u64) -> media::ArrangeOp {
+        media::ArrangeOp::AddClip {
+            track: "t0".into(),
+            clip: media::Clip {
+                id: id.into(),
+                source: "s1".into(),
+                src_start: 0,
+                src_len: 4_800,
+                at_frame: at,
+                fade_in: 0,
+                fade_out: 0,
+                gain: 1.0,
+                loop_len: None,
+            },
+        }
+    }
+
+    fn move_clip(id: &str, at: u64) -> media::ArrangeOp {
+        media::ArrangeOp::MoveClip { track: "t0".into(), clip: id.into(), at_frame: at }
+    }
+
+    /// Undo drops the most recent arrangement edit and rebuilds **to the current
+    /// position**; redo re-applies it; a new edit clears the redo branch.
+    #[test]
+    fn undo_and_redo_revert_and_reapply_an_edit() {
+        let pool = std::env::temp_dir().join(format!("host-undo-pool-{}", std::process::id()));
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_take(&pool, "s1", 48_000);
+        let mut s = HostSession::new();
+        s.execute(&HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 2.0)],
+            at_frame: Some(0),
+        })
+        .expect("mount mixer");
+        s.execute(&HostCommand::Pool { dir: pool.clone() }).expect("pool");
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::AddTrack { track: "t0".into() },
+            at_frame: None,
+        })
+        .expect("add track");
+        s.execute(&HostCommand::Arrange { op: add_clip("c0", 0), at_frame: None })
+            .expect("add clip");
+
+        assert!(s.can_undo(), "edits are undoable");
+        assert!(!s.can_redo(), "nothing is undone yet");
+
+        // Play to 9600 so we can prove an undo does not rewind the playhead.
+        s.execute(&HostCommand::TransportSeek { frame: 9_600 }).expect("seek");
+        s.execute(&HostCommand::Arrange { op: move_clip("c0", 4_800), at_frame: None })
+            .expect("move");
+        assert_eq!(s.arrangement().expect("tl").tracks[0].clips[0].at_frame, 4_800);
+
+        assert!(s.undo().expect("undo works"), "undo reports an edit was undone");
+        assert_eq!(
+            s.arrangement().expect("tl").tracks[0].clips[0].at_frame,
+            0,
+            "the move is reverted"
+        );
+        assert_eq!(s.position().frame, 9_600, "undo keeps the playhead where it was");
+        assert!(s.can_redo(), "the undone edit can be redone");
+
+        assert!(s.redo().expect("redo works"));
+        assert_eq!(
+            s.arrangement().expect("tl").tracks[0].clips[0].at_frame,
+            4_800,
+            "redo re-applies the move"
+        );
+        assert!(!s.can_redo(), "the redo branch is consumed");
+
+        // A new edit discards the redo branch.
+        s.undo().expect("undo again");
+        assert!(s.can_redo());
+        s.execute(&HostCommand::Arrange { op: move_clip("c0", 20_000), at_frame: None })
+            .expect("a new edit");
+        assert!(!s.can_redo(), "a new edit clears the redo branch");
+
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// Nothing to undo is a clean no-op — and session setup is not an edit.
+    #[test]
+    fn undo_with_nothing_to_undo_is_a_noop() {
+        let mut s = HostSession::new();
+        s.execute(&HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 2.0)],
+            at_frame: Some(0),
+        })
+        .expect("mount mixer");
+        assert!(!s.can_undo(), "a mount is session setup, not an edit");
+        assert!(!s.undo().expect("undo is a no-op"), "nothing was undone");
+        assert!(!s.redo().expect("redo is a no-op"), "nothing was redone");
+        assert_eq!(s.position().frame, 0);
+    }
+
+    /// The undo / redo grammar lines parse.
+    #[test]
+    fn undo_and_redo_lines_parse() {
+        let cmds = parse_script("host v1\nundo\nredo\n").expect("parse");
+        assert!(matches!(cmds[0], HostCommand::Undo));
+        assert!(matches!(cmds[1], HostCommand::Redo));
     }
 
     /// The transport text grammar parses play / seek / stop.

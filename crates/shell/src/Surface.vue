@@ -3,13 +3,15 @@
 // ui-plugins into slots. It is intentionally thin — transport/undo chrome live
 // here; the panels come from registered ui-plugins (src/plugins.ts).
 //
-// The transport is **live**: play/stop drive the host (host::live, on its own
-// thread) and the position + meters are polled from the bridge. Undo/redo and
-// record remain chrome (undo needs edit history; record needs the device path).
+// The transport and edit history are **live**: play/stop drive the host
+// (host::live, on its own thread), the position + meters are polled from the
+// bridge, and undo/redo replay the host's session log. Record remains chrome
+// (it needs the device recording path).
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { registry, soundArrangerProfile, type Profile, type SurfaceSlot } from "./plugins";
 import { bridgeState } from "./bridge";
 import { formatTime, startTransportPoll, transportPlay, transportStop } from "./transport";
+import { redoEdit, undoEdit } from "./editor";
 import { RATE, fitTimeline, timelineView } from "./timelineView";
 
 const props = defineProps<{ profile?: Profile }>();
@@ -57,12 +59,37 @@ function togglePlay() {
   else play();
 }
 
+function undo() {
+  if (!bridgeState.canUndo) return;
+  undoEdit().catch((e) => (bridgeState.status = String(e)));
+}
+function redo() {
+  if (!bridgeState.canRedo) return;
+  redoEdit().catch((e) => (bridgeState.status = String(e)));
+}
+
+// Ctrl/Cmd+Z (Shift to redo) anywhere except while typing in a text field, so
+// the header buttons and the timeline share one history.
+function onKey(e: KeyboardEvent) {
+  if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+  if (e.key !== "z" && e.key !== "Z") return;
+  const target = e.target as HTMLElement | null;
+  if (target && (target.tagName === "TEXTAREA" || target.tagName === "INPUT")) return;
+  e.preventDefault();
+  if (e.shiftKey) redo();
+  else undo();
+}
+
 // Poll the live host for the playhead + meters while the shell is mounted.
 let stopPoll: (() => void) | null = null;
 onMounted(() => {
   stopPoll = startTransportPoll();
+  window.addEventListener("keydown", onKey);
 });
-onUnmounted(() => stopPoll?.());
+onUnmounted(() => {
+  stopPoll?.();
+  window.removeEventListener("keydown", onKey);
+});
 
 // Resolve a profile slot to its registered view.
 function slotView(slot: SurfaceSlot) {
@@ -91,8 +118,18 @@ function slotView(slot: SurfaceSlot) {
       <div class="divider"></div>
 
       <div class="group" role="group" aria-label="edit">
-        <button class="btn" title="undo (atomic undo/redo — wiring pending)" disabled>⟲</button>
-        <button class="btn" title="redo" disabled>⟳</button>
+        <button
+          class="btn"
+          :disabled="!bridgeState.canUndo"
+          :title="bridgeState.canUndo ? 'undo the last edit (Ctrl+Z)' : 'nothing to undo'"
+          @click="undo"
+        >⟲</button>
+        <button
+          class="btn"
+          :disabled="!bridgeState.canRedo"
+          :title="bridgeState.canRedo ? 'redo the undone edit (Ctrl+Shift+Z)' : 'nothing to redo'"
+          @click="redo"
+        >⟳</button>
         <button class="btn btn--icon" title="snap on/off" :class="{ 'is-active': true }">⌗</button>
         <button class="btn" title="zoom to fit (the whole arrangement)" @click="fitTimeline">FIT</button>
         <button

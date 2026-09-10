@@ -47,6 +47,9 @@ pub struct Snapshot {
     /// The audio output's state: `None` when the host runs silent (no device was
     /// requested), otherwise the negotiated rate/layout and the played counters.
     pub audio: Option<AudioStatus>,
+    /// Whether an arrangement edit can be undone / redone (the shell's buttons).
+    pub can_undo: bool,
+    pub can_redo: bool,
     /// The last error the pump hit while rendering (a wiring failure) — recorded
     /// so the shell surfaces it instead of a silently moving, silent playhead.
     pub last_error: Option<String>,
@@ -84,6 +87,8 @@ impl Default for Snapshot {
             channel_count: 0,
             master: 0.0,
             audio: None,
+            can_undo: false,
+            can_redo: false,
             last_error: None,
         }
     }
@@ -441,6 +446,8 @@ fn publish(session: &HostSession, shared: &Mutex<Snapshot>, audio: &AudioState) 
     s.bpm = p.bpm;
     s.playing = p.playing;
     s.channel_count = session.mixer_channels().unwrap_or(0);
+    s.can_undo = session.can_undo();
+    s.can_redo = session.can_redo();
     match session.meters() {
         Some(bank) => {
             for k in 0..MIXER_CHANNELS_MAX {

@@ -44,8 +44,8 @@ incremental arrange seam existed ([note](2026-09-10-bridge-incremental-arrange.m
   *baked* `loop_len` (a repeated read, `src_len = r * times`), not the design's live
   `loop_in`/`loop_out` + fill rule, so there is no loop span to drag. The clip model has to grow
   first (an engine step, not a UI one). Today a resize is a **trim** (a contiguous read).
-- **Undo.** Not in this unit: the log is append-only and the host has no inverse-op or snapshot
-  history. It is the next piece.
+- **Undo.** Not in this unit: the log is append-only and the host had no inverse-op or snapshot
+  history. Shipped next, over that same log — [undo/redo](2026-09-10-undo-redo-arrangement-history.md).
 
 ## Consequences
 
@@ -54,7 +54,8 @@ incremental arrange seam existed ([note](2026-09-10-bridge-incremental-arrange.m
   session).
 - Resize is trim (no loop fill); razor refuses a looped clip with an explanation; there are no loop
   handles. These are all consequences of the clip model, recorded above.
-- Undo/redo (and the top bar's disabled buttons) is the next milestone.
+- Undo/redo shipped next ([note](2026-09-10-undo-redo-arrangement-history.md)): the top bar's `⟲`/`⟳`
+  now replay the session log, so every gesture here is reversible.
 
 ## Attribution
 

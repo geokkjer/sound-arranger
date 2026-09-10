@@ -64,8 +64,15 @@ impl AudioInfo {
     }
 }
 
-/// A poll of the live host: position + meters + audio + the pump's last error.
-/// The shell calls this on a timer (~30 Hz) to tick the playhead and meters.
+/// Whether the arrangement has an edit to undo / redo (the top bar's buttons).
+#[derive(Debug, Clone, Serialize)]
+pub struct EditState {
+    pub can_undo: bool,
+    pub can_redo: bool,
+}
+
+/// A poll of the live host: position + meters + audio + edit flags + the pump's
+/// last error. The shell calls this on a timer (~30 Hz).
 #[derive(Debug, Clone, Serialize)]
 pub struct TransportState {
     pub position: TransportPosition,
@@ -74,6 +81,7 @@ pub struct TransportState {
     pub master: f32,
     pub last_error: Option<String>,
     pub audio: Option<AudioInfo>,
+    pub edit: EditState,
 }
 
 /// A runnable outcome the frontend can show: a script's diagnostics plus a
@@ -101,6 +109,9 @@ pub struct ScriptOutcome {
     pub position: TransportPosition,
     /// How many mixer channels are mounted (drives the mixer strips).
     pub channel_count: usize,
+    /// Whether an edit can be undone / redone, so the top bar's ⟲/⟳ buttons
+    /// track the live history without waiting for the next transport poll.
+    pub edit: EditState,
 }
 
 /// The live transport poll, mapped from the shared snapshot.
@@ -119,6 +130,7 @@ fn to_transport_state(s: &Snapshot) -> TransportState {
         master: s.master,
         last_error: s.last_error.clone(),
         audio: s.audio.as_ref().map(AudioInfo::from_status),
+        edit: EditState { can_undo: s.can_undo, can_redo: s.can_redo },
     }
 }
 
@@ -153,6 +165,7 @@ fn to_wire(handle: &HostHandle, outcome: HostOutcome, bounce_written: bool) -> S
             playing: snap.playing,
         },
         channel_count: snap.channel_count,
+        edit: EditState { can_undo: snap.can_undo, can_redo: snap.can_redo },
     }
 }
 
@@ -212,6 +225,18 @@ fn transport_seek(frame: u64, host: State<'_, HostHandle>) -> Result<(), String>
     host.execute(HostCommand::TransportSeek { frame })
 }
 
+/// Undo the most recent arrangement edit (a rebuild to the current position).
+#[tauri::command]
+fn edit_undo(host: State<'_, HostHandle>) -> Result<(), String> {
+    host.execute(HostCommand::Undo)
+}
+
+/// Redo the most recently undone edit.
+#[tauri::command]
+fn edit_redo(host: State<'_, HostHandle>) -> Result<(), String> {
+    host.execute(HostCommand::Redo)
+}
+
 /// Poll the live host for the playhead + meters (non-blocking).
 #[tauri::command]
 fn transport_state(host: State<'_, HostHandle>) -> TransportState {
@@ -248,6 +273,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             run_host_script,
             arrange,
+            edit_undo,
+            edit_redo,
             transport_play,
             transport_stop,
             transport_seek,
@@ -322,6 +349,44 @@ mod tests {
         assert!(err.contains("nope"), "the refusal names the clip: {err}");
         let after = host.outcome().expect("outcome").arrangement.expect("arrangement");
         assert_eq!(after.tracks[0].clips[0].at_frame, 9_600, "the refused op changed nothing");
+
+        host.shutdown();
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// Undo/redo round-trip over the live handle, with the flags the top bar reads.
+    #[test]
+    fn undo_and_redo_round_trip_over_the_bridge() {
+        let host = HostHandle::spawn();
+        let pool = std::env::temp_dir().join(format!("shell-undo-pool-{}", std::process::id()));
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        // a take, so the rebuild's render can wire the clip's reader
+        let take = pool.join("s1.wav");
+        let mut w = media::WavWriter::create(&take, 48_000, 1).expect("wav writer");
+        w.write(&vec![0.0f32; 48_000]).expect("write take");
+        w.finalize().expect("finalize take");
+        load_script(
+            &host,
+            &format!(
+                "host v1\nmount mixer channels=2 @0\npool {}\narrange add_track t0 @0\narrange add_clip t0 c0 s1 0 4800 0 0 0 1.0 @0\n",
+                pool.display()
+            ),
+        )
+        .expect("load");
+
+        apply_arrange(&host, "arrange move_clip t0 c0 9600").expect("move");
+        assert!(host.snapshot().can_undo, "an edit makes undo available");
+        assert!(!host.snapshot().can_redo, "nothing is undone yet");
+
+        host.execute(HostCommand::Undo).expect("undo");
+        let undone = host.outcome().expect("outcome").arrangement.expect("tl");
+        assert_eq!(undone.tracks[0].clips[0].at_frame, 0, "the move is reverted");
+        assert!(host.snapshot().can_redo, "redo is available after an undo");
+
+        host.execute(HostCommand::Redo).expect("redo");
+        let redone = host.outcome().expect("outcome").arrangement.expect("tl");
+        assert_eq!(redone.tracks[0].clips[0].at_frame, 9_600, "redo re-applies the move");
+        assert!(!host.snapshot().can_redo, "the redo branch is consumed");
 
         host.shutdown();
         let _ = std::fs::remove_dir_all(&pool);
