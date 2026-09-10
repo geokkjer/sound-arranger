@@ -134,10 +134,17 @@ by the [`~/Projects/music`](../music/README.md) symlink view.
 
 ## Dev environment
 
-Nix + devenv (`flake.nix` / `devenv.nix` / `devenv.yaml` / `.envrc`):
+**Native host toolchain** (Arch/CachyOS). Dev builds use the system Rust, `node`/`pnpm`, and the
+**host** GTK/WebKit/Mesa. The Nix/devenv setup is parked under [`nix/`](nix/): on this non-NixOS
+host a Nix-built GUI binary cannot open a window (the Nix glvnd ships no EGL vendor, and host WebKit
+needs `GLIBC_2.44` vs the Nix toolchain's 2.42). The diagnosis and the decision are in the
+[native host dev toolchain note](.agents/notes/implemented/process/2026-09-10-native-host-dev-toolchain.md).
 
+Install (Arch):
 ```sh
-direnv allow        # or: devenv shell
+sudo pacman -S --needed base-devel rust nodejs npm pnpm \
+  webkit2gtk-4.1 gtk3 libsoup3 librsvg libayatana-appindicator \
+  alsa-lib openssl appmenu-gtk-module
 ```
 
 One-time git setup — hooks live in-repo:
@@ -147,8 +154,8 @@ git config core.hooksPath .githooks
 ```
 
 The pre-commit hook verifies the Agent Notes tree and refuses edits under
-`.agents/notes/archived/`. It needs `node` from the devenv shell; without node it warns
-and skips rather than blocking the commit.
+`.agents/notes/archived/`. It needs `node` on `PATH`; without node it warns and skips
+rather than blocking the commit.
 
 ## License
 

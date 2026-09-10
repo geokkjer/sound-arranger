@@ -4,7 +4,7 @@
 set -euo pipefail
 
 if ! command -v node >/dev/null 2>&1; then
-  echo "pre-commit: node not found on PATH (devenv provides it) — skipping Agent Note verification" >&2
+  echo "pre-commit: node not found on PATH (install node) — skipping Agent Note verification" >&2
   exit 0
 fi
 

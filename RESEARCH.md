@@ -356,7 +356,7 @@ Dependency compatibility matrix (verified where marked):
 
 ## 13. Dev environment & audio latency
 
-- **Nix + devenv** (same pattern as `tidal-lsp`): `flake.nix`, `devenv.nix`, `devenv.yaml`, `.envrc` are committed. Run `direnv allow` (or `devenv shell`) for Rust + Node/pnpm + the Tauri (webkit2gtk) and ALSA build deps.
+- **Host-native dev (2026-09-10).** Dev uses the host toolchain: system `rust` (rustc/cargo/rustfmt/clippy), `node`/`pnpm`, and the host GTK/WebKit/Mesa (`base-devel`/`pkgconf`, `webkit2gtk-4.1`, `gtk3`, `libsoup3`, `librsvg`, `libayatana-appindicator`, `alsa-lib`, `openssl`, `appmenu-gtk-module`). The Nix + devenv config (previously `flake.nix` / `devenv.nix` / `.envrc`) is **parked under [`nix/`](nix/)** and reproducibility is deferred: on a non-NixOS host a Nix-built GUI binary cannot open a window (the Nix glvnd ships no EGL vendor, and host WebKit needs `GLIBC_2.44` vs the Nix toolchain's 2.42) — see the [native host dev toolchain note](.agents/notes/implemented/process/2026-09-10-native-host-dev-toolchain.md).
 - **Kernel / latency on Linux & NixOS**: see [`docs/audio-latency.md`](docs/audio-latency.md). TL;DR — nixpkgs has **removed the `-rt` kernels** (PREEMPT_RT is mainlined since 6.12, so the separate package is gone); run `linuxPackages_latest`/`zen` + `rtkit` + `performance` governor, and talk to ALSA `hw:` from `cpal`. No RT kernel needed for an arranger.
 
 ---

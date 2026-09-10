@@ -15,8 +15,8 @@ shell, the timeline) drives this same contract.
 
 ## Before you start
 
-Enter the dev shell (Nix/devenv — see [../README.md](../README.md)), then prove
-the toolchain:
+You need the Rust toolchain and `node` on `PATH` (see the
+[dev environment](../README.md#dev-environment)), then prove the toolchain:
 
 ```sh
 cargo test -p engine          # ~56 core tests, should pass in about a second
