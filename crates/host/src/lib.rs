@@ -29,6 +29,8 @@ use std::sync::atomic::Ordering;
 use engine::*;
 use media::{ClipRef, FilePlayer, Mailbox, PlaybackNode, SpliceCmd, DEFAULT_RING_CAPACITY};
 
+pub mod live;
+
 /// The Host API contract version. The text format's first line must be
 /// `host v{N}`; mismatches are refused (kimi review finding 6).
 pub const HOST_API_VERSION: u32 = 1;
@@ -622,6 +624,17 @@ impl HostSession {
     /// Whether the transport is running.
     pub fn is_playing(&self) -> bool {
         self.playing
+    }
+
+    /// The session sample rate (the live pump paces against it).
+    pub fn sample_rate(&self) -> u32 {
+        self.engine.clock.sample_rate
+    }
+
+    /// The mixer's mounted channel count, if a mixer is mounted (what the shell
+    /// draws strips for).
+    pub fn mixer_channels(&self) -> Option<usize> {
+        self.mixer_channels
     }
 
     /// The transport position (frame + derived musical time + playing). A shell
