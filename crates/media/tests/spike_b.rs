@@ -513,7 +513,12 @@ fn devices_open_and_run() {
 
     if let Some(name) = out_name {
         let ring = Arc::new(Spsc::new(1 << 16));
-        let handle = media::devices::open_output(ring.clone()).expect("open output");
+        let handle = media::devices::open_output(ring.clone(), 1, 48_000).expect("open output");
+        assert!(
+            !handle.rate_mismatch,
+            "the test device should provide 48 kHz (got {})",
+            handle.sample_rate
+        );
         let n = handle.sample_rate as usize;
         let mut phase = 0.0f64;
         for _ in 0..n {
