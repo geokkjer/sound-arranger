@@ -15,8 +15,21 @@ import { onMounted, onUnmounted, ref, watch } from "vue";
 import { bridgeState, type PoolSource, type Timeline } from "./bridge";
 import { transportSeek } from "./transport";
 
+// The default script is the synth chain (euclidean → scale → tone → mixer), so
+// "Run in host" then ▶ makes sound with no pool/recording needed. It must be a
+// <textarea>: an <input> strips newlines from its value, collapsing the script
+// into one line and failing the `host v1` header check.
 const hostScript = ref(
-  "host v1\nmount mixer channels=4 @0\narrange add_track t0 @0\narrange add_track t1 @0",
+  [
+    "host v1",
+    "mount euclidean steps=8 pulses=5 @0",
+    "mount scale root=0 note_len=2400 @0",
+    "mount tone gain=0.9 blip_len=1800 @0",
+    "mount mixer channels=4 @0",
+    "patch euclidean.triggers scale.trigger @0",
+    "patch scale.note tone.note @0",
+    "patch tone.audio mixer.ch0 @0",
+  ].join("\n"),
 );
 const status = ref("drawing demo arrangement");
 
@@ -167,7 +180,7 @@ async function loadFromHost() {
       status.value = `loaded ${outcome.arrangement.tracks.length} track(s)`;
     } else {
       drawn.value = demo;
-      status.value = "no arrangement (add a `pool <dir>` + arrange add_clip) — showing demo";
+      status.value = "no arrangement tracks — showing the demo (the graph still plays)";
     }
     bridgeState.status = status.value;
     draw();
@@ -194,7 +207,14 @@ onUnmounted(() => window.removeEventListener("resize", draw));
   <div class="timeline">
     <div class="tl-bar">
       <span class="tl-status">{{ status }}</span>
-      <input v-model="hostScript" class="tl-script" spellcheck="false" />
+      <textarea
+        v-model="hostScript"
+        class="tl-script"
+        rows="1"
+        spellcheck="false"
+        placeholder="host v1 — one command per line"
+        title="the host script (one command per line; drag to expand)"
+      ></textarea>
       <button class="btn" @click="loadFromHost">Run in host</button>
     </div>
     <canvas ref="canvas" class="tl-canvas" title="click to seek" @click="seekFromClick"></canvas>
@@ -205,6 +225,21 @@ onUnmounted(() => window.removeEventListener("resize", draw));
 .timeline { display: flex; flex-direction: column; height: 100%; min-height: 0; }
 .tl-bar { display: flex; gap: 8px; align-items: center; padding: 8px; background: #17191f; border-bottom: 1px solid #22252c; }
 .tl-status { font: 11px ui-monospace, monospace; color: #8b93a7; white-space: nowrap; max-width: 40%; overflow: hidden; text-overflow: ellipsis; }
-.tl-script { flex: 1; font: 11px ui-monospace, monospace; color: #cfd6e4; background: #0e1013; border: 1px solid #262a32; border-radius: 4px; padding: 4px 6px; }
+.tl-script {
+  flex: 1;
+  font: 11px ui-monospace, monospace;
+  color: #cfd6e4;
+  background: #0e1013;
+  border: 1px solid #262a32;
+  border-radius: 4px;
+  padding: 4px 6px;
+  /* a <textarea> keeps the newlines an <input> would strip; drag to expand */
+  resize: vertical;
+  min-height: 22px;
+  max-height: 40vh;
+  line-height: 1.35;
+  white-space: pre;
+  overflow: auto;
+}
 .tl-canvas { flex: 1; width: 100%; min-height: 0; display: block; cursor: text; }
 </style>
