@@ -1,19 +1,30 @@
 <script setup lang="ts">
-// The timeline canvas — the first real ui-plugin of the clip-arranger profile.
-// It draws the arrangement value (tracks → clips) as blocks on a frame-scaled
-// timeline, draws the **live playhead** at the polled transport position, and
-// lets a click seek. "Run in host" loads a script into the live session
-// (reset-and-apply), so the arrangement, meters and transport all come from the
-// engine.
+// The timeline canvas — the clip-arranger's hero ui-plugin. It draws the
+// arrangement value (tracks → clips) through the **viewport** (zoom · t0), the
+// live playhead, and the seek gesture. "Run in host" loads a script into the live
+// session (reset-and-apply), so the arrangement, meters and transport come from
+// the engine.
 //
-// Fit-to-view: the whole arrangement is scaled to the canvas width, so the
-// playhead stays visible and a click maps cleanly to a frame. (The pixels-per-
-// second viewport / zoom model from docs/design/ui-plan.md is a later step.)
+// The timeline is a fixed time-space viewed through a scrolling window: zoom is a
+// *mapping change* (`x = (frame - t0) * zoom`), so nothing relayouts — only the
+// canvas repaints, and clips outside the window are culled. The view state and
+// maths live in ./timelineView (shared with the shell's FIT / follow).
 
 import { invoke } from "@tauri-apps/api/core";
 import { onMounted, onUnmounted, ref, watch } from "vue";
 import { bridgeState, type PoolSource, type Timeline } from "./bridge";
 import { transportSeek } from "./transport";
+import {
+  RATE,
+  clampView,
+  fitTimeline,
+  fitZoom,
+  frameAt,
+  panBy,
+  timelineView as view,
+  xFor,
+  zoomAt,
+} from "./timelineView";
 
 // The default script is the synth chain (euclidean → scale → tone → mixer), so
 // "Run in host" then ▶ makes sound with no pool/recording needed. It must be a
@@ -50,12 +61,20 @@ const demo: Timeline = {
 const canvas = ref<HTMLCanvasElement | null>(null);
 // The arrangement currently drawn (the loaded one, or the demo).
 const drawn = ref<Timeline>(demo);
-let pxPerFrame = 0.01; // recomputed on every draw (fit-to-view)
 
 // Per-track identity colors (mirror the --track-N tokens in style.css). A track
 // keeps one hue across its lane swatch, its clips (and, later, its mixer strip).
 const TRACK_COLORS = ["#4fa3ad", "#5aa46a", "#d0723a", "#b45c8c", "#8a6bb0", "#c3a84a", "#6d9a77", "#9a6d7a"];
-const RATE = 48_000;
+
+/** Geometry (px): the ruler is a fixed strip; lanes fill it at fit zoom. */
+const RULER_H = 20;
+const MAX_LANE_H = 220;
+/** A ruler tick's label needs at least this much room. */
+const MIN_TICK_PX = 64;
+/** "Nice" tick steps, in seconds. */
+const NICE_SECONDS = [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
+
+const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n));
 
 /** The arrangement's length in frames (a 4 s default window when empty). */
 function durationFrames(tl: Timeline): number {
@@ -66,14 +85,30 @@ function durationFrames(tl: Timeline): number {
   return max > 0 ? max : RATE * 4;
 }
 
+/** The smallest "nice" tick step whose labels are at least MIN_TICK_PX apart. */
+function tickStepFrames(zoom: number): number {
+  const pxPerSec = zoom * RATE;
+  const sec = NICE_SECONDS.find((s) => s * pxPerSec >= MIN_TICK_PX) ?? NICE_SECONDS[NICE_SECONDS.length - 1];
+  return sec * RATE;
+}
+
+function tickLabel(frame: number): string {
+  const s = frame / RATE;
+  if (s >= 60) {
+    const m = Math.floor(s / 60);
+    return `${m}:${Math.round(s - m * 60).toString().padStart(2, "0")}`;
+  }
+  return s < 1 ? `${s.toFixed(2)}s` : `${Number.isInteger(s) ? s : s.toFixed(1)}s`;
+}
+
 function draw() {
   const c = canvas.value;
   if (!c) return;
   const ctx = c.getContext("2d");
   if (!ctx) return;
-  const tl = drawn.value;
-  const dpr = window.devicePixelRatio || 1;
   const w = c.clientWidth, h = c.clientHeight;
+  if (w === 0 || h === 0) return;
+  const dpr = window.devicePixelRatio || 1;
   if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) {
     c.width = Math.round(w * dpr);
     c.height = Math.round(h * dpr);
@@ -81,17 +116,32 @@ function draw() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, h);
 
+  const tl = drawn.value;
+  // Publish the viewport, then clamp the view (fit floor, inside the arrangement).
+  view.width = w;
+  view.height = h;
+  view.duration = durationFrames(tl);
+  clampView();
+
+  const z = view.zoom;
+  const x0 = view.t0;
+  const tracks = Math.max(1, tl.tracks.length);
+  // One unified zoom gesture: lanes fill the height at fit zoom and grow taller as
+  // you zoom in (ui-plan §3), scrollable once they outgrow the viewport.
+  const fillLaneH = (h - RULER_H) / tracks;
+  // Lanes **fill** the container at fit zoom; they grow taller as you zoom in
+  // (one unified zoom gesture, ui-plan §3), capped so they stay readable.
+  const laneH = Math.max(fillLaneH, Math.min(fillLaneH * (z / fitZoom()), MAX_LANE_H));
+  const viewH = h - RULER_H;
+  view.vScroll = clamp(view.vScroll, 0, Math.max(0, tracks * laneH - viewH));
+
   ctx.fillStyle = "#14161a";
   ctx.fillRect(0, 0, w, h);
 
-  // Fit the whole arrangement to the width (2 px right margin) so the playhead
-  // is always on screen and a click maps linearly to a frame.
-  pxPerFrame = Math.max(1e-6, (w - 2) / durationFrames(tl));
-
-  const laneH = Math.max(48, (h - 20) / Math.max(1, tl.tracks.length));
+  // lanes + clips — culled, so a 30-minute arrangement draws only what is on screen
   tl.tracks.forEach((track, ti) => {
-    const y = 20 + ti * laneH;
-    // lane background + label
+    const y = RULER_H - view.vScroll + ti * laneH;
+    if (y >= h || y + laneH <= RULER_H) return;
     ctx.fillStyle = "#1d2026";
     ctx.fillRect(0, y, w, laneH - 4);
     ctx.fillStyle = "#6b7280";
@@ -101,15 +151,14 @@ function draw() {
     const trackColor = TRACK_COLORS[ti % TRACK_COLORS.length];
     ctx.fillStyle = trackColor;
     ctx.fillRect(0, y, 3, laneH - 4);
-    // clips
     for (const clip of track.clips) {
-      const x = clip.at_frame * pxPerFrame;
-      const wpx = clip.src_len * pxPerFrame;
+      const x = (clip.at_frame - x0) * z;
+      const wpx = clip.src_len * z;
+      if (x >= w || x + wpx <= 0) continue; // off-screen
       ctx.fillStyle = trackColor;
       ctx.fillRect(x, y + 4, Math.max(2, wpx), laneH - 12);
       ctx.strokeStyle = "rgba(255,255,255,0.35)";
       ctx.strokeRect(x, y + 4, Math.max(2, wpx), laneH - 12);
-      // id label, only if the block is wide enough
       if (wpx > 24) {
         ctx.fillStyle = "#0b0d10";
         ctx.font = "10px ui-monospace, monospace";
@@ -118,19 +167,43 @@ function draw() {
     }
   });
 
-  // ruler — a "nice" tick step whose labels are at least ~64 px apart
-  ctx.fillStyle = "#8891a5";
+  // ruler — ticks at absolute times, their step derived from the zoom
+  ctx.fillStyle = "#17191f";
+  ctx.fillRect(0, 0, w, RULER_H);
+  ctx.strokeStyle = "#22252c";
+  ctx.beginPath();
+  ctx.moveTo(0, RULER_H - 0.5);
+  ctx.lineTo(w, RULER_H - 0.5);
+  ctx.stroke();
+  const step = tickStepFrames(z);
   ctx.font = "10px ui-monospace, monospace";
-  const nice = [0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300];
-  const secPerPx = 1 / (pxPerFrame * RATE);
-  const stepSec = nice.find((s) => s / secPerPx >= 64) ?? nice[nice.length - 1];
-  for (let t = 0; t * RATE * pxPerFrame < w; t += stepSec) {
-    const x = t * RATE * pxPerFrame;
-    ctx.fillText(`${t >= 60 ? `${Math.floor(t / 60)}m` : ""}${(t % 60).toFixed(t < 1 ? 1 : 0)}s`, x + 2, 12);
+  for (let f = Math.floor(x0 / step) * step; ; f += step) {
+    const x = (f - x0) * z;
+    if (x > w) break;
+    if (x < -1) continue;
+    ctx.strokeStyle = "#2b313a";
+    ctx.beginPath();
+    ctx.moveTo(Math.round(x) + 0.5, RULER_H - 5);
+    ctx.lineTo(Math.round(x) + 0.5, RULER_H);
+    ctx.stroke();
+    ctx.fillStyle = "#8891a5";
+    ctx.fillText(tickLabel(f), x + 3, 11);
+  }
+
+  // vertical scrollbar — appears only once the lanes outgrow the viewport
+  const totalH = tracks * laneH;
+  if (totalH > viewH + 1) {
+    const trackW = 3;
+    ctx.fillStyle = "#1d2026";
+    ctx.fillRect(w - trackW, RULER_H, trackW, viewH);
+    const thumbH = Math.max(12, (viewH / totalH) * viewH);
+    const thumbY = RULER_H + (view.vScroll / (totalH - viewH)) * (viewH - thumbH);
+    ctx.fillStyle = "#3a424e";
+    ctx.fillRect(w - trackW, thumbY, trackW, thumbH);
   }
 
   // playhead — the live transport position (amber, per the design system)
-  const px = bridgeState.position.frame * pxPerFrame;
+  const px = xFor(bridgeState.position.frame);
   if (px >= 0 && px <= w) {
     ctx.strokeStyle = "#e5b567";
     ctx.lineWidth = 1;
@@ -148,13 +221,31 @@ function draw() {
   }
 }
 
+/**
+ * The wheel is the one zoom gesture (ui-plan §3): plain wheel zooms around the
+ * cursor, shift+wheel pans in time, ctrl/cmd+wheel scrolls the lanes.
+ */
+function onWheel(e: WheelEvent) {
+  e.preventDefault();
+  const c = canvas.value;
+  if (!c) return;
+  const rect = c.getBoundingClientRect();
+  if (e.ctrlKey || e.metaKey) {
+    view.vScroll = Math.max(0, view.vScroll + e.deltaY);
+  } else if (e.shiftKey) {
+    panBy(e.deltaY);
+  } else {
+    zoomAt(e.clientX - rect.left, Math.exp(-e.deltaY * 0.0015));
+  }
+  // The view watcher redraws (batched per tick, so a fast wheel is one repaint).
+}
+
 /** A click sets the playhead (seek to the frame under the pointer). */
 function seekFromClick(e: MouseEvent) {
   const c = canvas.value;
   if (!c) return;
   const rect = c.getBoundingClientRect();
-  const x = e.clientX - rect.left;
-  const frame = Math.max(0, Math.round(x / pxPerFrame));
+  const frame = Math.max(0, Math.round(frameAt(e.clientX - rect.left)));
   transportSeek(frame).catch((err) => (bridgeState.status = String(err)));
 }
 
@@ -183,6 +274,9 @@ async function loadFromHost() {
       status.value = "no arrangement tracks — showing the demo (the graph still plays)";
     }
     bridgeState.status = status.value;
+    // Frame the new arrangement: fit it (the load may be much longer/shorter).
+    view.duration = durationFrames(drawn.value);
+    fitTimeline();
     draw();
   } catch (e) {
     status.value = String(e);
@@ -195,12 +289,19 @@ async function loadFromHost() {
 
 // Redraw the playhead whenever the polled position changes.
 watch(() => bridgeState.position.frame, () => draw());
+// Redraw when the shell changes the view (FIT, follow), not for width/duration
+// (draw sets those — watching them would loop).
+watch(() => [view.zoom, view.t0, view.vScroll], () => draw());
 
 onMounted(() => {
   draw();
   window.addEventListener("resize", draw);
+  canvas.value?.addEventListener("wheel", onWheel, { passive: false });
 });
-onUnmounted(() => window.removeEventListener("resize", draw));
+onUnmounted(() => {
+  window.removeEventListener("resize", draw);
+  canvas.value?.removeEventListener("wheel", onWheel);
+});
 </script>
 
 <template>
@@ -217,7 +318,12 @@ onUnmounted(() => window.removeEventListener("resize", draw));
       ></textarea>
       <button class="btn" @click="loadFromHost">Run in host</button>
     </div>
-    <canvas ref="canvas" class="tl-canvas" title="click to seek" @click="seekFromClick"></canvas>
+    <canvas
+      ref="canvas"
+      class="tl-canvas"
+      title="wheel: zoom · shift+wheel: pan · ctrl+wheel: scroll lanes · click: seek"
+      @click="seekFromClick"
+    ></canvas>
   </div>
 </template>
 
@@ -241,5 +347,5 @@ onUnmounted(() => window.removeEventListener("resize", draw));
   white-space: pre;
   overflow: auto;
 }
-.tl-canvas { flex: 1; width: 100%; min-height: 0; display: block; cursor: text; }
+.tl-canvas { flex: 1; width: 100%; min-height: 0; display: block; cursor: crosshair; }
 </style>

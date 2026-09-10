@@ -10,6 +10,7 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import { registry, soundArrangerProfile, type Profile, type SurfaceSlot } from "./plugins";
 import { bridgeState } from "./bridge";
 import { formatTime, startTransportPoll, transportPlay, transportStop } from "./transport";
+import { RATE, fitTimeline, timelineView } from "./timelineView";
 
 const props = defineProps<{ profile?: Profile }>();
 const profile = computed(() => props.profile ?? soundArrangerProfile);
@@ -20,6 +21,8 @@ const showMixer = ref(true);
 const playing = computed(() => bridgeState.position.playing);
 const timecode = computed(() => formatTime(bridgeState.position.seconds));
 const bpm = computed(() => bridgeState.position.bpm);
+// The timeline zoom, in pixels per second (frames × zoom).
+const zoomPxPerSec = computed(() => Math.round(timelineView.zoom * RATE));
 
 // The audio readout: the device the pump feeds (or why there is none).
 const audioLabel = computed(() => {
@@ -91,7 +94,8 @@ function slotView(slot: SurfaceSlot) {
         <button class="btn" title="undo (atomic undo/redo — wiring pending)" disabled>⟲</button>
         <button class="btn" title="redo" disabled>⟳</button>
         <button class="btn btn--icon" title="snap on/off" :class="{ 'is-active': true }">⌗</button>
-        <button class="btn" title="zoom to fit">FIT</button>
+        <button class="btn" title="zoom to fit (the whole arrangement)" @click="fitTimeline">FIT</button>
+        <span class="zoom" title="timeline zoom">{{ zoomPxPerSec }} px/s</span>
       </div>
 
       <button class="btn" title="toggle the mixer panel" @click="showMixer = !showMixer">
@@ -216,6 +220,15 @@ function slotView(slot: SurfaceSlot) {
 }
 .audio--bad {
   color: var(--record);
+}
+
+.zoom {
+  font: 11px ui-monospace, monospace;
+  color: var(--fg-mute);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  min-width: 58px;
+  text-align: right;
 }
 
 .divider {
