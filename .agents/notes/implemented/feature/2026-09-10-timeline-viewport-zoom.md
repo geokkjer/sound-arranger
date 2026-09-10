@@ -58,9 +58,9 @@ never a relayout.
 - **Transport follow** is applied on top: while the transport runs and `follow` is on (the default),
   the canvas calls `followPlayhead(frame)`, which parks the playhead at the left margin once it passes
   the right margin (or sits behind the view). The top bar has a toggle (`⇥`).
-- No frontend test runner exists, so this maths is verified by typecheck/build and in use rather than
-  by unit tests. A `vitest` setup would let us pin `zoomAt`/`clampView`/`followPlayhead` (worth it if
-  the viewport grows more logic).
+- The maths is unit-tested with `vitest` (see the
+  [frontend tests note](../process/2026-09-10-frontend-unit-tests-vitest.md)): anchored-zoom
+  invariance, the fit floor and the px/s ceiling, `t0` clamping, follow parking, and the ruler ticks.
 
 ## Attribution
 

@@ -147,6 +147,9 @@ sudo pacman -S --needed base-devel rust nodejs npm pnpm \
   alsa-lib openssl appmenu-gtk-module
 ```
 
+Frontend checks, from `crates/shell`: `pnpm typecheck` · `pnpm test` · `pnpm build`
+(and `pnpm tauri dev` to run the app).
+
 One-time git setup — hooks live in-repo:
 
 ```sh

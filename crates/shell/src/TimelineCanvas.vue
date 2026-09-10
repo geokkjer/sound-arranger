@@ -14,6 +14,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { onMounted, onUnmounted, ref, watch } from "vue";
 import { bridgeState, type PoolSource, type Timeline } from "./bridge";
 import { transportSeek } from "./transport";
+import { tickLabel, tickStepFrames } from "./timelineTicks";
 import {
   RATE,
   clampView,
@@ -70,10 +71,6 @@ const TRACK_COLORS = ["#4fa3ad", "#5aa46a", "#d0723a", "#b45c8c", "#8a6bb0", "#c
 /** Geometry (px): the ruler is a fixed strip; lanes fill it at fit zoom. */
 const RULER_H = 20;
 const MAX_LANE_H = 220;
-/** A ruler tick's label needs at least this much room. */
-const MIN_TICK_PX = 64;
-/** "Nice" tick steps, in seconds. */
-const NICE_SECONDS = [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
 
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n));
 
@@ -84,22 +81,6 @@ function durationFrames(tl: Timeline): number {
     for (const c of t.clips) max = Math.max(max, c.at_frame + c.src_len);
   }
   return max > 0 ? max : RATE * 4;
-}
-
-/** The smallest "nice" tick step whose labels are at least MIN_TICK_PX apart. */
-function tickStepFrames(zoom: number): number {
-  const pxPerSec = zoom * RATE;
-  const sec = NICE_SECONDS.find((s) => s * pxPerSec >= MIN_TICK_PX) ?? NICE_SECONDS[NICE_SECONDS.length - 1];
-  return sec * RATE;
-}
-
-function tickLabel(frame: number): string {
-  const s = frame / RATE;
-  if (s >= 60) {
-    const m = Math.floor(s / 60);
-    return `${m}:${Math.round(s - m * 60).toString().padStart(2, "0")}`;
-  }
-  return s < 1 ? `${s.toFixed(2)}s` : `${Number.isInteger(s) ? s : s.toFixed(1)}s`;
 }
 
 function draw() {

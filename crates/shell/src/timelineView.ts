@@ -57,7 +57,7 @@ export function xFor(frame: number): number {
 export function zoomAt(px: number, factor: number): void {
   const v = timelineView;
   const anchor = frameAt(px);
-  v.zoom = clamp(v.zoom * factor, fitZoom(), MAX_PX_PER_SEC / RATE);
+  v.zoom = clampZoom(v.zoom * factor);
   v.t0 = anchor - px / v.zoom;
   clampView();
 }
@@ -71,9 +71,21 @@ export function panBy(deltaPx: number): void {
 /** Clamp zoom to the fit floor/ceiling and `t0` inside `[0, duration - visible]`. */
 export function clampView(): void {
   const v = timelineView;
-  v.zoom = clamp(v.zoom, fitZoom(), MAX_PX_PER_SEC / RATE);
+  v.zoom = clampZoom(v.zoom);
   const visible = v.width / v.zoom;
   v.t0 = clamp(v.t0, 0, Math.max(0, v.duration - visible));
+}
+
+/**
+ * Clamp a zoom to the allowed range. **Fit is a hard floor** — the arrangement
+ * always reaches the container edges (ui-plan §3: no dead space) — and the
+ * px/second ceiling applies above it. When fit is itself above the ceiling (a
+ * very short arrangement in a very wide window) fit wins, which is why this is
+ * not a plain `clamp` with an inverted range.
+ */
+function clampZoom(zoom: number): number {
+  const floor = fitZoom();
+  return Math.max(floor, Math.min(zoom, Math.max(floor, MAX_PX_PER_SEC / RATE)));
 }
 
 /**
