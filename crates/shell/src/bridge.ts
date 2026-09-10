@@ -46,6 +46,15 @@ export interface Timeline {
   tracks: Track[];
 }
 
+/** The live transport position (mirrors the bridge's `TransportPosition`). */
+export interface TransportPosition {
+  frame: number;
+  seconds: number;
+  beat: number;
+  bpm: number;
+  playing: boolean;
+}
+
 export const bridgeState = reactive({
   /** human-readable transport/run status shown in the top bar. */
   status: "showing demo arrangement",
@@ -55,6 +64,12 @@ export const bridgeState = reactive({
   sources: [] as PoolSource[],
   /** the arrangement value (drives the timeline canvas), if the host produced one. */
   arrangement: null as Timeline | null,
+  /** the live transport position, polled from the bridge (drives the playhead). */
+  position: { frame: 0, seconds: 0, beat: 0, bpm: 120, playing: false } as TransportPosition,
+  /** the mixer's mounted channel count (drives the strip count). */
+  channelCount: 0,
+  /** the pump's last unrecoverable error, if any (surfaced in the top bar). */
+  lastError: null as string | null,
 });
 
 /** [dB → 0..1] meter fill, clamped to [-60, 0] dB (matches the mixer panel). */

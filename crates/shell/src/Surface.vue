@@ -3,13 +3,13 @@
 // ui-plugins into slots. It is intentionally thin — transport/undo chrome live
 // here; the panels come from registered ui-plugins (src/plugins.ts).
 //
-// Transport and undo/redo are *chrome* for now: the Host-API bridge only drives
-// a one-shot `run_host_script`, so play/stop/record and undo are placeholders
-// that light up a local indicator. Wiring them to live engine commands is the
-// next bridge step.
-import { computed, ref } from "vue";
+// The transport is **live**: play/stop drive the host (host::live, on its own
+// thread) and the position + meters are polled from the bridge. Undo/redo and
+// record remain chrome (undo needs edit history; record needs the device path).
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { registry, soundArrangerProfile, type Profile, type SurfaceSlot } from "./plugins";
 import { bridgeState } from "./bridge";
+import { formatTime, startTransportPoll, transportPlay, transportStop } from "./transport";
 
 const props = defineProps<{ profile?: Profile }>();
 const profile = computed(() => props.profile ?? soundArrangerProfile);
@@ -17,12 +17,27 @@ const profile = computed(() => props.profile ?? soundArrangerProfile);
 // The mixer is a pass, not the default state (docs/design/ui-plan.md §6).
 const showMixer = ref(true);
 
-// Demo transport indicator — replaced when live transport lands on the bridge.
-const playing = ref(false);
-function togglePlay() {
-  playing.value = !playing.value;
-  bridgeState.status = playing.value ? "transport playing (demo)" : "transport stopped (demo)";
+const playing = computed(() => bridgeState.position.playing);
+const timecode = computed(() => formatTime(bridgeState.position.seconds));
+const bpm = computed(() => bridgeState.position.bpm);
+
+function play() {
+  transportPlay().catch((e) => (bridgeState.status = String(e)));
 }
+function stop() {
+  transportStop().catch((e) => (bridgeState.status = String(e)));
+}
+function togglePlay() {
+  if (playing.value) stop();
+  else play();
+}
+
+// Poll the live host for the playhead + meters while the shell is mounted.
+let stopPoll: (() => void) | null = null;
+onMounted(() => {
+  stopPoll = startTransportPoll();
+});
+onUnmounted(() => stopPoll?.());
 
 // Resolve a profile slot to its registered view.
 function slotView(slot: SurfaceSlot) {
@@ -41,10 +56,11 @@ function slotView(slot: SurfaceSlot) {
 
       <div class="transport" role="group" aria-label="transport">
         <button class="btn btn--icon" :class="{ 'is-active': playing }" title="play" @click="togglePlay">▶</button>
-        <button class="btn btn--icon" title="record (wiring pending)" disabled>⏺</button>
-        <button class="btn btn--icon" title="stop" @click="playing = false; bridgeState.status = 'stopped'">■</button>
+        <button class="btn btn--icon" title="record (device recording not wired)" disabled>⏺</button>
+        <button class="btn btn--icon" :class="{ 'is-active': !playing }" title="stop" @click="stop">■</button>
       </div>
-      <span class="tempo"><b>{{ playing ? "120.0" : "—" }}</b> BPM</span>
+      <span class="tempo"><b>{{ bpm.toFixed(1) }}</b> BPM</span>
+      <span class="timecode">{{ timecode }}</span>
 
       <div class="divider"></div>
 
@@ -61,7 +77,11 @@ function slotView(slot: SurfaceSlot) {
 
       <div class="spacer"></div>
 
-      <span class="status" :title="bridgeState.status">{{ bridgeState.status }}</span>
+      <span
+        class="status"
+        :class="{ 'status--error': bridgeState.lastError }"
+        :title="bridgeState.lastError ?? bridgeState.status"
+      >{{ bridgeState.lastError ?? bridgeState.status }}</span>
 
       <button class="btn" disabled>PROFILE ▾</button>
       <button class="btn btn--icon" title="settings">⚙</button>
@@ -155,6 +175,13 @@ function slotView(slot: SurfaceSlot) {
   font-weight: 500;
 }
 
+.timecode {
+  font: 11px ui-monospace, monospace;
+  color: var(--fg);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
 .divider {
   width: 1px;
   height: 18px;
@@ -169,6 +196,9 @@ function slotView(slot: SurfaceSlot) {
   max-width: 30%;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.status--error {
+  color: var(--record);
 }
 
 .spacer {

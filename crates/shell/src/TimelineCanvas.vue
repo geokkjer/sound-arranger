@@ -1,28 +1,24 @@
 <script setup lang="ts">
 // The timeline canvas — the first real ui-plugin of the clip-arranger profile.
 // It draws the arrangement value (tracks → clips) as blocks on a frame-scaled
-// timeline, and wires the Host-API bridge (Tauri `run_host_script`) so a real
-// arrangement from the engine is rendered when the user points it at a pool.
+// timeline, draws the **live playhead** at the polled transport position, and
+// lets a click seek. "Run in host" loads a script into the live session
+// (reset-and-apply), so the arrangement, meters and transport all come from the
+// engine.
 //
-// The demo arrangement below lets the canvas show something without a media
-// pool; the "Load from host" path drives the engine (it needs `mount mixer` +
-// a `pool <dir>` with float-WAV sources in the script).
+// Fit-to-view: the whole arrangement is scaled to the canvas width, so the
+// playhead stays visible and a click maps cleanly to a frame. (The pixels-per-
+// second viewport / zoom model from docs/design/ui-plan.md is a later step.)
 
 import { invoke } from "@tauri-apps/api/core";
-import { onMounted, onUnmounted, ref } from "vue";
-import { bridgeState, type MixerMeters, type PoolSource, type Timeline } from "./bridge";
-
-// The arrangement value as serialized by `media::Timeline` (serde, snake_case);
-// shared against the bridge types in src/bridge.ts.
+import { onMounted, onUnmounted, ref, watch } from "vue";
+import { bridgeState, type PoolSource, type Timeline } from "./bridge";
+import { transportSeek } from "./transport";
 
 const hostScript = ref(
   "host v1\nmount mixer channels=4 @0\narrange add_track t0 @0\narrange add_track t1 @0",
 );
 const status = ref("drawing demo arrangement");
-
-// The bridge's meter snapshot + pool listing are written to the shared bridge
-// state (src/bridge.ts) so the mixer and source-pool panels draw without a
-// second round-trip and without prop-drilling through the slot renderer.
 
 // A demo arrangement (frames = samples at 48 kHz) so the canvas is meaningful
 // without a pool. 48000 frames = 1 second.
@@ -39,32 +35,45 @@ const demo: Timeline = {
 };
 
 const canvas = ref<HTMLCanvasElement | null>(null);
-let pxPerFrame = 0.01; // 100 px per second at 48 kHz
-let lastTime = 0;
-
-const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n));
+// The arrangement currently drawn (the loaded one, or the demo).
+const drawn = ref<Timeline>(demo);
+let pxPerFrame = 0.01; // recomputed on every draw (fit-to-view)
 
 // Per-track identity colors (mirror the --track-N tokens in style.css). A track
 // keeps one hue across its lane swatch, its clips (and, later, its mixer strip).
 const TRACK_COLORS = ["#4fa3ad", "#5aa46a", "#d0723a", "#b45c8c", "#8a6bb0", "#c3a84a", "#6d9a77", "#9a6d7a"];
+const RATE = 48_000;
 
-function draw(tl: Timeline) {
+/** The arrangement's length in frames (a 4 s default window when empty). */
+function durationFrames(tl: Timeline): number {
+  let max = 0;
+  for (const t of tl.tracks) {
+    for (const c of t.clips) max = Math.max(max, c.at_frame + c.src_len);
+  }
+  return max > 0 ? max : RATE * 4;
+}
+
+function draw() {
   const c = canvas.value;
   if (!c) return;
   const ctx = c.getContext("2d");
   if (!ctx) return;
+  const tl = drawn.value;
   const dpr = window.devicePixelRatio || 1;
   const w = c.clientWidth, h = c.clientHeight;
-  if (c.width !== w * dpr || c.height !== h * dpr) {
-    c.width = w * dpr;
-    c.height = h * dpr;
+  if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) {
+    c.width = Math.round(w * dpr);
+    c.height = Math.round(h * dpr);
   }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, h);
 
-  // background
   ctx.fillStyle = "#14161a";
   ctx.fillRect(0, 0, w, h);
+
+  // Fit the whole arrangement to the width (2 px right margin) so the playhead
+  // is always on screen and a click maps linearly to a frame.
+  pxPerFrame = Math.max(1e-6, (w - 2) / durationFrames(tl));
 
   const laneH = Math.max(48, (h - 20) / Math.max(1, tl.tracks.length));
   tl.tracks.forEach((track, ti) => {
@@ -95,53 +104,90 @@ function draw(tl: Timeline) {
       }
     }
   });
-  // ruler
+
+  // ruler — a "nice" tick step whose labels are at least ~64 px apart
   ctx.fillStyle = "#8891a5";
   ctx.font = "10px ui-monospace, monospace";
-  const step = 48000 * Math.max(0.25, Math.round((1 / (pxPerFrame * 48000)))); // nice clamp
-  for (let f = 0; f * pxPerFrame < w; f += step) {
-    ctx.fillText(`${(f / 48000).toFixed(1)}s`, f * pxPerFrame + 2, 12);
+  const nice = [0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300];
+  const secPerPx = 1 / (pxPerFrame * RATE);
+  const stepSec = nice.find((s) => s / secPerPx >= 64) ?? nice[nice.length - 1];
+  for (let t = 0; t * RATE * pxPerFrame < w; t += stepSec) {
+    const x = t * RATE * pxPerFrame;
+    ctx.fillText(`${t >= 60 ? `${Math.floor(t / 60)}m` : ""}${(t % 60).toFixed(t < 1 ? 1 : 0)}s`, x + 2, 12);
+  }
+
+  // playhead — the live transport position (amber, per the design system)
+  const px = bridgeState.position.frame * pxPerFrame;
+  if (px >= 0 && px <= w) {
+    ctx.strokeStyle = "#e5b567";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(px + 0.5, 0);
+    ctx.lineTo(px + 0.5, h);
+    ctx.stroke();
+    ctx.fillStyle = "#e5b567";
+    ctx.beginPath();
+    ctx.moveTo(px - 4, 0);
+    ctx.lineTo(px + 4, 0);
+    ctx.lineTo(px, 6);
+    ctx.closePath();
+    ctx.fill();
   }
 }
 
-function resize() {
-  draw(demo);
+/** A click sets the playhead (seek to the frame under the pointer). */
+function seekFromClick(e: MouseEvent) {
+  const c = canvas.value;
+  if (!c) return;
+  const rect = c.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const frame = Math.max(0, Math.round(x / pxPerFrame));
+  transportSeek(frame).catch((err) => (bridgeState.status = String(err)));
 }
 
 async function loadFromHost() {
   try {
-    status.value = "running host script…";
-    const outcome = await invoke<{ arrangement: Timeline | null; mixer_meters: MixerMeters | null; pool_sources: PoolSource[] | null }>("run_host_script", {
-      scriptText: hostScript.value,
-    });
+    status.value = "loading into the live host…";
+    const outcome = await invoke<{
+      arrangement: Timeline | null;
+      arrangement_error: string | null;
+      mixer_meters: { channels: number[]; master: number } | null;
+      pool_sources: PoolSource[] | null;
+      position: { frame: number; seconds: number; beat: number; bpm: number; playing: boolean };
+      channel_count: number;
+    }>("run_host_script", { scriptText: hostScript.value });
     bridgeState.meters = outcome.mixer_meters;
     bridgeState.sources = outcome.pool_sources ?? [];
     bridgeState.arrangement = outcome.arrangement;
+    bridgeState.position = outcome.position;
+    bridgeState.channelCount = outcome.channel_count;
+    bridgeState.lastError = outcome.arrangement_error;
     if (outcome.arrangement && outcome.arrangement.tracks.length > 0) {
-      status.value = `loaded ${outcome.arrangement.tracks.length} track(s) from the engine`;
-      bridgeState.status = `loaded ${outcome.arrangement.tracks.length} track(s)`;
-      draw(outcome.arrangement);
+      drawn.value = outcome.arrangement;
+      status.value = `loaded ${outcome.arrangement.tracks.length} track(s)`;
     } else {
-      status.value = "host produced no arrangement (add a `pool <dir>` + arrange add_clip) — showing demo";
-      bridgeState.status = "no arrangement — showing demo";
-      draw(demo);
+      drawn.value = demo;
+      status.value = "no arrangement (add a `pool <dir>` + arrange add_clip) — showing demo";
     }
+    bridgeState.status = status.value;
+    draw();
   } catch (e) {
     status.value = String(e);
     bridgeState.status = String(e);
-    bridgeState.meters = null;
-    bridgeState.sources = [];
-    bridgeState.arrangement = null;
-    draw(demo);
+    bridgeState.lastError = String(e);
+    drawn.value = demo;
+    draw();
   }
 }
 
+// Redraw the playhead whenever the polled position changes.
+watch(() => bridgeState.position.frame, () => draw());
+
 onMounted(() => {
-  resize();
-  window.addEventListener("resize", resize);
-  lastTime = performance.now();
+  draw();
+  window.addEventListener("resize", draw);
 });
-onUnmounted(() => window.removeEventListener("resize", resize));
+onUnmounted(() => window.removeEventListener("resize", draw));
 </script>
 
 <template>
@@ -151,7 +197,7 @@ onUnmounted(() => window.removeEventListener("resize", resize));
       <input v-model="hostScript" class="tl-script" spellcheck="false" />
       <button class="btn" @click="loadFromHost">Run in host</button>
     </div>
-    <canvas ref="canvas" class="tl-canvas"></canvas>
+    <canvas ref="canvas" class="tl-canvas" title="click to seek" @click="seekFromClick"></canvas>
   </div>
 </template>
 
@@ -160,5 +206,5 @@ onUnmounted(() => window.removeEventListener("resize", resize));
 .tl-bar { display: flex; gap: 8px; align-items: center; padding: 8px; background: #17191f; border-bottom: 1px solid #22252c; }
 .tl-status { font: 11px ui-monospace, monospace; color: #8b93a7; white-space: nowrap; max-width: 40%; overflow: hidden; text-overflow: ellipsis; }
 .tl-script { flex: 1; font: 11px ui-monospace, monospace; color: #cfd6e4; background: #0e1013; border: 1px solid #262a32; border-radius: 4px; padding: 4px 6px; }
-.tl-canvas { flex: 1; width: 100%; min-height: 0; display: block; }
+.tl-canvas { flex: 1; width: 100%; min-height: 0; display: block; cursor: text; }
 </style>

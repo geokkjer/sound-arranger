@@ -51,9 +51,12 @@ Tests: a tone+bounce script loads with clean diagnostics and a channel count; a 
 
 ## Consequences
 
-- The frontend can load a session (`run_host_script`), drive it (`transport_play/stop/seek`), and
-  tick the playhead + meters (`transport_state`) — the shell's transport chrome can stop being a
-  placeholder.
+- The frontend is wired to the live bridge: `Surface.vue` polls `transport_state` at ~25 Hz (and
+  stops itself if the bridge is unreachable, e.g. a plain `pnpm dev` browser), drives
+  `transport_play`/`transport_stop`, and shows the polled BPM + timecode; `TimelineCanvas.vue` fits
+  the arrangement to the canvas, draws the live playhead at the polled frame, and a click seeks
+  (`transport_seek`). The shared `bridgeState` (`src/bridge.ts`) grew
+  `position`/`channelCount`/`lastError`.
 - The text contract still drives the same session (`transport play|stop|seek` parse); the CLI and the
   shell share the command vocabulary.
 - Device audio output is still absent (the pump renders into the void); the transport ticks and the
