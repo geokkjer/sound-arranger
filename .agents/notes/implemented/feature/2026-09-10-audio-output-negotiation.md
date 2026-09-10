@@ -17,12 +17,16 @@ The shell was **silent**: the live pump rendered the engine master into the void
 
 ## Decision
 
-- **`open_output(ring, source_channels, requested_rate)`** negotiates the config: it scans
-  `supported_output_configs()`, prefers **F32** then the **most channels** among the ranges whose
-  `[min, max]` contains `requested_rate`, and runs at the session rate. If no range supports it, it
-  falls back to the device default and sets **`rate_mismatch`** — the shell surfaces that instead of
-  playing at the wrong speed. `best_output_range` is pure, so the preference order is unit-tested
-  without a device.
+- **`open_output(ring, source_channels, requested_rate)`** negotiates the config: the device's **own
+  default** wins whenever it already runs at the session rate (its layout is the system's correct
+  one); otherwise it scans `supported_output_configs()` for a range covering `requested_rate`,
+  preferring the default's **channel count** and **format**. If nothing covers the rate it falls back
+  to the default and sets **`rate_mismatch`** — the shell surfaces that instead of playing at the
+  wrong speed. `best_output_range` is pure, so the preference order is unit-tested without a device.
+  *Preferring the most channels is a trap* (found on real hardware): a PipeWire pro-audio node
+  advertises `1..=64` channels, so "widest" picked a 64-channel config and the stereo mix landed on
+  ch0/1 — **not** the monitor pair: silence, with nothing counted. The ignored `output_device_report`
+  test prints a device's default + every range, which is how it was found.
 - **`fill_output` maps one source frame per device frame** (`source_channels` interleaved samples):
   passthrough when the counts match, duplicated from a mono source, averaged for a mono device
   (never silently dropping a channel). A **partial source frame is never consumed**, so L/R stay
@@ -39,7 +43,8 @@ The shell was **silent**: the live pump rendered the engine master into the void
   an `error` when the device cannot be opened at all — silent, never a hard failure.
 
 Tests: mono duplication, stereo passthrough, stereo→mono downmix, empty-ring silence counting
-underruns, partial-frame starvation keeping alignment, zero-channel degradation, and range selection.
+underruns, partial-frame starvation keeping alignment, zero-channel degradation, and range selection
+(including "the device default's channel count beats more channels").
 
 ## Alternatives considered
 

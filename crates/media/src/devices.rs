@@ -123,13 +123,26 @@ pub fn open_output(
 /// stereo); a larger source is clamped rather than indexed past the frame.
 const MAX_SOURCE_CHANNELS: usize = 2;
 
-/// Choose an output config: the best range that supports `requested_rate`
-/// (preferring F32, then the most channels), else the device default with
-/// `rate_mismatch = true` so the caller can surface it.
+/// Choose an output config. The device's **own default** wins whenever it already
+/// runs at `requested_rate` — that layout is the one the system considers correct.
+///
+/// Searching by channel count is a trap: a pro-audio node offers `1..=64`
+/// channels, and preferring "the most channels" picks a 64-channel config whose
+/// ch0/1 are *not* the monitor pair — audible silence, with nothing counted.
+///
+/// When the default's rate differs, find a range covering `requested_rate`,
+/// preferring the default's channel count and format; if nothing covers it, fall
+/// back to the default with `rate_mismatch = true` so the caller can surface it.
 fn select_output_config(
     device: &cpal::Device,
     requested_rate: u32,
 ) -> Result<(cpal::SupportedStreamConfig, bool), String> {
+    let default = device
+        .default_output_config()
+        .map_err(|e| format!("output config: {e}"))?;
+    if default.sample_rate() == requested_rate {
+        return Ok((default, false));
+    }
     let ranges: Vec<cpal::SupportedStreamConfigRange> = device
         .supported_output_configs()
         .map_err(|e| format!("output configs: {e}"))?
@@ -145,25 +158,28 @@ fn select_output_config(
             )
         })
         .collect();
-    if let Some(idx) = best_output_range(&meta, requested_rate) {
+    let prefer_f32 = default.sample_format() == cpal::SampleFormat::F32;
+    if let Some(idx) = best_output_range(&meta, requested_rate, default.channels(), prefer_f32) {
         let range = ranges.into_iter().nth(idx).expect("index from the same list");
         return Ok((range.with_sample_rate(requested_rate), false));
     }
-    let default = device
-        .default_output_config()
-        .map_err(|e| format!("output config: {e}"))?;
     Ok((default, true))
 }
 
-/// The best supported output range for `requested_rate`: those whose
-/// `[min, max]` contains it, preferring F32 over integer formats and then the
-/// most channels. Pure, so it is unit-tested without a device.
-fn best_output_range(ranges: &[(u16, u32, u32, bool)], requested: u32) -> Option<usize> {
-    let mut best: Option<(usize, (u8, u16))> = None;
+/// The best supported output range for `requested_rate`: those whose `[min, max]`
+/// contains it, preferring `prefer_channels` (the device default's layout) and then
+/// `prefer_f32`. Pure, so it is unit-tested without a device.
+fn best_output_range(
+    ranges: &[(u16, u32, u32, bool)],
+    requested: u32,
+    prefer_channels: u16,
+    prefer_f32: bool,
+) -> Option<usize> {
+    let mut best: Option<(usize, (u16, u8))> = None;
     for (i, &(channels, min, max, is_f32)) in ranges.iter().enumerate() {
         if min <= requested && requested <= max {
-            let key = (u8::from(is_f32), channels);
-            if best.is_none_or(|(_, b)| key > b) {
+            let key = (channels.abs_diff(prefer_channels), u8::from(is_f32 != prefer_f32));
+            if best.is_none_or(|(_, b)| key < b) {
                 best = Some((i, key));
             }
         }
@@ -393,19 +409,65 @@ mod tests {
         assert_eq!(out, [0.5; 4]);
     }
 
-    /// Rate negotiation prefers F32 and the most channels at the requested rate,
-    /// and reports "no range" when the rate is unsupported (so the caller falls
-    /// back and flags the mismatch rather than lying about the clock).
+    /// Prints what the default output device actually offers — the diagnostic for
+    /// "which config should negotiation pick". Ignored by default (real hardware).
     #[test]
-    fn output_range_selection_prefers_f32_stereo_at_the_rate() {
+    #[ignore = "needs real audio hardware; run: cargo test -p media -- --ignored output_device_report -- --nocapture"]
+    fn output_device_report() {
+        let host = cpal::default_host();
+        let Some(device) = host.default_output_device() else {
+            eprintln!("no default output device");
+            return;
+        };
+        let default = device.default_output_config().expect("default output config");
+        eprintln!(
+            "default: {} ch @ {} Hz {:?}",
+            default.channels(),
+            default.sample_rate(),
+            default.sample_format()
+        );
+        match device.supported_output_configs() {
+            Ok(configs) => {
+                for r in configs {
+                    eprintln!(
+                        "  range: {} ch, {}..{} Hz, {:?}",
+                        r.channels(),
+                        r.min_sample_rate(),
+                        r.max_sample_rate(),
+                        r.sample_format()
+                    );
+                }
+            }
+            Err(e) => eprintln!("supported_output_configs: {e}"),
+        }
+    }
+
+    /// Negotiation prefers the device's own channel count — **not** the most
+    /// channels. A pro-audio node offers 1..=64; picking the widest put the stereo
+    /// mix on channels that were not the monitor pair (silent, uncounted).
+    #[test]
+    fn output_range_prefers_the_default_channel_count_over_more_channels() {
         let ranges = [
-            (2u16, 44_100u32, 48_000u32, false), // i16 stereo covering 48k
-            (1, 44_100, 192_000, true),          // f32 mono
-            (2, 44_100, 192_000, true),          // f32 stereo
+            (2u16, 1u32, 384_000u32, true),
+            (64, 1, 384_000, true),
+            (2, 1, 384_000, false),
         ];
-        assert_eq!(best_output_range(&ranges, 48_000), Some(2), "f32 stereo wins");
-        assert_eq!(best_output_range(&ranges, 96_000), Some(2));
-        assert_eq!(best_output_range(&ranges, 22_050), None, "below every min -> fall back");
+        assert_eq!(best_output_range(&ranges, 48_000, 2, true), Some(0), "2-ch F32 beats 64-ch");
+    }
+
+    /// …and requires the requested rate, preferring the default's format, and
+    /// reports "no range" when nothing covers it (so the caller flags the mismatch
+    /// rather than lying about the clock).
+    #[test]
+    fn output_range_requires_the_rate_and_prefers_the_default_format() {
+        let ranges = [
+            (2u16, 44_100u32, 44_100u32, true), // wrong rate
+            (2, 44_100, 192_000, false),        // right rate, integer
+            (2, 44_100, 192_000, true),         // right rate, f32  <- pick
+        ];
+        assert_eq!(best_output_range(&ranges, 48_000, 2, true), Some(2), "f32 over integer");
+        assert_eq!(best_output_range(&ranges, 48_000, 2, false), Some(1), "integer when preferred");
+        assert_eq!(best_output_range(&ranges, 22_050, 2, true), None, "below every min -> fall back");
     }
 
     #[test]
