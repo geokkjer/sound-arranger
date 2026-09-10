@@ -21,6 +21,28 @@ const playing = computed(() => bridgeState.position.playing);
 const timecode = computed(() => formatTime(bridgeState.position.seconds));
 const bpm = computed(() => bridgeState.position.bpm);
 
+// The audio readout: the device the pump feeds (or why there is none).
+const audioLabel = computed(() => {
+  const a = bridgeState.audio;
+  if (!a) return "♪ —";
+  if (a.error) return "♪ ✕";
+  const khz = (a.sample_rate / 1000).toFixed(1);
+  return a.rate_mismatch ? `♪ ${khz}k ⚠` : `♪ ${khz}k`;
+});
+const audioTitle = computed(() => {
+  const a = bridgeState.audio;
+  if (!a) return "no audio output (silent host)";
+  if (a.error) return `audio unavailable — ${a.error}`;
+  const mismatch = a.rate_mismatch
+    ? ` — DEVICE RATE MISMATCH (requested ${a.requested_rate} Hz): playback is off-speed`
+    : "";
+  return `${a.sample_rate} Hz · ${a.channels} ch — underruns ${a.underruns}, drops ${a.drops}${mismatch}`;
+});
+const audioClass = computed(() => ({
+  "audio--warn": !!bridgeState.audio && !bridgeState.audio.error && bridgeState.audio.rate_mismatch,
+  "audio--bad": !!bridgeState.audio?.error,
+}));
+
 function play() {
   transportPlay().catch((e) => (bridgeState.status = String(e)));
 }
@@ -61,6 +83,7 @@ function slotView(slot: SurfaceSlot) {
       </div>
       <span class="tempo"><b>{{ bpm.toFixed(1) }}</b> BPM</span>
       <span class="timecode">{{ timecode }}</span>
+      <span class="audio" :class="audioClass" :title="audioTitle">{{ audioLabel }}</span>
 
       <div class="divider"></div>
 
@@ -180,6 +203,19 @@ function slotView(slot: SurfaceSlot) {
   color: var(--fg);
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
+}
+
+/* the audio readout: device rate, or why there is no output */
+.audio {
+  font: 11px ui-monospace, monospace;
+  color: var(--fg-mute);
+  white-space: nowrap;
+}
+.audio--warn {
+  color: var(--warn);
+}
+.audio--bad {
+  color: var(--record);
 }
 
 .divider {

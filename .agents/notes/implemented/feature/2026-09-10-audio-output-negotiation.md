@@ -57,7 +57,10 @@ underruns, partial-frame starvation keeping alignment, zero-channel degradation,
 - The device path is stereo-capable and **clock-honest**: it either runs at the session rate or says
   it could not.
 - The counters are what the live runtime and the shell will surface (next unit).
-- The shell can surface the audio state (`Snapshot::audio`) — the bridge/shell wiring is the next step.
+- The shell surfaces it: the bridge opens the device by default
+  (`HostHandle::spawn_with_audio`), `TransportState` carries the negotiated rate / mismatch /
+  counters, and the top bar shows a small readout (`♪ 48.0k`) — amber with a rate-mismatch warning,
+  red with the reason when audio is unavailable, counters in the tooltip.
 
 ## Attribution
 

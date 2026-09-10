@@ -55,6 +55,17 @@ export interface TransportPosition {
   playing: boolean;
 }
 
+/** The audio output's state (mirrors the bridge's `AudioInfo`). */
+export interface AudioInfo {
+  sample_rate: number;
+  channels: number;
+  requested_rate: number;
+  rate_mismatch: boolean;
+  underruns: number;
+  drops: number;
+  error: string | null;
+}
+
 export const bridgeState = reactive({
   /** human-readable transport/run status shown in the top bar. */
   status: "showing demo arrangement",
@@ -68,6 +79,8 @@ export const bridgeState = reactive({
   position: { frame: 0, seconds: 0, beat: 0, bpm: 120, playing: false } as TransportPosition,
   /** the mixer's mounted channel count (drives the strip count). */
   channelCount: 0,
+  /** the audio output's state (device/rate/counters), polled from the bridge. */
+  audio: null as AudioInfo | null,
   /** the pump's last unrecoverable error, if any (surfaced in the top bar). */
   lastError: null as string | null,
 });

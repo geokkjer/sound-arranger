@@ -16,7 +16,7 @@
 use serde::Serialize;
 use tauri::{Manager, State};
 
-use host::live::{HostHandle, HostOutcome, Snapshot};
+use host::live::{AudioStatus, HostHandle, HostOutcome, Snapshot};
 use host::HostCommand;
 
 /// The mixer meter snapshot: per-channel peaks (post-gain, pre-mute/solo) plus
@@ -37,8 +37,35 @@ pub struct TransportPosition {
     pub playing: bool,
 }
 
-/// A poll of the live host: position + meters + the pump's last error. The shell
-/// calls this on a timer (~30 Hz) to tick the playhead and meters.
+/// The audio output's state (the device the pump feeds), for the shell's audio
+/// readout. `error` set means playback is silent.
+#[derive(Debug, Clone, Serialize)]
+pub struct AudioInfo {
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub requested_rate: u32,
+    pub rate_mismatch: bool,
+    pub underruns: u64,
+    pub drops: u64,
+    pub error: Option<String>,
+}
+
+impl AudioInfo {
+    fn from_status(a: &AudioStatus) -> Self {
+        AudioInfo {
+            sample_rate: a.sample_rate,
+            channels: a.channels,
+            requested_rate: a.requested_rate,
+            rate_mismatch: a.rate_mismatch,
+            underruns: a.underruns,
+            drops: a.drops,
+            error: a.error.clone(),
+        }
+    }
+}
+
+/// A poll of the live host: position + meters + audio + the pump's last error.
+/// The shell calls this on a timer (~30 Hz) to tick the playhead and meters.
 #[derive(Debug, Clone, Serialize)]
 pub struct TransportState {
     pub position: TransportPosition,
@@ -46,6 +73,7 @@ pub struct TransportState {
     pub channel_count: usize,
     pub master: f32,
     pub last_error: Option<String>,
+    pub audio: Option<AudioInfo>,
 }
 
 /// A runnable outcome the frontend can show: a script's diagnostics plus a
@@ -90,6 +118,7 @@ fn to_transport_state(s: &Snapshot) -> TransportState {
         channel_count: s.channel_count,
         master: s.master,
         last_error: s.last_error.clone(),
+        audio: s.audio.as_ref().map(AudioInfo::from_status),
     }
 }
 
@@ -189,7 +218,7 @@ fn prefer_undecorated() -> bool {
 /// Build and run the Tauri application with a live host session.
 pub fn run() {
     tauri::Builder::default()
-        .manage(HostHandle::spawn())
+        .manage(HostHandle::spawn_with_audio())
         .setup(|app| {
             // The window is created undecorated (tauri.conf.json); restore the
             // native title bar on a floating desktop.

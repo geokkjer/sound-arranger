@@ -23,6 +23,8 @@
   --accent-dim: #3b4a7c;
   --playhead: #e5b567;
   --record: #e06a76;
+  --ok: #7fc9a0;
+  --warn: #d9a13f;
 
   /* per-track identity (cycle; reused across lane header, clips, mixer strip) */
   --track-0: #4fa3ad;  /* teal */

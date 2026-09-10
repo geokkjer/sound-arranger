@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { bridgeState, type TransportPosition } from "./bridge";
+import { bridgeState, type AudioInfo, type TransportPosition } from "./bridge";
 
 // The live transport client. The host session runs on its own thread
 // (`host::live`); the shell polls a shared snapshot (~25 Hz) to tick the playhead
@@ -12,6 +12,7 @@ interface WireTransportState {
   channel_count: number;
   master: number;
   last_error: string | null;
+  audio: AudioInfo | null;
 }
 
 /** Poll the host once and fold the result into the shared bridge state. */
@@ -21,6 +22,7 @@ export async function pollTransport(): Promise<void> {
   bridgeState.channelCount = st.channel_count;
   bridgeState.meters = { channels: st.channels, master: st.master };
   bridgeState.lastError = st.last_error;
+  bridgeState.audio = st.audio;
 }
 
 /**
