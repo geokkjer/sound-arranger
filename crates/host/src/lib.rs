@@ -917,6 +917,38 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
     Ok(commands)
 }
 
+/// Parse a single `arrange …` command line — the wire form a live UI sends per
+/// edit — returning the op and its optional `@frame`. It reuses the script
+/// grammar ([`parse_arrange`]), so the text format stays the *one* op grammar
+/// (no second schema to drift against).
+///
+/// ```text
+/// arrange move_clip t0 c0 96000 @0
+/// arrange trim t0 c0 end -24000
+/// arrange razor_split t0 c0 cL cR 48000
+/// trim t0 c0 start 4800          # the `arrange` keyword is optional
+/// ```
+pub fn parse_arrange_line(line: &str) -> Result<(media::ArrangeOp, Option<u64>), String> {
+    let line = line.split('#').next().unwrap_or("").trim();
+    if line.is_empty() {
+        return Err("empty arrange line".into());
+    }
+    let mut words: Vec<&str> = line.split_whitespace().collect();
+    let at_frame = match words.last() {
+        Some(tok) if tok.starts_with('@') => {
+            let f = tok[1..]
+                .parse::<u64>()
+                .map_err(|_| format!("bad frame '{tok}'"))?;
+            words.pop();
+            Some(f)
+        }
+        _ => None,
+    };
+    let operands = if words.first() == Some(&"arrange") { &words[1..] } else { &words[..] };
+    let op = parse_arrange(operands, 1)?;
+    Ok((op, at_frame))
+}
+
 /// Parse an `arrange` command's operands (everything after the `arrange`
 /// keyword) into an [`ArrangeOp`]. Grammar per op:
 ///
@@ -1205,10 +1237,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&pool);
     }
 
+    /// A single `arrange …` line parses to its op + optional frame; the `arrange`
+    /// keyword is optional (only the operands are required).
+    #[test]
+    fn parse_arrange_line_takes_the_op_and_an_optional_frame() {
+        let (op, at) = parse_arrange_line("arrange move_clip t0 c0 9600 @48000").expect("parse");
+        assert!(matches!(op, media::ArrangeOp::MoveClip { at_frame: 9_600, .. }));
+        assert_eq!(at, Some(48_000));
+
+        let (op, at) = parse_arrange_line("trim t0 c0 end -24000").expect("parse without the keyword");
+        assert!(matches!(op, media::ArrangeOp::Trim { by_frames: -24_000, .. }));
+        assert_eq!(at, None);
+
+        assert!(parse_arrange_line("").is_err(), "an empty line is refused");
+        assert!(parse_arrange_line("arrange nonsense t0").is_err(), "an unknown op is refused");
+    }
+
     /// The transport text grammar parses play / seek / stop.
     #[test]
-    fn transport_lines_parse() {
-        let cmds = parse_script("host v1\ntransport play\ntransport seek 4800\ntransport stop\n")
+    fn transport_lines_parse() {        let cmds = parse_script("host v1\ntransport play\ntransport seek 4800\ntransport stop\n")
             .expect("transport lines parse");
         assert!(matches!(&cmds[0], HostCommand::TransportPlay));
         assert!(matches!(&cmds[2], HostCommand::TransportStop));

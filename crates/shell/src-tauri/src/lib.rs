@@ -123,7 +123,7 @@ fn to_transport_state(s: &Snapshot) -> TransportState {
 }
 
 /// Map a live outcome + the current snapshot into the serializable wire shape.
-fn to_wire(handle: &HostHandle, outcome: HostOutcome, commands: &[HostCommand]) -> ScriptOutcome {
+fn to_wire(handle: &HostHandle, outcome: HostOutcome, bounce_written: bool) -> ScriptOutcome {
     let snap = handle.snapshot();
     let (arrangement, arrangement_error) = match outcome.arrangement {
         Ok(tl) => (Some(tl), None),
@@ -144,10 +144,7 @@ fn to_wire(handle: &HostHandle, outcome: HostOutcome, commands: &[HostCommand]) 
         arrangement_error,
         mixer_meters,
         pool_sources: outcome.pool_sources,
-        bounce_written: commands
-            .iter()
-            .rev()
-            .any(|c| matches!(c, HostCommand::Bounce { .. })),
+        bounce_written,
         position: TransportPosition {
             frame: snap.frame,
             seconds: snap.seconds,
@@ -164,8 +161,22 @@ fn to_wire(handle: &HostHandle, outcome: HostOutcome, commands: &[HostCommand]) 
 /// Tauri runtime.
 pub fn load_script(handle: &HostHandle, script_text: &str) -> Result<ScriptOutcome, String> {
     let commands = host::parse_script(script_text)?;
+    let bounce_written = commands
+        .iter()
+        .rev()
+        .any(|c| matches!(c, HostCommand::Bounce { .. }));
     let outcome = handle.load(&commands)?;
-    Ok(to_wire(handle, outcome, &commands))
+    Ok(to_wire(handle, outcome, bounce_written))
+}
+
+/// Apply one arrangement op — the text-format op line a gesture sends — to the
+/// live session, and return the refreshed outcome. This is the incremental edit
+/// path (one op per gesture); the text grammar stays the one op vocabulary.
+pub fn apply_arrange(handle: &HostHandle, line: &str) -> Result<ScriptOutcome, String> {
+    let (op, at_frame) = host::parse_arrange_line(line)?;
+    handle.execute(HostCommand::Arrange { op, at_frame })?;
+    let outcome = handle.outcome()?;
+    Ok(to_wire(handle, outcome, false))
 }
 
 /// Load a host script into the live session (reset-and-apply). Rejections (bad
@@ -174,6 +185,13 @@ pub fn load_script(handle: &HostHandle, script_text: &str) -> Result<ScriptOutco
 #[tauri::command]
 fn run_host_script(script_text: String, host: State<'_, HostHandle>) -> Result<ScriptOutcome, String> {
     load_script(&host, &script_text)
+}
+
+/// Apply one arrangement op to the live session (the text grammar:
+/// `arrange move_clip t0 c0 9600`) — the gesture-by-gesture edit path.
+#[tauri::command]
+fn arrange(line: String, host: State<'_, HostHandle>) -> Result<ScriptOutcome, String> {
+    apply_arrange(&host, &line)
 }
 
 /// Start the transport (the pump advances the clock while it runs).
@@ -229,6 +247,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             run_host_script,
+            arrange,
             transport_play,
             transport_stop,
             transport_seek,
@@ -276,6 +295,36 @@ mod tests {
         let err = load_script(&host, "mount mixer channels=4 @0\n").unwrap_err();
         assert!(err.contains("host v"), "the versioned header is required: {err}");
         host.shutdown();
+    }
+
+    /// A single arrange op edits the live session — the incremental path — and a
+    /// refused op returns `Err` without changing the arrangement.
+    #[test]
+    fn apply_arrange_edits_the_live_session() {
+        let host = HostHandle::spawn();
+        let pool = std::env::temp_dir().join(format!("shell-arrange-pool-{}", std::process::id()));
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        load_script(
+            &host,
+            &format!(
+                "host v1\nmount mixer channels=2 @0\npool {}\narrange add_track t0 @0\narrange add_clip t0 c0 s1 0 4800 0 0 0 1.0 @0\n",
+                pool.display()
+            ),
+        )
+        .expect("load");
+
+        let moved = apply_arrange(&host, "arrange move_clip t0 c0 9600").expect("move");
+        let tl = moved.arrangement.expect("arrangement");
+        assert_eq!(tl.tracks[0].clips[0].at_frame, 9_600, "the op reached the value");
+
+        // A refused op (no such clip) surfaces and changes nothing.
+        let err = apply_arrange(&host, "arrange move_clip t0 nope 0").unwrap_err();
+        assert!(err.contains("nope"), "the refusal names the clip: {err}");
+        let after = host.outcome().expect("outcome").arrangement.expect("arrangement");
+        assert_eq!(after.tracks[0].clips[0].at_frame, 9_600, "the refused op changed nothing");
+
+        host.shutdown();
+        let _ = std::fs::remove_dir_all(&pool);
     }
 
     /// Transport is reachable over the same handle the commands use: load, play,

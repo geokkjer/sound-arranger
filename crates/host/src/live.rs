@@ -114,6 +114,9 @@ enum Request {
     /// resulting outcome — the live equivalent of `run_script`, leaving the
     /// session resident for transport.
     Load(Vec<HostCommand>, Sender<Result<HostOutcome, String>>),
+    /// Read the current outcome (arrangement + diagnostics) without changing
+    /// anything — what the bridge returns after a single incremental edit.
+    Outcome(Sender<HostOutcome>),
     Shutdown,
 }
 
@@ -196,6 +199,20 @@ impl HostHandle {
         reply_rx
             .recv()
             .map_err(|_| "host actor exited".to_string())?
+    }
+
+    /// The session's current outcome (arrangement + diagnostics) — what the
+    /// bridge returns after a single incremental edit. Nothing changes.
+    pub fn outcome(&self) -> Result<HostOutcome, String> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .lock()
+            .map_err(|_| "host actor poisoned".to_string())?
+            .send(Request::Outcome(reply_tx))
+            .map_err(|_| "host actor exited".to_string())?;
+        reply_rx
+            .recv()
+            .map_err(|_| "host actor exited".to_string())
     }
 
     /// The latest published snapshot (position + meters + audio).
@@ -307,6 +324,10 @@ fn run(mut session: HostSession, rx: Receiver<Request>, shared: Arc<Mutex<Snapsh
                     while a.ring.try_pop().is_some() {}
                 }
                 let _ = reply.send(outcome);
+                publish(&session, &shared, &audio);
+            }
+            Ok(Request::Outcome(reply)) => {
+                let _ = reply.send(build_outcome(&session));
                 publish(&session, &shared, &audio);
             }
             Ok(Request::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
