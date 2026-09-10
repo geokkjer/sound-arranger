@@ -23,10 +23,13 @@ The shell was **silent**: the live pump rendered the engine master into the void
   preferring the default's **channel count** and **format**. If nothing covers the rate it falls back
   to the default and sets **`rate_mismatch`** — the shell surfaces that instead of playing at the
   wrong speed. `best_output_range` is pure, so the preference order is unit-tested without a device.
-  *Preferring the most channels is a trap* (found on real hardware): a PipeWire pro-audio node
-  advertises `1..=64` channels, so "widest" picked a 64-channel config and the stereo mix landed on
-  ch0/1 — **not** the monitor pair: silence, with nothing counted. The ignored `output_device_report`
-  test prints a device's default + every range, which is how it was found.
+  *Preferring the most channels is a trap* (measured on real hardware): a PipeWire pro-audio node
+  advertises `1..=64` channels, so "widest" picked a **64-channel** config while the device's own
+  default is `2 ch @ 48 kHz F32` — a 2-of-64 layout (62 silent channels, 32× the buffers) instead of
+  the system's chosen stereo one. Whether that layout was *inaudible* on this node is **not proven**
+  (it was reported alongside a "no sound" that may have had the play control unpressed), but the
+  selection was plainly wrong and is now correct. The ignored `output_device_report` test prints a
+  device's default + every range — the measurement that found it.
 - **`fill_output` maps one source frame per device frame** (`source_channels` interleaved samples):
   passthrough when the counts match, duplicated from a mono source, averaged for a mono device
   (never silently dropping a channel). A **partial source frame is never consumed**, so L/R stay
