@@ -217,3 +217,7 @@ does not need a bespoke "LLM mode".
 - **Latency-doc drift.** `docs/audio-latency.md` and the realtime-path emphasis remain, and
   nothing currently marks them as tuning rather than requirements. A future agent may
   re-optimize for a constraint that was withdrawn.
+
+## Attribution
+
+Authored with DeepSeek-v4-flash · DeepSeek Harness, 2026-09-10.

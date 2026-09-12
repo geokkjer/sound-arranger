@@ -93,3 +93,7 @@ deferral forbids something it was never about.
 - **Judgement replaces a test.** "A state we are happy with" is not machine-checkable. Accepted
   deliberately: the alternative is a checklist that declares Phase 2 done while the music is
   still not worth arranging.
+
+## Attribution
+
+Authored with DeepSeek-v4-flash · DeepSeek Harness, 2026-09-10.
