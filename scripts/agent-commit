@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Commit as the model, not the human.
+#
+# Git cannot tell *who* is committing from repository config: `includeIf` keys on
+# path/branch/remote, not on the actor, and both the human and the agent commit in this
+# checkout. So the actor sets the identity, and this wrapper is that for agent commits:
+#
+#   author    = DeepSeek V4 Flash <deepseek-v4-flash@geokkjer.eu>
+#   committer = the human's configured identity (deliberately untouched)
+#
+# `.githooks/commit-msg` appends the `Assisted-by:` trailer whenever this author is
+# active, so agent commits are always attributed. See the git-identity note:
+# .agents/notes/implemented/process/2026-09-12-git-identity-for-agent-commits.md
+#
+# Usage: identical to `git commit` — e.g. `scripts/agent-commit -F -`, `scripts/agent-commit -m "…"`.
+set -euo pipefail
+
+export GIT_AUTHOR_NAME="DeepSeek V4 Flash"
+export GIT_AUTHOR_EMAIL="deepseek-v4-flash@geokkjer.eu"
+# GIT_COMMITTER_* is intentionally not set: the committer stays the human.
+
+exec git commit "$@"

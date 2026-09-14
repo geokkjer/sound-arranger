@@ -2,6 +2,12 @@
 
 Status: implemented
 
+> **Extended 2026-09-12:** agent commits now also carry a git **author identity** (the model),
+> set by `scripts/agent-commit`, with the `Assisted-by:` trailer auto-appended by
+> `.githooks/commit-msg` — see
+> [the git-identity note](2026-09-12-git-identity-for-agent-commits.md). The document
+> `Authored with` footer below is unchanged.
+
 ## Problem
 
 The project's history is its decision record, and several models now collaborate on it (kimi-cli reviews, GLM-5.3 Flash review passes and implementation work, a planned DeepSeek lead-review role). None of that authorship is visible in the artifacts themselves: git records one human identity regardless of which model drafted a change, and nothing in a note says who wrote it. Attribution added only in commit messages or chat would rot; the story of *which model did what* would not survive into the documents future agents actually read.

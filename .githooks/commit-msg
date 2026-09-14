@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Attribute model commits automatically (paired with scripts/agent-commit).
+#
+# When the model identity is the commit author, ensure the message carries the
+# `Assisted-by:` trailer the attribution convention requires. Commits by any other author
+# (i.e. the human) are left exactly as written.
+#
+# The hook receives the message file as $1; editing that file is the supported way to
+# amend the message before the commit object is created.
+set -euo pipefail
+
+msg_file="${1:?commit-msg hook needs the message file path}"
+author="${GIT_AUTHOR_NAME:-}"
+
+# Only model-authored commits are auto-attributed.
+case "$author" in
+  "DeepSeek V4 Flash") ;;
+  *) exit 0 ;;
+esac
+
+# Already attributed? Leave it alone (idempotent across --amend and re-runs).
+if grep -qE '^Assisted-by:' "$msg_file"; then
+  exit 0
+fi
+
+trailer='Assisted-by: DeepSeek-v4-flash · DeepSeek Harness'
+
+# Trim trailing blank lines, then append exactly one blank line + the trailer, so the
+# message always ends in a clean trailer block.
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+awk 'NF { last = NR } { line[NR] = $0 } END { for (i = 1; i <= last; i++) print line[i] }' "$msg_file" > "$tmp"
+printf '\n%s\n' "$trailer" >> "$tmp"
+mv "$tmp" "$msg_file"
