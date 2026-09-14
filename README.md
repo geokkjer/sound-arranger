@@ -65,7 +65,7 @@ sketched pending selection wiring; record is still chrome). The direction is loc
 | `crates/shell` | The Tauri v2 + Vue 3 shell — now a **working timeline editor**, not a stub: the four planned views as components (`Surface`, `TimelineCanvas`, `SourcePool` with Project/Library contexts, `MixerPanel`, `DetailView`), plus `bridge` (the Host API over Tauri), `transport`, `editor` (undo/redo replayed from the host's session log) and the timeline viewport/editing maths with unit tests. The Detail View is present with its three context tabs, but its bodies are placeholders pending selection wiring. | works; UI wiring in progress |
 | `plugins/` | **Sidecar plugins** (placeholder): VST3/CLAP builds of core capabilities and the CDP / offline-process sidecar (`OfflineProcess`). Not engine crates — thin wrappers that expose a capability to a plug-in API. See [plugins/README.md](plugins/README.md). | placeholder |
 
-**187 Rust tests + 38 frontend unit tests**, all passing; the core's invariants (byte-identical
+**191 Rust tests + 38 frontend unit tests**, all passing; the core's invariants (byte-identical
 replay, no-allocation render, sample-accurate lifecycle) are tested, and the streaming soak +
 real hardware capture run as `#[ignore]`d tests.
 
@@ -74,7 +74,8 @@ into L/R and the bounce is 2-channel) but stereo *sources/clips* are still forth
 genuine stereo take/clip is the next sub-step, using the per-port channel-count seam;
 control-side mutations apply on the render call stack (the real control→render handoff is
 seeded by `flush_scheduled`, not finished); the recorder's `play`/`splice` media commands are
-not yet logged events (the **arrangement** ops *are*); **live-edit-while-playing reader reuse**
+now **logged events** (the [media-commands note](.agents/notes/implemented/architecture/2026-09-12-media-commands-logged.md));
+`record` stays unwired; **live-edit-while-playing reader reuse**
 (edits after a bounce are rebuilt and readers are re-positioned at the transport frame, so they
 reach audio and removed tracks no longer ghost — but each rebuild re-warms readers, and the
 shared-state `ArrangerNode` reuse is still deferred); the

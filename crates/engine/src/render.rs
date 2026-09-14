@@ -561,6 +561,13 @@ impl Engine {
                     );
                 }
                 Event::Arrangement { op, fields, at_frame } => {
+                    // Fail loud: replaying into an engine without the op's handler
+                    // would otherwise schedule an op that is silently dropped at
+                    // apply (release: `debug_assert` only), yielding a session
+                    // with no media/arrangement state and no error.
+                    if !self.op_handlers.contains_key(op) {
+                        return Err(format!("replay: no handler registered for op '{op}'"));
+                    }
                     self.scheduler.schedule(
                         *at_frame,
                         SchedEvent::Arrangement {

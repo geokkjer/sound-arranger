@@ -4,8 +4,9 @@
 //! The contract has three parts:
 //! - **commands** — [`HostCommand`]: engine commands carry an optional
 //!   `at_frame` (applied at that frame by rendering up to it; the log records
-//!   the same frame — *the log is the command list*), media commands are the
-//!   spike-B command types until P1.3 merges them into the log (documented);
+//!   the same frame — *the log is the command list*). Media commands are logged
+//!   too: `pool`/`play`/`splice` ride the same `Event::Arrangement` carrier as
+//!   media ops (see [`media_ops`]), so media determinism is in the one log;
 //! - **events** — the append-only log stream, meters, peaks, transport (the
 //!   host renders these, never computes them; `meters()`/`log()` ship now);
 //! - **values** — declarative snapshots the host interprets: the graph value,
@@ -25,11 +26,15 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use engine::*;
-use media::{ClipRef, FilePlayer, Mailbox, PlaybackNode, SpliceCmd, DEFAULT_RING_CAPACITY};
+use media::{ClipRef, FilePlayer, Interner, Mailbox, PlaybackNode, SpliceCmd, DEFAULT_RING_CAPACITY};
 
 pub mod live;
+pub mod media_ops;
+
+use media_ops::{BounceRecord, MediaSession, PlayerIntent, SpliceIntent};
 
 /// The Host API contract version. The text format's first line must be
 /// `host v{N}`; mismatches are refused (kimi review finding 6).
@@ -162,8 +167,9 @@ impl HostCommand {
     }
 
     /// Whether this command defines *state* — replayed to rebuild a session on a
-    /// seek (see `seek_to`). Actions (the transport ops, `Bounce`, and the
-    /// one-shot player path `Play`/`Splice`/`Record`) are not state.
+    /// seek (see `seek_to`). The media commands that shape the session
+    /// (`pool`/`play`/`splice`, and the arrangement ops) are state; pure actions
+    /// (`bounce`, the transport ops, `record`) are not.
     fn is_state(&self) -> bool {
         matches!(
             self,
@@ -174,6 +180,8 @@ impl HostCommand {
                 | HostCommand::Unmount { .. }
                 | HostCommand::Arrange { .. }
                 | HostCommand::Pool { .. }
+                | HostCommand::Play { .. }
+                | HostCommand::Splice { .. }
         )
     }
 }
@@ -233,6 +241,13 @@ pub struct HostSession {
     /// The edits undone since the last edit, each with the history position it
     /// came from, so a redo reconstructs the same session. Cleared by a new edit.
     redo: Vec<(usize, HostCommand)>,
+    /// The media intent value (pool dir, player, splices, bounce records). The
+    /// media-op handlers rebuild it on replay, so a replayed log reproduces the
+    /// media session — media determinism is in the one log, not a parallel seam.
+    media: Arc<Mutex<MediaSession>>,
+    /// Interns runtime media strings (paths) to `&'static str` for the log
+    /// (spike scale — a serialized log would use a string table).
+    media_intern: Interner,
 }
 
 impl HostSession {
@@ -245,8 +260,13 @@ impl HostSession {
         engine.register_factory("scale", plugins::scale_factory, plugins::scale::SCALE_PORTS, &[]);
         engine.register_factory("tone", plugins::tone_factory, plugins::tone::TONE_PORTS, plugins::tone::TONE_PARAMS);
         engine.register_factory("mixer", plugins::mixer_factory, plugins::mixer::MIXER_PORTS, plugins::mixer::MIXER_PARAMS);
+        let media: Arc<Mutex<MediaSession>> = Arc::new(Mutex::new(MediaSession::default()));
+        media_ops::register_handlers(&mut engine, media.clone())
+            .expect("media op handlers register once on a fresh engine");
         HostSession {
             engine,
+            media,
+            media_intern: Interner::new(),
             pending_cords: Vec::new(),
             player_mailbox: None,
             player_underruns: None,
@@ -376,18 +396,30 @@ impl HostSession {
                     return Err("the reference host plays one clip at a time".into());
                 }
                 let clip = Self::resolve_clip(clip)?;
+                let intent = PlayerIntent {
+                    path: clip.path.to_string_lossy().into_owned(),
+                    start: clip.start,
+                    len: clip.len,
+                    channel: *channel,
+                };
+                // Open + warm before logging, so a bad path never enters the log
+                // (a refused command is never logged).
                 let player = FilePlayer::start(clip, DEFAULT_RING_CAPACITY)?;
                 Self::warm_player(&player, DEFAULT_RING_CAPACITY)?; // deterministic, no race
+                // Logged as a media op; `arrange_logged` never schedules, so the
+                // live path applies once and replay reconstructs the value.
+                let (op, fields) = media_ops::encode_play(&mut self.media_intern, &intent);
+                self.engine.arrange_logged(op, fields)?;
+                // Commit (infallible after the validation above). Place the player
+                // BEFORE the mixer in topological order (the graph's forward-order
+                // rule): if the mixer is already materialized, insert_before(mixer);
+                // otherwise add (append) and the mixer materializes later and lands
+                // after the player. A player appended after a materialized mixer
+                // would make its cord backward — every later render fails.
                 let mailbox = media::mailbox();
                 let node = PlaybackNode::new(Some(player), mailbox.clone());
                 let underruns = node.underrun_counter();
                 let deferred = node.deferred_counter();
-                // Place the player BEFORE the mixer in topological order (the
-                // graph's forward-order rule): if the mixer is already
-                // materialized, insert_before(mixer); otherwise add (append) and
-                // the mixer materializes later and lands after the player. A
-                // player appended after a materialized mixer would make its cord
-                // backward — every later render fails.
                 let node = NodeKind::Opaque(Box::new(node));
                 let ports = vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio, channels: 1 }];
                 let id = match self.engine.graph.out_node {
@@ -399,21 +431,33 @@ impl HostSession {
                 self.player_underruns = Some(underruns);
                 self.player_deferred = Some(deferred);
                 self.pending_cords.push((id, *channel));
+                self.media.lock().map_err(|_| "media session poisoned")?.player = Some(intent);
                 self.media_commands += 1;
                 Ok(())
             }
             HostCommand::Splice { at_frame, clip, crossfade } => {
-                let Some(mailbox) = &self.player_mailbox else {
+                if self.player_mailbox.is_none() {
                     return Err("splice requires a playing clip".into());
-                };
+                }
                 let clip = Self::resolve_clip(clip)?;
+                let intent = SpliceIntent {
+                    at_frame: *at_frame,
+                    path: clip.path.to_string_lossy().into_owned(),
+                    start: clip.start,
+                    len: clip.len,
+                    crossfade: *crossfade,
+                };
                 let incoming = FilePlayer::start(clip, DEFAULT_RING_CAPACITY)?;
                 Self::warm_player(&incoming, DEFAULT_RING_CAPACITY)?;
+                let (op, fields) = media_ops::encode_splice(&mut self.media_intern, &intent);
+                self.engine.arrange_logged(op, fields)?;
+                let mailbox = self.player_mailbox.as_ref().expect("checked above");
                 mailbox.lock().map_err(|_| "player mailbox poisoned")?.push_back(SpliceCmd {
                     at_frame: *at_frame,
                     incoming,
                     crossfade: *crossfade,
                 });
+                self.media.lock().map_err(|_| "media session poisoned")?.splices.push(intent);
                 self.media_commands += 1;
                 Ok(())
             }
@@ -432,7 +476,11 @@ impl HostSession {
                 Ok(())
             }
             HostCommand::Pool { dir } => {
+                // Validate + resolve, then log (a refused pool is never logged).
                 self.set_pool(dir.clone())?;
+                let (op, fields) = media_ops::encode_pool(&mut self.media_intern, &dir.to_string_lossy());
+                self.engine.arrange_logged(op, fields)?;
+                self.media.lock().map_err(|_| "media session poisoned")?.pool_dir = Some(dir.clone());
                 self.media_commands += 1;
                 Ok(())
             }
@@ -450,6 +498,17 @@ impl HostSession {
                 let mut w = media::WavWriter::create(path, self.engine.clock.sample_rate, channels)?;
                 w.write(&out)?;
                 w.finalize()?;
+                // Record the bounce in the log (frames, path, the drain policy's
+                // outcome) — the drain note's "the bounce event records the policy".
+                // A bounce writes a file, so it is a *record*, not replayed state.
+                let record = BounceRecord {
+                    frames: *frames as u64,
+                    drained_frames: drain.tail_frames,
+                    capped: drain.capped,
+                };
+                let (op, fields) = media_ops::encode_bounce(&record);
+                self.engine.arrange_logged(op, fields)?;
+                self.media.lock().map_err(|_| "media session poisoned")?.bounces.push(record);
                 self.last_drain = drain;
                 self.media_commands += 1;
                 Ok(())
@@ -770,6 +829,14 @@ impl HostSession {
         let playing = self.playing;
         let mut rebuilt = HostSession::new();
         for cmd in &history {
+            // State that takes effect *after* the target is not yet in force at
+            // `frame`. Applying it would render the clock past the target — which
+            // makes a backward seek a no-op, because `process` renders up to the
+            // command's `at_frame`. Skip it: the rebuild reconstructs the session
+            // as it was at `frame`.
+            if cmd.at_frame().is_some_and(|at| at > frame) {
+                continue;
+            }
             rebuilt.process(cmd)?;
         }
         rebuilt.render_to(frame)?;

@@ -302,7 +302,7 @@ mod tests {
         let outcome = load_script(&host, &script).expect("script must run");
         assert!(outcome.bounce_written, "a Bounce command was in the script");
         assert_eq!(outcome.underruns, 0, "no underruns on a clean tone bounce");
-        assert_eq!(outcome.event_count, 1, "one logged engine event (the mount)");
+        assert_eq!(outcome.event_count, 2, "the mixer mount + the logged bounce record");
         assert_eq!(outcome.media_commands, 1, "one media command (the bounce)");
         assert_eq!(
             outcome.arrangement.as_ref().map_or(0, |t| t.tracks.len()),

@@ -38,4 +38,8 @@ Phase 1 runs in the engine workspace (no Tauri — the canvas/drag UI waits for 
 
 - **Graph generalization regressions** — per-port routing touches the hot loop; the engine's existing no-alloc and determinism tests guard it, plus new mixer tests.
 - **Solo/mute semantics** — solo interacts across channels; the rule (any solo ⇒ only solo'd channels) is stated and tested.
-- **The mailbox stays for media commands until the recorder step** — the recorder/clip-editor absorb it into logged events; the phase note tracks it.
+- **The mailbox stays for media commands until the recorder step** — the
+  recorder/clip-editor absorb it into logged events; the phase note tracks it.
+  **Shipped 2026-09-12:** `pool`/`play`/`splice` are logged media ops — see the
+  [media-commands note](../../implemented/architecture/2026-09-12-media-commands-logged.md);
+  the mailbox remains the reader's internal buffer.
