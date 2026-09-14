@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 
 use crate::clock::{Clock, Scheduler};
-use crate::graph::{Graph, NodeId, Port, RenderBlock, SignalKind, BLOCK};
+use crate::graph::{Graph, NodeId, Port, RenderBlock, RenderMode, SignalKind, BLOCK};
 use crate::log::{Event, SessionLog};
 use crate::plugins::{Disposer, DisposerCtx, ParamDef, Plugin, PluginApi};
 use crate::value::Value;
@@ -66,6 +66,33 @@ pub type PluginFactory = fn(&[(&'static str, f32)]) -> Result<Box<dyn Plugin>, S
 /// op stream** (plus its own logged state), so replay reproduces the same value.
 /// If it reconciles readers, referenced pool files must be immutable by id.
 pub type OpHandler = Box<dyn FnMut(&[(&'static str, Value)]) -> Result<(), String>>;
+
+/// Whether a render drains stateful nodes' buffered tails after the timeline
+/// ends, or hard-cuts at the last frame. The policy belongs to the bounce /
+/// `OfflineProcess` event; recording it in the session log rides the
+/// media-command logging step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainPolicy {
+    /// Stop at the timeline's last frame — the pre-drain behaviour.
+    HardCut,
+    /// Render drain blocks until no node holds a tail (bounded).
+    Tails,
+}
+
+/// What a drain phase emitted after the timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DrainOutcome {
+    /// Frames of buffered tail emitted after the timeline.
+    pub tail_frames: u64,
+    /// True when the bound was hit with output still pending — an explicit,
+    /// fail-loud outcome, never a silent truncation.
+    pub capped: bool,
+}
+
+/// The default bound on a drain phase: ~60 s at 48 kHz. A feedback structure can
+/// ring indefinitely, so the cap makes drain terminating (and hitting it is
+/// reported, not hidden).
+pub const MAX_DRAIN_FRAMES: usize = 48_000 * 60;
 
 /// The assembled minimal core.
 pub struct Engine {
@@ -684,6 +711,81 @@ impl Engine {
         out
     }
 
+    /// Render `frames` of timeline, then drain buffered tails per `policy` — the
+    /// offline bounce shape. With [`DrainPolicy::Tails`] the returned buffer is
+    /// timeline ++ drain; a graph with no tail returns the timeline unchanged
+    /// (`DrainOutcome::default()`).
+    pub fn render_with_drain(
+        &mut self,
+        frames: usize,
+        policy: DrainPolicy,
+        max_tail_frames: usize,
+    ) -> (Vec<f32>, DrainOutcome) {
+        let mut out = self.render(frames);
+        match policy {
+            DrainPolicy::HardCut => (out, DrainOutcome::default()),
+            DrainPolicy::Tails => {
+                let (tail, outcome) = self.drain(max_tail_frames);
+                out.extend_from_slice(&tail);
+                (out, outcome)
+            }
+        }
+    }
+
+    /// Drain stateful nodes' buffered tails: render extra [`RenderMode::Drain`]
+    /// blocks after the timeline until every node reports no tail, then flush the
+    /// PDC transit still in flight (so a compensated path is not cut short), or
+    /// `max_frames` is reached (bounded by [`MAX_DRAIN_FRAMES`]). Advances the
+    /// clock. Deterministic — a pure function of graph state (no wall clock, no
+    /// randomness) — so a drained render is byte-identical.
+    pub fn drain(&mut self, max_frames: usize) -> (Vec<f32>, DrainOutcome) {
+        // Bound the drain: a feedback structure can ring indefinitely.
+        let max_frames = max_frames.min(MAX_DRAIN_FRAMES);
+        let ch = self.graph.out_channels().max(1);
+        let mut tail: Vec<f32> = Vec::new();
+
+        // The PDC transit still in flight, independent of tails. When a tail is
+        // live the flush is *re-armed* at the tail→false transition, so a tail
+        // longer than the transit is still followed by its flush; when no tail is
+        // live it arms immediately, so in-flight samples are never dropped.
+        let mut flush: Option<usize> = None;
+        let mut capped = false;
+        loop {
+            let has_tail = self.graph.has_tail();
+            if !has_tail && flush.is_none() {
+                flush = Some(self.graph.flush_frames() as usize);
+            }
+            if !has_tail && flush == Some(0) {
+                break;
+            }
+            let frames_done = tail.len() / ch;
+            if frames_done >= max_frames {
+                capped = true;
+                break;
+            }
+            let frames = BLOCK.min(max_frames - frames_done);
+            let f0 = self.clock.frame();
+            let mut block = vec![0.0f32; frames * ch];
+            {
+                let Engine { clock, graph, .. } = self;
+                let rb = RenderBlock {
+                    frame: f0,
+                    sample_rate: clock.sample_rate,
+                    tempo: &clock.tempo_map,
+                    mode: RenderMode::Drain,
+                };
+                graph.render_drain(&mut block, rb);
+            }
+            self.clock.advance(frames as u64);
+            tail.extend_from_slice(&block);
+            if let Some(f) = flush.as_mut() {
+                *f = f.saturating_sub(frames);
+            }
+        }
+        let tail_frames = (tail.len() / ch) as u64;
+        (tail, DrainOutcome { tail_frames, capped })
+    }
+
     /// Render into a caller-provided buffer, in fixed-size blocks.
     pub fn render_into(&mut self, out: &mut [f32]) {
         let ch = self.channels_for_render();
@@ -787,6 +889,7 @@ impl Engine {
             frame: f0,
             sample_rate: clock.sample_rate,
             tempo: &clock.tempo_map,
+            mode: RenderMode::Timeline,
         };
         graph.render(out, block);
         clock.advance((out.len() as u64) / graph.out_channels().max(1) as u64);

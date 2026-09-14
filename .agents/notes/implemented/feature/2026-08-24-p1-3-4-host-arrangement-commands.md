@@ -67,4 +67,5 @@ naive test passed a *vacuous* silent bounce).
   architecture — a reconcile that reuses readers rather than rebuilding them, needed for live
   edit-while-playing where re-warming on every edit is too heavy); `render()` panics on a bad
   script via `.expect` (make it `Result`); `parse_script` text for `arrange`/`pool`; the
-  drain/EOF phase for tailed effects (a separate proposed note — the arranger's clips are finite).
+  drain/EOF phase for tailed effects — now [implemented](2026-08-20-drain-eof-phase.md); the
+  arranger's clips are finite, so this was the gap for tailed effects, not the arranger itself).

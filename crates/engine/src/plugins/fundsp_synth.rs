@@ -72,6 +72,12 @@ impl AudioNode for FundspSynth {
         0
     }
 
+    /// A live envelope is output the piece owns — the drain phase renders it out
+    /// rather than cutting the decaying voice at the frame budget.
+    fn has_tail(&self) -> bool {
+        self.remaining > 0
+    }
+
     fn render(
         &mut self,
         io: &NodeIO,

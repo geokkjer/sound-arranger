@@ -288,8 +288,12 @@ impl AudioNode for CaptureNode {
         _control: &mut f32,
         _triggers: &mut EventBuf<Trigger, CAP_EVENTS>,
         _notes: &mut EventBuf<NoteEvent, CAP_EVENTS>,
-        _block: RenderBlock,
+        block: RenderBlock,
     ) {
+        if block.mode == engine::RenderMode::Drain {
+            out.fill(0.0); // a source mutes past the timeline; only tails drain
+            return;
+        }
         for sample in out.iter_mut() {
             match self.ring.try_pop() {
                 Some(v) => *sample = v,

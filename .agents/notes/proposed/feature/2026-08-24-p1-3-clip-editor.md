@@ -206,7 +206,7 @@ is a value enum, and the payload encodes `f32` bit-exactly.
   takes and rebuilds missing `.peaks`, re-hashes recovered sources (fail-loud on stale ids),
   and is logged.
 - Bounce does not truncate a tailed arranger (drain/EOF — see the
-  [drain-eof note](2026-08-20-drain-eof-phase.md)).
+  [drain-eof note](../../implemented/feature/2026-08-20-drain-eof-phase.md)).
 - Workspace tests green; clippy clean.
 
 ## Risks

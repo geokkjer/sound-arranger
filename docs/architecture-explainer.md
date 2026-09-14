@@ -1,6 +1,6 @@
 # sound-arranger: from architecture up
 
-> 🕒 Last verified against commit `7c5a2e7` (2026-09-05). If the code has moved on,
+> 🕒 Last verified against commit `2be3104` (2026-09-12). If the code has moved on,
 > trust the code and move this line forward.
 
 > A plain-English (mostly) tour of the Rust code, for a developer with roughly six
@@ -496,6 +496,16 @@ exactly that shape existed until the control→render handoff note fixed it;
 [`implemented/architecture/2026-08-27-control-render-handoff-parked-ops.md`](../.agents/notes/implemented/architecture/2026-08-27-control-render-handoff-parked-ops.md)
 owns the contract). The practical rule while the host is single-owner: *call
 `flush_scheduled()` before rendering*.
+
+**The drain/EOF phase (bounce tails).** `render_into` stops at the frame budget,
+so `Engine::drain` renders extra `RenderMode::Drain` blocks after the timeline
+until no mounted node reports `has_tail()` (a decaying voice, a delay/reverb
+tail), then flushes the PDC transit still in flight. The mode is explicit: in a
+drain block a self-driven source (`Sine`, `EuclideanGen`, the ring-streaming
+media nodes) mutes itself, while processing nodes keep rendering so tails travel
+the chain. `DrainPolicy::{HardCut, Tails}` names the choice; the offline `Bounce`
+uses `Tails` and fails loud on a `capped` drain rather than writing a silently
+shortened file (the drain/EOF note owns the contract).
 
 > **Rustism — `debug_assert!` for "cheap in dev, gone in release":**
 > The codebase is littered with `debug_assert!` — invariants that are checked in

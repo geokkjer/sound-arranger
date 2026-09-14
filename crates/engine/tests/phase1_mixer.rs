@@ -88,7 +88,7 @@ fn render_node(g: &mut Graph, frames: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; frames * ch];
     let mut pos = 0u64;
     for chunk in out.chunks_mut(BLOCK * ch) {
-        g.render(chunk, RenderBlock { frame: pos, sample_rate: SR, tempo: &tempo });
+        g.render(chunk, RenderBlock { frame: pos, sample_rate: SR, tempo: &tempo, mode: RenderMode::Timeline });
         pos += (chunk.len() / ch) as u64;
     }
     if ch >= 2 {
@@ -484,7 +484,7 @@ fn pan_law_is_equal_power_and_hard_left_right() {
     let tempo = TempoMap::new(SR, 120.0, 4);
     let render = |g: &mut Graph| -> Vec<f32> {
         let mut out = vec![0.0f32; BLOCK * 2];
-        g.render(&mut out, RenderBlock { frame: 0, sample_rate: SR, tempo: &tempo });
+        g.render(&mut out, RenderBlock { frame: 0, sample_rate: SR, tempo: &tempo, mode: RenderMode::Timeline });
         out
     };
     let frame_of = |samples: &[f32], i: usize| (samples[2 * i], samples[2 * i + 1]);

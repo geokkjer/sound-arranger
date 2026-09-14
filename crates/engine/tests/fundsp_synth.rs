@@ -228,4 +228,23 @@ fn fundsp_latency_is_reported_for_pdc() {
     assert_eq!(v.latency(), 0, "a minimum-phase fundsp path adds no whole-sample latency");
 }
 
+/// The decaying voice is a **tail**: a short render leaves the envelope live, and
+/// the drain renders it out instead of cutting it at the frame budget.
+#[test]
+fn fundsp_voice_tail_is_drained() {
+    let mut e = engine();
+    mount_chain(&mut e);
+
+    let (out, outcome) = e.render_with_drain(4_800, DrainPolicy::Tails, MAX_DRAIN_FRAMES);
+    assert!(outcome.tail_frames > 0, "a live envelope must drain");
+    assert!(!outcome.capped, "a 20k envelope drains well inside the bound");
+
+    let ch = e.graph.out_channels().max(1);
+    let drained = &out[4_800 * ch..];
+    assert!(
+        drained.iter().any(|s| s.abs() > 1e-5),
+        "the tail must carry the decaying voice, not silence"
+    );
+}
+
 

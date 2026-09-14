@@ -170,11 +170,24 @@ impl Port {
     }
 }
 
+/// What phase a render is in. `Timeline` is the normal pass. `Drain` is the
+/// post-timeline flush of buffered tails — the EOF signal (FFmpeg's send-NULL):
+/// self-driven sources mute themselves, so only buffered tails, and the
+/// processing chain that carries them, reach the master. The mode is explicit so
+/// drain participation never depends on a node's port shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderMode {
+    Timeline,
+    Drain,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct RenderBlock<'a> {
     pub frame: u64,
     pub sample_rate: u32,
     pub tempo: &'a TempoMap,
+    /// Which phase this block is; a self-driven source emits silence in `Drain`.
+    pub mode: RenderMode,
 }
 
 /// Maximum audio inputs a node may declare (the mixer's channels, Phase 1).
@@ -215,6 +228,18 @@ pub trait AudioNode: Send {
         block: RenderBlock,
     );
     fn set_param(&mut self, _name: &str, _value: f32) {}
+
+    /// Whether this node still holds buffered output that belongs to the piece
+    /// (a delay/reverb tail, a decaying voice, an encoder's delay). The engine's
+    /// drain phase keeps rendering while any mounted node reports a tail;
+    /// stateless and pass-through nodes keep the default `false`.
+    ///
+    /// **Contract:** during a drain this must be *monotone non-increasing* (it is
+    /// what makes the drain terminate), and a node reporting `false` must emit no
+    /// non-zero audio in a drain block.
+    fn has_tail(&self) -> bool {
+        false
+    }
 }
 
 /// A node in the graph: the value model's unit, with its declared ports.
@@ -229,6 +254,15 @@ impl Node {
         match &self.kind {
             NodeKind::Sine(_) | NodeKind::Gain(_) => 0,
             NodeKind::Opaque(node) => node.latency(),
+        }
+    }
+
+    /// Whether this node holds buffered output (the drain gate's per-node term).
+    pub fn has_tail(&self) -> bool {
+        match &self.kind {
+            NodeKind::Sine(node) => node.has_tail(),
+            NodeKind::Gain(node) => node.has_tail(),
+            NodeKind::Opaque(node) => node.has_tail(),
         }
     }
 
@@ -302,6 +336,10 @@ impl AudioNode for Sine {
         _notes: &mut EventBuf<NoteEvent, CAP_EVENTS>,
         block: RenderBlock,
     ) {
+        if block.mode == RenderMode::Drain {
+            out.fill(0.0); // a free-running source does not sound past the timeline
+            return;
+        }
         let inc = TAU * self.freq as f64 / block.sample_rate as f64;
         for sample in out.iter_mut() {
             *sample = self.phase.sin() as f32;
@@ -377,6 +415,9 @@ impl AudioNode for EuclideanGen {
         _notes: &mut EventBuf<NoteEvent, CAP_EVENTS>,
         block: RenderBlock,
     ) {
+        if block.mode == RenderMode::Drain {
+            return; // no new onsets past the timeline; only tails drain
+        }
         let len = out_audio.len() as u64;
         let step_beats = 1.0 / self.pulses_per_beat.max(1) as f64;
         let b0 = block.tempo.beat_at(block.frame);
@@ -498,6 +539,14 @@ impl ToneGen {
 impl AudioNode for ToneGen {
     fn latency(&self) -> u32 {
         0
+    }
+
+    /// A blip still sounding is output the piece owns — the drain phase must
+    /// render it out before the bounce ends. A merely *queued* onset is not a
+    /// tail (and a malformed `offset >= frames` could never be drained by the
+    /// per-sample loop, so counting it would pin the drain open).
+    fn has_tail(&self) -> bool {
+        self.blips.iter().any(|b| b.is_some())
     }
 
     fn render(
@@ -897,10 +946,54 @@ impl Graph {
             .unwrap_or(1)
     }
 
+    /// Whether any mounted node still holds buffered output — the drain gate.
+    pub fn has_tail(&self) -> bool {
+        self.nodes.iter().any(Node::has_tail)
+    }
+
+    /// Frames still in flight after the last rendered block — the flush a drain
+    /// owes so a rendered sample is never dropped. The transit from node `i` is
+    /// `T[i] = d_i + max over consumers c (latency[c] + T[c])` (`T = 0` at a node
+    /// with no consumer), where `d_i` is the PDC delay applied to node `i`;
+    /// `max_cum` alone under-counts chained paths. Computed in reverse node order
+    /// (cords only go forward).
+    pub fn flush_frames(&self) -> u32 {
+        let n = self.nodes.len();
+        let max_cum = self.cum.iter().copied().max().unwrap_or(0);
+        let mut transit = vec![0u32; n];
+        for i in (0..n).rev() {
+            let d = max_cum.saturating_sub(self.cum[i]);
+            let downstream = self
+                .cords
+                .iter()
+                .filter(|c| c.from.0 == i && c.kind == SignalKind::Audio)
+                .map(|c| self.nodes[c.to.0].latency().saturating_add(transit[c.to.0]))
+                .max()
+                .unwrap_or(0);
+            transit[i] = d.saturating_add(downstream);
+        }
+        transit.iter().copied().max().unwrap_or(0)
+    }
+
     /// Render one block into `out` (interleaved `channels * frames` samples).
     /// Allocation-free: every buffer is preallocated or fixed-capacity; audio
-    /// paths are PDC-aligned.
+    /// paths are PDC-aligned. The block's [`RenderMode`] decides whether
+    /// self-driven sources sound or mute.
     pub fn render(&mut self, out: &mut [f32], block: RenderBlock) {
+        self.render_inner(out, block);
+    }
+
+    /// Render one **drain** block (a [`RenderMode::Drain`] block) and report
+    /// whether a tail remains. Every node renders in index order; a self-driven
+    /// source mutes itself on the mode, so only buffered tails — and the
+    /// processing chain that carries them — reach the master.
+    pub fn render_drain(&mut self, out: &mut [f32], block: RenderBlock) -> bool {
+        debug_assert_eq!(block.mode, RenderMode::Drain, "render_drain needs a Drain block");
+        self.render_inner(out, block);
+        self.has_tail()
+    }
+
+    fn render_inner(&mut self, out: &mut [f32], block: RenderBlock) {
         let channels = self.out_channels();
         // Frame count in this chunk. The master output is interleaved, so
         // `out.len() == channels * frames`. Node buffers are always mono (or
@@ -1076,7 +1169,7 @@ mod tests {
         g.set_out(delay);
 
         let mut out = [0.0f32; 64];
-        let block = RenderBlock { frame: 0, sample_rate: 48_000, tempo: &tempo() };
+        let block = RenderBlock { frame: 0, sample_rate: 48_000, tempo: &tempo(), mode: RenderMode::Timeline };
         g.render(&mut out, block);
 
         assert_eq!(out[0], 0.0);
@@ -1129,7 +1222,7 @@ mod tests {
         assert_eq!(g.out_node, Some(sink));
 
         let mut out = [0.0f32; 64];
-        let block = RenderBlock { frame: 0, sample_rate: 48_000, tempo: &tempo() };
+        let block = RenderBlock { frame: 0, sample_rate: 48_000, tempo: &tempo(), mode: RenderMode::Timeline };
         g.render(&mut out, block);
         assert!(
             out[..32].iter().any(|s| s.abs() > 1e-6),
@@ -1163,5 +1256,123 @@ mod tests {
         assert_eq!(x, NodeId(2), "inserted node is a fresh id");
         // the pre-existing a->b cord is still forward-ordered after the shift.
         g.connect(a, "audio", b, "audio").unwrap();
+    }
+
+    /// A node with an unbounded tail: emits 1.0 forever and declares a tail.
+    struct ForeverTail;
+
+    impl AudioNode for ForeverTail {
+        fn latency(&self) -> u32 {
+            0
+        }
+        fn render(
+            &mut self,
+            _io: &NodeIO,
+            out: &mut [f32],
+            _control: &mut f32,
+            _triggers: &mut EventBuf<Trigger, CAP_EVENTS>,
+            _notes: &mut EventBuf<NoteEvent, CAP_EVENTS>,
+            _block: RenderBlock,
+        ) {
+            out.fill(1.0);
+        }
+        fn has_tail(&self) -> bool {
+            true
+        }
+    }
+
+    /// A two-input summer (a processing node, to carry a tail across the gate).
+    struct Sum;
+
+    impl AudioNode for Sum {
+        fn latency(&self) -> u32 {
+            0
+        }
+        fn render(
+            &mut self,
+            io: &NodeIO,
+            out: &mut [f32],
+            _control: &mut f32,
+            _triggers: &mut EventBuf<Trigger, CAP_EVENTS>,
+            _notes: &mut EventBuf<NoteEvent, CAP_EVENTS>,
+            _block: RenderBlock,
+        ) {
+            out.fill(0.0);
+            for k in 0..io.audio_in_count {
+                for (o, i) in out.iter_mut().zip(io.audio_ins[k]) {
+                    *o += *i;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn render_drain_mutes_a_source_but_keeps_a_tail() {
+        let mut g = Graph::new();
+        let sine = g.add_node(
+            NodeKind::Sine(Sine::new(440.0)),
+            vec![Port::audio("audio", Direction::Out)],
+        );
+        let tail = g.add_node(
+            NodeKind::Opaque(Box::new(ForeverTail)),
+            vec![Port::audio("audio", Direction::Out)],
+        );
+        let mix = g.add_node(
+            NodeKind::Opaque(Box::new(Sum)),
+            vec![
+                Port::audio("a", Direction::In),
+                Port::audio("b", Direction::In),
+                Port::audio("audio", Direction::Out),
+            ],
+        );
+        g.connect(sine, "audio", mix, "a").unwrap();
+        g.connect(tail, "audio", mix, "b").unwrap();
+        g.set_out(mix);
+
+        // A normal render sums both: the sine is audible alongside the tail.
+        let mut normal = [0.0f32; 32];
+        g.render(&mut normal, RenderBlock { frame: 0, sample_rate: 48_000, tempo: &tempo(), mode: RenderMode::Timeline });
+        assert!(
+            normal.iter().any(|s| (*s - 1.0).abs() > 1e-6),
+            "the sine contributes in a normal render"
+        );
+
+        // A drain render mutes the free-running source: only the tail's 1.0.
+        let mut drain = [0.0f32; 32];
+        g.render_drain(&mut drain, RenderBlock { frame: 0, sample_rate: 48_000, tempo: &tempo(), mode: RenderMode::Drain });
+        assert_eq!(drain, [1.0f32; 32], "the source is muted; only the tail sounds");
+    }
+
+    #[test]
+    fn has_tail_is_false_without_buffered_output() {
+        // A sine is a source, not a tail: the drain gate must not treat it as
+        // something to render out.
+        let mut g = Graph::new();
+        let sine = g.add_node(
+            NodeKind::Sine(Sine::new(440.0)),
+            vec![Port::audio("audio", Direction::Out)],
+        );
+        g.set_out(sine);
+        assert!(!g.has_tail());
+    }
+
+    #[test]
+    fn flush_frames_covers_the_chained_pdc_transit() {
+        let mut g = Graph::new();
+        let src = g.add_node(
+            NodeKind::Opaque(Box::new(ForeverTail)),
+            vec![Port::audio("audio", Direction::Out)],
+        );
+        let sink = g.add_node(
+            NodeKind::Opaque(Box::new(TestDelay { len: 3 })),
+            vec![Port::audio("audio", Direction::In), Port::audio("audio", Direction::Out)],
+        );
+        g.connect(src, "audio", sink, "audio").unwrap();
+        g.set_out(sink);
+        let mut out = [0.0f32; 16];
+        g.render(&mut out, RenderBlock { frame: 0, sample_rate: 48_000, tempo: &tempo(), mode: RenderMode::Timeline });
+        // The source's PDC delay (3) *plus* the sink's own latency (3): the
+        // cumulative latency alone (3) under-flushes the chained path.
+        assert_eq!(g.flush_frames(), 6);
     }
 }

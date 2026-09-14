@@ -44,8 +44,8 @@ pub use clock::{Clock, Scheduler, TempoMap};
 pub use ctx::Context;
 pub use graph::{
     AudioNode, Direction, EventBuf, EuclideanGen, Gain, Graph, MAX_AUDIO_INS, Node, NodeId, NodeIO,
-    NodeKind, NoteEvent, Port, RenderBlock, ScaleGen, SignalKind, Sine, ToneGen, Trigger, BLOCK,
-    CAP_EVENTS, MERGE_CAP,
+    NodeKind, NoteEvent, Port, RenderBlock, RenderMode, ScaleGen, SignalKind, Sine, ToneGen,
+    Trigger, BLOCK, CAP_EVENTS, MERGE_CAP,
 };
 pub use log::{Event, SessionLog};
 pub use plugins::{
@@ -54,5 +54,5 @@ pub use plugins::{
     MIXER_PARAMS, MIXER_PORTS, OscSink, OscSource, ParamDef, Plugin, PluginApi, Rhythm, Scale,
     Tone, TONE_PARAMS,
 };
-pub use render::{Engine, OpHandler, PluginFactory, SchedEvent};
+pub use render::{DrainOutcome, DrainPolicy, Engine, OpHandler, PluginFactory, SchedEvent, MAX_DRAIN_FRAMES};
 pub use value::{OpMsg, Value};

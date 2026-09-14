@@ -37,8 +37,8 @@ replayed from the host's session log.
 
 What doesn't exist yet: effects (no `fundsp` effect plugins), MIDI/OSC implementations (declared
 seams only), CLAP hosting, live-edit audio re-wiring, stereo *sources/clips* (the master is
-stereo and mono channels pan into it, but a genuine stereo take/clip is still forthcoming), the
-drain/EOF phase for tailed effects, and **full UI wiring** — several surfaces are real
+stereo and mono channels pan into it, but a genuine stereo take/clip is still forthcoming),
+and **full UI wiring** — several surfaces are real
 components with placeholder bodies (the Detail View's three contexts are tabs whose bodies are
 sketched pending selection wiring; record is still chrome). The direction is locked
 ([umbrella-first note](.agents/notes/proposed/architecture/2026-08-15-umbrella-first-product-direction.md)):
@@ -65,7 +65,7 @@ sketched pending selection wiring; record is still chrome). The direction is loc
 | `crates/shell` | The Tauri v2 + Vue 3 shell — now a **working timeline editor**, not a stub: the four planned views as components (`Surface`, `TimelineCanvas`, `SourcePool` with Project/Library contexts, `MixerPanel`, `DetailView`), plus `bridge` (the Host API over Tauri), `transport`, `editor` (undo/redo replayed from the host's session log) and the timeline viewport/editing maths with unit tests. The Detail View is present with its three context tabs, but its bodies are placeholders pending selection wiring. | works; UI wiring in progress |
 | `plugins/` | **Sidecar plugins** (placeholder): VST3/CLAP builds of core capabilities and the CDP / offline-process sidecar (`OfflineProcess`). Not engine crates — thin wrappers that expose a capability to a plug-in API. See [plugins/README.md](plugins/README.md). | placeholder |
 
-**178 Rust tests + 38 frontend unit tests**, all passing; the core's invariants (byte-identical
+**187 Rust tests + 38 frontend unit tests**, all passing; the core's invariants (byte-identical
 replay, no-allocation render, sample-accurate lifecycle) are tested, and the streaming soak +
 real hardware capture run as `#[ignore]`d tests.
 
@@ -78,7 +78,9 @@ not yet logged events (the **arrangement** ops *are*); **live-edit-while-playing
 (edits after a bounce are rebuilt and readers are re-positioned at the transport frame, so they
 reach audio and removed tracks no longer ghost — but each rebuild re-warms readers, and the
 shared-state `ArrangerNode` reuse is still deferred); the
-**drain/EOF phase** for tailed effects (reverb/delay/codec) is a proposed note;
+the **drain/EOF phase** for tailed effects shipped (a bounce renders stateful nodes'
+`has_tail()` tails and flushes in-flight PDC, with a `capped` fail-loud bound) — realtime
+transport stop does not drain yet, and the drain is not a logged event;
 MIDI/OSC are declared seams, not implementations; **no effects**; and in the UI, **selection is
 not wired** — the Detail View's three contexts are tabs with placeholder bodies, and record
 remains chrome.

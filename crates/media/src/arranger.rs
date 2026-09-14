@@ -178,6 +178,10 @@ impl AudioNode for ArrangerNode {
         _notes: &mut EventBuf<NoteEvent, CAP_EVENTS>,
         block: RenderBlock,
     ) {
+        if block.mode == engine::RenderMode::Drain {
+            out.fill(0.0); // a source mutes past the timeline; only tails drain
+            return;
+        }
         let f0 = block.frame;
         let f1 = f0 + out.len() as u64;
         debug_assert!(out.len() <= engine::BLOCK, "render chunk exceeds BLOCK");
@@ -319,6 +323,7 @@ mod tests {
                 frame: start_frame + (bi * engine::BLOCK) as u64,
                 sample_rate: sr,
                 tempo: &tempo,
+                mode: engine::RenderMode::Timeline,
             });
         }
         out

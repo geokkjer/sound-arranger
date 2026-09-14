@@ -224,6 +224,9 @@ pub struct HostSession {
     /// Whether the transport is running. The live runtime reads this; the
     /// offline reference host only records it (`Bounce` renders regardless).
     playing: bool,
+    /// What the last offline `Bounce` drained (tail frames + capped). The live
+    /// transport hard-cuts, so this stays default until a bounce runs.
+    last_drain: DrainOutcome,
     /// The **state** commands applied so far, in order — replayed by `seek_to`
     /// to rebuild the session at a target frame. Actions are not recorded.
     history: Vec<HostCommand>,
@@ -257,6 +260,7 @@ impl HostSession {
             wired_tracks: std::collections::HashMap::new(),
             arrange_dirty: false,
             playing: false,
+            last_drain: DrainOutcome::default(),
             history: Vec::new(),
             redo: Vec::new(),
         }
@@ -433,11 +437,20 @@ impl HostSession {
                 Ok(())
             }
             HostCommand::Bounce { frames, path } => {
-                let out = self.render(*frames)?; // wires (pending + arranger) then renders
+                // Offline bounce: render + drain buffered tails. A capped drain
+                // is a *different, truncated* piece, so it fails loud rather than
+                // writing a quietly shortened file.
+                let (out, drain) = self.render_with_drain(*frames)?;
+                if drain.capped {
+                    return Err(format!(
+                        "bounce drain hit the {MAX_DRAIN_FRAMES}-frame bound with output still pending — the tail is truncated"
+                    ));
+                }
                 let channels = self.engine.graph.out_channels().max(1) as u16;
                 let mut w = media::WavWriter::create(path, self.engine.clock.sample_rate, channels)?;
                 w.write(&out)?;
                 w.finalize()?;
+                self.last_drain = drain;
                 self.media_commands += 1;
                 Ok(())
             }
@@ -559,16 +572,35 @@ impl HostSession {
     /// first). A wiring failure (e.g. the mixer was unmounted after a `play`) is
     /// a clean `Err`, never a panic in a host.
     pub fn render(&mut self, frames: usize) -> Result<Vec<f32>, String> {
-        // The master may be stereo (L/R), so a frame costs up to 2 * 4 bytes.
+        Self::check_bounce_budget(frames)?;
+        self.wire_pending()?;
+        self.wire_arranger()?;
+        Ok(self.engine.render(frames))
+    }
+
+    /// Like [`render`](Self::render), but drain buffered tails after the timeline
+    /// — the **offline bounce** shape. The live transport uses `render` (a hard
+    /// cut): a stopped device is paused, so there is nowhere for a tail to ring.
+    pub fn render_with_drain(&mut self, frames: usize) -> Result<(Vec<f32>, DrainOutcome), String> {
+        // The drain can add up to MAX_DRAIN_FRAMES on top of `frames`.
+        Self::check_bounce_budget(frames.saturating_add(MAX_DRAIN_FRAMES))?;
+        self.wire_pending()?;
+        self.wire_arranger()?;
+        Ok(self
+            .engine
+            .render_with_drain(frames, DrainPolicy::Tails, MAX_DRAIN_FRAMES))
+    }
+
+    /// The offline bounce budget: the master may be stereo (L/R), so a frame
+    /// costs up to 2 * 4 bytes; a malformed `bounce` must not OOM.
+    fn check_bounce_budget(frames: usize) -> Result<(), String> {
         let budget = frames
             .saturating_mul(std::mem::size_of::<f32>())
             .saturating_mul(2);
         if budget > Self::MAX_BOUNCE_BYTES {
             return Err(format!("bounce of {frames} frames exceeds the ~{:.0} MiB budget", Self::MAX_BOUNCE_BYTES / (1 << 20)));
         }
-        self.wire_pending()?;
-        self.wire_arranger()?;
-        Ok(self.engine.render(frames))
+        Ok(())
     }
 
     pub fn log(&self) -> &SessionLog {
@@ -581,6 +613,13 @@ impl HostSession {
 
     pub fn media_command_count(&self) -> usize {
         self.media_commands
+    }
+
+    /// What the last offline `Bounce` drained: tail frames emitted, and whether
+    /// the bound was hit. The live transport hard-cuts, so this is default until
+    /// a bounce runs.
+    pub fn last_drain(&self) -> DrainOutcome {
+        self.last_drain
     }
 
     /// The clip editor's arrangement value (read-only snapshot). `Ok(default)`
@@ -1149,13 +1188,16 @@ fn channel_of(s: &str, at: usize) -> Result<usize, String> {
 /// A structured summary of a finished script run (the CLI's report; a future
 /// shell renders the same facts).
 pub fn summarize(session: &HostSession) -> String {
+    let drain = session.last_drain();
     format!(
-        "engine log events: {}\nmedia commands: {}\nunderruns: {}\ndeferred splices: {}\nmaster out node: {:?}\n",
+        "engine log events: {}\nmedia commands: {}\nunderruns: {}\ndeferred splices: {}\nmaster out node: {:?}\ndrain tail frames: {}{}\n",
         session.event_count(),
         session.media_command_count(),
         session.underruns(),
         session.deferred(),
         session.engine_ref().graph.out_node,
+        drain.tail_frames,
+        if drain.capped { " (CAPPED)" } else { "" },
     )
 }
 
