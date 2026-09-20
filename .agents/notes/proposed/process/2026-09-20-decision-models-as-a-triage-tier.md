@@ -4,7 +4,7 @@ Status: proposed
 
 ## Problem
 
-A new class of small "System 1 decision models" arrived in September 2026 — TypeSafe's commercial **Jev** and Convai Innovations' open-weights **Laya** (Apache-2.0, 2026-09-18). Both take one short piece of state (text, ticket, JSON) plus **typed questions** (`choice`, `score`, `noul`) and return **calibrated probabilities** in a single forward pass at ~33 ms, without generating text ([Laya model card](https://huggingface.co/convaiinnovations/laya)).
+A new class of small "System 1 decision models" arrived in September 2026 — TypeSafe's commercial **Jev** and **Convai Innovations'** open-weights **Laya** (Apache-2.0, 2026-09-18; independent implementations in the same class from different companies, not a release of one another). Both take one short piece of state (text, ticket, JSON) plus **typed questions** (`choice`, `score`, `noul`) and return **calibrated probabilities** in a single forward pass, without generating text ([Laya model card](https://huggingface.co/convaiinnovations/laya)).
 
 The question they raise here is positional, and the repo cannot answer it from the record: the project already runs a **four-tier co-work routing** (driver / value pass / escalation / reviewer gate, [note](../../implemented/process/2026-08-27-model-co-work-routing.md)) and already has an **LLM seam** in the product (the Host API text format, [note](../architecture/2026-09-10-hub-and-spokes-and-the-llm-seam.md)). Is a decision model a new tier in the first, a new component behind the second, or neither — and if it is neither today, what would have to change for it to be worth revisiting? Without a written answer, each new release invites the same ad-hoc debate.
 
@@ -33,7 +33,7 @@ The full evaluation, with numbers and sources, is the [research memo](../../../.
 - **Use it in the product as a guardrail on LLM-authored command lists** — rejected *for syntactic* validity (the engine's parser and refusals are exact and already exist; a probabilistic check is strictly worse), and premature for semantic validity (that is the four-condition trigger, not met).
 - **Run it in-process for audio decisions** — rejected on modality: Laya and Jev are text-only, while the decisions worth automating here are about audio; that line is audio embeddings/classifiers or a multimodal LLM, not a text decision model.
 - **Fine-tune one on the repo's own history (commits, reviews, notes)** — rejected as a first move: the corpus is ~125 commits and 32 archives with confounded labels, and the decision it would predict is the one the driver already makes conservatively at negligible cost.
-- **Do nothing and keep the question in chat** — rejected: the field is three days old and moving fast, so the same question will recur with the next release; the criteria belong in the record, not in a conversation.
+- **Do nothing and keep the question in chat** — rejected: the packaging is new and moving fast (open weights, request-time schemas, an independent benchmark and a public dataset all within a week), so the same question will recur with the next release; the criteria belong in the record, not in a conversation.
 
 ## Acceptance criteria
 
