@@ -1,14 +1,17 @@
 # sound-arranger (working title)
 
-> 🕒 Last verified against commit `87f0d28` (2026-09-21). If the code has
+> 🕒 Last verified against commit `0b50dd8` (2026-09-21). If the code has
 > moved on, trust the code and move this line forward.
 
 An **audio platform where everything is a plugin**: a minimal core — clock · audio graph
 interpreter · session event log · context plumbing — with every capability as a plugin, and
 the product an **assembled profile**. Rust (engine core + media engine + host), driven by a
 Tauri v2 + Vue 3 shell over the Host API (the same versioned text format the CLI drives) — with
-**iced** under evaluation as an in-process Rust shell that would remove the webview, the IPC wire
-and TypeScript entirely ([RESEARCH §4.5](RESEARCH.md), [evaluation note](.agents/notes/proposed/architecture/2026-09-21-iced-shell-evaluation.md)).
+**iced** and a **ratatui TUI** under evaluation as in-process Rust shells that would remove the
+webview, the IPC wire and TypeScript entirely ([RESEARCH §4.5–4.6](RESEARCH.md)). The interaction
+direction under evaluation with them: **modal editing — visual mode for clips — with the `host v1`
+command language as the `:` prompt**, i.e. for audio what vim/helix/emacs is for text
+([note](.agents/notes/proposed/architecture/2026-09-21-modal-editing-model.md)).
 
 ## Scope (focused core)
 

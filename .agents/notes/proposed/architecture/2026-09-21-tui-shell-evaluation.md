@@ -55,7 +55,53 @@ Deliberately different, because these are the TUI's own questions:
    it to a key owns that stall.
 4. **Verifiability without a display.** ratatui's `TestBackend` makes the *view* testable (a
    deterministic `--dump` frame plus five assertions on the rendered buffer), and a pty harness
-   covers the real path (raw mode, alternate screen, mouse capture, input decoding).
+   (`scripts/pty-check.sh`) covers the real path (raw mode, alternate screen, mouse capture, input
+   decoding).
+
+## Reference and prior art
+
+A dedicated study — [Helix's keyboard model, and what a terminal can actually draw](../../../../research/architecture/2026-09-21-tui-audio-prior-art.md)
+— answers the two questions this spike deliberately left open, and both answers are load-bearing:
+
+- **The interaction model has a proven ancestor, and it is not vim.** Helix's **selection-first**
+  ("select, then act") model fits clips better than it fits text: a selection *is* `{track, clip,
+  start, end}`, the acted-on set is rendered *before* anything is destroyed, and bulk edits need
+  collapse/keep-primary keys to stay escapable. Alongside it, four mechanisms are directly
+  portable: a **labelled keymap trie** with "user wins" TOML overrides and `no_op`, a **prefix
+  infobox** that replaces this spike's full-screen `?` help, a **command palette** whose second
+  column shows the keys bound to each command, and **documentation generated from the live keymap**
+  (so the spike's hand-written keymap table stops being a second source of truth).
+- **The `:` command line does not need to be invented.** Helix declares every action as typed data
+  with arity validation; this project already has that — the versioned `host v1` text format, with
+  registry validation and line-numbered errors, which is simultaneously the CLI surface, the LLM
+  seam and the replay log. A TUI needs a **prompt widget**, not a command language.
+- **The timeline is a density question, and the answer is "overview, not samples".** At 200×50 the
+  terminal gives ~400 time columns and ~200 amplitude steps; 400 columns over a 3-minute clip is
+  0.45 s/column, and the zoom floor is ~0.6 ms/column (~30 samples). So the timeline is an
+  overview + coarse-trim surface, and the honest design is a **min/max envelope per column from the
+  existing peak pyramid** (`PeakBuilder::range_minmax`) — the `audiowaveform` model, which needs no
+  new audio work. Lanes want **braille** (2×4 sub-cells, one colour per cell); clip colour bars,
+  meters and the playhead want **blocks/half-blocks** (colour per sub-pixel, lower resolution).
+  **Terminal image protocols are a detail-pane luxury, never the timeline**: Kitty is stateful and
+  can draw *under* text, sixel is immediate-mode and is *erased* by text drawn over it, tmux has no
+  Kitty support at all, and Alacritty/Konsole are unusable.
+- **The ground is unclaimed.** No terminal program draws a waveform in a **multi-track
+  arrangement**: the field splits into single-file sample editors (`tui-wave` — Rust, alive, braille
+  in every terminal plus Kitty graphics where available, cut/copy/undo on **one** buffer — and
+  destructively `MrDopey/audio-tui-editor`), live meters with no file at all (cava, Prism at 60 FPS,
+  scope-tui, sgram-tui), and **MIDI-only** DAWs (Phosphor, tek's arranger). No timeline, therefore no
+  arrangement view anywhere. The nearest ancestors are `audiowaveform` (the data model), `cava`
+  (sub-cell bars), `waveformchart` (a braille ratatui widget — a *pattern to fork*: it pins
+  `ratatui 0.29` and we are on 0.30.2) and the tracker grid as an editing surface.
+- **The rendering is not the moat.** The closest projects are agent-built or LLM-assisted
+  (`tui-wave` states it outright), so drawing a waveform in a terminal is cheap for anyone now. What
+  none of them has — and this repo's engine already does — is the **non-destructive clip model over a
+  replayable log**.
+- **And the model now has a direction.** The human's read is that the UI should be *for audio what
+  vim/helix/emacs is for text*, with **visual mode** as the selection model. That is a shell-agnostic
+  interaction contract, written down in the
+  [modal editing model note](2026-09-21-modal-editing-model.md); this spike is where it gets tested
+  (a TUI has no mouse to fall back on, so the keymap has to carry the whole workflow).
 
 ## Alternatives considered
 
@@ -82,11 +128,15 @@ The evaluation is answered — with an implemented or rejected note replacing th
 1. The spike runs in a real terminal, restores the screen and mouse capture on exit, and its pty
    harness (entered alternate screen, no panic, exit 0) passes on a clean checkout under the rustup
    toolchain. **Met** (see Consequences), including one real crash found and fixed this way.
-2. **The timeline question is answered with a built prototype**, not an opinion: draw N clips with
-   their waveform peaks in a terminal (braille/block codepoints, and — if the target terminal
-   supports it — the Kitty graphics protocol), state the measured density (clips × seconds of
-   material visible per screen), and demonstrate the editing gestures (select, move, split, trim)
-   with the keyboard alone.
+2. **The timeline question is answered with a built prototype**, not an opinion, and now with
+   numbers to check it against (see *Reference and prior art*): draw tracks as **min/max envelopes
+   per column from the existing peak pyramid**, lanes in braille, clip colour bars in blocks,
+   playhead and boundaries marking the grid; state the **measured density** (columns, s/column at
+   overview and at maximum zoom, tracks × rows, visible clips) and **what the prototype cannot do**
+   (sample-accurate trim, zoom past ~1 ms/column, 20+ tracks with vertical detail, per-pixel
+   colour); and demonstrate the editing gestures (select, move, split, trim) with the keyboard
+   alone. If a terminal image protocol is used at all, it is a **detail pane** that degrades
+   silently — never the scrolling timeline.
 3. **A task-level mouse-vs-keys verdict**: the same short task list (select a clip, seek, split,
    nudge, mute a channel) performed both ways, with the friction noted — including the terminal
    facts that matter (mouse capture vs copy/paste, tmux/niri passthrough, wheel vs key repeat).

@@ -1,0 +1,135 @@
+# Agent Note: the editing model is modal — audio's vim/helix, not a DAW's mouse
+
+Status: proposed
+
+## Problem
+
+The shell question — Tauri + Vue, iced, or ratatui — is a decision about **rendering**. The app has
+never decided its **interaction model**, and today it does not have one: the shipped Vue shell is
+GUI-shaped, with panels, clicks and a canvas timeline driven by pointer events, and 38 frontend
+tests behind its viewport/editing maths. That is a conventional DAW arrangement view. It works, and
+it is the right *default* for a mouse user; it is not a model anyone chose.
+
+The direction from the human (2026-09-21): **the UI should be for audio what vim / helix / emacs is
+for text**, with the modal model — **visual mode for selecting** — as the likely fit.
+
+This is not only taste, because the architecture is already editor-shaped in every respect except
+its interface:
+
+- the **session log is a typed, versioned command list** (`host v1`: `mount`, `patch`, `set_param`,
+  `set_tempo`, `unmount`, `transport`, `undo`, `redo`, `play`, `splice`, `record`, `bounce`, `pool`,
+  `arrange`), validated per slot against registries, with line-numbered errors
+  (`crates/host/src/lib.rs`);
+- the **arrangement is a value** (a `Timeline`), and every edit is a logged command;
+- **undo/redo already replay the log** — the arrangement history exists, and the live shell drives
+  it over `HostCommand`.
+
+Text editors won their ergonomics by making exactly that — *commands over a value* — the interface:
+modes, selections, registers, macros, `:`, scriptability, generated documentation. This repo has the
+value and the command vocabulary and exposes them through a pointer. The engine thinks in vim;
+the shell thinks in windows.
+
+## Proposal
+
+**Adopt a modal, selection-first, log-backed interaction model as the contract for *whichever* shell
+wins**, and validate it in the TUI spike (the cheapest place to test a keyboard model). Proposed
+concretely:
+
+1. **Four modes.** `Normal` (navigate, select, act), `Visual` (extend/refine a selection, then act),
+   `Insert` (text only: clip names, markers, search), `Command` (`:` prompt). The mode is always
+   visible in the statusline; `Esc` always returns to `Normal`; nothing destructive happens in a
+   mode the user cannot see.
+2. **Selection-first (noun, then verb).** One `Selection` value with kinds — *clip*, *time span on a
+   track*, *track*, *mixer channel*, *pool source* — always rendered, and every destructive command
+   acts on it. Split / trim / move / duplicate / delete / fade become "select, then act", so the
+   acted-on set is verifiable **before** it changes. This is the property that removes the need for
+   confirmation dialogs a TUI has no room for.
+3. **`:` is the existing vocabulary — do not invent a second one.** The prompt types what the CLI
+   already parses, bindings dispatch the same commands, and both land in the same log. Keys, macros,
+   tests, the LLM seam and the undo stack then share one vocabulary (the Emacs "everything is a
+   command" property, which this repo already has latent).
+4. **Registers, repeat, macros.** Named registers for clip selections (vim's `"a`), `.` to repeat the
+   last edit, and recorded command sequences — all of which fall out of having a command list.
+5. **Discoverability is part of the contract, not a nicety.** A prefix infobox (which-key style:
+   show the labelled children of the key you just pressed), a command palette whose second column
+   shows the bound keys, `:help`, an interactive tutor, and **documentation generated from the live
+   keymap** so it cannot drift. A modal model without these is a maze.
+6. **The mouse is a second input to the same commands.** A click dispatches the command its key
+   would; there is no parallel pointer path, one log, one undo stack. (This is how the model stays
+   honest in a GUI shell, and it is why the shipped shell does not have to be thrown away.)
+7. **The Emacs half is extensibility.** Plugins contribute *commands + bindings + views*, not
+   bespoke UI — which is the composition thesis again, and makes runtime-contributed UI an explicit
+   open question in a compiled shell (see the [iced evaluation](2026-09-21-iced-shell-evaluation.md),
+   criterion 4).
+8. **Where the model must bend, it bends deliberately.** Live capture/recording is not text-like: the
+   transport is global, always available, and identical in every mode — **recording is never modal**.
+   Mixing is fader-like: a momentary grab mode (or per-channel command surface) rather than pretending
+   a fader is a text motion.
+
+## Alternatives considered
+
+- **Pointer-first DAW UI (today, by default).** Panels, drag, canvas editing. Rejected as the
+  *primary* model — it hides the log, makes the shell the product, and throws away an ergonomic
+  advantage the architecture already paid for. **Kept as the baseline the model must not break**:
+  the GUI shell keeps working, with the modal model layered on as keys + a visible mode + the same
+  commands.
+- **Pure REPL / live-coding (Tidal-style).** Everything is a typed command, no visual arrangement.
+  Rejected: the arrangement **is** the product; a timeline has to be visible and shaped on screen.
+  (This is also why the Helix study matters more than the Tidal lineage here.)
+- **Tracker model (pattern grid).** A character-grid editing surface with decades of proven
+  ergonomics — but it models *step/pattern* music, not a clip arrangement over recorded audio. Not
+  rejected as an inspiration (the grid is a good visual vocabulary for a clip matrix); rejected as
+  the editing model for timeline audio.
+- **Menu-driven TUI with no modes** (nano/micro style). Fewer concepts, trivially discoverable, but
+  the reason to consider a TUI at all is speed and composability; vim/helix answered "powerful and
+  discoverable" with modes *plus* strong discovery aids, which is the combination proposed here.
+- **Modal keys + drag-first timeline (a true hybrid) as the *first* step.** Not rejected — arguable
+  end state for the GUI shell, and criterion 6 in the proposal is the bridge. Not chosen as the
+  first step because a modal model is cheapest to test where there is no mouse to fall back on.
+
+## Acceptance criteria
+
+The model is decided (this note becomes implemented, or is rejected) when:
+
+1. **A keymap spec exists as data** — modes × bindings × commands — loadable by the shell, with the
+   `host v1` verb set as the command vocabulary, and a test asserting every binding names a real
+   command (no binding can drift from the log).
+2. **`:` and the keys dispatch the same commands** in the spike, both visible in the log; a scripted
+   session and a hand-played session produce the same event sequence.
+3. **Everything is reachable and documented from the model**: every command appears in the palette
+   with its bound keys, and the in-app help is generated from the keymap (no hand-written second
+   copy).
+4. **A real session works keyboard-only** — select a clip, split, move, duplicate, mute a channel,
+   set a marker, bounce — with no mouse, and the session reports **keystrokes and mode switches per
+   gesture** so the claim ("fewer, and composable") is measured rather than asserted.
+5. **One gesture is one undo step**, verified in the log: a drag-equivalent operation appears as a
+   single logged command, not one per key repeat.
+6. **The shipped GUI shell still works**, and the model is additive to it (keys + a visible mode over
+   the existing commands), not a replacement of the pointer path.
+
+## Risks
+
+- **The learning cliff is real.** Modality is a bet on a user who will invest; vim's ergonomics are
+  also its reputation. The mitigation is criteria 3 and 5 of the proposal (discovery aids are not
+  optional), and shipping `Normal` mode as fully usable without `Visual`.
+- **Audio is two-dimensional and continuous; text is one-dimensional and discrete.** "Next word" has
+  no obvious audio analogue — it has several (next clip boundary, next beat, next marker, next
+  transient, next channel). Choosing those motions *is* the design work, and getting them wrong is
+  how a vim-for-audio becomes unusable rather than powerful.
+- **Recording and mixing resist modes.** Handled by proposal item 8, but it means the model is not
+  uniform: there will be a global transport rule and a fader exception, and inconsistency is exactly
+  what makes modal UIs frustrating.
+- **The GUI shell could rot into a second-class citizen.** If the modal model is the "real" model,
+  the Vue shell risks becoming a viewer. Criterion 6 exists to prevent that, but it needs real
+  attention, not a checkbox.
+- **Scope.** This is a genuine product-level bet: it shapes the keymap, the help system, the plugin
+  surface and the shell choice. It should be validated on the TUI spike (cheap, keyboard-native)
+  before any of it is built into the shipped shell — which is exactly why the shell evaluation and
+  this note have to be decided together.
+
+## Attribution
+
+Authored with DeepSeek-v4-flash · DeepSeek Harness, 2026-09-21. The direction is the human's
+("what we want from ui/tui is to be for audio what helix/vim/emacs is for text … visual mode for
+selecting"); the supporting evidence is the [Helix + terminal-drawing study](../../../../research/architecture/2026-09-21-tui-audio-prior-art.md)
+and the existing `host v1` command contract.

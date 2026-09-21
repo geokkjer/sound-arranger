@@ -66,6 +66,12 @@ question, and keep the Tauri + Vue shell shipped until those measurements exist.
 - **A second candidate is now in flight**: a terminal shell
   ([TUI evaluation](2026-09-21-tui-shell-evaluation.md)), deliberately scoped identically, so the
   choice is between three shapes rather than two.
+- **And the interaction model is now a decided direction, separate from the shell**: the UI should be
+  *for audio what vim/helix/emacs is for text* — modal, selection-first, with the existing `host v1`
+  vocabulary as the `:` command line ([modal editing model](2026-09-21-modal-editing-model.md)).
+  iced can host that model (keys, a visible mode, the same commands), but the two decisions belong
+  together: a GUI-shaped shell hides the log that this engine is built around, and a modal model is
+  cheapest to validate where there is no mouse to fall back on.
 - **The spikes are already earning their keep on the host side**: running them against live audio
   surfaced a one-time ~2–3 s underrun-counter burst at the first transport command
   ([bug-fix note](../bug-fix/2026-09-21-live-host-underrun-burst-on-transport-change.md)).

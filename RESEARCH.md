@@ -187,6 +187,13 @@ evaluation note is [`.agents/notes/proposed/architecture/2026-09-21-iced-shell-e
 **Where it stands:** a spike, not a decision. The shipped shell stays Tauri + Vue until the canvas
 slice and the widget inventory above are answered.
 
+**The shell and the model are one decision (2026-09-21).** The direction is that the UI should be
+*for audio what vim/helix/emacs is for text* — modal, selection-first, with the existing `host v1`
+vocabulary as the `:` command line — written down in the
+[modal editing model note](.agents/notes/proposed/architecture/2026-09-21-modal-editing-model.md).
+iced can host that model, but a GUI-shaped shell hides the log this engine is built around, so the
+two are evaluated together; the keyboard-native TUI is where the model gets tested first.
+
 ### 4.6 ratatui — the terminal shell (under evaluation, 2026-09-21)
 
 **Why it is on the table.** `egui` and Slint are out by inspection (immediate mode; a second view
@@ -226,10 +233,10 @@ zero-height crash.
 
 **What is still open — the questions that decide it.**
 
-1. **The timeline.** A terminal cannot draw a waveform at DAW fidelity without an image protocol
-   (Kitty graphics / sixel); the fallback — braille/block codepoints, or a list of clips with a
-   coarse tape map — is a much smaller instrument. Density (clips × seconds of material per screen)
-   and whether editing gestures survive keyboard-only are unmeasured.
+1. **The timeline.** The density is now known analytically (see *Reference and prior art* below):
+   a terminal gives an overview envelope, not samples. What is still missing is the **built
+   prototype** — envelopes from the real peak pyramid, clip boundaries, playhead, and the keyboard
+   editing gestures — and an honest statement of what it cannot do.
 2. **Mouse vs keys.** The working hypothesis is that a well-designed key scheme carries the
    workflow and the mouse is a bonus; mouse capture in a terminal is global (it takes over
    copy/paste) and interacts with multiplexers. A task-level comparison is the test.
@@ -238,7 +245,38 @@ zero-height crash.
 4. **Sizes and fonts.** Anything that only works at one terminal size is not shippable; the
    zero-height crash is the first instance of a whole class.
 
+**Reference and prior art (2026-09-21).** Two questions the spike left open now have answers in the
+[Helix + terminal-drawing study](research/architecture/2026-09-21-tui-audio-prior-art.md):
+
+- **The interaction model.** [Helix](https://github.com/helix-editor/helix) is the reference, and
+  not for its text engine: **selection-first** ("select, then act") fits clips better than text —
+  the selection *is* `{track, clip, start, end}` and it is rendered before anything is destroyed —
+  plus a labelled keymap trie with "user wins" TOML overrides, a **prefix infobox** (better than the
+  spike's full-screen `?` help), a command palette with a reverse-bound-keys column, the statusline
+  as configured data, and **docs generated from the live keymap**. Crucially, the `:` prompt needs
+  *no new vocabulary*: the versioned `host v1` text format already is that command line.
+- **The timeline.** It is a density question, and the answer is **overview, not samples**: ~400 time
+  columns and ~200 amplitude steps at 200×50, 0.45 s/column for a 3-minute clip, zoom floor ~0.6 ms
+  (~30 samples). So the design is a **min/max envelope per column from the existing peak pyramid**
+  (`PeakBuilder::range_minmax` — the `audiowaveform` model, no new audio work), braille (2×4
+  sub-cells, one colour per cell) for lanes and blocks (colour per sub-pixel) for clip bars, meters
+  and playhead. Terminal **image protocols are a detail-pane luxury, not the timeline**: Kitty is
+  stateful and can draw under text, sixel is immediate-mode and erased by text over it, tmux has no
+  Kitty support, and Alacritty/Konsole are unusable. No terminal app was found that draws an
+  *editable* multi-track waveform timeline — the ground is unclaimed.
+
 **Where it stands:** a spike, not a decision. The shipped shell stays Tauri + Vue.
+
+**Prior art, precisely (2026-09-21).** The [study](research/architecture/2026-09-21-tui-audio-prior-art.md)
+§3 surveyed the field and §5 draws the line. The gap is narrow but exact: **no terminal program
+draws a waveform in a multi-track arrangement.** Everything waveform-capable is a single-file sample
+editor (`tui-wave` — the closest prior art, alive, braille everywhere plus Kitty graphics,
+cut/copy/undo on **one** buffer; `MrDopey/audio-tui-editor` — agent-built, destructive in-place
+trimming), a live meter/scope with no file (cava, Open Cubic Player, Prism at 60 FPS, scope-tui,
+sgram-tui), or a MIDI-only DAW (Phosphor, tek's arranger). None has a timeline; none has a
+non-destructive clip model over a log. Since the three closest are agent-built or LLM-assisted, the
+rendering is not the moat — **the clip/timeline model is**. And the interaction direction is now
+written down: [modal editing: audio's vim/helix](.agents/notes/proposed/architecture/2026-09-21-modal-editing-model.md).
 
 ---
 
