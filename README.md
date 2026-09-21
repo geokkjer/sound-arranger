@@ -1,12 +1,14 @@
 # sound-arranger (working title)
 
-> 🕒 Last verified against commit `1ac4f28` (2026-09-10). If the code has
+> 🕒 Last verified against commit `bc91299` (2026-09-21). If the code has
 > moved on, trust the code and move this line forward.
 
 An **audio platform where everything is a plugin**: a minimal core — clock · audio graph
 interpreter · session event log · context plumbing — with every capability as a plugin, and
 the product an **assembled profile**. Rust (engine core + media engine + host), driven by a
-Tauri v2 + Vue 3 shell over the Host API (the same versioned text format the CLI drives).
+Tauri v2 + Vue 3 shell over the Host API (the same versioned text format the CLI drives) — with
+**iced** under evaluation as an in-process Rust shell that would remove the webview, the IPC wire
+and TypeScript entirely ([RESEARCH §4.5](RESEARCH.md), [evaluation note](.agents/notes/proposed/architecture/2026-09-21-iced-shell-evaluation.md)).
 
 ## Scope (focused core)
 
@@ -63,6 +65,7 @@ sketched pending selection wiring; record is still chrome). The direction is loc
 | `crates/media` | The media engine (core-privileged, not a plugin): disk streaming, splice-during-playback, recording writer with crash recovery, **device-clock drift compensation wired into the capture**, multi-channel capture → **float-WAV media pool with live peak pyramids**, pool **enumeration + crash recovery** (finalize un-finalized takes, rebuild `.peaks`), the **clip editor's value + ACID ops + `ArrangerNode`** (renders a track from the value), and the **`ArrangeOp ↔ engine-command` codec**. | works, tested |
 | `crates/host` | The **Host API contract** (commands = logged events, events, values) + the **headless reference host**: `run_script` assembles the profile and bounces byte-identically — now including the **clip-arrangement commands** (`pool`/`arrange`) in the versioned **text format**, so the CLI smoke binary drives the clip editor end-to-end. It is also a **persistent live session** (`execute()` for incremental edits, `arrangement()` for a serializable snapshot a shell reads). The UI-as-plugin seam — the Tauri shell implements the same contract; swapping shells swaps only the transport adapter. | works, tested |
 | `crates/shell` | The Tauri v2 + Vue 3 shell — now a **working timeline editor**, not a stub: the four planned views as components (`Surface`, `TimelineCanvas`, `SourcePool` with Project/Library contexts, `MixerPanel`, `DetailView`), plus `bridge` (the Host API over Tauri), `transport`, `editor` (undo/redo replayed from the host's session log) and the timeline viewport/editing maths with unit tests. The Detail View is present with its three context tabs, but its bodies are placeholders pending selection wiring. | works; UI wiring in progress |
+| `spikes/iced-shell` | The **iced evaluation spike** (its own workspace, excluded from the core build): a minimal second shell — window, transport, channel/master meters following the audio — driving the *same* `host::live::HostHandle` as the Tauri bridge, but in-process: no IPC, no serde wire, no webview. Ships a headless `--probe` mode that asserts live meter signal. iced 0.14. | spike; decision open — delete the directory to drop the option |
 | `plugins/` | **Sidecar plugins** (placeholder): VST3/CLAP builds of core capabilities and the CDP / offline-process sidecar (`OfflineProcess`). Not engine crates — thin wrappers that expose a capability to a plug-in API. See [plugins/README.md](plugins/README.md). | placeholder |
 
 **191 Rust tests + 38 frontend unit tests**, all passing; the core's invariants (byte-identical
@@ -148,21 +151,34 @@ by the [`~/Projects/music`](../music/README.md) symlink view.
 
 ## Dev environment
 
-**Native host toolchain** (Arch/CachyOS). Dev builds use the system Rust, `node`/`pnpm`, and the
-**host** GTK/WebKit/Mesa. The Nix/devenv setup is parked under [`nix/`](nix/): on this non-NixOS
-host a Nix-built GUI binary cannot open a window (the Nix glvnd ships no EGL vendor, and host WebKit
-needs `GLIBC_2.44` vs the Nix toolchain's 2.42). The diagnosis and the decision are in the
-[native host dev toolchain note](.agents/notes/implemented/process/2026-09-10-native-host-dev-toolchain.md).
+**Native host toolchain** (Arch/CachyOS). Dev builds use the system `node`/`pnpm` and the
+**host** GTK/WebKit/Mesa; the **Rust toolchain is rustup-managed**, declared in
+[`rust-toolchain.toml`](rust-toolchain.toml) (`stable` + rustfmt/clippy/rust-analyzer), so the
+compiler is a property of the repo rather than of the distro package. The Nix/devenv setup is
+parked under [`nix/`](nix/): on this non-NixOS host a Nix-built GUI binary cannot open a window (the
+Nix glvnd ships no EGL vendor, and host WebKit needs `GLIBC_2.44` vs the Nix toolchain's 2.42). The
+diagnosis and the decisions are in the
+[host toolchain note](.agents/notes/implemented/process/2026-09-10-native-host-dev-toolchain.md)
+and the [rustup note](.agents/notes/implemented/process/2026-09-21-rustup-managed-toolchain.md).
 
-Install (Arch):
+Install (Arch) — `rustup` **replaces** the distro `rust` package (they conflict):
 ```sh
-sudo pacman -S --needed base-devel rust nodejs npm pnpm \
+sudo pacman -S --needed base-devel rustup nodejs npm pnpm \
   webkit2gtk-4.1 gtk3 libsoup3 librsvg libayatana-appindicator \
   alsa-lib openssl appmenu-gtk-module
+
+rustup default stable     # the repo's rust-toolchain.toml then supplies the components
 ```
 
 Frontend checks, from `crates/shell`: `pnpm typecheck` · `pnpm test` · `pnpm build`
 (and `pnpm tauri dev` to run the app).
+
+The **iced spike** is its own workspace, so iced and wgpu never enter the core build:
+```sh
+cd spikes/iced-shell
+cargo run              # the window (needs a display and an audio device)
+cargo run -- --probe   # headless proof: host thread + transport + live meters, no display needed
+```
 
 One-time git setup — hooks live in-repo:
 

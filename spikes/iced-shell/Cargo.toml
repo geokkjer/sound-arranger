@@ -1,0 +1,14 @@
+[package]
+name = "iced-shell"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "iced spike — the minimal proof that a second, in-process Rust shell can drive the Host API (iced-shell evaluation note)"
+
+# Its own workspace on purpose: iced (and wgpu) must not enter the default
+# `cargo build --workspace` of the core. This is an evaluation, not a shell yet.
+[workspace]
+
+[dependencies]
+iced = "0.14"
+host = { path = "../../crates/host" }

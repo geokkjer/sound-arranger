@@ -12,7 +12,7 @@
 |---|---|---|
 | **Target** | **x86 desktop first** (Linux primary; macOS/Windows via Tauri). ARM/RPi + hardware controls = a separate later phase | Best technical solution trumps; don't pre-optimize for a Pi |
 | **Direction** | **Umbrella-first** — the platform is the goal; profiles are the products; sound-arranger is profile #1 | [umbrella-first note](.agents/notes/proposed/architecture/2026-08-15-umbrella-first-product-direction.md) |
-| **App shell** | Tauri v2 + Vue 3 + TypeScript | Rust audio engine + web UI |
+| **App shell** | Tauri v2 + Vue 3 + TypeScript (shipped) — and **iced**, evaluated as an in-process Rust replacement (§4.5) | Rust audio engine + web UI; the single-stack option is a live question |
 | **Architecture** | **Minimal core (clock · graph interpreter · session log · context plumbing) + everything-else-as-plugin; the product is an assembled profile** | §11, §16.7, [minimal-core note](.agents/notes/proposed/architecture/2026-08-15-minimal-core-clock-graph-session-log.md) |
 | **UI library** | **`reka-ui` + shadcn-vue + Tailwind v4** (the "cdp-front" stack — now a documented decision, not a repo) | Headless primitives fit a bespoke DAW. Do **not** add Naive UI / PrimeVue |
 | **Timeline rendering** | `<canvas>` 2D + precomputed waveform **peak pyramids** + viewport culling + offscreen clip caching | Fast and predictable; DOM-per-clip is a dead end |
@@ -131,6 +131,61 @@ Supporting techniques:
 - **Never stream audio samples over IPC.** Peaks arrive downsampled; audio stays in Rust.
 - **Transport position** — local clock on the frontend, re-synced by sparse events (~10 Hz), not 60 Hz polling.
 - **Meters / job progress** via throttled `emit` events (~30 Hz).
+
+### 4.5 iced — the in-process Rust shell (under evaluation, 2026-09-21)
+
+**Why it is on the table.** The shipped shell is three runtimes for one program: a Rust core, a
+Rust transport adapter, and a TypeScript/Vue UI, with an IPC + serde wire between the last two.
+iced is the opposite bet — *all* of it in Rust, no HTML/CSS/JS split, and a framework built around
+[the Elm architecture](https://book.iced.rs/philosophy.html) (state · message · update · view),
+which is close to this project's own FP-shaped discipline (values, logged commands, replayable
+state). The [UI-as-plugin note](.agents/notes/implemented/architecture/2026-08-18-ui-as-plugin-host-api-and-headless-reference.md)
+already listed "egui / iced in-process shell — the boundary becomes voluntary" as the anticipated
+second host; this section is that option being *measured* rather than assumed.
+
+**Versions and features (verified 2026-09-21).** `iced 0.14.0` (released 2025-12-07, MSRV 1.88) is
+the released baseline; `master` is `0.15.0-dev` (edition 2024, MSRV **1.93**) — so the pinned
+`stable` toolchain is a prerequisite, not a luxury. Default features are
+`["wgpu", "tiny-skia", "crisp", "web-colors", "thread-pool", "linux-theme-detection", "x11", "wayland"]`:
+GPU (wgpu) *and* software (tiny-skia) renderers, both windowing backends. Two API facts that matter
+to a live shell:
+
+- **Frame-driven redraw has no timer backend.** `time::every()` exists only in iced's tokio/smol
+  time backends, which the default feature set does *not* enable. `iced::window::frames()` →
+  `Subscription<Instant>` is the idiom instead: each redraw is itself a message, so the loop is
+  self-sustaining. That is exactly what a playhead wants.
+- **`update` may return `()` or `Task<Message>`**; the builder form is
+  `iced::application(boot, update, view).title(..).subscription(..).theme(..).window_size(..).run()`.
+
+**What the spike measured** ([`spikes/iced-shell/`](spikes/iced-shell/), isolated workspace, iced
+0.14): the window opens and renders on this host (niri/Wayland, Mesa, wgpu — the exact thing the
+parked Nix/devenv shell died on); the shell owns the **same `host::live::HostHandle`** the Tauri
+bridge uses, in-process (no IPC, no webview, no serde wire); transport (play/stop/rewind) drives it
+and channel + master meters and the position readout follow the audio; the audio device opened at
+its own rate with no negotiation work; and a headless `--probe` mode (boot → load → play → poll the
+published `Snapshot`) is CI-able and fails loudly when no meter signal appears. The
+evaluation note is [`.agents/notes/proposed/architecture/2026-09-21-iced-shell-evaluation.md`](.agents/notes/proposed/architecture/2026-09-21-iced-shell-evaluation.md).
+
+**What is still open — the questions that actually decide it.**
+
+1. **Canvas parity.** The Vue timeline's maths (`timelineView` / `timelineEdit` / `timelineTicks` +
+   unit tests) and its peak-pyramid drawing have to exist in iced's `canvas` widget at 60 fps
+   before this is a real option. Unmeasured.
+2. **The widget gap.** reka-ui/shadcn give menus, dialogs, popovers, tooltips, context menus,
+   comboboxes, virtualised lists, drag-and-drop, and text inputs with IME. iced ships a smaller
+   core set (`button`, `text_input`, `pick_list`, `slider`, `pane_grid`, `table`, `scrollable`,
+   canvas) plus third-party crates (`iced_aw`, …). The count of hand-rolled widgets
+   *is* the cost of the single stack.
+3. **The UI-as-plugin tension.** The composition thesis wants UI plugins loaded at runtime; the Vue
+   shell does that with a declarative loader + registry. Compiled Rust has no runtime widget
+   loader — an iced shell would need a data-driven view layer or a WASM/scripted seam to keep that
+   promise. This is the sharpest architectural question, not a performance one.
+4. **Framework churn.** iced is a single-maintainer project that explicitly reserves the right to
+   break its API (0.14 is the released baseline; `master` already requires rustc 1.93). That is a
+   real ongoing cost against a frozen Vue/webview baseline.
+
+**Where it stands:** a spike, not a decision. The shipped shell stays Tauri + Vue until the canvas
+slice and the widget inventory above are answered.
 
 ---
 

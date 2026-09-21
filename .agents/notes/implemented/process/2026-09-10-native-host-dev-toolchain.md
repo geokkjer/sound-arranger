@@ -31,14 +31,16 @@ vendor, and the host GUI libs demand a newer glibc than the Nix toolchain provid
 
 ## Decision
 
-**Dev builds and runs with the host toolchain; the Nix/devenv config is parked.** There is no
-`rust-toolchain.toml` (Arch's rolling `rust` = latest stable is the target) and no Nix GUI libs in
-play. Concretely:
+**Dev builds and runs with the host toolchain; the Nix/devenv config is parked.** No Nix GUI libs
+are in play. Concretely:
 
 - `devenv.nix`, `devenv.lock`, `devenv.yaml`, and `flake.nix` move to **`nix/`** (kept for a future
   reproducible/packaged build), and **`.envrc` is removed**, so direnv no longer activates the
   devenv. `nix/README.md` records why it is parked.
-- Dev deps are host packages: `rust` (rustc / cargo / rustdoc / rustfmt / clippy), `nodejs` / `npm`
+- Dev deps are host packages: `rustup` (rustc / cargo / rustdoc / rustfmt / clippy / rust-analyzer
+  — the toolchain *mechanism* later moved from the Arch `rust` package to rustup under a declared
+  `rust-toolchain.toml`; see the [rustup toolchain note](2026-09-21-rustup-managed-toolchain.md)),
+  `nodejs` / `npm`
   / `pnpm`, `base-devel` / `gcc` / `pkgconf`, `webkit2gtk-4.1`, `gtk3`, `libsoup3`, `librsvg`,
   `libayatana-appindicator`, `alsa-lib`, `openssl`, `appmenu-gtk-module`.
 - The build is a plain host build — host `cargo` + host `cc` + host `pkg-config`. Verified: the
@@ -57,9 +59,12 @@ a real packaging need appears.
 - **Keep the Nix toolchain and link host GUI libs (the `PKG_CONFIG` / `LIBRARY_PATH` / host-`cc`
   experiments).** Impossible on the evidence: host WebKit needs `GLIBC_2.44`, the Nix toolchain's
   glibc is 2.42. Rejected.
-- **`rustup` + a pinned `rust-toolchain.toml`.** No pin is currently needed (no nightly features;
-  edition 2024 is stable), and Arch's `rust` tracks stable with less machinery. Kept as an option
-  if a pin becomes useful.
+- **`rustup` + a pinned `rust-toolchain.toml`.** Rejected *at the time* — no pin was needed (no
+  nightly features; edition 2024 is stable) and Arch's `rust` tracked stable with less machinery.
+  **Later adopted**, as a declared `stable` channel rather than a version pin: see the
+  [rustup toolchain note](2026-09-21-rustup-managed-toolchain.md), which supersedes this note's
+  toolchain *mechanism* while leaving its Nix diagnosis and its "no Nix in the dev loop" decision
+  intact.
 - **Keep `.envrc` and disable the devenv per-shell.** Fragile — it is easy to re-enter the Nix shell
   by accident and silently get the Nix toolchain again. Removing `.envrc` is unambiguous.
 
@@ -68,6 +73,9 @@ a real packaging need appears.
 - `pnpm tauri dev` and `cargo test --workspace` run in a **plain terminal** (not a devenv shell);
   the GUI uses the host GTK/WebKit/Mesa and opens normally.
 - The dev loop depends on host packages rather than a Nix closure; the README lists them.
+- The toolchain itself is now **rustup-managed and declared in `rust-toolchain.toml`**, not the
+  distro `rust` package — see the [rustup toolchain note](2026-09-21-rustup-managed-toolchain.md).
+  The "host toolchain, no Nix" decision above is unchanged; reproducibility is still deferred.
 - Reproducibility is unowned until packaging; `nix/` preserves the previous attempt and its lock.
 - A different machine (or CI) would need the same host libs; the packaging story is the place to
   solve this properly.

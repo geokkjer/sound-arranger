@@ -1,0 +1,14 @@
+# The repo's toolchain, managed by rustup (not the distro package).
+#
+# `stable` rather than a hard version pin: this project tracks a rolling target
+# and `rustup update` is the intended way to move. The point of the file is that
+# the toolchain is *declared here* — explicit, per-repo, and independent of
+# whatever `/usr/bin/rustc` a distro upgrade happens to install.
+#
+# Components are listed so a fresh machine gets the full dev set in one step:
+# rustup installs them on first use. See the toolchain note:
+# .agents/notes/implemented/process/2026-09-21-rustup-managed-toolchain.md
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy", "rust-analyzer"]
+profile = "default"
