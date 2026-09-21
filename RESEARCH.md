@@ -277,6 +277,14 @@ terminal at **98.917 ms/col**, the zoom-out ceiling is the arrangement **plus a 
 zoom floor stays the pyramid's one bin (5.333 ms/col). A 6 s seek blocks the UI thread for
 **~92 ms** — `TransportSeek` is O(target), now measured rather than theorised.
 
+**The mixer is a console now (2026-09-21).** With an arrangement loaded the mixer takes the right-hand
+column as **channel strips** — a fader with a visible position, a meter fed by the host's snapshot, a
+name with mute/solo flags, a value, and a master strip. Keys ride it (`+`/`-`, `0`, `M`, `S`) and the
+mouse can click or drag a strip; every change is dispatched as `set_param mixer …` **through the
+host's text format**, so a fader ride lands in the session log as automation
+(`last command: set_param (0.1 ms)` — unlike `TransportSeek`'s ~92 ms O(target) rebuild). Known gap:
+the shell cannot *read* gains back from the host yet, so a reload resets faders to unity.
+
 **Where it stands:** a spike, not a decision. The shipped shell stays Tauri + Vue.
 
 **Prior art, precisely (2026-09-21).** The [study](research/architecture/2026-09-21-tui-audio-prior-art.md)

@@ -31,6 +31,11 @@ What this spike adds, because it is what a TUI has to answer for:
 - **panel focus** — `Tab`/`Shift-Tab` move between the mixer and the timeline, the
   focused panel shows a lit border, and `j`/`k` mean "channel" or "track"
   depending on where you are;
+- **a console, not a bar chart** — with a timeline loaded the mixer moves to the
+  **right** and becomes channel strips: a fader with a visible position, a meter
+  beside it, a name and a value, mute/solo flags, and a master strip. Ride it with
+  `+`/`-`, reset with `0`, click or drag a strip with the mouse; every change goes
+  to the host as a logged `set_param` (see below);
 - **an explicit key scheme**, with a `?` overlay rendered from the same table the
   key handler uses, so the help cannot drift from the behaviour;
 - **mouse support** — click a panel to focus it, a lane to make that track active
@@ -129,6 +134,25 @@ cargo run -- --wave /tmp/demo.wav
 > scheduled frame, and everything before it is never written). Bounce per section
 > and join, or schedule nothing and vary the file another way.
 
+## The mixer
+
+With an arrangement loaded, the console takes the right-hand column and the
+timeline takes the rest — the desk layout, not a stack of panels. Each strip is a
+**fader** (`░` above the handle, `█` the handle, `│` below), a **meter** showing
+what the engine is publishing next to it, the channel name with a mute/solo flag
+(`ch0M`, `ch1S`), and the value. The last strip is the master.
+
+| | |
+|---|---|
+| **The host owns the audio** | The shell holds the fader positions it has *asked for* and sends each change as `set_param mixer ch<n>.gain …` — through the host's own text format. The meters are the host's, so moving a fader moves its meter. |
+| **A fader ride is automation** | Every step is a logged `set_param` at its frame, which is exactly what a moving fader on a real console records. `last command: set_param (0.1 ms in the UI thread)` — unlike a seek, a parameter change is cheap. |
+| **Keys** | `+`/`-` ride the selected fader by 0.05, `0` returns it to unity, `M` mutes, `S` solos, `j`/`k` (or `Tab` then the arrows) pick the strip. |
+| **Mouse** | Click or drag anywhere on a strip: the fader follows the row under the pointer, and the strip becomes the selected one. |
+| **Honest limit** | The shell cannot yet *read* the gains back from the host (the snapshot carries meters and transport, not parameters), so a reload resets the faders to unity while the engine keeps whatever was last logged. Reading the params — or replaying them from the log — is the follow-up; `RESEARCH.md` §4.6 tracks it. |
+
+Without an arrangement there is no console column (only one panel would be
+pointless), so the shell falls back to the wide meter bars under the transport.
+
 ## The keymap
 
 | keys | meaning |
@@ -142,15 +166,16 @@ cargo run -- --wave /tmp/demo.wav
 | `n` / `N` | timeline: jump the playhead to the next / previous clip |
 | `v` | **visual mode**: anchor a selection at the playhead |
 | `h` / `l` | timeline: scroll — in visual mode, extend the selection instead |
-| `+` / `-` | timeline: zoom in / out (floor: one peak bin per column) |
-| `0` | timeline: fit the whole arrangement |
+| `+` / `-` | timeline: zoom in / out · **mixer: ride the selected fader** |
+| `0` | timeline: fit · **mixer: fader to unity** |
+| `M` / `S` | **mixer: mute / solo** the selected channel |
 | `x` | timeline: razor-split the clip under the playhead |
 | `d` | timeline: delete the clip under the playhead |
 | `Esc` | leave visual mode / close this overlay — **never quits** |
 | `m` | toggle mouse capture |
 | `?` | the keymap |
 | `q` / `Ctrl+c` | quit |
-| mouse | click a panel to focus · a lane = that track + seek · the ruler = seek · a meter row = select · Play/Stop/Rewind · wheel = seek |
+| mouse | click a panel to focus · a lane = that track + seek · the ruler = seek · **drag a mixer strip = set that fader** · Play/Stop/Rewind · wheel = seek |
 
 ## What a deterministic frame looks like
 

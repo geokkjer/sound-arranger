@@ -37,7 +37,9 @@ use std::time::{Duration, Instant};
 use host::HostCommand;
 use host::live::{AudioStatus, HostHandle, Snapshot};
 
+mod mixer;
 mod timeline;
+use mixer::Mixer;
 use timeline::{Arrangement, Mode, Sources, View};
 
 use ratatui::crossterm::event::{
@@ -92,8 +94,12 @@ const KEYMAP: &[(&str, &str)] = &[
         "h  l",
         "timeline: scroll (visual mode: extend the selection)",
     ),
-    ("+  -", "timeline: zoom in / out"),
-    ("0", "timeline: fit the whole arrangement"),
+    (
+        "+  -",
+        "timeline: zoom in / out · mixer: ride the selected fader",
+    ),
+    ("0", "timeline: fit · mixer: fader to unity"),
+    ("M  S", "mixer: mute / solo the selected channel"),
     ("x", "timeline: split the clip under the playhead"),
     ("d", "timeline: delete the clip under the playhead"),
     ("n  N", "timeline: jump to the next / previous clip"),
@@ -158,6 +164,11 @@ struct App {
     buttons: Vec<(Rect, Action)>,
     meter_rows: Vec<(usize, Rect)>,
     mixer_rect: Rect,
+    /// The console: fader positions, mutes and solos the shell has asked the
+    /// host for (the host owns the audio state; this is the view of the ask).
+    mixer: Mixer,
+    /// What the mixer strips drew, for hit-testing.
+    strips: mixer::Strips,
     /// The timeline: the arrangement the host holds, its viewport, the focused
     /// panel, the active track, and the mode.
     arrangement: Option<Arrangement>,
@@ -226,6 +237,8 @@ impl App {
             last_command: None,
             buttons: Vec::new(),
             meter_rows: Vec::new(),
+            mixer: Mixer::new(4),
+            strips: mixer::Strips::default(),
             mixer_rect: Rect::default(),
             arrangement: None,
             sources: Sources::default(),
@@ -433,6 +446,8 @@ impl App {
             last_command: None,
             buttons: Vec::new(),
             meter_rows: Vec::new(),
+            mixer: Mixer::new(4),
+            strips: mixer::Strips::default(),
             mixer_rect: Rect::default(),
             arrangement: None,
             sources: Sources::default(),
@@ -494,7 +509,8 @@ impl App {
     }
 
     fn select(&mut self, delta: i64) {
-        let count = self.snap.channel_count as i64;
+        // Strips include the master, so the console's last strip is reachable.
+        let count = self.mixer.strips() as i64;
         if count == 0 {
             return;
         }
@@ -534,13 +550,11 @@ impl App {
             // editing talk to the host).
             KeyCode::Char('h') | KeyCode::Left => self.timeline_key(|app| app.timeline_move(-1)),
             KeyCode::Char('l') | KeyCode::Right => self.timeline_key(|app| app.timeline_move(1)),
-            KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char('Z') => {
-                self.timeline_key(|app| app.timeline_zoom(true))
-            }
-            KeyCode::Char('-') | KeyCode::Char('z') => {
-                self.timeline_key(|app| app.timeline_zoom(false))
-            }
-            KeyCode::Char('0') => self.timeline_key(|app| app.timeline_fit()),
+            KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char('Z') => self.plus(),
+            KeyCode::Char('-') | KeyCode::Char('z') => self.minus(),
+            KeyCode::Char('0') => self.zero(),
+            KeyCode::Char('M') => self.mixer_key(|app| app.mute()),
+            KeyCode::Char('S') => self.mixer_key(|app| app.solo()),
             KeyCode::Char('v') => self.timeline_key(|app| app.visual()),
             KeyCode::Char('x') => self.timeline_key(|app| app.split_at_playhead()),
             KeyCode::Char('d') => self.timeline_key(|app| app.delete_at_playhead()),
@@ -573,6 +587,89 @@ impl App {
     fn timeline_key(&mut self, action: impl FnOnce(&mut App)) {
         if self.focus == Panel::Timeline {
             action(self);
+        }
+    }
+
+    /// Run `action` only when the mixer is the focused panel.
+    fn mixer_key(&mut self, action: impl FnOnce(&mut App)) {
+        if self.focus == Panel::Mixer {
+            action(self);
+        }
+    }
+
+    /// `+` / `-` / `0` mean different things per panel — the payoff of the focus
+    /// ring: zoom the timeline, or ride the selected fader.
+    fn plus(&mut self) {
+        match self.focus {
+            Panel::Timeline => self.timeline_zoom(true),
+            Panel::Mixer => self.ride(0.05),
+        }
+    }
+
+    fn minus(&mut self) {
+        match self.focus {
+            Panel::Timeline => self.timeline_zoom(false),
+            Panel::Mixer => self.ride(-0.05),
+        }
+    }
+
+    fn zero(&mut self) {
+        match self.focus {
+            Panel::Timeline => self.timeline_fit(),
+            Panel::Mixer => self.set_fader(self.selected, 1.0),
+        }
+    }
+
+    /// Move the selected fader and tell the host. A fader ride is a stream of
+    /// logged `set_param` commands — which is what automation is.
+    fn ride(&mut self, delta: f32) {
+        let strip = self.selected;
+        let before = self.mixer.value(strip);
+        self.mixer.nudge(strip, delta);
+        let after = self.mixer.value(strip);
+        if (after - before).abs() > f32::EPSILON {
+            let param = self.mixer.gain_param(strip);
+            self.set_param(&param, after);
+        }
+    }
+
+    fn set_fader(&mut self, strip: usize, value: f32) {
+        let before = self.mixer.value(strip);
+        self.mixer.set_value(strip, value);
+        let after = self.mixer.value(strip);
+        if (after - before).abs() < f32::EPSILON {
+            return;
+        }
+        let param = self.mixer.gain_param(strip);
+        self.set_param(&param, after);
+    }
+
+    fn mute(&mut self) {
+        let strip = self.selected;
+        self.mixer.toggle_mute(strip);
+        let param = self.mixer.mute_param(strip);
+        let value = f32::from(u8::from(self.mixer.muted(strip)));
+        self.set_param(&param, value);
+    }
+
+    fn solo(&mut self) {
+        let strip = self.selected;
+        self.mixer.toggle_solo(strip);
+        let param = self.mixer.solo_param(strip);
+        let value = f32::from(u8::from(self.mixer.soloed(strip)));
+        self.set_param(&param, value);
+    }
+
+    /// Send one `set_param` **through the host's own text format**, so the
+    /// console speaks the same language a script does and the engine logs it.
+    fn set_param(&mut self, param: &str, value: f32) {
+        let script = format!("host v1\nset_param mixer {param} {value:.4}\n");
+        match host::parse_script(&script) {
+            Ok(commands) => match commands.into_iter().next() {
+                Some(command) => self.command("set_param", command),
+                None => self.status = format!("set_param {param}: nothing parsed"),
+            },
+            Err(e) => self.status = format!("set_param {param}: {e}"),
         }
     }
 
@@ -790,6 +887,19 @@ impl App {
     fn on_mouse(&mut self, mouse: MouseEvent) {
         let position = Position::new(mouse.column, mouse.row);
 
+        // A click or drag on a strip sets that fader from the row under the
+        // pointer — the one gesture a console is expected to have.
+        if matches!(
+            mouse.kind,
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)
+        ) && let Some((strip, ratio)) = self.strips.at(position)
+        {
+            self.focus = Panel::Mixer;
+            self.selected = strip;
+            self.set_fader(strip, ratio);
+            return;
+        }
+
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(action) = self.action_at(position) {
@@ -801,7 +911,7 @@ impl App {
                 // acts on what was clicked (seek, and make that track active).
                 if self.panel.outer.contains(position) {
                     self.focus = Panel::Timeline;
-                } else if self.mixer_rect.contains(position) {
+                } else if self.strips.contains(position) || self.mixer_rect.contains(position) {
                     self.focus = Panel::Mixer;
                 }
 
@@ -835,19 +945,27 @@ impl App {
         // The timeline panel appears when an arrangement is loaded; the meters
         // take its space otherwise.
         if self.arrangement.is_some() {
-            let [head, controls, meters, timeline_area, foot] = Layout::vertical([
+            let [head, controls, body, foot] = Layout::vertical([
                 Constraint::Length(5),
                 Constraint::Length(3),
-                Constraint::Length(self.snap.channel_count as u16 + 3),
-                Constraint::Min(6),
+                Constraint::Min(8),
                 Constraint::Length(5),
             ])
             .areas(area);
 
+            // The console sits on the right, as on a desk: strips wide enough to
+            // carry a fader, a meter, a name and a value — or as much of that as
+            // half the terminal allows.
+            let strips = self.mixer.strips() as u16;
+            let mixer_width = (strips * 6 + 2).min(area.width / 2).max(10);
+            let [timeline_area, mixer_area] =
+                Layout::horizontal([Constraint::Min(20), Constraint::Length(mixer_width)])
+                    .areas(body);
+
             self.draw_head(frame, head);
             self.draw_controls(frame, controls);
-            self.draw_meters(frame, meters);
             self.draw_timeline(frame, timeline_area);
+            self.draw_mixer(frame, mixer_area);
             self.draw_foot(frame, foot);
         } else {
             let [head, controls, meters, foot] = Layout::vertical([
@@ -867,6 +985,28 @@ impl App {
         if self.help {
             self.draw_help(frame, area);
         }
+    }
+
+    /// The console: channel strips with faders and meters, on the right. The
+    /// host owns the audio; the strips show the levels it publishes next to the
+    /// positions the shell has asked for.
+    fn draw_mixer(&mut self, frame: &mut Frame, area: Rect) {
+        self.mixer.resize(self.snap.channel_count);
+        self.mixer_rect = area;
+
+        let levels: Vec<f32> = (0..self.snap.channel_count)
+            .map(|channel| self.snap.channels[channel])
+            .collect();
+
+        self.strips = mixer::draw(
+            frame,
+            area,
+            &self.mixer,
+            &levels,
+            self.snap.master,
+            self.selected,
+            self.focus == Panel::Mixer,
+        );
     }
 
     /// The timeline: origin, ruler, one envelope lane per track, clip

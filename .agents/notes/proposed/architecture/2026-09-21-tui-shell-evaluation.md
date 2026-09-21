@@ -207,7 +207,17 @@ The spike exists and is verified; the decision is **open**:
   now only a widget away.
 - **Panel focus exists** (`Tab`/`Shift-Tab`, click-to-focus, a lit border), so `j`/`k` mean
   "channel" or "active track" depending on where the keys are pointed — the structure a multi-panel
-  editor needs, and the reason the mixer and the timeline can both be live in one key space.
+  editor needs, and the reason the mixer and the timeline can both be live in one key space. It pays
+  for itself immediately: `+`/`-`/`0` zoom and fit the timeline, and ride and reset a fader in the
+  mixer, without a modal prefix.
+- **The mixer is a console, not a bar chart** (the human's ask): with an arrangement loaded it takes
+  the right-hand column as channel strips — a fader with a visible position, a meter showing the
+  host's level beside it, a name with mute/solo flags, a value, and a master strip. Keys ride it
+  (`+`/`-`/`0`, `M`/`S`), the mouse can click/drag a strip, and each change goes to the host as a
+  logged `set_param` — so **a fader ride is automation in the session log**, which is what a moving
+  fader on a real console records. **Known gap:** the shell cannot read gains back from the host yet
+  (the snapshot carries meters and transport, not parameters), so a reload resets the faders while
+  the engine keeps what was logged; reading or replaying the params is the follow-up.
 - **Visual mode has a real object.** `v` anchors a selection at the playhead, `h`/`l` extend it, the
   state line shows the span and its duration, and `Esc` leaves — with `Esc` no longer quitting (the
   safety key must not be destructive; `q`/`Ctrl+c` are the way out).

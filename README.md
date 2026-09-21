@@ -1,6 +1,6 @@
 # sound-arranger (working title)
 
-> 🕒 Last verified against commit `992c4d4` (2026-09-21). If the code has
+> 🕒 Last verified against commit `5ce6793` (2026-09-21). If the code has
 > moved on, trust the code and move this line forward.
 
 An **audio platform where everything is a plugin**: a minimal core — clock · audio graph
