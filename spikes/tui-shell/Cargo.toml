@@ -15,3 +15,5 @@ description = "ratatui spike — the terminal counterpart of the iced spike, dri
 # drift from the widget crate's.
 ratatui = "0.30"
 host = { path = "../../crates/host" }
+# For the timeline: the peak pyramid (`media::peaks`) and the WAV reader.
+media = { path = "../../crates/media" }

@@ -31,10 +31,14 @@
 //! ```
 
 use std::io;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use host::HostCommand;
 use host::live::{AudioStatus, HostHandle, Snapshot};
+
+mod timeline;
+use timeline::{Mode, View, Wave};
 
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -79,28 +83,43 @@ const KEYMAP: &[(&str, &str)] = &[
     ("r  Home", "rewind to 0"),
     (",  .", "seek -1 s / +1 s (stops first)"),
     ("j  k  ↑  ↓", "select the next / previous channel"),
+    ("v", "visual mode: select from the playhead"),
+    (
+        "h  l",
+        "scroll the timeline (visual mode: extend the selection)",
+    ),
+    (
+        "+  -",
+        "zoom in (one frame per column) / out (fit the file)",
+    ),
+    ("0", "fit the whole file"),
+    ("Esc", "leave visual mode"),
     ("m", "toggle mouse capture"),
     ("?", "this keymap"),
     ("q  Esc  Ctrl+c", "quit"),
     (
         "mouse",
-        "click Play/Stop/Rewind · click a meter row to select · wheel = seek",
+        "click Play/Stop/Rewind · click a meter row · click the timeline = seek · wheel = seek",
     ),
 ];
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let keys = args.iter().any(|arg| arg == "--keys");
+    let wave = args
+        .windows(2)
+        .find(|pair| pair[0] == "--wave")
+        .map(|pair| std::path::PathBuf::from(&pair[1]));
 
     if args.iter().any(|arg| arg == "--probe") {
         std::process::exit(probe());
     }
 
     if args.iter().any(|arg| arg == "--dump") {
-        return dump(keys);
+        return dump(keys, wave);
     }
 
-    run(keys)
+    run(keys, wave)
 }
 
 // ---------------------------------------------------------------------------
@@ -127,6 +146,11 @@ struct App {
     /// no widget tree to query, so the view publishes what is clickable.
     buttons: Vec<(Rect, Action)>,
     meter_rows: Vec<(usize, Rect)>,
+    /// The timeline: an audio file, its viewport, and the current mode.
+    wave: Option<Wave>,
+    view: Option<View>,
+    mode: Mode,
+    panel: timeline::PanelRects,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -139,7 +163,7 @@ enum Action {
 impl App {
     /// Boot against the live host, with a real audio device when one exists, and
     /// load the demo profile. Failures land in `status`, never as a panic.
-    fn boot() -> Self {
+    fn boot(wave: Option<PathBuf>) -> Self {
         let host = HostHandle::spawn_with_audio();
         let status = match host::parse_script(DEMO_SCRIPT) {
             Ok(script) => match host.load(&script) {
@@ -154,7 +178,7 @@ impl App {
             Err(e) => format!("demo script does not parse: {e}"),
         };
 
-        App {
+        let mut app = App {
             snap: host.snapshot(),
             host,
             status,
@@ -165,6 +189,35 @@ impl App {
             last_command: None,
             buttons: Vec::new(),
             meter_rows: Vec::new(),
+            wave: None,
+            view: None,
+            mode: Mode::Normal,
+            panel: timeline::PanelRects::default(),
+        };
+
+        if let Some(path) = wave {
+            app.open_wave(&path);
+        }
+
+        app
+    }
+
+    /// Load an audio file into the timeline. A failure is a status line, never a
+    /// panic — the rest of the shell keeps working.
+    fn open_wave(&mut self, path: &std::path::Path) {
+        match Wave::load(path) {
+            Ok(wave) => {
+                self.status = format!(
+                    "timeline: {} — {:.2} s, {} Hz, {} frames",
+                    wave.file_name(),
+                    wave.seconds(),
+                    wave.sample_rate,
+                    wave.frames,
+                );
+                self.view = Some(View::new(&wave));
+                self.wave = Some(wave);
+            }
+            Err(e) => self.status = format!("cannot open {}: {e}", path.display()),
         }
     }
 
@@ -219,6 +272,10 @@ impl App {
             last_command: None,
             buttons: Vec::new(),
             meter_rows: Vec::new(),
+            wave: None,
+            view: None,
+            mode: Mode::Normal,
+            panel: timeline::PanelRects::default(),
         }
     }
 
@@ -297,12 +354,101 @@ impl App {
             KeyCode::Char('.') => self.nudge(1),
             KeyCode::Char('j') | KeyCode::Down => self.select(1),
             KeyCode::Char('k') | KeyCode::Up => self.select(-1),
+            // Timeline: the viewport is free to move; only seeking talks to the
+            // host (and that one is O(target), so it stays on `,`/`.` and clicks).
+            KeyCode::Char('h') | KeyCode::Left => self.timeline_move(-1),
+            KeyCode::Char('l') | KeyCode::Right => self.timeline_move(1),
+            KeyCode::Char('+') | KeyCode::Char('=') => self.timeline_zoom(true),
+            KeyCode::Char('-') | KeyCode::Char('z') => self.timeline_zoom(false),
+            KeyCode::Char('Z') => self.timeline_zoom(true),
+            KeyCode::Char('0') => self.timeline_fit(),
+            KeyCode::Char('v') => self.visual(),
             KeyCode::Char('?') => self.help = !self.help,
             KeyCode::Char('m') => self.toggle_mouse(),
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('q') => self.quit = true,
+            // Esc leaves visual mode first; a second Esc quits.
+            KeyCode::Esc => {
+                if self.mode == Mode::Visual {
+                    self.mode = Mode::Normal;
+                    if let Some(view) = self.view.as_mut() {
+                        view.selection = None;
+                    }
+                } else {
+                    self.quit = true;
+                }
+            }
             KeyCode::Char('c') if ctrl => self.quit = true,
             _ => {}
         }
+    }
+
+    // -- the timeline's update side ----------------------------------------
+
+    /// `h`/`l`: scroll in normal mode, extend the selection in visual mode. The
+    /// two behaviours are the whole point of the mode being visible.
+    fn timeline_move(&mut self, direction: i64) {
+        let Some(wave) = &self.wave else { return };
+        let width = self.panel.timeline.width.max(1) as u64;
+        let Some(view) = self.view.as_mut() else {
+            return;
+        };
+
+        if self.mode == Mode::Visual {
+            let head = view
+                .selection
+                .map(|(_, head)| head)
+                .unwrap_or(self.snap.frame);
+            let step = view.frames_per_cell as i64 * 4 * direction;
+            let next = (head as i64 + step).clamp(0, wave.frames as i64) as u64;
+            let anchor = view.selection.map(|(anchor, _)| anchor).unwrap_or(head);
+            view.selection = Some((anchor, next));
+            // Keep the head in view.
+            if next < view.start || next >= view.start + view.visible(width) {
+                view.start = next.saturating_sub(view.visible(width) / 2);
+                view.clamp(wave, width);
+            }
+        } else {
+            view.scroll(wave, width, direction * (width as i64 / 8).max(1));
+        }
+    }
+
+    fn timeline_zoom(&mut self, in_: bool) {
+        let Some(wave) = &self.wave else { return };
+        let width = self.panel.timeline.width.max(1) as u64;
+        let anchor = self.snap.frame;
+        if let Some(view) = self.view.as_mut() {
+            view.zoom(wave, width, anchor, in_);
+        }
+    }
+
+    fn timeline_fit(&mut self) {
+        let Some(wave) = &self.wave else { return };
+        let width = self.panel.timeline.width.max(1) as u64;
+        if let Some(view) = self.view.as_mut() {
+            view.fit(wave, width);
+        }
+    }
+
+    /// `v`: enter visual mode, anchoring a selection at the playhead.
+    fn visual(&mut self) {
+        let Some(view) = self.view.as_mut() else {
+            self.status = "visual mode needs a timeline: run with --wave <file.wav>".to_string();
+            return;
+        };
+        self.mode = Mode::Visual;
+        view.selection = Some((self.snap.frame, self.snap.frame));
+    }
+
+    /// A click on the timeline seeks the transport to that point — the mouse
+    /// dispatching exactly the command a key would, so there is one log.
+    fn timeline_seek(&mut self, position: Position) {
+        let (Some(wave), Some(view)) = (&self.wave, &self.view) else {
+            return;
+        };
+        let cell = (position.x.saturating_sub(self.panel.timeline.x)) as u64;
+        let frame = view.frame_at(cell).min(wave.frames);
+        self.stop();
+        self.command("seek", HostCommand::TransportSeek { frame });
     }
 
     fn toggle_mouse(&mut self) {
@@ -333,6 +479,13 @@ impl App {
                     return;
                 }
 
+                // Clicking the envelope or the ruler seeks there. (The ruler is
+                // its own rect so a drag-vs-scrub distinction can come later.)
+                if self.panel.timeline.contains(position) || self.panel.ruler.contains(position) {
+                    self.timeline_seek(position);
+                    return;
+                }
+
                 if let Some((channel, _)) = self
                     .meter_rows
                     .iter()
@@ -352,22 +505,58 @@ impl App {
     fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
 
-        let [head, controls, meters, foot] = Layout::vertical([
-            Constraint::Length(5),
-            Constraint::Length(3),
-            Constraint::Min(3),
-            Constraint::Length(4),
-        ])
-        .areas(area);
+        // The timeline panel appears only when a file is loaded; the meters take
+        // its space otherwise.
+        if self.wave.is_some() {
+            let [head, controls, meters, timeline_area, foot] = Layout::vertical([
+                Constraint::Length(5),
+                Constraint::Length(3),
+                Constraint::Length(self.snap.channel_count as u16 + 3),
+                Constraint::Min(6),
+                Constraint::Length(5),
+            ])
+            .areas(area);
 
-        self.draw_head(frame, head);
-        self.draw_controls(frame, controls);
-        self.draw_meters(frame, meters);
-        self.draw_foot(frame, foot);
+            self.draw_head(frame, head);
+            self.draw_controls(frame, controls);
+            self.draw_meters(frame, meters);
+            self.draw_timeline(frame, timeline_area);
+            self.draw_foot(frame, foot);
+        } else {
+            let [head, controls, meters, foot] = Layout::vertical([
+                Constraint::Length(5),
+                Constraint::Length(3),
+                Constraint::Min(3),
+                Constraint::Length(4),
+            ])
+            .areas(area);
+
+            self.draw_head(frame, head);
+            self.draw_controls(frame, controls);
+            self.draw_meters(frame, meters);
+            self.draw_foot(frame, foot);
+        }
 
         if self.help {
             self.draw_help(frame, area);
         }
+    }
+
+    /// The timeline: file, ruler, braille envelope, selection, playhead. The
+    /// panel publishes its rects for the mouse.
+    fn draw_timeline(&mut self, frame: &mut Frame, area: Rect) {
+        let Some(wave) = self.wave.as_ref() else {
+            return;
+        };
+        // The real panel width is only known once drawn (minus the border).
+        let inner_width = area.width.saturating_sub(2).max(1) as u64;
+        let Some(view) = self.view.as_mut() else {
+            return;
+        };
+        view.fit_if_needed(wave, inner_width);
+
+        let panel = timeline::draw(frame, area, wave, view, self.snap.frame, self.mode);
+        self.panel = panel;
     }
 
     fn draw_head(&self, frame: &mut Frame, area: Rect) {
@@ -467,8 +656,17 @@ impl App {
             return;
         }
 
-        // The rows that fit: one per channel plus the master.
-        let rows = (inner.height as usize).min(count + 1);
+        // The rows that fit: one per channel plus the master. When they do not
+        // all fit, the last row is reserved for the notice instead of drawing a
+        // meter under it (a small-terminal overlap, same class as the
+        // zero-height crash the pty run found).
+        let entries = count + 1;
+        let truncated = entries > inner.height as usize;
+        let rows = if truncated {
+            (inner.height as usize).saturating_sub(1)
+        } else {
+            entries
+        };
         let constraints = vec![Constraint::Length(1); rows];
         let row_areas = Layout::vertical(constraints).split(inner);
 
@@ -537,10 +735,11 @@ impl App {
         // A terminal can be resized to almost nothing; the notice goes on the
         // last visible row only when there is one. (A zero-height area here used
         // to underflow — found by running the spike under a pty.)
-        if count + 1 > rows && inner.height > 0 {
-            let hidden = count + 1 - rows;
+        if truncated && inner.height > 0 {
+            let hidden = entries - rows;
             frame.render_widget(
-                Paragraph::new(format!("… {hidden} more")).style(Style::new().fg(Color::DarkGray)),
+                Paragraph::new(format!("… {hidden} more (resize for the master)"))
+                    .style(Style::new().fg(Color::DarkGray)),
                 Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
             );
         }
@@ -557,8 +756,49 @@ impl App {
             None => "last command: —".to_string(),
         };
 
+        // The mode is always on screen — a modal UI that hides its mode is a trap
+        // (the modal editing note's first rule).
+        let mode_label = format!(" {} ", self.mode.label());
+        let mode = if self.mode == Mode::Visual {
+            Span::styled(
+                mode_label,
+                Style::new()
+                    .fg(Color::Black)
+                    .bg(Color::LightMagenta)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(
+                mode_label,
+                Style::new().fg(Color::Black).bg(Color::DarkGray),
+            )
+        };
+
+        let timeline = match (&self.wave, &self.view) {
+            (Some(wave), Some(view)) => {
+                let selection = view
+                    .selection_label(wave)
+                    .map(|label| format!("   sel {label}"))
+                    .unwrap_or_default();
+                let end = (view.start + view.visible(self.panel.timeline.width.max(1) as u64))
+                    .min(wave.frames);
+                format!(
+                    "   view {:.3}–{:.3} s of {:.3} s   {:.3} ms/col{selection}",
+                    view.start as f64 / wave.sample_rate as f64,
+                    end as f64 / wave.sample_rate as f64,
+                    wave.seconds(),
+                    view.ms_per_cell(wave),
+                )
+            }
+            _ => String::new(),
+        };
+
         let paragraph = Paragraph::new(vec![
-            format!("mouse: {}   {}", on_off(self.mouse), latency).into(),
+            ratatui::text::Line::from(vec![
+                mode,
+                Span::raw(format!("  mouse {}   {latency}", on_off(self.mouse))),
+                Span::styled(timeline, Style::new().fg(Color::Gray)),
+            ]),
             self.status.clone().into(),
         ])
         .block(Block::bordered().title(" state "))
@@ -599,11 +839,11 @@ impl App {
 // The terminal runtime
 // ---------------------------------------------------------------------------
 
-fn run(keys: bool) -> io::Result<()> {
+fn run(keys: bool, wave: Option<PathBuf>) -> io::Result<()> {
     let mut terminal = ratatui::init();
     let _ = execute!(io::stdout(), EnableMouseCapture);
 
-    let mut app = App::boot();
+    let mut app = App::boot(wave);
     app.help = keys;
     let outcome = event_loop(&mut terminal, &mut app);
 
@@ -641,10 +881,17 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
 /// `--dump`: render one deterministic frame and print it as plain text. This is
 /// the TUI's version of "look at the window" — what CI, the note, and a
 /// screenshot-less review can actually read. `--dump --keys` renders the keymap
-/// overlay instead of the main view.
-fn dump(keys: bool) -> io::Result<()> {
+/// overlay instead; `--dump --wave <file.wav>` renders the timeline for a real
+/// file (still deterministic: the viewport, the envelope and the synthetic
+/// playhead do not depend on timing).
+fn dump(keys: bool, wave: Option<PathBuf>) -> io::Result<()> {
+    // The synthetic snapshot stays the base so the dump is deterministic; the
+    // wave (if any) layers the timeline on top, with the playhead at 2.000 s.
     let mut app = App::demo();
     app.help = keys;
+    if let Some(path) = wave {
+        app.open_wave(&path);
+    }
 
     let backend = ratatui::backend::TestBackend::new(100, 26);
     // The test backend cannot fail, so these are expects rather than a Result
@@ -811,6 +1058,31 @@ mod tests {
         buffer_text(terminal.backend().buffer())
     }
 
+    /// A three-second WAV on disk (a loud second and a half, then silence), so
+    /// the timeline has a shape to look for and the synthetic 2.000 s playhead
+    /// lands inside the file.
+    fn wav_fixture(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "tui-shell-render-{name}-{}.wav",
+            std::process::id()
+        ));
+
+        let rate = 48_000u32;
+        let frames = rate as usize * 3;
+        let mut writer =
+            media::wav::WavWriter::create_float(&path, rate, 1).expect("create the fixture");
+        let samples: Vec<f32> = (0..frames)
+            .map(|i| {
+                let amplitude = if i < frames / 2 { 0.8f32 } else { 0.0 };
+                amplitude * (i as f32 * 0.05).sin()
+            })
+            .collect();
+        writer.write(&samples).expect("write");
+        writer.finalize().expect("finalize");
+        path
+    }
+
     #[test]
     fn the_readout_meters_and_transport_are_rendered() {
         let screen = rendered(&mut App::demo());
@@ -907,5 +1179,106 @@ mod tests {
 
         app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()));
         assert!(app.quit, "q quits");
+    }
+
+    #[test]
+    fn the_timeline_panel_draws_a_real_file() {
+        let path = wav_fixture("panel");
+        let mut app = App::demo();
+        app.open_wave(&path);
+        let screen = rendered(&mut app);
+
+        assert!(
+            screen.contains("timeline —"),
+            "no timeline panel:\n{screen}"
+        );
+        assert!(
+            screen.contains(path.file_name().unwrap().to_str().unwrap()),
+            "the file name is not shown:\n{screen}"
+        );
+        assert!(screen.contains("ms/col"), "no density readout:\n{screen}");
+        assert!(screen.contains("NORMAL"), "no mode indicator:\n{screen}");
+        assert!(
+            screen.contains('⣿') || screen.contains('⣤') || screen.contains('⠿'),
+            "no braille envelope was drawn:\n{screen}"
+        );
+        assert!(
+            screen.contains('┃'),
+            "no playhead (the synthetic transport sits at 2.000 s):\n{screen}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn visual_mode_selects_from_the_playhead_and_escape_leaves_it() {
+        let path = wav_fixture("visual");
+        let mut app = App::demo();
+        app.open_wave(&path);
+        let _ = rendered(&mut app);
+
+        assert_eq!(app.mode, Mode::Normal);
+
+        // `v` anchors the selection at the playhead (the synthetic 2.000 s).
+        app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::empty()));
+        assert_eq!(app.mode, Mode::Visual);
+        let view = app.view.as_ref().expect("a view");
+        assert_eq!(view.selection, Some((app.snap.frame, app.snap.frame)));
+
+        // `l` extends the head, leaving the anchor alone.
+        let before = view.selection.expect("selection");
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::empty()));
+        let after = app
+            .view
+            .as_ref()
+            .expect("a view")
+            .selection
+            .expect("selection");
+        assert_eq!(after.0, before.0, "the anchor does not move");
+        assert!(after.1 > before.1, "the head extends forward: {after:?}");
+
+        // The mode and the span are on screen while it is active.
+        let screen = rendered(&mut app);
+        assert!(screen.contains("VISUAL"), "mode not shown:\n{screen}");
+        assert!(screen.contains("sel "), "selection not shown:\n{screen}");
+
+        // Esc leaves visual mode and drops the selection; a second Esc quits.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.view.as_ref().expect("a view").selection.is_none());
+        assert!(!app.quit, "the first Esc must not quit");
+
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(app.quit, "the second Esc quits");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn zoom_keys_change_the_density_without_touching_the_host() {
+        let path = wav_fixture("zoom-keys");
+        let mut app = App::demo();
+        app.open_wave(&path);
+        let _ = rendered(&mut app);
+
+        let fitted = app.view.as_ref().expect("a view").frames_per_cell;
+        app.on_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::empty()));
+        assert!(
+            app.view.as_ref().expect("a view").frames_per_cell < fitted,
+            "zoom in narrows the column"
+        );
+        assert!(
+            app.last_command.is_none(),
+            "the viewport is free to move — no host command"
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::empty()));
+        assert_eq!(
+            app.view.as_ref().expect("a view").frames_per_cell,
+            fitted,
+            "0 refits the file"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

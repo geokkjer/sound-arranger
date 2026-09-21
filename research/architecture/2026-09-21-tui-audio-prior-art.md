@@ -350,6 +350,14 @@ seam (`?` overlay, plain keys, mouse hit regions).
 100–200 amplitude steps**. That is a genuinely useful clip-arranger *overview*; it is not
 sample-level editing. Everything below follows from that.
 
+**Built, not just argued (2026-09-21).** The prototype now exists in
+[`spikes/tui-shell`](../../spikes/tui-shell/) — `--wave <file.wav>` renders a real file as a braille
+min/max envelope with a ruler, zoom/scroll, a playhead and a visual-mode selection. It was verified
+against a known signal (loud → silence, which draws as the *centre line* → quiet) and driven
+interactively under a pty (`v`, `h`/`l`, `+`). Two numbers come out of it: a 3-second file fitted to
+a 100-cell panel is **30 ms/col**, and the honest zoom floor is **5.333 ms/col** — because of the
+peak pyramid's bin size, which is the surprising part (§2).
+
 1. **The overview is a min/max envelope per column, never samples.** 400 columns over a 3-minute
    clip at 48 kHz is 21,600 samples per column (0.45 s); a 1 Hz waveform is unresolvable. This is
    exactly `audiowaveform`'s model — min/max pairs per N samples, `--pixels-per-second 100` by
@@ -358,9 +366,20 @@ sample-level editing. Everything below follows from that.
    timeline's data source.**
 2. **Horizontal resolution sets what the timeline *is*.** 400 columns over 10 s ≈ 25 ms/column
    (comfortable bar-level editing); over 1 s ≈ 2.5 ms; over 250 ms ≈ 0.6 ms ≈ 30 samples — the
-   effective floor. **Design consequence: the TUI timeline is an overview + coarse-trim surface**
-   (bars, beats, seconds), and sample-accurate work belongs either in a numeric detail view with
-   fine nudge keys or in a GUI shell. Claiming otherwise would be the classic TUI overreach.
+   terminal's *display* floor. **Design consequence: the TUI timeline is an overview + coarse-trim
+   surface** (bars, beats, seconds), and sample-accurate work belongs either in a numeric detail
+   view with fine nudge keys or in a GUI shell. Claiming otherwise would be the classic TUI
+   overreach.
+
+   **Measured, after building it (2026-09-21, `spikes/tui-shell`):** the binding constraint is not
+   the terminal — it is the **data**, and it arrives one level earlier than this study assumed.
+   `PeakBuilder::range_minmax` walks whole **256-sample base bins**, so the finest honest column is
+   one bin: **256 frames = 5.333 ms at 48 kHz**, nine times coarser than what braille can display.
+   A narrower column would redraw the same bin and claim resolution the pyramid does not have, so the
+   prototype clamps its zoom there and shows `ms/col` in the status line. Going to the display floor
+   needs a **raw-sample read path** for the zoomed-in window (exactly how `tui-wave` reaches single
+   samples) — a decimated/summed cache over the pyramid for overview plus direct reads for detail.
+   That is the next step, and it is a *data* step, not a rendering one.
 3. **Amplitude needs ≥4 rows per lane to mean anything.** A 4-row braille lane is 16 vertical steps
    ≈ 4 dB/step across a 70 dB range **[V/I]**; 3-row lanes are for density, 1-row lanes are a tape
    map (boundaries + playhead), not a waveform.

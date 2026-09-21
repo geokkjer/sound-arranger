@@ -21,33 +21,67 @@ In scope (identical to the iced spike):
 
 What this spike adds, because it is what a TUI has to answer for:
 
+- **a timeline** — `--wave <file.wav>` draws a real audio file as a **min/max
+  envelope in braille**, with a ruler, a viewport you can zoom and scroll, a
+  playhead, and a **visual-mode selection** over a frame span (see below);
 - **an explicit key scheme**, with a `?` overlay rendered from the same table the
   key handler uses, so the help cannot drift from the behaviour;
 - **mouse support** — clickable transport buttons, click-to-select meter rows,
-  wheel = seek — so *you* can judge whether a mouse in a terminal is workable or
-  the keys carry it (the open question the iced comparison raises);
+  click the timeline to seek, wheel = seek — so *you* can judge whether a mouse in
+  a terminal is workable or the keys carry it;
 - **command latency in the UI thread** (`last command: seek (13.4 ms …)`), because
   the host's `TransportSeek` is O(target) and a shell that binds it to a key owns
   that stall.
 
-Not in scope: a timeline, waveforms, clip editing, dialogs. Same as iced.
+Not in scope: clips (there is one file, not an arrangement), editing that changes
+audio, dialogs.
 
 ## Run it
 
 ```sh
 cd spikes/tui-shell
 
-cargo run                 # the TUI (any terminal)
-cargo run -- --keys       # (same as pressing ? in the app)
-cargo run -- --probe      # headless: host thread + transport + live meters, no TTY
-cargo run -- --dump       # render one deterministic frame and print it as text
-cargo run -- --dump --keys# …the keymap overlay instead
-cargo test                # 5 tests; asserts the rendered frame, no TTY needed
+cargo run                          # the TUI (any terminal)
+cargo run -- --wave /tmp/demo.wav   # …with the timeline for a file
+cargo run -- --keys                # (same as pressing ? in the app)
+cargo run -- --probe               # headless: host thread + transport + live meters, no TTY
+cargo run -- --dump                # render one deterministic frame and print it as text
+cargo run -- --dump --wave f.wav    # …including the timeline (deterministic)
+cargo test                         # 13 tests; asserts the rendered frame, no TTY needed
+./scripts/pty-check.sh             # the real terminal path, asserted
 ```
 
 `--probe` and `--dump` are the two halves of a CI-able check: the probe exercises
 the live host, the dump exercises the view (through ratatui's `TestBackend`, so
 it needs no terminal), and the tests assert on the rendered buffer.
+
+## The timeline (`--wave`)
+
+The "audiofile view" a text editor has no analogue for, and the first object for
+visual mode. What it does, and what it honestly cannot:
+
+| | |
+|---|---|
+| **Envelope** | min/max per column from the media engine's **peak pyramid** (`PeakBuilder::range_minmax`) — never raw samples. Silence draws as the centre line. |
+| **Resolution** | Braille is 2×4 sub-cells, so a 100-cell panel is 200 time positions × 4× vertical. |
+| **Zoom floor** | **one base bin per cell — 256 frames, 5.333 ms at 48 kHz.** The pyramid walks whole 256-sample bins, so a narrower column would redraw the same bin and claim detail the data does not have. Going finer needs a raw-sample read path (that is how `tui-wave` reaches single samples); this is the next step, not a bug. |
+| **Zoom ceiling** | the whole file, one column per ~1/width of it. The state line always shows the current `ms/col`, so the density claim is visible, not asserted. |
+| **Selection** | `v` anchors at the playhead; `h`/`l` extend it; the statusline shows the span and its duration; `Esc` leaves. One mode, one visible indicator — a first slice of the [modal editing model](../../.agents/notes/proposed/architecture/2026-09-21-modal-editing-model.md). |
+| **Not yet** | clips/tracks (one file, one lane), split/trim/move, and auditioning — the file is not wired to the transport, so the playhead shows the *session* position against the file's grid. |
+
+A demo file with visible structure, made by the host itself:
+
+```sh
+printf 'host v1\nmount euclidean steps=8 pulses=5\nmount scale root=0 note_len=2400\nmount tone gain=0.9 blip_len=1800\nmount mixer channels=4\npatch euclidean.triggers scale.trigger\npatch scale.note tone.note\npatch tone.audio mixer.ch0\nset_param mixer master.gain 0.5 @0\nbounce 1440000 /tmp/demo.wav\n' | cargo run -q -p host
+cargo run -- --wave /tmp/demo.wav
+```
+
+> **Watch the `@frame` trap when scripting one:** a command scheduled at frame *f*
+> renders the session *up to* `f` first, and a `bounce` renders from wherever the
+> clock now is — so several `set_param … @frame` lines followed by one `bounce`
+> do not produce a file with those changes at those offsets (it starts at the last
+> scheduled frame, and everything before it is never written). Bounce per section
+> and join, or schedule nothing and vary the file another way.
 
 ## The keymap
 
@@ -58,10 +92,15 @@ it needs no terminal), and the tests assert on the rendered buffer.
 | `r` / `Home` | rewind to 0 |
 | `,` / `.` | seek −1 s / +1 s (stops first: seek is rebuild-to-target) |
 | `j` / `k` / `↑` / `↓` | select the next / previous channel |
+| `v` | **visual mode**: anchor a selection at the playhead |
+| `h` / `l` | scroll the timeline — in visual mode, extend the selection instead |
+| `+` / `-` | zoom in / out (floor: one peak bin per column) |
+| `0` | fit the whole file |
+| `Esc` | leave visual mode (a second `Esc` quits) |
 | `m` | toggle mouse capture |
 | `?` | the keymap |
-| `q` / `Esc` / `Ctrl+c` | quit |
-| mouse | click Play/Stop/Rewind · click a meter row to select · wheel = seek |
+| `q` / `Ctrl+c` | quit |
+| mouse | click Play/Stop/Rewind · click a meter row · click the timeline = seek · wheel = seek |
 
 ## What a deterministic frame looks like
 

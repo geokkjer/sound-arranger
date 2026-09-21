@@ -1832,6 +1832,7 @@ name = "tui-shell"
 version = "0.1.0"
 dependencies = [
  "host",
+ "media",
  "ratatui",
 ]
 

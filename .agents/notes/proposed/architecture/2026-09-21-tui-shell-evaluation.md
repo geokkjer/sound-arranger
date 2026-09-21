@@ -128,15 +128,17 @@ The evaluation is answered — with an implemented or rejected note replacing th
 1. The spike runs in a real terminal, restores the screen and mouse capture on exit, and its pty
    harness (entered alternate screen, no panic, exit 0) passes on a clean checkout under the rustup
    toolchain. **Met** (see Consequences), including one real crash found and fixed this way.
-2. **The timeline question is answered with a built prototype**, not an opinion, and now with
-   numbers to check it against (see *Reference and prior art*): draw tracks as **min/max envelopes
-   per column from the existing peak pyramid**, lanes in braille, clip colour bars in blocks,
-   playhead and boundaries marking the grid; state the **measured density** (columns, s/column at
-   overview and at maximum zoom, tracks × rows, visible clips) and **what the prototype cannot do**
-   (sample-accurate trim, zoom past ~1 ms/column, 20+ tracks with vertical detail, per-pixel
-   colour); and demonstrate the editing gestures (select, move, split, trim) with the keyboard
-   alone. If a terminal image protocol is used at all, it is a **detail pane** that degrades
-   silently — never the scrolling timeline.
+2. **The timeline question is answered with a built prototype**, not an opinion. **Partly met**
+   (2026-09-21): `--wave <file.wav>` draws a real file as a **braille min/max envelope from the peak
+   pyramid**, with a ruler, zoom/scroll, a playhead and a **visual-mode selection**, verified
+   against a known signal (loud → silence-as-centre-line → quiet) and driven under a pty. The
+   **measured density** is in the status line and in the study: 30 ms/col fitted for a 3 s file
+   across 100 cells, and an honest floor of **5.333 ms/col**, because the pyramid's base bin is 256
+   samples. **Still open:** clips and tracks (there is one file and one lane), the editing gestures
+   (select/move/split/trim — only *select* exists), wiring the file to the transport so the playhead
+   means something, and therefore any auditioning of an arrangement. Going below 5.333 ms/col needs
+   a **raw-sample read path**, not a better renderer. If a terminal image protocol is used at all it
+   is a **detail pane** that degrades silently — never the scrolling timeline.
 3. **A task-level mouse-vs-keys verdict**: the same short task list (select a clip, seek, split,
    nudge, mute a channel) performed both ways, with the friction noted — including the terminal
    facts that matter (mouse capture vs copy/paste, tmux/niri passthrough, wheel vs key repeat).
@@ -148,9 +150,12 @@ The evaluation is answered — with an implemented or rejected note replacing th
 
 ## Risks
 
-- **The graphics ceiling is the real risk.** A terminal cannot draw a waveform at DAW fidelity
-  without an image protocol; if the timeline degrades to a list, the product is a different (much
-  smaller) instrument. This, not performance, is what decides it.
+- **The graphics ceiling is the real risk.** If the timeline degrades to a list, the product is a
+  different (much smaller) instrument. This, not performance, is what decides it — and it is *not*
+  about terminals: Prism runs a full meter rack at 60 FPS in a plain terminal, and this spike draws
+  a real file's envelope in braille. The measured ceiling is in the **data**: the peak pyramid's
+  256-sample bins cap the honest zoom at 5.333 ms/col, so a raw-sample path is what stands between
+  this and sample-level work.
 - **Mouse in a terminal is awkward, and capture is global.** Enabling mouse capture takes over
   selection (copy/paste) for the whole app; terminal multiplexers and some compositors interfere.
   The `m` toggle exists because a user may need to give the mouse back to the terminal.
@@ -175,9 +180,20 @@ The spike exists and is verified; the decision is **open**:
   alternate screen and releases mouse capture; the keymap overlay renders from the same table the
   handler uses; clicks map to transport actions and meter-row selection; and `--probe` observes
   live meter signal (peak 0.88) exactly as the iced spike does.
-- **Verification is cheap and CI-able**: five tests assert the rendered buffer through
-  `TestBackend`, `--dump` prints a deterministic frame (the README embeds one), and a pty harness
-  covers the real terminal path.
+- **The timeline exists and is measured** (`--wave <file.wav>`): a real file drawn as a braille
+  min/max envelope from the peak pyramid, with a ruler, zoom/scroll, a playhead and a
+  visual-mode selection, verified against a known signal and driven under a pty. It answers the
+  "audiofile view" question with a working artifact and two numbers (30 ms/col fitted; 5.333 ms/col
+  floor, set by the 256-sample peak bin) — and it produced the clearest next step in the whole
+  evaluation: **a raw-sample read path** for the zoomed-in window, since no renderer improvement can
+  go below the data's resolution.
+- **Visual mode has a real object.** `v` anchors a selection at the playhead, `h`/`l` extend it, the
+  statusline shows the span and its duration, and `Esc` leaves — the first concrete slice of the
+  [modal editing model](2026-09-21-modal-editing-model.md), with the mode always visible.
+- **Verification is cheap and CI-able**: thirteen tests assert the rendered buffer (including the
+  timeline panel, the zoom floor and the visual-mode transition) through `TestBackend`, `--dump`
+  prints a deterministic frame (the README embeds one), and a pty harness covers the real terminal
+  path.
 - **Two findings already, both from running it rather than testing it**: a zero-height terminal
   panicked the meter view (fixed in the spike; the class of bug matters for a UI that must survive
   arbitrary terminal sizes), and the live host's underrun counter jumps once by ~2–3 s of device
