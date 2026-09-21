@@ -354,3 +354,48 @@ fn play_after_a_render_does_not_break_the_session() {
     let _ = std::fs::remove_file(&out1);
     let _ = std::fs::remove_file(&out2);
 }
+
+/// The parameter value a shell reads is a **fold of the log**, not a second
+/// store: mounts contribute their initial params, `SetParam` overwrites (last
+/// write wins), and an unmount removes a plugin's entry. This is what lets a
+/// shell rebuild its faders after a reload — or after a log replay — instead of
+/// holding state the engine already has.
+#[test]
+fn params_fold_from_the_log() {
+    let script = parse_script(
+        "host v1\n\
+         mount mixer channels=2 master.gain=0.5 @0\n\
+         set_param mixer ch0.gain 0.25 @0\n\
+         set_param mixer ch1.mute 1 @128\n\
+         set_param mixer ch0.gain 0.8 @256\n",
+    )
+    .expect("parse");
+
+    let session = run_script(&script).expect("run");
+    let params = session.params();
+
+    let get = |plugin: &str, param: &str| {
+        params
+            .iter()
+            .find(|(p, n, _)| *p == plugin && *n == param)
+            .map(|(_, _, v)| *v)
+    };
+
+    assert_eq!(get("mixer", "channels"), Some(2.0), "mount params are in the fold");
+    assert_eq!(get("mixer", "master.gain"), Some(0.5), "mount params are in the fold");
+    assert_eq!(get("mixer", "ch0.gain"), Some(0.8), "the last write wins");
+    assert_eq!(get("mixer", "ch1.mute"), Some(1.0));
+    assert_eq!(get("mixer", "ch9.gain"), None, "nothing invented");
+
+    // An unmount drops the plugin's params; a later mount brings them back.
+    let script = parse_script(
+        "host v1\nmount mixer channels=2 @0\nset_param mixer ch0.gain 0.4 @0\nunmount mixer @0\n",
+    )
+    .expect("parse");
+    let session = run_script(&script).expect("run");
+    assert!(
+        session.params().iter().all(|(p, _, _)| *p != "mixer"),
+        "unmounted plugins leave no params: {:?}",
+        session.params()
+    );
+}

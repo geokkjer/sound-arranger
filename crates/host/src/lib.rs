@@ -670,6 +670,57 @@ impl HostSession {
         self.engine.log.len()
     }
 
+    /// The session's current parameter values, **folded from the log**.
+    ///
+    /// The log is the command list (minimal-core note §3: *model-visible means
+    /// logged*), so the current value of a parameter is simply the last thing
+    /// logged for it — no second store that a shell has to keep in sync with the
+    /// engine. `Mount` contributes its initial params; `SetParam` overwrites;
+    /// `ScheduleUnmount` drops a plugin's params (a later mount re-adds them).
+    ///
+    /// Order is first-appearance, which is stable across replays, so a shell can
+    /// diff two reads to see what changed.
+    pub fn params(&self) -> Vec<(&'static str, &'static str, f32)> {
+        let mut values: Vec<(&'static str, &'static str, f32)> = Vec::new();
+
+        fn set(
+            values: &mut Vec<(&'static str, &'static str, f32)>,
+            plugin: &'static str,
+            param: &'static str,
+            value: f32,
+        ) {
+            match values
+                .iter_mut()
+                .find(|(p, n, _)| *p == plugin && *n == param)
+            {
+                Some(entry) => entry.2 = value,
+                None => values.push((plugin, param, value)),
+            }
+        }
+
+        for event in self.log().events() {
+            match event {
+                Event::Mount { plugin, params, .. } => {
+                    for (param, value) in params {
+                        set(&mut values, plugin, param, *value);
+                    }
+                }
+                Event::SetParam {
+                    plugin,
+                    param,
+                    value,
+                    ..
+                } => set(&mut values, plugin, param, *value),
+                Event::ScheduleUnmount { plugin, .. } => {
+                    values.retain(|(p, _, _)| p != plugin);
+                }
+                _ => {}
+            }
+        }
+
+        values
+    }
+
     pub fn media_command_count(&self) -> usize {
         self.media_commands
     }

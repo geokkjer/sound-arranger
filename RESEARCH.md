@@ -285,6 +285,16 @@ host's text format**, so a fader ride lands in the session log as automation
 (`last command: set_param (0.1 ms)` — unlike `TransportSeek`'s ~92 ms O(target) rebuild). Known gap:
 the shell cannot *read* gains back from the host yet, so a reload resets faders to unity.
 
+**State is a fold of the log (2026-09-21).** The Host API gained a **`params`** value — the session's
+current parameters, **folded from the log** (mount params → `SetParam`, last write wins; unmount
+removes) — so a shell derives its controls instead of mirroring them
+([note](.agents/notes/implemented/architecture/2026-09-21-shell-state-is-a-fold-of-the-log.md)). The
+TUI's console now shows what the log says (`ch0.gain 0.3` in a script → 0.30 on the strip), `u`/`Ctrl+r`
+undo/redo by the host's **log replay** with the faders untouched, and `--wave <file>` is *audible*
+because the shell hands the host a synthesised one-clip script rather than drawing a private picture
+of the file (`--probe --wave` reports the file's amplitude on ch0 and the centre-pan law on the
+master).
+
 **Where it stands:** a spike, not a decision. The shipped shell stays Tauri + Vue.
 
 **Prior art, precisely (2026-09-21).** The [study](research/architecture/2026-09-21-tui-audio-prior-art.md)

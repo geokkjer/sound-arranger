@@ -99,6 +99,19 @@ impl Mixer {
         }
     }
 
+    /// Set mute outright — what the host's folded params say, rather than a toggle.
+    pub fn set_muted(&mut self, strip: usize, muted: bool) {
+        if strip < self.channels {
+            self.mutes[strip] = muted;
+        }
+    }
+
+    pub fn set_soloed(&mut self, strip: usize, soloed: bool) {
+        if strip < self.channels {
+            self.solos[strip] = soloed;
+        }
+    }
+
     pub fn toggle_solo(&mut self, strip: usize) {
         if strip < self.channels {
             self.solos[strip] = !self.solos[strip];

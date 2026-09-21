@@ -215,9 +215,18 @@ The spike exists and is verified; the decision is **open**:
   host's level beside it, a name with mute/solo flags, a value, and a master strip. Keys ride it
   (`+`/`-`/`0`, `M`/`S`), the mouse can click/drag a strip, and each change goes to the host as a
   logged `set_param` — so **a fader ride is automation in the session log**, which is what a moving
-  fader on a real console records. **Known gap:** the shell cannot read gains back from the host yet
-  (the snapshot carries meters and transport, not parameters), so a reload resets the faders while
-  the engine keeps what was logged; reading or replaying the params is the follow-up.
+  fader on a real console records.
+- **And the console is a *view of the log*, not a mirror of it.** The Host API gained a `params`
+  value — the session's parameters **folded from the log** — and the shell adopts it on every load
+  and refresh, so a script's `ch0.gain 0.3` shows as 0.30, and `u`/`Ctrl+r` (undo/redo, which the host
+  implements by **replaying the log**) restore the arrangement *and* leave the faders exactly where
+  the log says they are. The shell stores no engine state; the decision and its alternatives are in
+  the [fold-of-the-log note](../../implemented/architecture/2026-09-21-shell-state-is-a-fold-of-the-log.md).
+- **A loaded file is audible, not just drawn.** `--wave <file.wav>` no longer builds a shell-side
+  arrangement: it synthesises the one-clip script a user would write, hands it to the host, and draws
+  the host's value — so `space` plays it (verified headlessly: `--probe --wave` reports the file's own
+  amplitude on ch0 and the equal-power centre-pan law on the master). The earlier caveat that the
+  timeline was not wired to the transport is gone.
 - **Visual mode has a real object.** `v` anchors a selection at the playhead, `h`/`l` extend it, the
   state line shows the span and its duration, and `Esc` leaves — with `Esc` no longer quitting (the
   safety key must not be destructive; `q`/`Ctrl+c` are the way out).

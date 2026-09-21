@@ -104,6 +104,10 @@ const KEYMAP: &[(&str, &str)] = &[
     ("d", "timeline: delete the clip under the playhead"),
     ("n  N", "timeline: jump to the next / previous clip"),
     (
+        "u  Ctrl+r",
+        "undo / redo the last arrangement edit (a log replay)",
+    ),
+    (
         "Esc",
         "leave visual mode / close this overlay (never quits)",
     ),
@@ -129,7 +133,7 @@ fn main() -> io::Result<()> {
     let script = value_of("--script");
 
     if args.iter().any(|arg| arg == "--probe") {
-        std::process::exit(probe());
+        std::process::exit(probe(wave, script));
     }
 
     if args.iter().any(|arg| arg == "--dump") {
@@ -260,21 +264,40 @@ impl App {
         app
     }
 
-    /// Load a single audio file into the timeline: one lane, one clip
-    /// (`--wave`). A failure is a status line, never a panic.
+    /// Load a single audio file as a **one-clip arrangement in the host**
+    /// (`--wave`): the shell synthesises the same kind of script a user would
+    /// write and hands it over, so the file is *audible* and the arrangement the
+    /// panel draws is the engine's own value — not a shell-side picture of a file
+    /// the host has never seen.
     fn open_wave(&mut self, path: &std::path::Path) {
-        match Arrangement::from_wave(path) {
-            Ok(arrangement) => {
-                self.status = format!(
-                    "timeline: {} — {:.2} s, {} Hz, {} frames",
-                    path.display(),
-                    arrangement.seconds(),
-                    arrangement.sample_rate,
-                    arrangement.frames,
-                );
-                self.adopt(arrangement, path.display().to_string());
+        let script = match wave_script(path) {
+            Ok(script) => script,
+            Err(e) => {
+                self.status = format!("cannot open {}: {e}", path.display());
+                return;
             }
-            Err(e) => self.status = format!("cannot open {}: {e}", path.display()),
+        };
+        self.origin = path.display().to_string();
+
+        match host::parse_script(&script) {
+            Ok(commands) => match self.host.load(&commands) {
+                Ok(outcome) => {
+                    let clips = outcome
+                        .arrangement
+                        .as_ref()
+                        .map(|t| t.tracks.iter().map(|t| t.clips.len()).sum::<usize>())
+                        .unwrap_or(0);
+                    self.status = format!(
+                        "loaded {} — {} clip(s), {} log events (press space to hear it)",
+                        path.display(),
+                        clips,
+                        outcome.event_count,
+                    );
+                    self.take_arrangement(outcome);
+                }
+                Err(e) => self.status = format!("loading {}: {e}", path.display()),
+            },
+            Err(e) => self.status = format!("{}: {e}", path.display()),
         }
     }
 
@@ -348,6 +371,11 @@ impl App {
             .filter(|rate| *rate > 0)
             .unwrap_or(SAMPLE_RATE as u32);
 
+        // The faders are a **fold of the log**, not the shell's memory: the host
+        // folded it for us, so a reload (or a replay) restores exactly what was
+        // last asked for.
+        self.apply_params(&outcome.params);
+
         let arrangement = Arrangement::from_host(
             &timeline,
             outcome.pool_sources.as_deref(),
@@ -362,6 +390,49 @@ impl App {
         }
 
         self.adopt(arrangement, self.origin.clone());
+    }
+
+    /// Adopt the host's parameter values into the console. Only the mixer's
+    /// params are understood; anything else is ignored rather than guessed at.
+    fn apply_params(&mut self, params: &[(&'static str, &'static str, f32)]) {
+        for (plugin, param, value) in params {
+            if *plugin != "mixer" {
+                continue;
+            }
+
+            match *param {
+                "master.gain" => {
+                    let master = self.mixer.channels();
+                    self.mixer.set_value(master, *value);
+                    continue;
+                }
+                "channels" => {
+                    self.mixer.resize((*value).max(0.0) as usize);
+                    continue;
+                }
+                _ => {}
+            }
+
+            let Some((channel, field)) = param.split_once('.') else {
+                continue;
+            };
+            let Some(index) = channel
+                .strip_prefix("ch")
+                .and_then(|n| n.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            if index >= self.mixer.channels() {
+                continue;
+            }
+
+            match field {
+                "gain" => self.mixer.set_value(index, *value),
+                "mute" => self.mixer.set_muted(index, *value != 0.0),
+                "solo" => self.mixer.set_soloed(index, *value != 0.0),
+                _ => {}
+            }
+        }
     }
 
     /// Install a new arrangement, keeping the viewport when there is one (an
@@ -533,9 +604,15 @@ impl App {
             // Global transport: available in either panel and in any mode.
             KeyCode::Char(' ') => self.toggle(),
             KeyCode::Char('s') => self.stop(),
+            KeyCode::Char('r') if ctrl => self.redo(),
             KeyCode::Char('r') | KeyCode::Home => self.rewind(),
             KeyCode::Char(',') => self.nudge(-1),
             KeyCode::Char('.') => self.nudge(1),
+            // Undo/redo are *log replays*: the host drops the last arrangement
+            // edit and rebuilds by replaying the log, and the shell re-reads the
+            // arrangement **and** the parameters — which is why a fader ride
+            // survives undoing a clip edit.
+            KeyCode::Char('u') => self.undo(),
 
             // Panel navigation. Shift-Tab arrives as BackTab on most terminals.
             KeyCode::Tab => self.cycle_focus(1),
@@ -808,6 +885,27 @@ impl App {
         };
         self.status = format!("delete {clip_id}");
         self.arrange(&format!("delete {track} {clip_id}"));
+    }
+
+    /// `u`: undo the last arrangement edit. The host does it by replaying the
+    /// log; the shell re-reads both values the log defines.
+    fn undo(&mut self) {
+        if !self.snap.can_undo {
+            self.status = "nothing to undo".to_string();
+            return;
+        }
+        self.command("undo", HostCommand::Undo);
+        self.refresh_arrangement();
+    }
+
+    /// `Ctrl+r`: redo the most recently undone edit, again by replaying the log.
+    fn redo(&mut self) {
+        if !self.snap.can_redo {
+            self.status = "nothing to redo".to_string();
+            return;
+        }
+        self.command("redo", HostCommand::Redo);
+        self.refresh_arrangement();
     }
 
     /// The (track id, clip id) at the playhead on the active track.
@@ -1405,13 +1503,71 @@ fn dump(keys: bool, wave: Option<PathBuf>, script: Option<PathBuf>) -> io::Resul
     Ok(())
 }
 
+/// The one-clip host script the shell synthesises for `--wave`. The host owns the
+/// result, so a loaded file is **audible**, editable and logged like any other
+/// arrangement — and the panel draws the engine's value, not the shell's picture
+/// of a file the host has never seen.
+fn wave_script(path: &std::path::Path) -> Result<String, String> {
+    let reader = media::wav::WavReader::open(path).map_err(|e| e.to_string())?;
+    let frames = reader.total_frames();
+    if frames == 0 {
+        return Err("the file has no audio frames".to_string());
+    }
+
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| "the file name is not valid UTF-8".to_string())?;
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+
+    // The text format is whitespace-separated, so a path with a space cannot be
+    // named in it. Renaming is the honest fix; quoting soup is not.
+    for part in [stem, dir.to_str().unwrap_or("")] {
+        if part.split_whitespace().count() != 1 {
+            return Err(format!(
+                "'{part}' contains whitespace — copy the file to a simple path first"
+            ));
+        }
+    }
+
+    Ok(format!(
+        "host v1\nmount mixer channels=2 @0\npool {}\narrange add_track t0\narrange add_clip t0 c0 {stem} 0 {frames} 0 0 0 1.0\n",
+        dir.display()
+    ))
+}
+
 /// `--probe`: the non-TUI half of the proof — host thread, transport, and live
-/// meters, with no terminal at all.
-fn probe() -> i32 {
-    let script = match host::parse_script(DEMO_SCRIPT) {
+/// meters, with no terminal at all. With `--wave` or `--script` it loads *that*
+/// material instead of the built-in demo, which is how "the loaded file actually
+/// plays" is asserted without speakers: a silent host's meters only move if the
+/// arrangement rendered through the mixer.
+fn probe(wave: Option<PathBuf>, script: Option<PathBuf>) -> i32 {
+    let (what, source) = match (&script, &wave) {
+        (Some(path), _) => match std::fs::read_to_string(path) {
+            Ok(text) => (format!("script {}", path.display()), text),
+            Err(e) => {
+                eprintln!("probe: cannot read {}: {e}", path.display());
+                return 2;
+            }
+        },
+        (None, Some(path)) => match wave_script(path) {
+            Ok(text) => (format!("wave {}", path.display()), text),
+            Err(e) => {
+                eprintln!("probe: {e}");
+                return 2;
+            }
+        },
+        (None, None) => (
+            "the built-in demo profile".to_string(),
+            DEMO_SCRIPT.to_string(),
+        ),
+    };
+    println!("probe: probing {what}");
+
+    let script = match host::parse_script(&source) {
         Ok(script) => script,
         Err(e) => {
-            eprintln!("probe: demo script does not parse: {e}");
+            eprintln!("probe: the script does not parse: {e}");
             return 2;
         }
     };
@@ -1822,11 +1978,13 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn edits_go_through_the_hosts_arrange_language() {
-        // A pool with one source, and a script that places one clip on one track.
-        let pool = std::env::temp_dir().join(format!("tui-shell-pool-{}", std::process::id()));
+    /// A pool with one three-second source, and a script that places it as one
+    /// clip on one track — plus whatever `extra` lines the test needs.
+    fn pool_script(name: &str, extra: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let pool =
+            std::env::temp_dir().join(format!("tui-shell-pool-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&pool).expect("pool dir");
+
         let source = pool.join("s1.wav");
         let mut writer =
             media::wav::WavWriter::create_float(&source, 48_000, 1).expect("fixture source");
@@ -1838,11 +1996,87 @@ mod tests {
 
         let script_path = pool.join("arrangement.script");
         let script = format!(
-            "host v1\nmount mixer channels=2\npool {}\narrange add_track t0\narrange add_clip t0 c0 s1 0 144000 0 0 0 1.0\n",
+            "host v1\nmount mixer channels=2 @0\npool {}\narrange add_track t0\narrange add_clip t0 c0 s1 0 144000 0 0 0 1.0\n{extra}",
             pool.display()
         );
         std::fs::write(&script_path, script).expect("write the script");
 
+        (pool, script_path)
+    }
+
+    #[test]
+    fn a_loaded_file_is_held_by_the_host_so_it_can_play() {
+        let path = wav_fixture("audible");
+        let mut app = App::idle();
+        app.open_wave(&path);
+
+        // The arrangement is the **host's**, not the shell's picture of a file the
+        // host has never seen — which is what makes it audible: the pump renders
+        // this value through the mixer.
+        let outcome = app.host.outcome().expect("outcome");
+        assert_eq!(outcome.mixer_channels, Some(2), "{}", app.status);
+        let timeline = outcome.arrangement.expect("the host holds an arrangement");
+        assert_eq!(timeline.tracks.len(), 1);
+        assert_eq!(timeline.tracks[0].clips.len(), 1);
+        assert_eq!(
+            timeline.tracks[0].clips[0].source,
+            path.file_stem().unwrap().to_str().unwrap()
+        );
+        assert_eq!(timeline.tracks[0].clips[0].src_len, 144_000);
+        assert_eq!(app.arrangement.as_ref().expect("the panel").clip_count(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn faders_are_read_from_the_log_and_survive_an_undo() {
+        let (pool, script) = pool_script(
+            "params",
+            "set_param mixer ch0.gain 0.3 @0\nset_param mixer master.gain 0.6 @0\nset_param mixer ch1.mute 1 @0\n",
+        );
+        let mut app = App::idle();
+        app.snap = App::demo_snapshot(); // the playhead lands inside the clip
+        app.open_script(&script);
+
+        // Reading: the console reflects the **log**, not a default.
+        assert_eq!(app.mixer.value(0), 0.3, "ch0 gain: {}", app.status);
+        assert_eq!(app.mixer.value(2), 0.6, "strip 2 is the master");
+        assert!(app.mixer.muted(1), "ch1 mute");
+
+        // A split edits the arrangement…
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()));
+        assert_eq!(
+            app.arrangement
+                .as_ref()
+                .expect("an arrangement")
+                .clip_count(),
+            2,
+            "{}",
+            app.status
+        );
+
+        // …and undo replays the log: the clip returns and the faders stay where
+        // the log says they are (a fader ride is not an arrangement edit).
+        app.snap.can_undo = true; // the live host publishes this; the demo snapshot does not
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::empty()));
+        assert_eq!(
+            app.arrangement
+                .as_ref()
+                .expect("an arrangement")
+                .clip_count(),
+            1,
+            "undo restores the clip: {}",
+            app.status
+        );
+        assert_eq!(app.mixer.value(0), 0.3, "the fader survives the replay");
+        assert!(app.mixer.muted(1), "the mute survives the replay");
+
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    #[test]
+    fn edits_go_through_the_hosts_arrange_language() {
+        let (pool, script_path) = pool_script("edits", "");
         let mut app = App::idle();
         app.snap = App::demo_snapshot(); // playhead at 2.000 s: inside the clip
         app.open_script(&script_path);

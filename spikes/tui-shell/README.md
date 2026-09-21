@@ -21,10 +21,12 @@ In scope (identical to the iced spike):
 
 What this spike adds, because it is what a TUI has to answer for:
 
-- **an arrangement** — `--script <host script>` draws the **clips and tracks the
-  host holds** (the engine's own `Timeline`, not a copy) as braille min/max
-  envelopes, one lane per track, clip boundaries and per-track colour; `--wave
-  <file.wav>` is the same view with one lane and one clip (see below);
+- **an arrangement you can hear** — `--script <host script>` loads the session and
+  draws the **clips and tracks the host holds** (the engine's own `Timeline`, not a
+  copy): braille min/max envelopes, one lane per track, boundaries, per-track
+  colour. `--wave <file.wav>` synthesises a one-clip script, hands it to the host
+  and draws the result — so a loaded file is **audible**, and the panel is never a
+  picture of something the engine has not got;
 - **edits that go through the host's own language** — `x` splits and `d` deletes
   by building an `arrange …` line and handing it to the host's parser, so a key
   runs exactly what a script writes, and the engine logs it like any command;
@@ -58,6 +60,7 @@ cargo run -- --wave /tmp/demo.wav     # …with a one-clip timeline for a file
 cargo run -- --script /tmp/arr.script # …with the clips/tracks a host script builds
 cargo run -- --keys                  # (same as pressing ? in the app)
 cargo run -- --probe                 # headless: host thread + transport + live meters, no TTY
+cargo run -- --probe --wave f.wav     # …and assert that the *loaded file* renders (meters move)
 cargo run -- --dump                  # render one deterministic frame and print it as text
 cargo run -- --dump --script f.script # …including the arrangement (deterministic)
 cargo test                           # 16 tests; asserts the rendered frame, no TTY needed
@@ -113,6 +116,11 @@ What it does, and what it honestly cannot:
 
 ### Measured, from the demo above
 
+`--probe --wave sections.wav` (a file whose first second is a 0.8-amplitude tone) reports
+**ch0 = 0.8000** and **master = 0.5657** — the file's own amplitude, and the equal-power centre-pan
+law (0.8 × 1/√2) on the way to the stereo master. That is the headless proof that a loaded file is
+audible: a silent host's meters only move if the arrangement rendered through the mixer.
+
 A 9-second arrangement, 3 tracks, 5 clips, rendered in a 100×26 terminal:
 **98.917 ms/cell** fitted (≈10 cells per second), playhead and ruler legible, all
 five clips distinguishable by colour and boundary. A seek from 0 to 6 s (the `n`
@@ -144,11 +152,11 @@ what the engine is publishing next to it, the channel name with a mute/solo flag
 
 | | |
 |---|---|
-| **The host owns the audio** | The shell holds the fader positions it has *asked for* and sends each change as `set_param mixer ch<n>.gain …` — through the host's own text format. The meters are the host's, so moving a fader moves its meter. |
+| **The host owns the audio *and* the values** | Every change is sent as `set_param mixer ch<n>.gain …` through the host's own text format, and the strips are **read back from the log** (the Host API's `params` value is a fold of the session log). Load a script that sets `ch0.gain 0.3` and the strip shows 0.30; `u` (undo) replays the log and returns the clip while the faders stay exactly where the log says they are. |
 | **A fader ride is automation** | Every step is a logged `set_param` at its frame, which is exactly what a moving fader on a real console records. `last command: set_param (0.1 ms in the UI thread)` — unlike a seek, a parameter change is cheap. |
 | **Keys** | `+`/`-` ride the selected fader by 0.05, `0` returns it to unity, `M` mutes, `S` solos, `j`/`k` (or `Tab` then the arrows) pick the strip. |
 | **Mouse** | Click or drag anywhere on a strip: the fader follows the row under the pointer, and the strip becomes the selected one. |
-| **Honest limit** | The shell cannot yet *read* the gains back from the host (the snapshot carries meters and transport, not parameters), so a reload resets the faders to unity while the engine keeps whatever was last logged. Reading the params — or replaying them from the log — is the follow-up; `RESEARCH.md` §4.6 tracks it. |
+| **Undo is a log replay** | `u` / `Ctrl+r` undo and redo the last arrangement edit; the host rebuilds by replaying the log and the shell re-reads the arrangement *and* the parameters. A fader ride is not an arrangement edit, so undoing a split leaves the faders alone — which is the correct answer, and now a visible one. |
 
 Without an arrangement there is no console column (only one panel would be
 pointless), so the shell falls back to the wide meter bars under the transport.
@@ -164,6 +172,7 @@ pointless), so the shell falls back to the wide meter bars under the transport.
 | `Tab` / `Shift-Tab` | move the focus ring: mixer ⇄ timeline |
 | `j` / `k` / `↑` / `↓` | the **focused** panel: mixer channel, or active track |
 | `n` / `N` | timeline: jump the playhead to the next / previous clip |
+| `u` / `Ctrl+r` | undo / redo the last arrangement edit (a log replay) |
 | `v` | **visual mode**: anchor a selection at the playhead |
 | `h` / `l` | timeline: scroll — in visual mode, extend the selection instead |
 | `+` / `-` | timeline: zoom in / out · **mixer: ride the selected fader** |

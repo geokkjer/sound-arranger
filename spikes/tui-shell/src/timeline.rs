@@ -51,7 +51,6 @@ const LANE_COLORS: [Color; 6] = [
 
 /// A loaded audio file: its peak pyramid and what the view needs to label it.
 pub struct Source {
-    pub sample_rate: u32,
     pub frames: u64,
     peaks: PeakBuilder,
 }
@@ -61,7 +60,6 @@ impl Source {
     /// mono frames (channel 0 of a stereo file), which is what the pyramid wants.
     pub fn load(path: &Path) -> Result<Source, String> {
         let mut reader = WavReader::open(path)?;
-        let sample_rate = reader.sample_rate();
         let mut peaks = PeakBuilder::new();
         let mut buffer = vec![0.0f32; 8192];
 
@@ -79,7 +77,6 @@ impl Source {
         }
 
         Ok(Source {
-            sample_rate,
             frames: peaks.frames(),
             peaks,
         })
@@ -183,33 +180,6 @@ pub struct Arrangement {
 }
 
 impl Arrangement {
-    /// One lane, one clip covering a single file (`--wave`).
-    pub fn from_wave(path: &Path) -> Result<Arrangement, String> {
-        let source = Arc::new(Source::load(path)?);
-        let frames = source.frames;
-        let sample_rate = source.sample_rate;
-
-        Ok(Arrangement {
-            lanes: vec![Lane {
-                id: "file".to_string(),
-                clips: vec![Placed {
-                    id: "c0".to_string(),
-                    source,
-                    src_start: 0,
-                    src_len: frames,
-                    at_frame: 0,
-                    gain: 1.0,
-                    fade_in: 0,
-                    fade_out: 0,
-                    loop_len: None,
-                }],
-            }],
-            frames,
-            sample_rate,
-            origin: path.display().to_string(),
-        })
-    }
-
     /// The host's arrangement, with each clip's source loaded from the pool.
     ///
     /// `pool` is the pool's own listing (`HostOutcome::pool_sources`), which is
@@ -836,10 +806,48 @@ mod tests {
         path
     }
 
+    /// A fixture WAV plus the **host-shaped** value the panel receives — a
+    /// `Timeline` and the pool listing that resolves its clip's source — so the
+    /// tests exercise the same path the running shell does (`from_host`).
     fn a_wave(name: &str, frames: usize) -> (PathBuf, Arrangement) {
         let path = temp_path(name);
         fixture(&path, 48_000, frames);
-        let arrangement = Arrangement::from_wave(&path).expect("load");
+
+        let pool = vec![media::PoolSource {
+            id: "s1".to_string(),
+            wav: path.clone(),
+            peaks: path.with_extension("peaks"),
+            frames: frames as u64,
+            sample_rate: 48_000,
+            peaks_missing: true,
+            finalized: true,
+        }];
+        let timeline = media::Timeline {
+            tracks: vec![media::Track {
+                id: "t0".to_string(),
+                clips: vec![media::Clip {
+                    id: "c0".to_string(),
+                    source: "s1".to_string(),
+                    src_start: 0,
+                    src_len: frames as u64,
+                    at_frame: 0,
+                    fade_in: 0,
+                    fade_out: 0,
+                    gain: 1.0,
+                    loop_len: None,
+                }],
+            }],
+        };
+
+        let mut sources = Sources::default();
+        let arrangement = Arrangement::from_host(
+            &timeline,
+            Some(&pool),
+            &mut sources,
+            48_000,
+            name.to_string(),
+        );
+
         (path, arrangement)
     }
 

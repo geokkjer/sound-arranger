@@ -109,6 +109,10 @@ pub struct HostOutcome {
     pub arrangement: Result<media::Timeline, String>,
     pub pool_sources: Option<Vec<media::PoolSource>>,
     pub mixer_channels: Option<usize>,
+    /// The session's current parameter values, folded from the log — what a
+    /// shell reads instead of keeping its own copy (see `HostSession::params`).
+    /// A live fader change is just the next `SetParam` in the log.
+    pub params: Vec<(&'static str, &'static str, f32)>,
 }
 
 /// A message to the host thread. `HostCommand` is `Send`, so the request is too.
@@ -432,6 +436,7 @@ fn build_outcome(session: &HostSession) -> HostOutcome {
         arrangement: session.arrangement(),
         pool_sources: session.pool_sources(),
         mixer_channels: session.mixer_channels(),
+        params: session.params(),
     }
 }
 
