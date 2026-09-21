@@ -104,12 +104,15 @@ not needed to review the view):
 ## Verifying a TUI without a display
 
 `TestBackend` covers the view; for the *real* path (raw mode, alternate screen,
-mouse capture, input decoding) the spike is run under a pty:
+mouse capture, input decoding) the spike is run under a pty. The reproducible
+form is a script:
 
 ```sh
-(sleep 3; printf 'q') | script -qec "stty rows 30 cols 100; ./target/debug/tui-shell" /tmp/tui.log
+./scripts/pty-check.sh
 ```
 
-Exit 0 with no panic, the alternate screen entered *and* restored, and the mouse
-released, is the pass condition; the raw log can be replayed into a screen to read
-what was actually drawn.
+It asserts: alternate screen entered *and* restored, mouse capture taken and
+released, the UI actually drawn, and no panic — then exits non-zero if any of
+those fail. `stty rows/cols` inside the pty matters (`script` allocates a
+zero-sized terminal, which is a degenerate case to survive, not to test
+through); the raw log can be replayed into a screen to read what was drawn.
