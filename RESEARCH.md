@@ -12,7 +12,7 @@
 |---|---|---|
 | **Target** | **x86 desktop first** (Linux primary; macOS/Windows via Tauri). ARM/RPi + hardware controls = a separate later phase | Best technical solution trumps; don't pre-optimize for a Pi |
 | **Direction** | **Umbrella-first** — the platform is the goal; profiles are the products; sound-arranger is profile #1 | [umbrella-first note](.agents/notes/proposed/architecture/2026-08-15-umbrella-first-product-direction.md) |
-| **App shell** | Tauri v2 + Vue 3 + TypeScript (shipped) — and **iced**, evaluated as an in-process Rust replacement (§4.5) | Rust audio engine + web UI; the single-stack option is a live question |
+| **App shell** | Tauri v2 + Vue 3 + TypeScript (shipped) — with **iced** (§4.5) and a **ratatui TUI** (§4.6) evaluated as in-process Rust replacements | Rust audio engine + web UI; the single-stack option is a live question |
 | **Architecture** | **Minimal core (clock · graph interpreter · session log · context plumbing) + everything-else-as-plugin; the product is an assembled profile** | §11, §16.7, [minimal-core note](.agents/notes/proposed/architecture/2026-08-15-minimal-core-clock-graph-session-log.md) |
 | **UI library** | **`reka-ui` + shadcn-vue + Tailwind v4** (the "cdp-front" stack — now a documented decision, not a repo) | Headless primitives fit a bespoke DAW. Do **not** add Naive UI / PrimeVue |
 | **Timeline rendering** | `<canvas>` 2D + precomputed waveform **peak pyramids** + viewport culling + offscreen clip caching | Fast and predictable; DOM-per-clip is a dead end |
@@ -186,6 +186,59 @@ evaluation note is [`.agents/notes/proposed/architecture/2026-09-21-iced-shell-e
 
 **Where it stands:** a spike, not a decision. The shipped shell stays Tauri + Vue until the canvas
 slice and the widget inventory above are answered.
+
+### 4.6 ratatui — the terminal shell (under evaluation, 2026-09-21)
+
+**Why it is on the table.** `egui` and Slint are out by inspection (immediate mode; a second view
+DSL) and the human's read of the iced spike is favourable ("looks good and more native"), but a
+terminal shell answers a question iced cannot: it runs **anywhere** — no GPU, no display server,
+over SSH, in a container, on the deferred Raspberry-Pi "box mode" — and it is the natural home for
+the keyboard-first workflow an instrument-like editor wants. The
+[UI-as-plugin note](.agents/notes/implemented/architecture/2026-08-18-ui-as-plugin-host-api-and-headless-reference.md)
+already listed ratatui as "a good later second reference (the CLI with a face)"; this is that option
+being measured as a *product* shell rather than a test shell.
+
+**Versions (verified 2026-09-21).** `ratatui 0.30.2` (MSRV 1.88) with `crossterm 0.29` reached
+through ratatui's own re-export (`ratatui::crossterm`), so the backend cannot drift from the widget
+crate. The backend split matters: `ratatui-core`, `ratatui-widgets` and `ratatui-crossterm` are
+separate crates now, and the `Backend` trait no longer exposes `buffer()` — `TestBackend::buffer()`
+is the inherent accessor a view test uses. `ratatui::init()`/`restore()` own raw mode + the
+alternate screen; mouse capture is still crossterm's to enable.
+
+**What the spike measured** ([`spikes/tui-shell/`](spikes/tui-shell/), isolated workspace, scoped
+identically to the iced spike): the TUI boots against the live host (real device at 48 kHz / 2 ch),
+renders transport + channel/master meters + the position readout, exits cleanly on `q` and restores
+the alternate screen and mouse capture; the `?` keymap overlay is rendered from the same table the
+key handler matches; clicks map to transport actions and meter-row selection; and a headless
+`--probe` observes live meter signal (peak 0.88), the same figure the iced spike reports. The
+evaluation note is
+[`.agents/notes/proposed/architecture/2026-09-21-tui-shell-evaluation.md`](.agents/notes/proposed/architecture/2026-09-21-tui-shell-evaluation.md).
+Running the shells against live audio also surfaced a host-side rough edge: the underrun counter
+jumps once by ~2–3 s of device frames on the first transport command — including a seek while
+stopped — and then stays flat
+([bug-fix note](.agents/notes/proposed/bug-fix/2026-09-21-live-host-underrun-burst-on-transport-change.md)).
+
+**Verifying a TUI is cheap** — which is itself part of the case for it: `TestBackend` makes the view
+testable (a deterministic `--dump` frame, embedded in the spike's README, plus five assertions on
+the rendered buffer), and a pty harness (`script -qec` with `stty rows/cols`) covers the real path
+(raw mode, alternate screen, mouse capture, input decoding). The pty run is what found the spike's
+zero-height crash.
+
+**What is still open — the questions that decide it.**
+
+1. **The timeline.** A terminal cannot draw a waveform at DAW fidelity without an image protocol
+   (Kitty graphics / sixel); the fallback — braille/block codepoints, or a list of clips with a
+   coarse tape map — is a much smaller instrument. Density (clips × seconds of material per screen)
+   and whether editing gestures survive keyboard-only are unmeasured.
+2. **Mouse vs keys.** The working hypothesis is that a well-designed key scheme carries the
+   workflow and the mouse is a bonus; mouse capture in a terminal is global (it takes over
+   copy/paste) and interacts with multiplexers. A task-level comparison is the test.
+3. **Widget inventory.** Expected to be *smaller* than iced's (fewer dialogs/menus needed if keys
+   carry it) but with a lower floor (no IME, no rich text, no colour fidelity guarantees).
+4. **Sizes and fonts.** Anything that only works at one terminal size is not shippable; the
+   zero-height crash is the first instance of a whole class.
+
+**Where it stands:** a spike, not a decision. The shipped shell stays Tauri + Vue.
 
 ---
 

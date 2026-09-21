@@ -11,7 +11,7 @@ were disabled chrome. A destructive-feeling editor without undo is not usable fo
 ## Decision
 
 - **Undo/redo lives in the host, over the same history a seek already replays.** `HostSession` gains
-  `redo: Vec<(usize, HostCommand)>`; `history: Vec<HostCommand>` ([note](2026-09-09-host-transport-seam.md))
+  `redo: Vec<(usize, HostCommand)>`; `history: Vec<HostCommand>` ([note](../architecture/2026-09-09-host-transport-seam.md))
   was already the session's reconstruction log, so undo needs no second mechanism.
 - **Only `Arrange` ops are undoable.** `undo` scans back for the last `Arrange` in `history`, removes
   it, pushes `(position, command)` onto `redo`, and rebuilds. A `Mount`/`Pool`/`SetTempo` is session
@@ -66,7 +66,7 @@ were disabled chrome. A destructive-feeling editor without undo is not usable fo
   arrangement edits. This is deliberate and visible (`can_undo` is false on a freshly loaded script).
 - The `redo` stack is unbounded and cleared by the next edit — standard linear-history behaviour.
 - Playback survives an undo: the rebuild restores the `playing` flag, and only `TransportStop` and
-  `Load` drain the ring ([note](2026-09-09-host-live-runtime-actor-pump.md)), so an edit while playing
+  `Load` drain the ring ([note](../architecture/2026-09-09-host-live-runtime-actor-pump.md)), so an edit while playing
   is audible on the next rendered chunk.
 
 ## Attribution

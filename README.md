@@ -1,6 +1,6 @@
 # sound-arranger (working title)
 
-> 🕒 Last verified against commit `bc91299` (2026-09-21). If the code has
+> 🕒 Last verified against commit `87f0d28` (2026-09-21). If the code has
 > moved on, trust the code and move this line forward.
 
 An **audio platform where everything is a plugin**: a minimal core — clock · audio graph
@@ -66,9 +66,11 @@ sketched pending selection wiring; record is still chrome). The direction is loc
 | `crates/host` | The **Host API contract** (commands = logged events, events, values) + the **headless reference host**: `run_script` assembles the profile and bounces byte-identically — now including the **clip-arrangement commands** (`pool`/`arrange`) in the versioned **text format**, so the CLI smoke binary drives the clip editor end-to-end. It is also a **persistent live session** (`execute()` for incremental edits, `arrangement()` for a serializable snapshot a shell reads). The UI-as-plugin seam — the Tauri shell implements the same contract; swapping shells swaps only the transport adapter. | works, tested |
 | `crates/shell` | The Tauri v2 + Vue 3 shell — now a **working timeline editor**, not a stub: the four planned views as components (`Surface`, `TimelineCanvas`, `SourcePool` with Project/Library contexts, `MixerPanel`, `DetailView`), plus `bridge` (the Host API over Tauri), `transport`, `editor` (undo/redo replayed from the host's session log) and the timeline viewport/editing maths with unit tests. The Detail View is present with its three context tabs, but its bodies are placeholders pending selection wiring. | works; UI wiring in progress |
 | `spikes/iced-shell` | The **iced evaluation spike** (its own workspace, excluded from the core build): a minimal second shell — window, transport, channel/master meters following the audio — driving the *same* `host::live::HostHandle` as the Tauri bridge, but in-process: no IPC, no serde wire, no webview. Ships a headless `--probe` mode that asserts live meter signal. iced 0.14. | spike; decision open — delete the directory to drop the option |
+| `spikes/tui-shell` | The **ratatui evaluation spike** (its own workspace): the terminal counterpart of the iced spike, scoped identically — transport, channel/master meters, position readout — over the same in-process `HostHandle`. Adds an explicit key scheme with a `?` overlay, mouse support (clickable transport, click-to-select meters), per-command UI latency, and a deterministic `--dump` frame. | spike; decision open — delete the directory to drop the option |
 | `plugins/` | **Sidecar plugins** (placeholder): VST3/CLAP builds of core capabilities and the CDP / offline-process sidecar (`OfflineProcess`). Not engine crates — thin wrappers that expose a capability to a plug-in API. See [plugins/README.md](plugins/README.md). | placeholder |
 
-**191 Rust tests + 38 frontend unit tests**, all passing; the core's invariants (byte-identical
+**191 Rust tests + 38 frontend unit tests**, all passing (the two spike workspaces are outside that
+count — `spikes/tui-shell` carries 5 view/input tests of its own); the core's invariants (byte-identical
 replay, no-allocation render, sample-accurate lifecycle) are tested, and the streaming soak +
 real hardware capture run as `#[ignore]`d tests.
 
@@ -173,11 +175,18 @@ rustup default stable     # the repo's rust-toolchain.toml then supplies the com
 Frontend checks, from `crates/shell`: `pnpm typecheck` · `pnpm test` · `pnpm build`
 (and `pnpm tauri dev` to run the app).
 
-The **iced spike** is its own workspace, so iced and wgpu never enter the core build:
+The **spike shells** are their own workspaces, so iced, wgpu and the terminal backend never enter
+the core build. Both drive the same in-process `HostHandle` the Tauri shell reaches over IPC:
+
 ```sh
-cd spikes/iced-shell
-cargo run              # the window (needs a display and an audio device)
-cargo run -- --probe   # headless proof: host thread + transport + live meters, no display needed
+cd spikes/iced-shell           # iced 0.14 — a native window
+cargo run                      # the window (needs a display and an audio device)
+cargo run -- --probe           # headless proof: host thread + transport + live meters
+
+cd spikes/tui-shell            # ratatui 0.30 — a terminal
+cargo run                      # the TUI (press ? for the keymap, q to quit)
+cargo run -- --dump            # render one deterministic frame as text, no TTY needed
+cargo run -- --probe           # the same headless proof
 ```
 
 One-time git setup — hooks live in-repo:

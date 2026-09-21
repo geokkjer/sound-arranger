@@ -52,6 +52,24 @@ question, and keep the Tauri + Vue shell shipped until those measurements exist.
    real pool peaks, zoom/pan, hit-testing, playhead) and a widget inventory of the surfaces the
    Vue shell already has.
 
+## Evidence so far
+
+- **The spike is built and verified** at [`spikes/iced-shell/`](../../../../spikes/iced-shell/)
+  (iced 0.14, its own workspace): the window opens and renders on this host (niri/Wayland, Mesa,
+  wgpu — the exact thing the parked Nix shell died on), it opens the real audio device at
+  48 kHz / 2 ch, the transport drives it, the channel and master meters and the readout follow the
+  audio, and `--probe` observes live meter signal (peak 0.88) headlessly.
+- **The human's read of the window is favourable** — "looks good and more native" than the webview
+  shell — and **`egui` and Slint were dismissed by inspection** as not what this app wants. The
+  appraisal is an input to the decision, not evidence for it: the acceptance criteria below are
+  what closes it.
+- **A second candidate is now in flight**: a terminal shell
+  ([TUI evaluation](2026-09-21-tui-shell-evaluation.md)), deliberately scoped identically, so the
+  choice is between three shapes rather than two.
+- **The spikes are already earning their keep on the host side**: running them against live audio
+  surfaced a one-time ~2–3 s underrun-counter burst at the first transport command
+  ([bug-fix note](../bug-fix/2026-09-21-live-host-underrun-burst-on-transport-change.md)).
+
 ## Alternatives considered
 
 - **Keep Tauri v2 + Vue 3 (the status quo).** The safe answer, and the shipped one. It is *not*
@@ -71,10 +89,12 @@ question, and keep the Tauri + Vue shell shipped until those measurements exist.
   Removes TypeScript and the serde wire but keeps HTML/CSS, keeps the webview's constraints, and
   adds WASM glue. Rejected: it pays most of the dual-stack cost for none of the single-language
   benefit.
-- **Terminal shell (ratatui) as the second host instead.** Much cheaper to build and test and a
-  genuinely useful second reference for CI, but it answers none of the questions a *DAW* UI raises
-  (canvas timeline, meters, drag editing). Rejected as the *evaluation*; still a good later
-  reference host.
+- **Terminal shell (ratatui).** Initially rejected as *the* evaluation — it answers none of the
+  questions a *pixel* DAW UI raises (waveform timeline, drag editing) — but it is now measured
+  alongside iced: a TUI runs headless and over SSH, it is the cheapest shell to build and test, and
+  it is the natural home for the keyboard-first workflow. It has its own spike and note
+  ([TUI evaluation](2026-09-21-tui-shell-evaluation.md)), deliberately scoped identically so the
+  two can be compared; the reference-host role is its fallback if it loses.
 
 ## Acceptance criteria
 

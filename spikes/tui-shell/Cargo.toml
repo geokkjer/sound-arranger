@@ -1,0 +1,17 @@
+[package]
+name = "tui-shell"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "ratatui spike — the terminal counterpart of the iced spike, driving the same in-process Host API (tui-shell evaluation note)"
+
+# Its own workspace on purpose: the terminal shell (and its backend crates) must
+# not enter the default `cargo build --workspace` of the core. Evaluation, not a
+# shell yet.
+[workspace]
+
+[dependencies]
+# crossterm comes through ratatui's re-export, so the backend version can never
+# drift from the widget crate's.
+ratatui = "0.30"
+host = { path = "../../crates/host" }
