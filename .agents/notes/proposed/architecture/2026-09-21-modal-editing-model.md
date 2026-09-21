@@ -66,6 +66,30 @@ concretely:
    Mixing is fader-like: a momentary grab mode (or per-channel command surface) rather than pretending
    a fader is a text motion.
 
+## What already holds (2026-09-21, in the TUI spike)
+
+Two of the criteria below are partly satisfied by the first slice built — which is why this note is a
+proposal to *finish* a model rather than to start one:
+
+- **Keys already dispatch the host's text format.** `x` (split) and `d` (delete) in the spike do not
+  call engine internals: they build an `arrange …` line and hand it to the host's own parser
+  (`host::parse_arrange_line`), which returns a `HostCommand::Arrange` the host logs like any other
+  command. A refused op (a split at frame 0) is reported in the state line and never logged. **The
+  `:` prompt is therefore a widget away, not a project**: it types the same vocabulary. *(`:` itself
+  is not built.)*
+- **Modes are visible and non-destructive to leave.** `NORMAL`/`VISUAL` is always on the state line,
+  visual mode carries a frame-span selection with its duration, and `Esc` now leaves state and never
+  quits — the safety key is not the destructive one.
+- **Panel focus exists** (`Tab`/`Shift-Tab`, click-to-focus, a lit border), so one key space serves
+  two panels: `j`/`k` mean "mixer channel" or "active track" depending on focus. That is the
+  structural prerequisite for a multi-panel editor, and it is what makes "the session is a document"
+  concrete.
+- **Clip motions exist in miniature**: `n`/`N` jump the playhead to the next/previous clip — the
+  arrangement's answer to "next word".
+
+What is *not* built: the `:` prompt, registers/repeat/macros, the keymap as loadable data, the
+prefix infobox, the palette, and the Emacs-style extensibility surface.
+
 ## Alternatives considered
 
 - **Pointer-first DAW UI (today, by default).** Panels, drag, canvas editing. Rejected as the

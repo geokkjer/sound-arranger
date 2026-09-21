@@ -38,7 +38,7 @@ use host::HostCommand;
 use host::live::{AudioStatus, HostHandle, Snapshot};
 
 mod timeline;
-use timeline::{Mode, View, Wave};
+use timeline::{Arrangement, Mode, Sources, View};
 
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -82,44 +82,55 @@ const KEYMAP: &[(&str, &str)] = &[
     ("s", "stop"),
     ("r  Home", "rewind to 0"),
     (",  .", "seek -1 s / +1 s (stops first)"),
-    ("j  k  ↑  ↓", "select the next / previous channel"),
+    ("Tab  Shift-Tab", "move between panels (mixer ⇄ timeline)"),
+    (
+        "j  k  ↑  ↓",
+        "the focused panel: mixer channel / active track",
+    ),
     ("v", "visual mode: select from the playhead"),
     (
         "h  l",
-        "scroll the timeline (visual mode: extend the selection)",
+        "timeline: scroll (visual mode: extend the selection)",
     ),
+    ("+  -", "timeline: zoom in / out"),
+    ("0", "timeline: fit the whole arrangement"),
+    ("x", "timeline: split the clip under the playhead"),
+    ("d", "timeline: delete the clip under the playhead"),
+    ("n  N", "timeline: jump to the next / previous clip"),
     (
-        "+  -",
-        "zoom in (one frame per column) / out (fit the file)",
+        "Esc",
+        "leave visual mode / close this overlay (never quits)",
     ),
-    ("0", "fit the whole file"),
-    ("Esc", "leave visual mode"),
     ("m", "toggle mouse capture"),
     ("?", "this keymap"),
-    ("q  Esc  Ctrl+c", "quit"),
+    ("q  Ctrl+c", "quit"),
     (
         "mouse",
-        "click Play/Stop/Rewind · click a meter row · click the timeline = seek · wheel = seek",
+        "click a panel to focus · click a lane = that track + seek · click the ruler = seek · wheel = seek",
     ),
 ];
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let keys = args.iter().any(|arg| arg == "--keys");
-    let wave = args
-        .windows(2)
-        .find(|pair| pair[0] == "--wave")
-        .map(|pair| std::path::PathBuf::from(&pair[1]));
+    let value_of = |flag: &str| {
+        args.windows(2)
+            .find(|pair| pair[0] == flag)
+            .map(|pair| PathBuf::from(&pair[1]))
+    };
+
+    let wave = value_of("--wave");
+    let script = value_of("--script");
 
     if args.iter().any(|arg| arg == "--probe") {
         std::process::exit(probe());
     }
 
     if args.iter().any(|arg| arg == "--dump") {
-        return dump(keys, wave);
+        return dump(keys, wave, script);
     }
 
-    run(keys, wave)
+    run(keys, wave, script)
 }
 
 // ---------------------------------------------------------------------------
@@ -135,7 +146,7 @@ struct App {
     snap: Snapshot,
     /// The last load/refusal message, shown in the state panel.
     status: String,
-    /// The selected mixer channel (the target for future edit keys).
+    /// The selected mixer channel.
     selected: usize,
     help: bool,
     mouse: bool,
@@ -146,11 +157,37 @@ struct App {
     /// no widget tree to query, so the view publishes what is clickable.
     buttons: Vec<(Rect, Action)>,
     meter_rows: Vec<(usize, Rect)>,
-    /// The timeline: an audio file, its viewport, and the current mode.
-    wave: Option<Wave>,
+    mixer_rect: Rect,
+    /// The timeline: the arrangement the host holds, its viewport, the focused
+    /// panel, the active track, and the mode.
+    arrangement: Option<Arrangement>,
+    sources: Sources,
     view: Option<View>,
     mode: Mode,
+    focus: Panel,
+    active_track: usize,
+    /// Where the timeline came from, for the panel title.
+    origin: String,
+    /// A counter for ids the shell generates (split halves) — ids are logged, so
+    /// they must be unique and deterministic per session.
+    next_id: u64,
     panel: timeline::PanelRects,
+}
+
+/// Which panel the keys act on. `Tab`/`Shift-Tab` cycle; a click focuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Panel {
+    Mixer,
+    Timeline,
+}
+
+impl Panel {
+    fn label(self) -> &'static str {
+        match self {
+            Panel::Mixer => "mixer",
+            Panel::Timeline => "timeline",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -163,7 +200,7 @@ enum Action {
 impl App {
     /// Boot against the live host, with a real audio device when one exists, and
     /// load the demo profile. Failures land in `status`, never as a panic.
-    fn boot(wave: Option<PathBuf>) -> Self {
+    fn boot(wave: Option<PathBuf>, script: Option<PathBuf>) -> Self {
         let host = HostHandle::spawn_with_audio();
         let status = match host::parse_script(DEMO_SCRIPT) {
             Ok(script) => match host.load(&script) {
@@ -189,44 +226,171 @@ impl App {
             last_command: None,
             buttons: Vec::new(),
             meter_rows: Vec::new(),
-            wave: None,
+            mixer_rect: Rect::default(),
+            arrangement: None,
+            sources: Sources::default(),
             view: None,
             mode: Mode::Normal,
+            focus: Panel::Mixer,
+            active_track: 0,
+            origin: String::new(),
+            next_id: 0,
             panel: timeline::PanelRects::default(),
         };
 
-        if let Some(path) = wave {
+        if let Some(path) = script {
+            app.open_script(&path);
+        } else if let Some(path) = wave {
             app.open_wave(&path);
         }
 
         app
     }
 
-    /// Load an audio file into the timeline. A failure is a status line, never a
-    /// panic — the rest of the shell keeps working.
+    /// Load a single audio file into the timeline: one lane, one clip
+    /// (`--wave`). A failure is a status line, never a panic.
     fn open_wave(&mut self, path: &std::path::Path) {
-        match Wave::load(path) {
-            Ok(wave) => {
+        match Arrangement::from_wave(path) {
+            Ok(arrangement) => {
                 self.status = format!(
                     "timeline: {} — {:.2} s, {} Hz, {} frames",
-                    wave.file_name(),
-                    wave.seconds(),
-                    wave.sample_rate,
-                    wave.frames,
+                    path.display(),
+                    arrangement.seconds(),
+                    arrangement.sample_rate,
+                    arrangement.frames,
                 );
-                self.view = Some(View::new(&wave));
-                self.wave = Some(wave);
+                self.adopt(arrangement, path.display().to_string());
             }
             Err(e) => self.status = format!("cannot open {}: {e}", path.display()),
         }
     }
 
-    /// The deterministic frame `--dump` and the tests render: a synthetic
-    /// snapshot with signal in it, so the output is reproducible and does not
-    /// depend on an audio device or on timing.
+    /// Load a **host script** (`pool`/`arrange` lines) into the live host and
+    /// draw the arrangement the host then holds — the same value the engine
+    /// renders, not a copy of it.
+    fn open_script(&mut self, path: &std::path::Path) {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) => {
+                self.status = format!("cannot read {}: {e}", path.display());
+                return;
+            }
+        };
+        let script = match host::parse_script(&text) {
+            Ok(script) => script,
+            Err(e) => {
+                self.status = format!("{}: {e}", path.display());
+                return;
+            }
+        };
+
+        self.origin = path.display().to_string();
+
+        match self.host.load(&script) {
+            Ok(outcome) => {
+                self.status = format!(
+                    "script loaded — {} tracks, {} clips, {} log events",
+                    outcome
+                        .arrangement
+                        .as_ref()
+                        .map(|t| t.tracks.len())
+                        .unwrap_or(0),
+                    outcome
+                        .arrangement
+                        .as_ref()
+                        .map(|t| t.tracks.iter().map(|t| t.clips.len()).sum::<usize>())
+                        .unwrap_or(0),
+                    outcome.event_count,
+                );
+                self.take_arrangement(outcome);
+            }
+            Err(e) => self.status = format!("script failed: {e}"),
+        }
+    }
+
+    /// Re-read the arrangement from the host after an edit, so the panel always
+    /// shows the engine's value.
+    fn refresh_arrangement(&mut self) {
+        match self.host.outcome() {
+            Ok(outcome) => self.take_arrangement(outcome),
+            Err(e) => self.status = format!("cannot read the arrangement: {e}"),
+        }
+    }
+
+    /// Adopt a host outcome's arrangement into the panel, keeping the viewport.
+    fn take_arrangement(&mut self, outcome: host::live::HostOutcome) {
+        let timeline = match outcome.arrangement {
+            Ok(timeline) => timeline,
+            Err(e) => {
+                self.status = format!("arrangement: {e}");
+                return;
+            }
+        };
+
+        let rate = self
+            .snap
+            .audio
+            .as_ref()
+            .map(|audio| audio.sample_rate)
+            .filter(|rate| *rate > 0)
+            .unwrap_or(SAMPLE_RATE as u32);
+
+        let arrangement = Arrangement::from_host(
+            &timeline,
+            outcome.pool_sources.as_deref(),
+            &mut self.sources,
+            rate,
+            self.origin.clone(),
+        );
+
+        // Sources that could not be read are the panel's problem to report.
+        if let Some((id, error)) = self.sources.errors().last() {
+            self.status = format!("source {id}: {error}");
+        }
+
+        self.adopt(arrangement, self.origin.clone());
+    }
+
+    /// Install a new arrangement, keeping the viewport when there is one (an
+    /// edit should not throw the user's zoom and scroll away).
+    fn adopt(&mut self, arrangement: Arrangement, origin: String) {
+        let frames = arrangement.frames;
+        self.origin = origin;
+        self.arrangement = Some(arrangement);
+
+        match self.view.as_mut() {
+            Some(view) => {
+                if view.start > frames {
+                    view.start = 0;
+                }
+            }
+            None => self.view = Some(View::new(frames)),
+        }
+
+        if self.focus == Panel::Mixer {
+            self.focus = Panel::Timeline;
+        }
+        self.active_track = self.active_track.min(
+            self.arrangement
+                .as_ref()
+                .map_or(0, |a| a.lanes.len().saturating_sub(1)),
+        );
+    }
+
+    /// The deterministic frame the tests render: a synthetic snapshot with
+    /// signal in it, so the output is reproducible and does not depend on an
+    /// audio device or on timing.
+    #[cfg(test)]
     fn demo() -> Self {
         let mut app = App::idle();
+        app.snap = App::demo_snapshot();
+        app.status = "demo loaded — mixer 4 ch, 8 log events, 0 underruns".to_string();
+        app.selected = 1;
+        app
+    }
 
+    /// The synthetic transport/meter state: 2.000 s in, playing, with signal.
+    fn demo_snapshot() -> Snapshot {
         let audio = AudioStatus {
             sample_rate: SAMPLE_RATE as u32,
             channels: 2,
@@ -249,16 +413,13 @@ impl App {
         snap.channels[0] = 0.88;
         snap.channels[1] = 0.12;
         snap.channels[3] = 0.94;
-
-        app.snap = snap;
-        app.status = "demo loaded — mixer 4 ch, 8 log events, 0 underruns".to_string();
-        app.selected = 1;
-        app
+        snap
     }
 
-    /// A silent, idle host for the dump/tests: the rendered state comes from the
+    /// A silent, idle host for the tests: the rendered state comes from the
     /// synthetic snapshot, so the host only exists to satisfy the type (and to
-    /// answer the transport commands the keymap tests exercise).
+    /// answer the transport/arrange commands the tests exercise).
+    #[cfg(test)]
     fn idle() -> Self {
         let host = HostHandle::spawn();
         App {
@@ -272,9 +433,15 @@ impl App {
             last_command: None,
             buttons: Vec::new(),
             meter_rows: Vec::new(),
-            wave: None,
+            mixer_rect: Rect::default(),
+            arrangement: None,
+            sources: Sources::default(),
             view: None,
             mode: Mode::Normal,
+            focus: Panel::Mixer,
+            active_track: 0,
+            origin: String::new(),
+            next_id: 0,
             panel: timeline::PanelRects::default(),
         }
     }
@@ -347,34 +514,54 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
         match key.code {
+            // Global transport: available in either panel and in any mode.
             KeyCode::Char(' ') => self.toggle(),
             KeyCode::Char('s') => self.stop(),
             KeyCode::Char('r') | KeyCode::Home => self.rewind(),
             KeyCode::Char(',') => self.nudge(-1),
             KeyCode::Char('.') => self.nudge(1),
-            KeyCode::Char('j') | KeyCode::Down => self.select(1),
-            KeyCode::Char('k') | KeyCode::Up => self.select(-1),
-            // Timeline: the viewport is free to move; only seeking talks to the
-            // host (and that one is O(target), so it stays on `,`/`.` and clicks).
-            KeyCode::Char('h') | KeyCode::Left => self.timeline_move(-1),
-            KeyCode::Char('l') | KeyCode::Right => self.timeline_move(1),
-            KeyCode::Char('+') | KeyCode::Char('=') => self.timeline_zoom(true),
-            KeyCode::Char('-') | KeyCode::Char('z') => self.timeline_zoom(false),
-            KeyCode::Char('Z') => self.timeline_zoom(true),
-            KeyCode::Char('0') => self.timeline_fit(),
-            KeyCode::Char('v') => self.visual(),
+
+            // Panel navigation. Shift-Tab arrives as BackTab on most terminals.
+            KeyCode::Tab => self.cycle_focus(1),
+            KeyCode::BackTab => self.cycle_focus(-1),
+
+            // Panel-scoped vertical movement: the mixer's channel, or the
+            // timeline's active track.
+            KeyCode::Char('j') | KeyCode::Down => self.vertical(1),
+            KeyCode::Char('k') | KeyCode::Up => self.vertical(-1),
+
+            // Timeline only (the viewport is free to move; only seeking and
+            // editing talk to the host).
+            KeyCode::Char('h') | KeyCode::Left => self.timeline_key(|app| app.timeline_move(-1)),
+            KeyCode::Char('l') | KeyCode::Right => self.timeline_key(|app| app.timeline_move(1)),
+            KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char('Z') => {
+                self.timeline_key(|app| app.timeline_zoom(true))
+            }
+            KeyCode::Char('-') | KeyCode::Char('z') => {
+                self.timeline_key(|app| app.timeline_zoom(false))
+            }
+            KeyCode::Char('0') => self.timeline_key(|app| app.timeline_fit()),
+            KeyCode::Char('v') => self.timeline_key(|app| app.visual()),
+            KeyCode::Char('x') => self.timeline_key(|app| app.split_at_playhead()),
+            KeyCode::Char('d') => self.timeline_key(|app| app.delete_at_playhead()),
+            // Clip-to-clip motion: the "next word" analogue for an arrangement.
+            KeyCode::Char('n') => self.timeline_key(|app| app.seek_clip(true)),
+            KeyCode::Char('N') => self.timeline_key(|app| app.seek_clip(false)),
+
             KeyCode::Char('?') => self.help = !self.help,
             KeyCode::Char('m') => self.toggle_mouse(),
             KeyCode::Char('q') => self.quit = true,
-            // Esc leaves visual mode first; a second Esc quits.
+            // Esc leaves *state* (the help overlay, a visual selection) and never
+            // quits: `q` and Ctrl+c are the only ways out. A double-Esc quit was a
+            // design mistake — it makes the safety key destructive.
             KeyCode::Esc => {
-                if self.mode == Mode::Visual {
+                if self.help {
+                    self.help = false;
+                } else if self.mode == Mode::Visual {
                     self.mode = Mode::Normal;
                     if let Some(view) = self.view.as_mut() {
                         view.selection = None;
                     }
-                } else {
-                    self.quit = true;
                 }
             }
             KeyCode::Char('c') if ctrl => self.quit = true,
@@ -382,13 +569,50 @@ impl App {
         }
     }
 
+    /// Run `action` only when the timeline is the focused panel.
+    fn timeline_key(&mut self, action: impl FnOnce(&mut App)) {
+        if self.focus == Panel::Timeline {
+            action(self);
+        }
+    }
+
+    /// `j`/`k`: the focused panel's vertical movement — mixer channel, or the
+    /// timeline's active track.
+    fn vertical(&mut self, direction: i64) {
+        match self.focus {
+            Panel::Mixer => self.select(direction),
+            Panel::Timeline => {
+                let lanes = self.arrangement.as_ref().map_or(0, |a| a.lanes.len());
+                if lanes == 0 {
+                    return;
+                }
+                self.active_track =
+                    (self.active_track as i64 + direction).clamp(0, lanes as i64 - 1) as usize;
+            }
+        }
+    }
+
+    /// `Tab`/`Shift-Tab`: move the focus ring.
+    fn cycle_focus(&mut self, _direction: i64) {
+        if self.arrangement.is_none() {
+            self.focus = Panel::Mixer; // only one panel to focus
+            return;
+        }
+        self.focus = match self.focus {
+            Panel::Mixer => Panel::Timeline,
+            Panel::Timeline => Panel::Mixer,
+        };
+    }
+
     // -- the timeline's update side ----------------------------------------
 
     /// `h`/`l`: scroll in normal mode, extend the selection in visual mode. The
     /// two behaviours are the whole point of the mode being visible.
     fn timeline_move(&mut self, direction: i64) {
-        let Some(wave) = &self.wave else { return };
-        let width = self.panel.timeline.width.max(1) as u64;
+        let Some(frames) = self.arrangement.as_ref().map(|a| a.frames) else {
+            return;
+        };
+        let width = self.panel_width();
         let Some(view) = self.view.as_mut() else {
             return;
         };
@@ -399,54 +623,148 @@ impl App {
                 .map(|(_, head)| head)
                 .unwrap_or(self.snap.frame);
             let step = view.frames_per_cell as i64 * 4 * direction;
-            let next = (head as i64 + step).clamp(0, wave.frames as i64) as u64;
+            let next = (head as i64 + step).clamp(0, frames as i64) as u64;
             let anchor = view.selection.map(|(anchor, _)| anchor).unwrap_or(head);
             view.selection = Some((anchor, next));
             // Keep the head in view.
             if next < view.start || next >= view.start + view.visible(width) {
                 view.start = next.saturating_sub(view.visible(width) / 2);
-                view.clamp(wave, width);
+                view.clamp(frames, width);
             }
         } else {
-            view.scroll(wave, width, direction * (width as i64 / 8).max(1));
+            view.scroll(frames, width, direction * (width as i64 / 8).max(1));
         }
     }
 
     fn timeline_zoom(&mut self, in_: bool) {
-        let Some(wave) = &self.wave else { return };
-        let width = self.panel.timeline.width.max(1) as u64;
+        let Some(frames) = self.arrangement.as_ref().map(|a| a.frames) else {
+            return;
+        };
+        let width = self.panel_width();
         let anchor = self.snap.frame;
         if let Some(view) = self.view.as_mut() {
-            view.zoom(wave, width, anchor, in_);
+            view.zoom(frames, width, anchor, in_);
         }
     }
 
     fn timeline_fit(&mut self) {
-        let Some(wave) = &self.wave else { return };
-        let width = self.panel.timeline.width.max(1) as u64;
+        let Some(frames) = self.arrangement.as_ref().map(|a| a.frames) else {
+            return;
+        };
+        let width = self.panel_width();
         if let Some(view) = self.view.as_mut() {
-            view.fit(wave, width);
+            view.fit(frames, width);
         }
     }
 
     /// `v`: enter visual mode, anchoring a selection at the playhead.
     fn visual(&mut self) {
         let Some(view) = self.view.as_mut() else {
-            self.status = "visual mode needs a timeline: run with --wave <file.wav>".to_string();
+            self.status =
+                "visual mode needs a timeline: run with --wave <file> or --script <script>"
+                    .to_string();
             return;
         };
         self.mode = Mode::Visual;
         view.selection = Some((self.snap.frame, self.snap.frame));
     }
 
+    // -- editing: the shell speaks the host's own text format ---------------
+
+    /// Dispatch an `arrange` line **through the host's parser**, so the shell and
+    /// the CLI share one vocabulary: the ops a key runs are the ops a script
+    /// writes, and the host logs them like any other command.
+    fn arrange(&mut self, line: &str) {
+        match host::parse_arrange_line(line) {
+            Ok((op, at_frame)) => {
+                self.command("arrange", HostCommand::Arrange { op, at_frame });
+                self.refresh_arrangement();
+            }
+            Err(e) => self.status = format!("arrange: {e}"),
+        }
+    }
+
+    /// `x`: razor-split the clip under the playhead on the active track. Both
+    /// halves are named here and logged with the op — ids are part of the log.
+    fn split_at_playhead(&mut self) {
+        let Some((track, clip_id)) = self.clip_under_playhead() else {
+            self.status = "no clip under the playhead on the active track".to_string();
+            return;
+        };
+
+        self.next_id += 1;
+        let left = format!("{clip_id}-a{}", self.next_id);
+        let right = format!("{clip_id}-b{}", self.next_id);
+        let at = self.snap.frame;
+
+        self.status = format!("split {clip_id} at {at} → {left} + {right}");
+        self.arrange(&format!(
+            "razor_split {track} {clip_id} {left} {right} {at}"
+        ));
+    }
+
+    /// `d`: delete the clip under the playhead on the active track.
+    fn delete_at_playhead(&mut self) {
+        let Some((track, clip_id)) = self.clip_under_playhead() else {
+            self.status = "no clip under the playhead on the active track".to_string();
+            return;
+        };
+        self.status = format!("delete {clip_id}");
+        self.arrange(&format!("delete {track} {clip_id}"));
+    }
+
+    /// The (track id, clip id) at the playhead on the active track.
+    fn clip_under_playhead(&self) -> Option<(String, String)> {
+        let arrangement = self.arrangement.as_ref()?;
+        let lane = arrangement.lanes.get(self.active_track)?;
+        let clip = arrangement.clip_at(self.active_track, self.snap.frame)?;
+        Some((lane.id.clone(), clip.id.clone()))
+    }
+
+    /// `n`/`N`: jump the playhead to the next/previous clip boundary on the
+    /// active track — the motion an arrangement needs where text has "next word".
+    fn seek_clip(&mut self, forward: bool) {
+        let target = {
+            let Some(arrangement) = self.arrangement.as_ref() else {
+                return;
+            };
+            let here = self.snap.frame;
+            let clip = if forward {
+                arrangement.clip_from(self.active_track, here)
+            } else {
+                arrangement.clip_before(self.active_track, here)
+            };
+            clip.map(|clip| clip.at_frame)
+        };
+
+        match target {
+            Some(frame) => {
+                self.stop();
+                self.command("seek", HostCommand::TransportSeek { frame });
+            }
+            None => {
+                self.status = if forward {
+                    "no later clip on this track".to_string()
+                } else {
+                    "no earlier clip on this track".to_string()
+                }
+            }
+        }
+    }
+
+    /// The envelope area's width in terminal cells.
+    fn panel_width(&self) -> u64 {
+        self.panel.ruler.width.max(1) as u64
+    }
+
     /// A click on the timeline seeks the transport to that point — the mouse
     /// dispatching exactly the command a key would, so there is one log.
     fn timeline_seek(&mut self, position: Position) {
-        let (Some(wave), Some(view)) = (&self.wave, &self.view) else {
+        let (Some(arrangement), Some(view)) = (&self.arrangement, &self.view) else {
             return;
         };
-        let cell = (position.x.saturating_sub(self.panel.timeline.x)) as u64;
-        let frame = view.frame_at(cell).min(wave.frames);
+        let cell = position.x.saturating_sub(self.panel.ruler.x) as u64;
+        let frame = view.frame_at(cell).min(arrangement.frames);
         self.stop();
         self.command("seek", HostCommand::TransportSeek { frame });
     }
@@ -479,9 +797,18 @@ impl App {
                     return;
                 }
 
-                // Clicking the envelope or the ruler seeks there. (The ruler is
-                // its own rect so a drag-vs-scrub distinction can come later.)
-                if self.panel.timeline.contains(position) || self.panel.ruler.contains(position) {
+                // Clicking a panel focuses it; clicking the ruler or a lane also
+                // acts on what was clicked (seek, and make that track active).
+                if self.panel.outer.contains(position) {
+                    self.focus = Panel::Timeline;
+                } else if self.mixer_rect.contains(position) {
+                    self.focus = Panel::Mixer;
+                }
+
+                if self.panel.contains(position) {
+                    if let Some(lane) = self.panel.lane_at(position) {
+                        self.active_track = lane;
+                    }
                     self.timeline_seek(position);
                     return;
                 }
@@ -505,9 +832,9 @@ impl App {
     fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
 
-        // The timeline panel appears only when a file is loaded; the meters take
-        // its space otherwise.
-        if self.wave.is_some() {
+        // The timeline panel appears when an arrangement is loaded; the meters
+        // take its space otherwise.
+        if self.arrangement.is_some() {
             let [head, controls, meters, timeline_area, foot] = Layout::vertical([
                 Constraint::Length(5),
                 Constraint::Length(3),
@@ -542,20 +869,32 @@ impl App {
         }
     }
 
-    /// The timeline: file, ruler, braille envelope, selection, playhead. The
-    /// panel publishes its rects for the mouse.
+    /// The timeline: origin, ruler, one envelope lane per track, clip
+    /// boundaries, the selection, the playhead, the active track. The panel
+    /// publishes its rects for the mouse.
     fn draw_timeline(&mut self, frame: &mut Frame, area: Rect) {
-        let Some(wave) = self.wave.as_ref() else {
+        let Some(arrangement) = self.arrangement.as_ref() else {
             return;
         };
-        // The real panel width is only known once drawn (minus the border).
-        let inner_width = area.width.saturating_sub(2).max(1) as u64;
+        // The real panel width is only known once drawn: minus the border and the
+        // track gutter.
+        let inner_width = area.width.saturating_sub(2 + timeline::GUTTER).max(1) as u64;
+        let frames = arrangement.frames;
         let Some(view) = self.view.as_mut() else {
             return;
         };
-        view.fit_if_needed(wave, inner_width);
+        view.fit_if_needed(frames, inner_width);
 
-        let panel = timeline::draw(frame, area, wave, view, self.snap.frame, self.mode);
+        let panel = timeline::draw(
+            frame,
+            area,
+            arrangement,
+            view,
+            self.snap.frame,
+            self.mode,
+            self.active_track,
+            self.focus == Panel::Timeline,
+        );
         self.panel = panel;
     }
 
@@ -641,9 +980,18 @@ impl App {
     }
 
     fn draw_meters(&mut self, frame: &mut Frame, area: Rect) {
-        let block = Block::bordered().title(" meters ");
+        // The focus ring: the mixer's border is lit when its keys are live.
+        let border = if self.focus == Panel::Mixer {
+            Color::LightBlue
+        } else {
+            Color::DarkGray
+        };
+        let block = Block::bordered()
+            .title(" meters ")
+            .border_style(Style::new().fg(border));
         let inner = block.inner(area);
         frame.render_widget(block, area);
+        self.mixer_rect = area;
 
         self.meter_rows.clear();
 
@@ -774,20 +1122,29 @@ impl App {
             )
         };
 
-        let timeline = match (&self.wave, &self.view) {
-            (Some(wave), Some(view)) => {
+        // Which panel the keys act on, the active track, the viewport, and the
+        // selection — all of it on one line so the state is never guessed.
+        let focus = format!("focus {}   ", self.focus.label());
+        let timeline = match (&self.arrangement, &self.view) {
+            (Some(arrangement), Some(view)) => {
                 let selection = view
-                    .selection_label(wave)
+                    .selection_label(arrangement.sample_rate)
                     .map(|label| format!("   sel {label}"))
                     .unwrap_or_default();
-                let end = (view.start + view.visible(self.panel.timeline.width.max(1) as u64))
-                    .min(wave.frames);
+                let end = (view.start + view.visible(self.panel.ruler.width.max(1) as u64))
+                    .min(arrangement.frames);
+                let rate = arrangement.sample_rate.max(1) as f64;
                 format!(
-                    "   view {:.3}–{:.3} s of {:.3} s   {:.3} ms/col{selection}",
-                    view.start as f64 / wave.sample_rate as f64,
-                    end as f64 / wave.sample_rate as f64,
-                    wave.seconds(),
-                    view.ms_per_cell(wave),
+                    "   track {}   view {:.3}–{:.3} s of {:.3} s   {:.3} ms/col{selection}",
+                    arrangement
+                        .lanes
+                        .get(self.active_track)
+                        .map(|lane| lane.id.as_str())
+                        .unwrap_or("—"),
+                    view.start as f64 / rate,
+                    end as f64 / rate,
+                    arrangement.seconds(),
+                    view.ms_per_cell(arrangement.sample_rate),
                 )
             }
             _ => String::new(),
@@ -796,7 +1153,7 @@ impl App {
         let paragraph = Paragraph::new(vec![
             ratatui::text::Line::from(vec![
                 mode,
-                Span::raw(format!("  mouse {}   {latency}", on_off(self.mouse))),
+                Span::raw(format!("  {focus}mouse {}   {latency}", on_off(self.mouse))),
                 Span::styled(timeline, Style::new().fg(Color::Gray)),
             ]),
             self.status.clone().into(),
@@ -839,11 +1196,11 @@ impl App {
 // The terminal runtime
 // ---------------------------------------------------------------------------
 
-fn run(keys: bool, wave: Option<PathBuf>) -> io::Result<()> {
+fn run(keys: bool, wave: Option<PathBuf>, script: Option<PathBuf>) -> io::Result<()> {
     let mut terminal = ratatui::init();
     let _ = execute!(io::stdout(), EnableMouseCapture);
 
-    let mut app = App::boot(wave);
+    let mut app = App::boot(wave, script);
     app.help = keys;
     let outcome = event_loop(&mut terminal, &mut app);
 
@@ -881,17 +1238,20 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
 /// `--dump`: render one deterministic frame and print it as plain text. This is
 /// the TUI's version of "look at the window" — what CI, the note, and a
 /// screenshot-less review can actually read. `--dump --keys` renders the keymap
-/// overlay instead; `--dump --wave <file.wav>` renders the timeline for a real
-/// file (still deterministic: the viewport, the envelope and the synthetic
-/// playhead do not depend on timing).
-fn dump(keys: bool, wave: Option<PathBuf>) -> io::Result<()> {
-    // The synthetic snapshot stays the base so the dump is deterministic; the
-    // wave (if any) layers the timeline on top, with the playhead at 2.000 s.
-    let mut app = App::demo();
+/// overlay instead; `--dump --wave <file.wav>` or `--dump --script <script>`
+/// renders an arrangement (still deterministic: the viewport, the envelope and
+/// the synthetic playhead do not depend on timing).
+fn dump(keys: bool, wave: Option<PathBuf>, script: Option<PathBuf>) -> io::Result<()> {
+    let mut app = App::boot(wave, script);
+    // The synthetic transport/meter state keeps the dump deterministic and
+    // readable; the arrangement (if any) is real.
+    app.snap = App::demo_snapshot();
     app.help = keys;
-    if let Some(path) = wave {
-        app.open_wave(&path);
-    }
+    app.focus = if app.arrangement.is_some() {
+        Panel::Timeline
+    } else {
+        Panel::Mixer
+    };
 
     let backend = ratatui::backend::TestBackend::new(100, 26);
     // The test backend cannot fail, so these are expects rather than a Result
@@ -1242,14 +1602,20 @@ mod tests {
         assert!(screen.contains("VISUAL"), "mode not shown:\n{screen}");
         assert!(screen.contains("sel "), "selection not shown:\n{screen}");
 
-        // Esc leaves visual mode and drops the selection; a second Esc quits.
+        // Esc leaves visual mode and drops the selection — and never quits, no
+        // matter how often it is pressed (the safety key must not be fatal).
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.view.as_ref().expect("a view").selection.is_none());
-        assert!(!app.quit, "the first Esc must not quit");
+        assert!(!app.quit, "Esc must not quit");
 
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
-        assert!(app.quit, "the second Esc quits");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(!app.quit, "Esc never quits, however often it is pressed");
+
+        // `q` is the way out.
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()));
+        assert!(app.quit, "q quits");
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1280,5 +1646,102 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tab_cycles_the_focus_and_scopes_the_timeline_keys() {
+        let path = wav_fixture("focus");
+        let mut app = App::demo();
+        assert_eq!(app.focus, Panel::Mixer, "no arrangement → the mixer");
+
+        app.open_wave(&path);
+        let _ = rendered(&mut app);
+        assert_eq!(app.focus, Panel::Timeline, "loading adopts the timeline");
+
+        // With the mixer focused, timeline keys are inert.
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+        assert_eq!(app.focus, Panel::Mixer);
+        let before = app.view.as_ref().expect("a view").start;
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::empty()));
+        assert_eq!(
+            app.view.as_ref().expect("a view").start,
+            before,
+            "the timeline does not scroll while the mixer has the keys"
+        );
+
+        // Shift-Tab (BackTab) goes back, and then the keys act again.
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()));
+        assert_eq!(app.focus, Panel::Timeline);
+        let before = app.view.as_ref().expect("a view").frames_per_cell;
+        app.on_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::empty()));
+        assert!(
+            app.view.as_ref().expect("a view").frames_per_cell < before,
+            "zoom is live again"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn edits_go_through_the_hosts_arrange_language() {
+        // A pool with one source, and a script that places one clip on one track.
+        let pool = std::env::temp_dir().join(format!("tui-shell-pool-{}", std::process::id()));
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        let source = pool.join("s1.wav");
+        let mut writer =
+            media::wav::WavWriter::create_float(&source, 48_000, 1).expect("fixture source");
+        let samples: Vec<f32> = (0..144_000)
+            .map(|i| (i as f32 * 0.05).sin() * 0.7)
+            .collect();
+        writer.write(&samples).expect("write");
+        writer.finalize().expect("finalize");
+
+        let script_path = pool.join("arrangement.script");
+        let script = format!(
+            "host v1\nmount mixer channels=2\npool {}\narrange add_track t0\narrange add_clip t0 c0 s1 0 144000 0 0 0 1.0\n",
+            pool.display()
+        );
+        std::fs::write(&script_path, script).expect("write the script");
+
+        let mut app = App::idle();
+        app.snap = App::demo_snapshot(); // playhead at 2.000 s: inside the clip
+        app.open_script(&script_path);
+
+        let arrangement = app.arrangement.as_ref().expect("an arrangement");
+        assert_eq!(arrangement.lanes.len(), 1, "{}", app.status);
+        assert_eq!(arrangement.clip_count(), 1, "{}", app.status);
+        assert_eq!(arrangement.frames, 144_000);
+        assert_eq!(app.active_track, 0);
+
+        // `x` splits through the host and re-reads the host's value.
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()));
+        assert!(
+            matches!(app.last_command, Some(("arrange", _))),
+            "split did not dispatch an arrange command: {:?} / {}",
+            app.last_command,
+            app.status
+        );
+        assert_eq!(
+            app.arrangement.as_ref().expect("arrangement").clip_count(),
+            2,
+            "the host split the clip: {}",
+            app.status
+        );
+
+        // `d` deletes the clip under the playhead.
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()));
+        assert_eq!(
+            app.arrangement.as_ref().expect("arrangement").clip_count(),
+            1,
+            "the host deleted a clip: {}",
+            app.status
+        );
+
+        // With nothing under the playhead, the key reports instead of panicking.
+        app.snap.frame = 1_000_000;
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()));
+        assert!(app.status.contains("no clip"), "status: {}", app.status);
+
+        let _ = std::fs::remove_dir_all(&pool);
     }
 }

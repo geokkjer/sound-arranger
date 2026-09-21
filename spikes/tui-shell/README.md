@@ -21,53 +21,99 @@ In scope (identical to the iced spike):
 
 What this spike adds, because it is what a TUI has to answer for:
 
-- **a timeline** — `--wave <file.wav>` draws a real audio file as a **min/max
-  envelope in braille**, with a ruler, a viewport you can zoom and scroll, a
-  playhead, and a **visual-mode selection** over a frame span (see below);
+- **an arrangement** — `--script <host script>` draws the **clips and tracks the
+  host holds** (the engine's own `Timeline`, not a copy) as braille min/max
+  envelopes, one lane per track, clip boundaries and per-track colour; `--wave
+  <file.wav>` is the same view with one lane and one clip (see below);
+- **edits that go through the host's own language** — `x` splits and `d` deletes
+  by building an `arrange …` line and handing it to the host's parser, so a key
+  runs exactly what a script writes, and the engine logs it like any command;
+- **panel focus** — `Tab`/`Shift-Tab` move between the mixer and the timeline, the
+  focused panel shows a lit border, and `j`/`k` mean "channel" or "track"
+  depending on where you are;
 - **an explicit key scheme**, with a `?` overlay rendered from the same table the
   key handler uses, so the help cannot drift from the behaviour;
-- **mouse support** — clickable transport buttons, click-to-select meter rows,
-  click the timeline to seek, wheel = seek — so *you* can judge whether a mouse in
-  a terminal is workable or the keys carry it;
-- **command latency in the UI thread** (`last command: seek (13.4 ms …)`), because
+- **mouse support** — click a panel to focus it, a lane to make that track active
+  and seek, the ruler to seek, a meter row to select, the transport to play;
+- **command latency in the UI thread** (`last command: seek (92.1 ms …)`), because
   the host's `TransportSeek` is O(target) and a shell that binds it to a key owns
-  that stall.
+  that stall — measured, not feared.
 
-Not in scope: clips (there is one file, not an arrangement), editing that changes
-audio, dialogs.
+Not in scope yet: dragging, moving clips between tracks, fades by mouse, undo
+gestures from the shell, the `:` prompt, and auditioning (`play` renders the
+session; the panel draws the arrangement).
 
 ## Run it
 
 ```sh
 cd spikes/tui-shell
 
-cargo run                          # the TUI (any terminal)
-cargo run -- --wave /tmp/demo.wav   # …with the timeline for a file
-cargo run -- --keys                # (same as pressing ? in the app)
-cargo run -- --probe               # headless: host thread + transport + live meters, no TTY
-cargo run -- --dump                # render one deterministic frame and print it as text
-cargo run -- --dump --wave f.wav    # …including the timeline (deterministic)
-cargo test                         # 13 tests; asserts the rendered frame, no TTY needed
-./scripts/pty-check.sh             # the real terminal path, asserted
+cargo run                            # the TUI (any terminal)
+cargo run -- --wave /tmp/demo.wav     # …with a one-clip timeline for a file
+cargo run -- --script /tmp/arr.script # …with the clips/tracks a host script builds
+cargo run -- --keys                  # (same as pressing ? in the app)
+cargo run -- --probe                 # headless: host thread + transport + live meters, no TTY
+cargo run -- --dump                  # render one deterministic frame and print it as text
+cargo run -- --dump --script f.script # …including the arrangement (deterministic)
+cargo test                           # 16 tests; asserts the rendered frame, no TTY needed
+./scripts/pty-check.sh               # the real terminal path, asserted
 ```
 
 `--probe` and `--dump` are the two halves of a CI-able check: the probe exercises
 the live host, the dump exercises the view (through ratatui's `TestBackend`, so
 it needs no terminal), and the tests assert on the rendered buffer.
 
-## The timeline (`--wave`)
+## The timeline (clips, tracks, and the audiofile view)
 
-The "audiofile view" a text editor has no analogue for, and the first object for
-visual mode. What it does, and what it honestly cannot:
+The "audiofile view" a text editor has no analogue for, the first object for visual
+mode, and — with `--script` — a real arrangement: **one lane per track, one braille
+envelope per clip, clip boundaries, per-track colour**.
+
+`--script <file>` is the interesting mode: the file is a normal **host script**
+(`pool` + `arrange` lines), the host loads it, and the panel draws the arrangement
+value the host hands back. The clips you see are the engine's clips; an edit from
+the shell is dispatched through the host's own parser (`host::parse_arrange_line`)
+as a `HostCommand::Arrange`, so **a key runs exactly what a script writes** and the
+engine logs it like any other command.
+
+```sh
+mkdir -p /tmp/pool && cd /tmp/pool      # put a few WAVs named after their ids
+# … s1.wav s2.wav s3.wav …
+cat > /tmp/arr.script <<'EOF'
+host v1
+mount mixer channels=4
+pool /tmp/pool
+arrange add_track t0
+arrange add_clip t0 c0 s1 0 192000 0 0 0 1.0
+arrange add_clip t0 c1 s2 0 96000 288000 0 0 0.8
+arrange add_track t1
+arrange add_clip t1 c2 s3 0 144000 48000 0 0 1.0
+EOF
+cargo run -- --script /tmp/arr.script
+```
+
+What it does, and what it honestly cannot:
 
 | | |
 |---|---|
 | **Envelope** | min/max per column from the media engine's **peak pyramid** (`PeakBuilder::range_minmax`) — never raw samples. Silence draws as the centre line. |
+| **Clips** | the engine's clip fields (`at_frame`, `src_start`, `src_len`, `gain`, fades, `loop_len`): the envelope is read from the clip's source window, `gain` and the **fades are drawn** (a column inside a fade is scaled by its ramp), and a baked loop wraps. Boundaries are the `▏`/`▕` edges in white; colour is per track. |
+| **Edit ops** | `x` razor-splits the clip under the playhead on the active track; `d` deletes it; `n`/`N` jump to the next/previous clip. A refused op (e.g. a split at frame 0) is reported in the state line and never logged. |
 | **Resolution** | Braille is 2×4 sub-cells, so a 100-cell panel is 200 time positions × 4× vertical. |
-| **Zoom floor** | **one base bin per cell — 256 frames, 5.333 ms at 48 kHz.** The pyramid walks whole 256-sample bins, so a narrower column would redraw the same bin and claim detail the data does not have. Going finer needs a raw-sample read path (that is how `tui-wave` reaches single samples); this is the next step, not a bug. |
-| **Zoom ceiling** | the whole file, one column per ~1/width of it. The state line always shows the current `ms/col`, so the density claim is visible, not asserted. |
-| **Selection** | `v` anchors at the playhead; `h`/`l` extend it; the statusline shows the span and its duration; `Esc` leaves. One mode, one visible indicator — a first slice of the [modal editing model](../../.agents/notes/proposed/architecture/2026-09-21-modal-editing-model.md). |
-| **Not yet** | clips/tracks (one file, one lane), split/trim/move, and auditioning — the file is not wired to the transport, so the playhead shows the *session* position against the file's grid. |
+| **Zoom floor** | **one base bin per cell — 256 frames, 5.333 ms at 48 kHz.** The pyramid walks whole 256-sample bins, so a narrower column would redraw the same bin and claim detail the data does not have. The human's read is that this is already enough resolution; going finer needs a raw-sample read path (how `tui-wave` reaches single samples). |
+| **Zoom ceiling** | the whole arrangement **plus margin** (4× the fitted density), so a piece can be seen with room around it. The state line always shows the current `ms/col`, so the density claim is visible, not asserted. |
+| **Lanes** | rows are shared out: `min(4, rows ÷ tracks)` per track, so 3 tracks in a 26-row terminal get 2 rows each and a tall terminal gives envelopes more amplitude resolution. |
+| **Selection** | `v` anchors a frame span at the playhead, `h`/`l` extend it, the state line shows the span and its duration, `Esc` leaves. Mode and focus are always on screen. |
+| **Not yet** | moving clips (within or across tracks), trimming, fades by key, undo gestures from the shell, the `:` prompt, and auditioning — `play` renders the session while the panel draws the arrangement, so the playhead is the *session* clock against the arrangement grid (they line up when the arrangement is what the session renders). |
+
+### Measured, from the demo above
+
+A 9-second arrangement, 3 tracks, 5 clips, rendered in a 100×26 terminal:
+**98.917 ms/cell** fitted (≈10 cells per second), playhead and ruler legible, all
+five clips distinguishable by colour and boundary. A seek from 0 to 6 s (the `n`
+motion) blocked the UI thread for **~92 ms** — that is `TransportSeek`'s
+`O(target)` rebuild, visible in the shell rather than theorised about.
+
 
 A demo file with visible structure, made by the host itself:
 
@@ -87,20 +133,24 @@ cargo run -- --wave /tmp/demo.wav
 
 | keys | meaning |
 |---|---|
-| `space` | play / stop |
+| `space` | play / stop (global, in any panel/mode) |
 | `s` | stop |
 | `r` / `Home` | rewind to 0 |
 | `,` / `.` | seek −1 s / +1 s (stops first: seek is rebuild-to-target) |
-| `j` / `k` / `↑` / `↓` | select the next / previous channel |
+| `Tab` / `Shift-Tab` | move the focus ring: mixer ⇄ timeline |
+| `j` / `k` / `↑` / `↓` | the **focused** panel: mixer channel, or active track |
+| `n` / `N` | timeline: jump the playhead to the next / previous clip |
 | `v` | **visual mode**: anchor a selection at the playhead |
-| `h` / `l` | scroll the timeline — in visual mode, extend the selection instead |
-| `+` / `-` | zoom in / out (floor: one peak bin per column) |
-| `0` | fit the whole file |
-| `Esc` | leave visual mode (a second `Esc` quits) |
+| `h` / `l` | timeline: scroll — in visual mode, extend the selection instead |
+| `+` / `-` | timeline: zoom in / out (floor: one peak bin per column) |
+| `0` | timeline: fit the whole arrangement |
+| `x` | timeline: razor-split the clip under the playhead |
+| `d` | timeline: delete the clip under the playhead |
+| `Esc` | leave visual mode / close this overlay — **never quits** |
 | `m` | toggle mouse capture |
 | `?` | the keymap |
 | `q` / `Ctrl+c` | quit |
-| mouse | click Play/Stop/Rewind · click a meter row · click the timeline = seek · wheel = seek |
+| mouse | click a panel to focus · a lane = that track + seek · the ruler = seek · a meter row = select · Play/Stop/Rewind · wheel = seek |
 
 ## What a deterministic frame looks like
 

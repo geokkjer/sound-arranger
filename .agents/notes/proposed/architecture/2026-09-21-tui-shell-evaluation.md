@@ -128,23 +128,34 @@ The evaluation is answered — with an implemented or rejected note replacing th
 1. The spike runs in a real terminal, restores the screen and mouse capture on exit, and its pty
    harness (entered alternate screen, no panic, exit 0) passes on a clean checkout under the rustup
    toolchain. **Met** (see Consequences), including one real crash found and fixed this way.
-2. **The timeline question is answered with a built prototype**, not an opinion. **Partly met**
-   (2026-09-21): `--wave <file.wav>` draws a real file as a **braille min/max envelope from the peak
-   pyramid**, with a ruler, zoom/scroll, a playhead and a **visual-mode selection**, verified
-   against a known signal (loud → silence-as-centre-line → quiet) and driven under a pty. The
-   **measured density** is in the status line and in the study: 30 ms/col fitted for a 3 s file
-   across 100 cells, and an honest floor of **5.333 ms/col**, because the pyramid's base bin is 256
-   samples. **Still open:** clips and tracks (there is one file and one lane), the editing gestures
-   (select/move/split/trim — only *select* exists), wiring the file to the transport so the playhead
-   means something, and therefore any auditioning of an arrangement. Going below 5.333 ms/col needs
-   a **raw-sample read path**, not a better renderer. If a terminal image protocol is used at all it
-   is a **detail pane** that degrades silently — never the scrolling timeline.
+2. **The timeline question is answered with a built prototype**, not an opinion. **Met — and now an
+   arrangement, not a viewer** (2026-09-21). `--script <host script>` draws the **clips and tracks the
+   host holds** (the engine's own `Timeline`, resolved through the pool): one lane per track, a
+   braille min/max envelope per clip from the peak pyramid, per-track colour, clip boundaries,
+   fades and gain drawn, and a **visual-mode selection**. `--wave <file.wav>` is the same view with
+   one lane. **Editing exists**: `x` splits and `d` deletes the clip under the playhead by handing
+   the host's own parser an `arrange …` line, so a key runs exactly what a script writes and the
+   engine logs it — demonstrated interactively (split at 2.000 s, delete the right half, the panel
+   re-reads the host's value) and in tests. **Measured density:** 98.917 ms/cell fitted for a 9 s,
+   3-track, 5-clip arrangement in a 100×26 terminal (≈10 cells/second), floor 5.333 ms/cell set by
+   the pyramid's 256-sample bin, ceiling = the arrangement **plus a 4× margin** so a piece can be
+   seen with room around it. **Still open:** move/trim/fades by key, undo gestures issued from the
+   shell, the `:` prompt, and auditioning (the playhead is the *session* clock against the
+   arrangement grid). Going below 5.333 ms/col needs a **raw-sample read path** — and the human's
+   read is that the braille resolution is already enough, so it is not urgent.
 3. **A task-level mouse-vs-keys verdict**: the same short task list (select a clip, seek, split,
    nudge, mute a channel) performed both ways, with the friction noted — including the terminal
    facts that matter (mouse capture vs copy/paste, tmux/niri passthrough, wheel vs key repeat).
+   **Partly met:** the mouse now focuses panels, selects a track by clicking its lane, seeks from
+   the ruler or a lane, picks a meter row and drives the transport — all dispatching the same
+   commands the keys do. What has not been done is the *timed comparison*, and the mouse has no
+   drag gestures yet.
 4. A **widget inventory** for the TUI: what the shell needs (dialogs? text input? menus?) against
    what a terminal provides well. This is *expected to be smaller* than iced's answer, and that
-   expectation has to be tested against the surfaces the app actually has.
+   expectation has to be tested against the surfaces the app actually has. **Evidence so far:** the
+   panel focus ring (`Tab`), the which-key overlay, the state line as a statusline, and click
+   regions published by the view are all the shell needed to be usable — the missing pieces are a
+   prompt (`:`), a picker (the media pool), and text entry (naming clips/markers).
 5. The transport/meters seam is exercised **only** through `HostCommand` + `Snapshot` — the shell
    compiles without touching `HostSession`, exactly as required of the iced spike.
 
@@ -180,16 +191,26 @@ The spike exists and is verified; the decision is **open**:
   alternate screen and releases mouse capture; the keymap overlay renders from the same table the
   handler uses; clicks map to transport actions and meter-row selection; and `--probe` observes
   live meter signal (peak 0.88) exactly as the iced spike does.
-- **The timeline exists and is measured** (`--wave <file.wav>`): a real file drawn as a braille
-  min/max envelope from the peak pyramid, with a ruler, zoom/scroll, a playhead and a
-  visual-mode selection, verified against a known signal and driven under a pty. It answers the
-  "audiofile view" question with a working artifact and two numbers (30 ms/col fitted; 5.333 ms/col
-  floor, set by the 256-sample peak bin) — and it produced the clearest next step in the whole
-  evaluation: **a raw-sample read path** for the zoomed-in window, since no renderer improvement can
-  go below the data's resolution.
+- **The timeline exists and is measured** (`--wave <file.wav>`, `--script <script>`): a real
+  arrangement drawn as braille min/max envelopes — one lane per track, per-clip boundaries and
+  colour, fades and gain drawn from the clip's own fields — with a ruler, zoom/scroll, a playhead
+  and a visual-mode selection. It answers the "audiofile view" question with a working artifact and
+  measured numbers (98.917 ms/col fitted for a 9 s arrangement in a 100×26 terminal; 5.333 ms/col
+  floor set by the 256-sample peak bin), and it produced the clearest next step in the evaluation:
+  **a raw-sample read path** for the zoomed-in window, since no renderer improvement can go below
+  the data's resolution.
+- **Edits are commands, not UI actions.** `x` and `d` build an `arrange …` line and hand it to the
+  host's **own parser** (`host::parse_arrange_line`), so a key runs exactly what a script writes,
+  the engine logs it like any other command, and a refused op (a split at frame 0) is reported in
+  the state line and never logged. This is the [modal editing model](2026-09-21-modal-editing-model.md)'s
+  "keys and `:` share one vocabulary" claim holding for two operations already — the `:` prompt is
+  now only a widget away.
+- **Panel focus exists** (`Tab`/`Shift-Tab`, click-to-focus, a lit border), so `j`/`k` mean
+  "channel" or "active track" depending on where the keys are pointed — the structure a multi-panel
+  editor needs, and the reason the mixer and the timeline can both be live in one key space.
 - **Visual mode has a real object.** `v` anchors a selection at the playhead, `h`/`l` extend it, the
-  statusline shows the span and its duration, and `Esc` leaves — the first concrete slice of the
-  [modal editing model](2026-09-21-modal-editing-model.md), with the mode always visible.
+  state line shows the span and its duration, and `Esc` leaves — with `Esc` no longer quitting (the
+  safety key must not be destructive; `q`/`Ctrl+c` are the way out).
 - **Verification is cheap and CI-able**: thirteen tests assert the rendered buffer (including the
   timeline panel, the zoom floor and the visual-mode transition) through `TestBackend`, `--dump`
   prints a deterministic frame (the README embeds one), and a pty harness covers the real terminal

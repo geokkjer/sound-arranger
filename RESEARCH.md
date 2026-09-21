@@ -265,6 +265,18 @@ zero-height crash.
   Kitty support, and Alacritty/Konsole are unusable. No terminal app was found that draws an
   *editable* multi-track waveform timeline — the ground is unclaimed.
 
+**Clips, tracks, and edits (2026-09-21).** The spike now draws an **arrangement**: `--script <host
+script>` loads `pool`/`arrange` lines into the host and the panel renders the engine's own `Timeline`
+— one lane per track, a braille min/max envelope per clip (gain and fades drawn from the clip's
+fields, baked loops honoured), per-track colour, `▏`/`▕` boundaries — and **edits go through the
+host's own text format** (`x` split, `d` delete build an `arrange …` line, hand it to
+`host::parse_arrange_line`, and the engine logs it; a refused op is reported, never logged).
+**Panel focus** (`Tab`, click-to-focus) makes `j`/`k` mean "mixer channel" or "active track"
+depending on where the keys point. Measured: a 9 s / 3-track / 5-clip arrangement fits a 100×26
+terminal at **98.917 ms/col**, the zoom-out ceiling is the arrangement **plus a 4× margin**, and the
+zoom floor stays the pyramid's one bin (5.333 ms/col). A 6 s seek blocks the UI thread for
+**~92 ms** — `TransportSeek` is O(target), now measured rather than theorised.
+
 **Where it stands:** a spike, not a decision. The shipped shell stays Tauri + Vue.
 
 **Prior art, precisely (2026-09-21).** The [study](research/architecture/2026-09-21-tui-audio-prior-art.md)

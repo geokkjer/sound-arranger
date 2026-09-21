@@ -393,6 +393,13 @@ peak pyramid's bin size, which is the surprising part (§2).
    arrangement, or **20–30 single-row tape lanes** as a coarse map. Realistic visible counts:
    **10–30 clips, 8–15 tracks** — more needs scroll/zoom, which is what real DAWs do too. Clip
    labels cap at ~8 characters in a 9-column clip.
+
+   **Measured, after building it:** rows are shared as `min(4, rows ÷ tracks)` per track, so a
+   100×26 terminal gives 3 tracks **2 rows each** (8 braille sub-rows of amplitude — enough to read
+   a fade and a clip's dynamics) with the gutter taking 7 columns. A 9-second, 5-clip, 3-track
+   arrangement fitted the width at **98.917 ms/cell** (≈10 cells per second), playhead and ruler
+   legible, every clip distinguishable by colour and its `▏`/`▕` edges — so the budget above holds
+   in practice at the small end of the terminal range.
 6. **Images are a detail-pane luxury, never the timeline [V]** — and that is a *preference*, not a
    ceiling. `tui-wave` ships exactly the two-tier design worth copying: zoom to single samples, with
    Kitty/Ghostty graphics where available and **braille approximation everywhere else** **[V]**; and
