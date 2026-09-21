@@ -16,6 +16,12 @@ sound-arranger has no composition story. Every planned extension — CDP8 offlin
 
 The core this runs on — clock, graph interpreter, session log, context plumbing — is defined in the [minimal-core note](2026-08-15-minimal-core-clock-graph-session-log.md).
 
+**Superseded in part (2026-09-21):** the *product boundary* is now external programs and devices —
+no VST3/CLAP builds, no CDP sidecar binary, no plugin host ([note](2026-09-21-external-programs-not-sidecars.md)).
+The internal seam discipline this note defines (traits, declarative composition, reversible
+effects, a pure interpreter core) is unchanged and is what makes the engine safe to integrate
+against.
+
 ## Alternatives considered
 
 - **Adopt Cordis wholesale into the Rust engine** — Cordis is a TypeScript/npm runtime; it belongs on the host side. The paper's own language guidance (§6.4) is that typeclasses/traits are how a host language extends the context type, i.e. Rust traits *are* the recommended mechanism here.

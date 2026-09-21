@@ -20,7 +20,9 @@ command language as the `:` prompt**, i.e. for audio what vim/helix/emacs is for
 drones or stretched audio — then cut, splice, rearrange and mix them into a finished piece:
 clips-as-objects, with a tape/edit-as-composition heritage (musique concrète, dub, ACID). This
 is the monorepo for that core **and
-its sidecar plugins** (`plugins/`): VST/CLAP builds and the CDP offline-process sidecar.
+its integrations**
+(`plugins/`): external programs and devices we sync and record, not plugin binaries —
+see the [no-sidecars note](.agents/notes/proposed/architecture/2026-09-21-external-programs-not-sidecars.md).
 
 Deliberately **out of scope** for this repo (kept as separate projects, indexed by the
 `~/Projects/music` view): the personal composition-theory corpus, the jam/recording rig, and
@@ -70,7 +72,7 @@ sketched pending selection wiring; record is still chrome). The direction is loc
 | `crates/shell` | The Tauri v2 + Vue 3 shell — now a **working timeline editor**, not a stub: the four planned views as components (`Surface`, `TimelineCanvas`, `SourcePool` with Project/Library contexts, `MixerPanel`, `DetailView`), plus `bridge` (the Host API over Tauri), `transport`, `editor` (undo/redo replayed from the host's session log) and the timeline viewport/editing maths with unit tests. The Detail View is present with its three context tabs, but its bodies are placeholders pending selection wiring. | works; UI wiring in progress |
 | `spikes/iced-shell` | The **iced evaluation spike** (its own workspace, excluded from the core build): a minimal second shell — window, transport, channel/master meters following the audio — driving the *same* `host::live::HostHandle` as the Tauri bridge, but in-process: no IPC, no serde wire, no webview. Ships a headless `--probe` mode that asserts live meter signal. iced 0.14. | spike; decision open — delete the directory to drop the option |
 | `spikes/tui-shell` | The **ratatui evaluation spike** (its own workspace): the terminal counterpart of the iced spike — transport, channel/master meters, position readout — over the same in-process `HostHandle`, plus an **arrangement view** (`--script <host script>` draws the engine's own clips and tracks: braille min/max envelopes per clip, per-track colour, boundaries, fades, ruler, zoom/scroll, playhead, **visual-mode selection**) with **edits dispatched through the host's own `arrange` text format** (`x` split, `d` delete, `n`/`N` clip motion) and **panel focus** (`Tab`). `--wave <file.wav>` gives the one-file view. Mouse, per-command UI latency, `?` keymap, deterministic `--dump`. | spike; decision open — delete the directory to drop the option |
-| `plugins/` | **Sidecar plugins** (placeholder): VST3/CLAP builds of core capabilities and the CDP / offline-process sidecar (`OfflineProcess`). Not engine crates — thin wrappers that expose a capability to a plug-in API. See [plugins/README.md](plugins/README.md). | placeholder |
+| `plugins/` | **External-integration home** (placeholder, direction changed 2026-09-21): **no VST/CLAP builds and no CDP sidecar binary** — capabilities that already exist as standalone programs (TidalCycles, VCV Rack, CDP8, sox, ffmpeg) are driven as *processes* and recorded into the pool, and hardware is synced and captured the same way. See [plugins/README.md](plugins/README.md) and the [note](.agents/notes/proposed/architecture/2026-09-21-external-programs-not-sidecars.md). | placeholder |
 
 **191 Rust tests + 38 frontend unit tests**, all passing (the two spike workspaces are outside that
 count — `spikes/tui-shell` carries 5 view/input tests of its own); the core's invariants (byte-identical

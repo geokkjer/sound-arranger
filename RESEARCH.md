@@ -358,6 +358,12 @@ Three tiers, matching "extendable to include audio effects". Tier 2 below is **n
 
 ### Tier 2 — offline "processes" (CDP8) — *the extension point you asked for*
 
+> **Direction changed (2026-09-21):** this tier is now **invoking external programs** (CDP8, sox,
+> ffmpeg, `tui-wave`) on rendered sources and importing the result as a new pool source — not
+> wrapping them as shipped sidecar artifacts. See the
+> [no-sidecars note](.agents/notes/proposed/architecture/2026-09-21-external-programs-not-sidecars.md).
+> The rest of this section stands as the research that shaped the seam.
+
 CDP8 and PaulStretch are **file-based, offline** processors. Model them as one abstraction:
 
 ```

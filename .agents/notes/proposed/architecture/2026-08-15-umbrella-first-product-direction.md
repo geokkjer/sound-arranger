@@ -15,6 +15,10 @@ The project began as an ACID/DAW recreation with tape inspiration, and the resea
 - **Naming:** the repo name "sound-arranger" names the first profile, not the platform. Rename candidates ("audio", "sound") are open — tracked as RESEARCH.md §14 risk 7; resolve before the first tag. No rename is executed by this note.
 - **Second opinions:** plugin-architecture decisions get a DeepSeek review (proximity to cordiverse/paper and dsh — the paradigm's own ecosystem); the kimi-cli review (`research/architecture/2026-08-15-kimi-review-minimal-core.md`) is the precedent for archiving external reviews verbatim with a disposition header.
 
+**Superseded in part (2026-09-21):** the *sound-sculptor* profile still stands as a separate
+profile, but its artifacts are external programs invoked and imported, not CDP8/`OfflineProcess`
+sidecars we ship ([note](2026-09-21-external-programs-not-sidecars.md)).
+
 ## Alternatives considered
 
 - **Arranger-first, umbrella as accidental byproduct** — the original framing. Rejected: the core/seams decisions are already platform decisions, and leaving the priority ambiguous produced the §7.3 incoherence (docs calling the arranger "the goal" while phases optimize for the framework).

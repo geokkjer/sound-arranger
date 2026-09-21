@@ -22,6 +22,11 @@ The platform wants to design **our own soft-synth voices in Rust**: import an os
 
 `crates/engine/src/plugins/fundsp_synth.rs` (gated on the optional `fundsp` feature) mounts a monophonic fundsp voice as an opaque `AudioNode`: a `Box<dyn AudioUnit>` for a `sine() >> lowpass_hz(cutoff, q)` graph, built and `allocate()`d at mount, with our own linear-decay envelope + gain and note scheduling from `io.notes_in` at sample offsets. `crates/engine/tests/fundsp_synth.rs` (7 tests) prove the claim: the voice sounds and its pitch follows the scale; a note onset is sample-accurate; rendering is byte-identical across replay; `set_param` is logged and undeclared params are refused; the render path allocates nothing (counting allocator); and `latency() == 0` (a minimum-phase biquad adds no whole-sample delay, so PDC composes correctly). The dependency is optional and feature-gated so the minimal core stays dep-lean by default (`cargo test -p engine` builds without fundsp). All 8 tests pass in **both debug and release** — validating the spike in release surfaced a pre-existing core bug (scheduled mounts never applied in release, so the engine was silent on every mounted path), now fixed ([bug-fix note](../../implemented/bug-fix/2026-08-30-scheduled-mounts-apply-in-release.md)).
 
+**Superseded in part (2026-09-21):** third-party instruments stay external — as **processes**
+(VCV Rack, SuperCollider, TidalCycles) synced and recorded, not as CLAP plugins we host
+([note](2026-09-21-external-programs-not-sidecars.md)). Our *own* voices in `crates/engine` are
+unaffected; this note is about them.
+
 ## Alternatives considered
 
 - **Adopt fundsp's graph notation as our patch model** — fundsp's combinators *consume* their arguments and enforce an acyclic tree, and the graph is baked into Rust types/closures, so it is compile-time, not serializable data, and it has **no note/trigger/event type** (notes are expressed as control signals via `Sequencer`/`midi_fundsp`). That collides with our patch-as-value + sample-accurate note/trigger streams. Rejected; use fundsp's components, not its graph.
