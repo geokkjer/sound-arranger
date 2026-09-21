@@ -819,6 +819,12 @@ impl HostSession {
     }
 }
 
+impl Default for HostSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl std::fmt::Debug for HostSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HostSession")

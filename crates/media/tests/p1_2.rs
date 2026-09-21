@@ -133,7 +133,7 @@ fn capture_into_adaptable_mixer_and_pool() {
     // device for the expected signal). Each channel is center-panned, so the L
     // channel carries the sum scaled by √2/2; the stereo master interleaves L,R.
     let mut expect_phase = [0.0f64; CHANNELS];
-    for (i, s) in out.chunks_exact(2).map(|p| p[0]).enumerate() {
+    for (i, s) in out.as_chunks::<2>().0.iter().map(|p| p[0]).enumerate() {
         let mut expected = 0.0f32;
         for k in 0..CHANNELS {
             expected += (TAU * expect_phase[k]).sin() as f32 * 0.5;

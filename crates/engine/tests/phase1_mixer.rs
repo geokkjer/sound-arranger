@@ -75,7 +75,7 @@ const CENTER: f32 = std::f32::consts::FRAC_1_SQRT_2;
 /// De-interleave a stereo master to its L channel (frames), the mono reference
 /// these channel-behaviour tests were written against.
 fn l(buf: &[f32]) -> Vec<f32> {
-    buf.chunks_exact(2).map(|p| p[0]).collect()
+    buf.as_chunks::<2>().0.iter().map(|p| p[0]).collect()
 }
 
 /// Render `frames` of the mixer (the stereo master) and return the L channel

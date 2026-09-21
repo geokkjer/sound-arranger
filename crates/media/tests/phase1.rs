@@ -52,7 +52,7 @@ fn bounce_to_wav_roundtrips_the_master() {
     assert_eq!(recorded.len(), frames, "the bounce holds every frame");
     // `out` is the interleaved stereo master; its channel 0 (L) must match the
     // bounced L channel (the chain is a single center-panned channel on ch0).
-    for (a, b) in out.chunks_exact(2).map(|p| p[0]).zip(&recorded) {
+    for (a, b) in out.as_chunks::<2>().0.iter().map(|p| p[0]).zip(&recorded) {
         assert!((a - b).abs() < 2e-4, "master {a} vs bounce {b}");
     }
     let _ = std::fs::remove_file(&path);

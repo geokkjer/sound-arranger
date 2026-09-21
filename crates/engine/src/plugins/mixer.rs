@@ -200,7 +200,7 @@ impl AudioNode for MixerNode {
         let n = io.audio_in_count.min(self.channels);
         let any_solo = self.solos[..n].iter().any(|&s| s);
         let mut peaks = [0.0f32; MIXER_CHANNELS_MAX + 1];
-        for (i, sample) in out.chunks_exact_mut(2).enumerate() {
+        for (i, sample) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
             let mut sl = 0.0f32;
             let mut sr = 0.0f32;
             for (ch, channel_in) in io.audio_ins[..n].iter().enumerate() {

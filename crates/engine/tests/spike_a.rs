@@ -19,7 +19,7 @@ const SR: u32 = 48_000;
 /// frame-aligned mono assertions (a center-panned mono source appears on both
 /// channels, so L carries the signal).
 fn l(buf: &[f32]) -> Vec<f32> {
-    buf.chunks_exact(2).map(|p| p[0]).collect()
+    buf.as_chunks::<2>().0.iter().map(|p| p[0]).collect()
 }
 
 fn engine() -> Engine {
