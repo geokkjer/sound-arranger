@@ -173,7 +173,10 @@ impl Pool {
     pub fn recover(&self) -> Result<Recovery, String> {
         let index = self.list()?;
         // carry list()'s unreadable sources through as recovery failures
-        let mut report = Recovery { errors: index.errors.clone(), ..Recovery::default() };
+        let mut report = Recovery {
+            errors: index.errors.clone(),
+            ..Recovery::default()
+        };
 
         for src in &index.sources {
             // Finalize a crashed take: the header still declares placeholder sizes.
@@ -202,7 +205,8 @@ impl Pool {
 
     /// Rebuild a `.peaks` sidecar from a float-WAV, streaming it in chunks.
     fn rebuild_peaks(wav: &Path, peaks: &Path) -> Result<(), String> {
-        let mut reader = WavReader::open(wav).map_err(|e| format!("rebuild peaks for {}: {e}", wav.display()))?;
+        let mut reader = WavReader::open(wav)
+            .map_err(|e| format!("rebuild peaks for {}: {e}", wav.display()))?;
         let sample_rate = reader.sample_rate();
         let mut builder = PeakBuilder::new();
         let mut buf = vec![0.0f32; 4096];
@@ -240,7 +244,8 @@ impl Pool {
             return Err(format!("'{id}' is not usable as a pool id"));
         }
         let dest = self.dir.join(format!("{id}.wav"));
-        let same_file = dest == src || (dest.exists() && fs::canonicalize(&dest).ok() == fs::canonicalize(src).ok());
+        let same_file = dest == src
+            || (dest.exists() && fs::canonicalize(&dest).ok() == fs::canonicalize(src).ok());
         if same_file {
             return self.conform_one(&dest, session_rate, &id);
         }
@@ -283,8 +288,15 @@ impl Pool {
             return Err("session rate must be non-zero".to_string());
         }
         let index = self.list()?;
-        let mut report = ConformReport { errors: index.errors.clone(), ..ConformReport::default() };
-        for src in index.sources.iter().filter(|s| s.sample_rate != session_rate) {
+        let mut report = ConformReport {
+            errors: index.errors.clone(),
+            ..ConformReport::default()
+        };
+        for src in index
+            .sources
+            .iter()
+            .filter(|s| s.sample_rate != session_rate)
+        {
             match self.conform_one(&src.wav, session_rate, &src.id) {
                 Ok(conform) => report.converted.push(conform),
                 Err(e) => report.errors.push((src.wav.clone(), e)),
@@ -298,7 +310,8 @@ impl Pool {
     /// source, so a crash never leaves the pool without its source (the
     /// pre-conversion copy is a hard link when the filesystem allows it).
     fn conform_one(&self, path: &Path, session_rate: u32, id: &str) -> Result<Conform, String> {
-        let reader = WavReader::open(path).map_err(|e| format!("conform {}: {e}", path.display()))?;
+        let reader =
+            WavReader::open(path).map_err(|e| format!("conform {}: {e}", path.display()))?;
         let from_rate = reader.sample_rate();
         let frames_in = reader.total_frames();
         drop(reader);
@@ -325,18 +338,22 @@ impl Pool {
 
         let backup = path.with_extension(format!("wav.pre{from_rate}"));
         let linked = fs::hard_link(path, &backup).is_ok();
-        if !linked
-            && let Err(e) = fs::copy(path, &backup)
-        {
+        if !linked && let Err(e) = fs::copy(path, &backup) {
             let _ = fs::remove_file(&tmp);
-            return Err(format!("conform {}: preserving the original failed: {e}", path.display()));
+            return Err(format!(
+                "conform {}: preserving the original failed: {e}",
+                path.display()
+            ));
         }
         if let Err(e) = fs::rename(&tmp, path) {
             let _ = fs::remove_file(&tmp);
             if linked {
                 let _ = fs::remove_file(&backup);
             }
-            return Err(format!("conform {}: replacing the source failed: {e}", path.display()));
+            return Err(format!(
+                "conform {}: replacing the source failed: {e}",
+                path.display()
+            ));
         }
         Self::rebuild_peaks(path, &path.with_extension("peaks"))?;
 
@@ -355,7 +372,8 @@ impl Pool {
     /// Returns `(from_rate, frames_in, frames_out)`. The reader yields mono
     /// frames (channel 0 of a stereo file, like every pool reader).
     fn convert_file(src: &Path, dst: &Path, out_rate: u32) -> Result<(u32, u64, u64), String> {
-        let mut reader = WavReader::open(src).map_err(|e| format!("convert {}: {e}", src.display()))?;
+        let mut reader =
+            WavReader::open(src).map_err(|e| format!("convert {}: {e}", src.display()))?;
         let from_rate = reader.sample_rate();
         let frames_in = reader.total_frames();
         let mut resampler = Resampler::new(from_rate, out_rate)?;

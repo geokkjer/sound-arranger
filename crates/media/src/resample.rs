@@ -88,7 +88,11 @@ impl Kernel {
                     bessel_i0(BETA * (1.0 - r * r).sqrt()) / i0_beta
                 };
                 // 2·fc·sinc(2·fc·x) = sin(2π·fc·x) / (π·x)
-                let sinc = if x == 0.0 { 2.0 * fc } else { (2.0 * fc * x * PI).sin() / (PI * x) };
+                let sinc = if x == 0.0 {
+                    2.0 * fc
+                } else {
+                    (2.0 * fc * x * PI).sin() / (PI * x)
+                };
                 let value = sinc * window;
                 *slot = value as f32;
                 sum += value;
@@ -138,7 +142,9 @@ impl Resampler {
     /// A converter `in_rate → out_rate`. Both rates must be non-zero.
     pub fn new(in_rate: u32, out_rate: u32) -> Result<Self, String> {
         if in_rate == 0 || out_rate == 0 {
-            return Err(format!("sample rate must be non-zero (got {in_rate} → {out_rate})"));
+            return Err(format!(
+                "sample rate must be non-zero (got {in_rate} → {out_rate})"
+            ));
         }
         Ok(Resampler {
             step: in_rate as f64 / out_rate as f64,
@@ -218,7 +224,10 @@ impl Resampler {
     /// interpolated between the two nearest kernel phases. With `pad`, input
     /// past the end reads as silence (the flush tail).
     fn sample(&self, pad: bool) -> f32 {
-        let kernel = self.kernel.as_ref().expect("sample() is not called in passthrough");
+        let kernel = self
+            .kernel
+            .as_ref()
+            .expect("sample() is not called in passthrough");
         let i = self.pos.floor();
         let first = i - (TAPS as f64 / 2.0 - 1.0);
         let frac = (self.pos - i) as f32;
@@ -341,7 +350,11 @@ mod tests {
         let input = tone(440.0, 44_100, 44_100, 0.5);
         let mut out = Vec::new();
         rs.process(&input, &mut out);
-        assert!(out.len() < 48_000, "the tail needs the flush: {}", out.len());
+        assert!(
+            out.len() < 48_000,
+            "the tail needs the flush: {}",
+            out.len()
+        );
         rs.flush(&mut out);
         assert_eq!(out.len(), 48_000, "one second in is one second out");
         // Flush is idempotent and never produces extra frames.
@@ -368,7 +381,10 @@ mod tests {
         let seconds = 5u32;
         let input = tone(440.0, 44_100, 44_100 * seconds as usize, 0.5);
         let out = resample_mono(&input, 44_100, 48_000).expect("rates");
-        let crossings = out.windows(2).filter(|w| (w[0] > 0.0) != (w[1] > 0.0)).count();
+        let crossings = out
+            .windows(2)
+            .filter(|w| (w[0] > 0.0) != (w[1] > 0.0))
+            .count();
         let expected = 440.0 * seconds as f32 * 2.0;
         assert!(
             (crossings as f32 - expected).abs() < expected * 0.01,
@@ -423,7 +439,10 @@ mod tests {
         assert_eq!(out.len(), 24_000);
         let middle = &out[TAPS..out.len() - TAPS];
         let ratio = rms(middle) / rms(&input);
-        assert!(ratio < 0.05, "alias not filtered: output is {ratio:.4} of the input");
+        assert!(
+            ratio < 0.05,
+            "alias not filtered: output is {ratio:.4} of the input"
+        );
     }
 
     #[test]
@@ -433,7 +452,10 @@ mod tests {
         let out = resample_mono(&input, 48_000, 44_100).expect("rates");
         let middle = &out[TAPS..out.len() - TAPS];
         let amplitude = rms(middle) * std::f64::consts::SQRT_2;
-        assert!((amplitude - 0.5).abs() < 0.02, "level changed: {amplitude:.3}");
+        assert!(
+            (amplitude - 0.5).abs() < 0.02,
+            "level changed: {amplitude:.3}"
+        );
         assert!(residual_db(middle, 44_100, 1000.0) < -60.0);
     }
 
@@ -454,7 +476,10 @@ mod tests {
         rs.flush(&mut many);
 
         assert_eq!(one.len(), many.len());
-        assert_eq!(one, many, "chunking changed the conversion (not deterministic)");
+        assert_eq!(
+            one, many,
+            "chunking changed the conversion (not deterministic)"
+        );
     }
 
     #[test]

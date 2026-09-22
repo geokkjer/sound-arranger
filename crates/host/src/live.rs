@@ -24,8 +24,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use engine::MIXER_CHANNELS_MAX;
-use media::devices::OutputHandle;
 use media::Spsc;
+use media::devices::OutputHandle;
 
 use crate::{HostCommand, HostSession};
 
@@ -222,9 +222,7 @@ impl HostHandle {
             .map_err(|_| "host actor poisoned".to_string())?
             .send(Request::Outcome(reply_tx))
             .map_err(|_| "host actor exited".to_string())?;
-        reply_rx
-            .recv()
-            .map_err(|_| "host actor exited".to_string())
+        reply_rx.recv().map_err(|_| "host actor exited".to_string())
     }
 
     /// The latest published snapshot (position + meters + audio).
@@ -267,7 +265,12 @@ const AUDIO_CHUNK_FRAMES: usize = 1024;
 
 /// The actor loop: drain commands, then (while playing) render — into the device
 /// ring when audio is open (device-paced), else to the wall clock — and publish.
-fn run(mut session: HostSession, rx: Receiver<Request>, shared: Arc<Mutex<Snapshot>>, want_audio: bool) {
+fn run(
+    mut session: HostSession,
+    rx: Receiver<Request>,
+    shared: Arc<Mutex<Snapshot>>,
+    want_audio: bool,
+) {
     let rate = session.sample_rate() as f64;
     // Wall-clock anchor for the silent pump: (wall, frame) at play/last change.
     let mut anchor: Option<(Instant, u64)> = None;
@@ -359,8 +362,8 @@ fn run(mut session: HostSession, rx: Receiver<Request>, shared: Arc<Mutex<Snapsh
                     }
                 }
                 _ => {
-                    let (wall0, frame0) = *anchor
-                        .get_or_insert_with(|| (Instant::now(), session.position().frame));
+                    let (wall0, frame0) =
+                        *anchor.get_or_insert_with(|| (Instant::now(), session.position().frame));
                     let target = frame0 + (wall0.elapsed().as_secs_f64() * rate) as u64;
                     let now = session.position().frame;
                     if target > now {
@@ -388,7 +391,8 @@ fn run(mut session: HostSession, rx: Receiver<Request>, shared: Arc<Mutex<Snapsh
 /// Open the default output device, negotiated to the session rate.
 fn open_audio(session: &HostSession) -> Result<Audio, String> {
     let ring = Arc::new(Spsc::new(AUDIO_RING_SAMPLES));
-    let handle = media::devices::open_output(Arc::clone(&ring), OUTPUT_CHANNELS, session.sample_rate())?;
+    let handle =
+        media::devices::open_output(Arc::clone(&ring), OUTPUT_CHANNELS, session.sample_rate())?;
     Ok(Audio {
         handle,
         ring,
@@ -399,7 +403,11 @@ fn open_audio(session: &HostSession) -> Result<Audio, String> {
 /// Keep the output ring about half full. The device callback drains it, so this
 /// paces the pump to the **device** clock — the ring's free space is the timing
 /// signal, not the wall clock.
-fn fill_audio(session: &mut HostSession, ring: &Spsc<f32>, drops: &AtomicU64) -> Result<(), String> {
+fn fill_audio(
+    session: &mut HostSession,
+    ring: &Spsc<f32>,
+    drops: &AtomicU64,
+) -> Result<(), String> {
     let target = ring.capacity() / 2;
     while session.is_playing() && ring.len() < target {
         let samples = session.render(AUDIO_CHUNK_FRAMES)?;
@@ -503,14 +511,22 @@ mod tests {
         std::thread::sleep(Duration::from_millis(150));
         let s = host.snapshot();
         assert!(s.playing, "the transport is running");
-        assert!(s.frame > 0, "the pump advanced the clock (frame={})", s.frame);
+        assert!(
+            s.frame > 0,
+            "the pump advanced the clock (frame={})",
+            s.frame
+        );
 
         host.execute(HostCommand::TransportStop).expect("stop");
         std::thread::sleep(Duration::from_millis(80));
         let stopped = host.snapshot().frame;
         assert!(!host.snapshot().playing, "the transport stopped");
         std::thread::sleep(Duration::from_millis(80));
-        assert_eq!(host.snapshot().frame, stopped, "the clock is still while stopped");
+        assert_eq!(
+            host.snapshot().frame,
+            stopped,
+            "the clock is still while stopped"
+        );
 
         host.shutdown();
     }
@@ -526,7 +542,11 @@ mod tests {
             at_frame: Some(0),
         })
         .expect("mount mixer");
-        assert_eq!(host.snapshot().channel_count, 2, "the mixer channel count is published");
+        assert_eq!(
+            host.snapshot().channel_count,
+            2,
+            "the mixer channel count is published"
+        );
 
         // The tone plugin is not mounted → the param is refused, but the host
         // (and its session) survive and keep serving commands.
@@ -539,7 +559,8 @@ mod tests {
             })
             .expect_err("an unmounted plugin's param is refused");
         assert!(err.contains("tone"), "the refusal names the plugin: {err}");
-        host.execute(HostCommand::TransportStop).expect("host still usable");
+        host.execute(HostCommand::TransportStop)
+            .expect("host still usable");
 
         host.shutdown();
     }
@@ -551,7 +572,11 @@ mod tests {
         let host = HostHandle::spawn();
         let script = crate::parse_script("host v1\nmount mixer channels=2 @0\n").expect("parse");
         let first = host.load(&script).expect("first load");
-        assert_eq!(first.mixer_channels, Some(2), "the mixer channel count is reported");
+        assert_eq!(
+            first.mixer_channels,
+            Some(2),
+            "the mixer channel count is reported"
+        );
         let second = host.load(&script).expect("re-load starts a fresh session");
         assert_eq!(second.mixer_channels, Some(2));
         assert!(second.summary.contains("underruns: 0"));
@@ -570,12 +595,19 @@ mod tests {
             if let Some(a) = host.snapshot().audio {
                 break a;
             }
-            assert!(Instant::now() < deadline, "no audio status published within 5 s");
+            assert!(
+                Instant::now() < deadline,
+                "no audio status published within 5 s"
+            );
             std::thread::sleep(Duration::from_millis(20));
         };
         eprintln!(
             "audio: {} Hz requested {} Hz, {} ch, mismatch={} — {:?}",
-            audio.sample_rate, audio.requested_rate, audio.channels, audio.rate_mismatch, audio.error
+            audio.sample_rate,
+            audio.requested_rate,
+            audio.channels,
+            audio.rate_mismatch,
+            audio.error
         );
         host.shutdown();
     }

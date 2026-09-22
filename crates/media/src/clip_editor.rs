@@ -64,29 +64,42 @@ fn v_f32(v: &Value) -> Option<f32> {
 pub fn encode_op(i: &mut Interner, op: &ArrangeOp) -> (&'static str, Vec<(&'static str, Value)>) {
     match op {
         ArrangeOp::AddTrack { track } => ("AddTrack", vec![("track", Value::Str(i.intern(track)))]),
-        ArrangeOp::RemoveTrack { track } => ("RemoveTrack", vec![("track", Value::Str(i.intern(track)))]),
+        ArrangeOp::RemoveTrack { track } => {
+            ("RemoveTrack", vec![("track", Value::Str(i.intern(track)))])
+        }
         ArrangeOp::AddClip { track, clip } => {
             // loop_len must be > 0 (validate_clip enforces it); Some(0) would silently
             // encode as None. Guard here so a direct encode of a hand-built clip is
             // caught in debug (kimi should-fix S2).
-            debug_assert!(clip.loop_len != Some(0), "clip '{}' loop_len must be > 0", clip.id);
+            debug_assert!(
+                clip.loop_len != Some(0),
+                "clip '{}' loop_len must be > 0",
+                clip.id
+            );
             (
-            "AddClip",
-            vec![
-                ("track", Value::Str(i.intern(track))),
-                ("id", Value::Str(i.intern(&clip.id))),
-                ("source", Value::Str(i.intern(&clip.source))),
-                ("src_start", Value::U64(clip.src_start)),
-                ("src_len", Value::U64(clip.src_len)),
-                ("at_frame", Value::U64(clip.at_frame)),
-                ("fade_in", Value::U64(clip.fade_in)),
-                ("fade_out", Value::U64(clip.fade_out)),
-                ("gain", Value::F32(clip.gain)),
-                // loop_len must be > 0; 0 encodes "no loop".
-                ("loop", Value::U64(clip.loop_len.unwrap_or(0))),
-            ],
-        )},
-        ArrangeOp::RazorSplit { track, clip, new_left, new_right, at_frame } => (
+                "AddClip",
+                vec![
+                    ("track", Value::Str(i.intern(track))),
+                    ("id", Value::Str(i.intern(&clip.id))),
+                    ("source", Value::Str(i.intern(&clip.source))),
+                    ("src_start", Value::U64(clip.src_start)),
+                    ("src_len", Value::U64(clip.src_len)),
+                    ("at_frame", Value::U64(clip.at_frame)),
+                    ("fade_in", Value::U64(clip.fade_in)),
+                    ("fade_out", Value::U64(clip.fade_out)),
+                    ("gain", Value::F32(clip.gain)),
+                    // loop_len must be > 0; 0 encodes "no loop".
+                    ("loop", Value::U64(clip.loop_len.unwrap_or(0))),
+                ],
+            )
+        }
+        ArrangeOp::RazorSplit {
+            track,
+            clip,
+            new_left,
+            new_right,
+            at_frame,
+        } => (
             "RazorSplit",
             vec![
                 ("track", Value::Str(i.intern(track))),
@@ -96,16 +109,31 @@ pub fn encode_op(i: &mut Interner, op: &ArrangeOp) -> (&'static str, Vec<(&'stat
                 ("at_frame", Value::U64(*at_frame)),
             ],
         ),
-        ArrangeOp::Trim { track, clip, edge, by_frames } => (
+        ArrangeOp::Trim {
+            track,
+            clip,
+            edge,
+            by_frames,
+        } => (
             "Trim",
             vec![
                 ("track", Value::Str(i.intern(track))),
                 ("clip", Value::Str(i.intern(clip))),
-                ("edge", Value::Str(match edge { Edge::Start => "start", Edge::End => "end" })),
+                (
+                    "edge",
+                    Value::Str(match edge {
+                        Edge::Start => "start",
+                        Edge::End => "end",
+                    }),
+                ),
                 ("by", Value::I64(*by_frames)),
             ],
         ),
-        ArrangeOp::MoveClip { track, clip, at_frame } => (
+        ArrangeOp::MoveClip {
+            track,
+            clip,
+            at_frame,
+        } => (
             "MoveClip",
             vec![
                 ("track", Value::Str(i.intern(track))),
@@ -113,7 +141,12 @@ pub fn encode_op(i: &mut Interner, op: &ArrangeOp) -> (&'static str, Vec<(&'stat
                 ("at_frame", Value::U64(*at_frame)),
             ],
         ),
-        ArrangeOp::MoveClipToTrack { from, clip, to, at_frame } => (
+        ArrangeOp::MoveClipToTrack {
+            from,
+            clip,
+            to,
+            at_frame,
+        } => (
             "MoveClipToTrack",
             vec![
                 ("from", Value::Str(i.intern(from))),
@@ -122,7 +155,11 @@ pub fn encode_op(i: &mut Interner, op: &ArrangeOp) -> (&'static str, Vec<(&'stat
                 ("at_frame", Value::U64(*at_frame)),
             ],
         ),
-        ArrangeOp::Duplicate { track, clip, new_id } => (
+        ArrangeOp::Duplicate {
+            track,
+            clip,
+            new_id,
+        } => (
             "Duplicate",
             vec![
                 ("track", Value::Str(i.intern(track))),
@@ -132,7 +169,10 @@ pub fn encode_op(i: &mut Interner, op: &ArrangeOp) -> (&'static str, Vec<(&'stat
         ),
         ArrangeOp::Delete { track, clip } => (
             "Delete",
-            vec![("track", Value::Str(i.intern(track))), ("clip", Value::Str(i.intern(clip)))],
+            vec![
+                ("track", Value::Str(i.intern(track))),
+                ("clip", Value::Str(i.intern(clip))),
+            ],
         ),
         ArrangeOp::SetClipGain { track, clip, gain } => (
             "SetClipGain",
@@ -142,7 +182,12 @@ pub fn encode_op(i: &mut Interner, op: &ArrangeOp) -> (&'static str, Vec<(&'stat
                 ("gain", Value::F32(*gain)),
             ],
         ),
-        ArrangeOp::SetClipFade { track, clip, fade_in, fade_out } => (
+        ArrangeOp::SetClipFade {
+            track,
+            clip,
+            fade_in,
+            fade_out,
+        } => (
             "SetClipFade",
             vec![
                 ("track", Value::Str(i.intern(track))),
@@ -159,7 +204,12 @@ pub fn encode_op(i: &mut Interner, op: &ArrangeOp) -> (&'static str, Vec<(&'stat
                 ("times", Value::U32(*times)),
             ],
         ),
-        ArrangeOp::ChopClip { track, clip, times, prefix } => (
+        ArrangeOp::ChopClip {
+            track,
+            clip,
+            times,
+            prefix,
+        } => (
             "ChopClip",
             vec![
                 ("track", Value::Str(i.intern(track))),
@@ -202,8 +252,12 @@ fn f32_field(fields: &[(&'static str, Value)], name: &str) -> Result<f32, String
 /// duplicate field returns the first match (encode never emits duplicates).
 pub fn decode_op(op: &str, fields: &[(&'static str, Value)]) -> Result<ArrangeOp, String> {
     match op {
-        "AddTrack" => Ok(ArrangeOp::AddTrack { track: str_field(fields, "track")? }),
-        "RemoveTrack" => Ok(ArrangeOp::RemoveTrack { track: str_field(fields, "track")? }),
+        "AddTrack" => Ok(ArrangeOp::AddTrack {
+            track: str_field(fields, "track")?,
+        }),
+        "RemoveTrack" => Ok(ArrangeOp::RemoveTrack {
+            track: str_field(fields, "track")?,
+        }),
         "AddClip" => {
             let src_len = u64_field(fields, "src_len")?;
             let loop_len = u64_field(fields, "loop")?;
@@ -218,7 +272,10 @@ pub fn decode_op(op: &str, fields: &[(&'static str, Value)]) -> Result<ArrangeOp
                 gain: f32_field(fields, "gain")?,
                 loop_len: (loop_len != 0).then_some(loop_len),
             };
-            Ok(ArrangeOp::AddClip { track: str_field(fields, "track")?, clip })
+            Ok(ArrangeOp::AddClip {
+                track: str_field(fields, "track")?,
+                clip,
+            })
         }
         "RazorSplit" => Ok(ArrangeOp::RazorSplit {
             track: str_field(fields, "track")?,
@@ -296,7 +353,10 @@ pub fn decode_op(op: &str, fields: &[(&'static str, Value)]) -> Result<ArrangeOp
 /// and applies the op to the shared `Timeline` (control side — a reconcile would
 /// also rebuild readers here, but graph-node mounting needs `&mut Engine`, which
 /// the host owns in P1.3.4).
-pub fn register_handlers(engine: &mut Engine, timeline: Arc<Mutex<Timeline>>) -> Result<(), String> {
+pub fn register_handlers(
+    engine: &mut Engine,
+    timeline: Arc<Mutex<Timeline>>,
+) -> Result<(), String> {
     for name in ALL_OPS {
         let tl = timeline.clone();
         let handler: OpHandler = Box::new(move |fields| {
@@ -312,8 +372,18 @@ pub fn register_handlers(engine: &mut Engine, timeline: Arc<Mutex<Timeline>>) ->
 
 /// All op names, in a fixed order, for registration iteration.
 pub const ALL_OPS: &[&str] = &[
-    "AddTrack", "RemoveTrack", "AddClip", "RazorSplit", "Trim", "MoveClip",
-    "MoveClipToTrack", "Duplicate", "Delete", "SetClipGain", "SetClipFade", "LoopRegion",
+    "AddTrack",
+    "RemoveTrack",
+    "AddClip",
+    "RazorSplit",
+    "Trim",
+    "MoveClip",
+    "MoveClipToTrack",
+    "Duplicate",
+    "Delete",
+    "SetClipGain",
+    "SetClipFade",
+    "LoopRegion",
     "ChopClip",
 ];
 
@@ -327,7 +397,10 @@ pub struct ClipEditor {
 
 impl ClipEditor {
     pub fn new() -> Self {
-        ClipEditor { intern: Interner::new(), timeline: Arc::new(Mutex::new(Timeline::new())) }
+        ClipEditor {
+            intern: Interner::new(),
+            timeline: Arc::new(Mutex::new(Timeline::new())),
+        }
     }
 
     /// A snapshot of the current value — a **read-only** window (no write handle
@@ -335,7 +408,10 @@ impl ClipEditor {
     /// op handlers, so it stays a pure reconstruction of the logged op stream.
     /// Poison maps to `Err` (matching `register_handlers`) — never a panic.
     pub fn snapshot(&self) -> Result<Timeline, String> {
-        self.timeline.lock().map(|g| g.clone()).map_err(|_| "timeline poisoned".to_string())
+        self.timeline
+            .lock()
+            .map(|g| g.clone())
+            .map_err(|_| "timeline poisoned".to_string())
     }
 
     /// Register the op handlers on an engine (once, after the engine is built).
@@ -351,7 +427,10 @@ impl ClipEditor {
     /// logged ops to reconstruct the identical value.
     pub fn apply(&mut self, engine: &mut Engine, op: &ArrangeOp) -> Result<(), String> {
         {
-            let mut tl = self.timeline.lock().map_err(|_| "timeline poisoned".to_string())?;
+            let mut tl = self
+                .timeline
+                .lock()
+                .map_err(|_| "timeline poisoned".to_string())?;
             *tl = tl.apply(op)?; // validate + apply live; a refused op returns before logging
         }
         let (name, fields) = encode_op(&mut self.intern, op);
@@ -390,7 +469,10 @@ mod tests {
         let (name, fields) = encode_op(&mut i, op);
         // every op name must be in the registration list (W1): a variant that
         // encodes but isn't registered would be refused by `engine.arrange`.
-        assert!(ALL_OPS.contains(&name), "op name '{name}' must be registered");
+        assert!(
+            ALL_OPS.contains(&name),
+            "op name '{name}' must be registered"
+        );
         let back = decode_op(name, &fields).unwrap();
         assert_eq!(back, *op, "round-trip must be exact for {name}");
     }
@@ -399,19 +481,65 @@ mod tests {
     fn every_op_round_trips_exactly() {
         roundtrip(&ArrangeOp::AddTrack { track: "t0".into() });
         roundtrip(&ArrangeOp::RemoveTrack { track: "t1".into() });
-        roundtrip(&ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", 100, 400) });
-        roundtrip(&ArrangeOp::RazorSplit {
-            track: "t0".into(), clip: "c0".into(), new_left: "l".into(), new_right: "r".into(), at_frame: 250,
+        roundtrip(&ArrangeOp::AddClip {
+            track: "t0".into(),
+            clip: clip("c0", 100, 400),
         });
-        roundtrip(&ArrangeOp::Trim { track: "t0".into(), clip: "c0".into(), edge: Edge::Start, by_frames: 25 });
-        roundtrip(&ArrangeOp::MoveClip { track: "t0".into(), clip: "c0".into(), at_frame: 900 });
-        roundtrip(&ArrangeOp::MoveClipToTrack { from: "t0".into(), clip: "c0".into(), to: "t1".into(), at_frame: 50 });
-        roundtrip(&ArrangeOp::Duplicate { track: "t0".into(), clip: "c0".into(), new_id: "c1".into() });
-        roundtrip(&ArrangeOp::Delete { track: "t0".into(), clip: "c0".into() });
-        roundtrip(&ArrangeOp::SetClipGain { track: "t0".into(), clip: "c0".into(), gain: 0.75 });
-        roundtrip(&ArrangeOp::SetClipFade { track: "t0".into(), clip: "c0".into(), fade_in: 16, fade_out: 0 });
-        roundtrip(&ArrangeOp::LoopRegion { track: "t0".into(), clip: "c0".into(), times: 3 });
-        roundtrip(&ArrangeOp::ChopClip { track: "t0".into(), clip: "c0".into(), times: 4, prefix: "slice".into() });
+        roundtrip(&ArrangeOp::RazorSplit {
+            track: "t0".into(),
+            clip: "c0".into(),
+            new_left: "l".into(),
+            new_right: "r".into(),
+            at_frame: 250,
+        });
+        roundtrip(&ArrangeOp::Trim {
+            track: "t0".into(),
+            clip: "c0".into(),
+            edge: Edge::Start,
+            by_frames: 25,
+        });
+        roundtrip(&ArrangeOp::MoveClip {
+            track: "t0".into(),
+            clip: "c0".into(),
+            at_frame: 900,
+        });
+        roundtrip(&ArrangeOp::MoveClipToTrack {
+            from: "t0".into(),
+            clip: "c0".into(),
+            to: "t1".into(),
+            at_frame: 50,
+        });
+        roundtrip(&ArrangeOp::Duplicate {
+            track: "t0".into(),
+            clip: "c0".into(),
+            new_id: "c1".into(),
+        });
+        roundtrip(&ArrangeOp::Delete {
+            track: "t0".into(),
+            clip: "c0".into(),
+        });
+        roundtrip(&ArrangeOp::SetClipGain {
+            track: "t0".into(),
+            clip: "c0".into(),
+            gain: 0.75,
+        });
+        roundtrip(&ArrangeOp::SetClipFade {
+            track: "t0".into(),
+            clip: "c0".into(),
+            fade_in: 16,
+            fade_out: 0,
+        });
+        roundtrip(&ArrangeOp::LoopRegion {
+            track: "t0".into(),
+            clip: "c0".into(),
+            times: 3,
+        });
+        roundtrip(&ArrangeOp::ChopClip {
+            track: "t0".into(),
+            clip: "c0".into(),
+            times: 4,
+            prefix: "slice".into(),
+        });
     }
 
     #[test]
@@ -419,10 +547,22 @@ mod tests {
         let mut i = Interner::new();
         // loop_len None encodes as ("loop", U64(0)); Some(100) as U64(100).
         let mut c = clip("c0", 0, 1000);
-        let (_, fields) = encode_op(&mut i, &ArrangeOp::AddClip { track: "t0".into(), clip: c.clone() });
+        let (_, fields) = encode_op(
+            &mut i,
+            &ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: c.clone(),
+            },
+        );
         assert_eq!(u64_field(&fields, "loop").unwrap(), 0);
         c.loop_len = Some(100);
-        let (_, fields) = encode_op(&mut i, &ArrangeOp::AddClip { track: "t0".into(), clip: c });
+        let (_, fields) = encode_op(
+            &mut i,
+            &ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: c,
+            },
+        );
         assert_eq!(u64_field(&fields, "loop").unwrap(), 100);
     }
 

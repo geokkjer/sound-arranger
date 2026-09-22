@@ -45,7 +45,9 @@ impl TempoMap {
     /// ascending `start_frame` order.
     pub fn push(&mut self, start_frame: u64, bpm: f64, beats_per_bar: u32) {
         debug_assert!(
-            self.segments.last().is_none_or(|s| start_frame >= s.start_frame),
+            self.segments
+                .last()
+                .is_none_or(|s| start_frame >= s.start_frame),
             "tempo segments must be appended in ascending order"
         );
         self.segments.push(TempoSegment {
@@ -104,7 +106,10 @@ impl TempoMap {
             remaining -= seg_beats;
         }
         // Unreachable: the final open-ended segment covers any finite beat.
-        self.segments.last().expect("tempo map never empty").start_frame
+        self.segments
+            .last()
+            .expect("tempo map never empty")
+            .start_frame
     }
 }
 
@@ -216,7 +221,10 @@ mod tests {
         for beat in [0.0, 0.5, 1.0, 7.25, 42.0] {
             let frame = map.frame_at(beat);
             let back = map.beat_at(frame);
-            assert!((back - beat).abs() < 1e-3, "beat {beat} → frame {frame} → {back}");
+            assert!(
+                (back - beat).abs() < 1e-3,
+                "beat {beat} → frame {frame} → {back}"
+            );
         }
     }
 

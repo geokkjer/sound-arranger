@@ -47,19 +47,64 @@ fn script(a: &Path, b: &Path, out: &Path) -> Vec<HostCommand> {
     vec![
         HostCommand::Mount {
             plugin: "euclidean",
-            params: vec![("steps", 8.0), ("pulses", 1.0), ("rotation", 1.0), ("pulses_per_beat", 4.0)],
+            params: vec![
+                ("steps", 8.0),
+                ("pulses", 1.0),
+                ("rotation", 1.0),
+                ("pulses_per_beat", 4.0),
+            ],
             at_frame: Some(0),
         },
-        HostCommand::Mount { plugin: "scale", params: vec![("root", 0.0)], at_frame: Some(0) },
-        HostCommand::Mount { plugin: "tone", params: vec![("gain", 0.25), ("blip_len", 1200.0)], at_frame: Some(0) },
-        HostCommand::Mount { plugin: "mixer", params: vec![("channels", 4.0)], at_frame: Some(0) },
-        HostCommand::Patch { from: ("euclidean", "triggers"), to: ("scale", "trigger"), at_frame: Some(0) },
-        HostCommand::Patch { from: ("scale", "note"), to: ("tone", "note"), at_frame: Some(0) },
-        HostCommand::Patch { from: ("tone", "audio"), to: ("mixer", "ch0"), at_frame: Some(0) },
-        HostCommand::Play { clip: media::ClipRef::whole(a).unwrap(), channel: 0, at_frame: Some(0) },
-        HostCommand::SetParam { plugin: "mixer", param: "ch0.gain", value: 0.5, at_frame: Some(2_000) },
-        HostCommand::Splice { at_frame: 4_000, clip: media::ClipRef::whole(b).unwrap(), crossfade: 512 },
-        HostCommand::Bounce { frames: 6_000, path: out.to_path_buf() },
+        HostCommand::Mount {
+            plugin: "scale",
+            params: vec![("root", 0.0)],
+            at_frame: Some(0),
+        },
+        HostCommand::Mount {
+            plugin: "tone",
+            params: vec![("gain", 0.25), ("blip_len", 1200.0)],
+            at_frame: Some(0),
+        },
+        HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 4.0)],
+            at_frame: Some(0),
+        },
+        HostCommand::Patch {
+            from: ("euclidean", "triggers"),
+            to: ("scale", "trigger"),
+            at_frame: Some(0),
+        },
+        HostCommand::Patch {
+            from: ("scale", "note"),
+            to: ("tone", "note"),
+            at_frame: Some(0),
+        },
+        HostCommand::Patch {
+            from: ("tone", "audio"),
+            to: ("mixer", "ch0"),
+            at_frame: Some(0),
+        },
+        HostCommand::Play {
+            clip: media::ClipRef::whole(a).unwrap(),
+            channel: 0,
+            at_frame: Some(0),
+        },
+        HostCommand::SetParam {
+            plugin: "mixer",
+            param: "ch0.gain",
+            value: 0.5,
+            at_frame: Some(2_000),
+        },
+        HostCommand::Splice {
+            at_frame: 4_000,
+            clip: media::ClipRef::whole(b).unwrap(),
+            crossfade: 512,
+        },
+        HostCommand::Bounce {
+            frames: 6_000,
+            path: out.to_path_buf(),
+        },
     ]
 }
 
@@ -78,14 +123,29 @@ fn full_script_bounces_byte_identically() {
     let run = |out: &Path| -> (Vec<u8>, Vec<engine::Event>, u64, u64) {
         let s = run_script(&script(&a, &b, out)).expect("script runs");
         let bytes = std::fs::read(out).unwrap();
-        (bytes, s.log().events().to_vec(), s.underruns(), s.deferred())
+        (
+            bytes,
+            s.log().events().to_vec(),
+            s.underruns(),
+            s.deferred(),
+        )
     };
 
     let (bytes1, log1, underruns1, deferred1) = run(&out1);
     let (bytes2, log2, _underruns2, _deferred2) = run(&out2);
-    assert_eq!(bytes1, bytes2, "the same script must bounce byte-identically");
-    assert_eq!(log1, log2, "the logs must be identical, not just equal length");
-    assert_eq!((underruns1, deferred1), (0, 0), "no underruns; the splice applies sample-accurately");
+    assert_eq!(
+        bytes1, bytes2,
+        "the same script must bounce byte-identically"
+    );
+    assert_eq!(
+        log1, log2,
+        "the logs must be identical, not just equal length"
+    );
+    assert_eq!(
+        (underruns1, deferred1),
+        (0, 0),
+        "no underruns; the splice applies sample-accurately"
+    );
     assert!(bytes1.len() > 44, "the bounce holds audio");
 
     // The log records the command's real frames (not all-zero).
@@ -96,7 +156,11 @@ fn full_script_bounces_byte_identically() {
             _ => None,
         })
         .collect();
-    assert_eq!(set_param_frames, vec![2_000], "the set_param is logged at its frame");
+    assert_eq!(
+        set_param_frames,
+        vec![2_000],
+        "the set_param is logged at its frame"
+    );
 
     // The bounce is audible content.
     let mut r = WavReader::open(&out1).unwrap();
@@ -127,13 +191,30 @@ fn lifecycle_and_refusals() {
 
     // set_tempo + unmount execute
     let s = run_script(&[
-        HostCommand::Mount { plugin: "euclidean", params: vec![], at_frame: Some(0) },
-        HostCommand::SetTempo { bpm: 240.0, beats_per_bar: 4, at_frame: Some(0) },
-        HostCommand::Unmount { plugin: "euclidean", at_frame: Some(0) },
-        HostCommand::Bounce { frames: 512, path: out.clone() },
+        HostCommand::Mount {
+            plugin: "euclidean",
+            params: vec![],
+            at_frame: Some(0),
+        },
+        HostCommand::SetTempo {
+            bpm: 240.0,
+            beats_per_bar: 4,
+            at_frame: Some(0),
+        },
+        HostCommand::Unmount {
+            plugin: "euclidean",
+            at_frame: Some(0),
+        },
+        HostCommand::Bounce {
+            frames: 512,
+            path: out.clone(),
+        },
     ])
     .expect("set_tempo and unmount run");
-    assert!(s.event_count() >= 3, "mount + set_tempo + unmount are logged");
+    assert!(
+        s.event_count() >= 3,
+        "mount + set_tempo + unmount are logged"
+    );
 
     // play without the mixer → refused
     let err = run_script(&[HostCommand::Play {
@@ -146,7 +227,11 @@ fn lifecycle_and_refusals() {
 
     // splice without a playing clip → refused
     let err = run_script(&[
-        HostCommand::Mount { plugin: "mixer", params: vec![("channels", 4.0)], at_frame: Some(0) },
+        HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 4.0)],
+            at_frame: Some(0),
+        },
         HostCommand::Splice {
             at_frame: 100,
             clip: media::ClipRef::whole(&a).unwrap(),
@@ -158,9 +243,21 @@ fn lifecycle_and_refusals() {
 
     // playing twice → refused
     let err = run_script(&[
-        HostCommand::Mount { plugin: "mixer", params: vec![("channels", 4.0)], at_frame: Some(0) },
-        HostCommand::Play { clip: media::ClipRef::whole(&a).unwrap(), channel: 0, at_frame: Some(0) },
-        HostCommand::Play { clip: media::ClipRef::whole(&a).unwrap(), channel: 1, at_frame: Some(0) },
+        HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 4.0)],
+            at_frame: Some(0),
+        },
+        HostCommand::Play {
+            clip: media::ClipRef::whole(&a).unwrap(),
+            channel: 0,
+            at_frame: Some(0),
+        },
+        HostCommand::Play {
+            clip: media::ClipRef::whole(&a).unwrap(),
+            channel: 1,
+            at_frame: Some(0),
+        },
     ])
     .unwrap_err();
     assert!(err.contains("one clip"), "got: {err}");
@@ -175,10 +272,25 @@ fn lifecycle_and_refusals() {
 fn refused_commands_are_rejected_identically() {
     let bad_script = |out: &Path| -> Vec<HostCommand> {
         vec![
-            HostCommand::Mount { plugin: "euclidean", params: vec![], at_frame: Some(0) },
-            HostCommand::Mount { plugin: "tone", params: vec![], at_frame: Some(0) },
-            HostCommand::Patch { from: ("euclidean", "triggers"), to: ("tone", "note"), at_frame: Some(0) }, // kind mismatch
-            HostCommand::Bounce { frames: 512, path: out.to_path_buf() },
+            HostCommand::Mount {
+                plugin: "euclidean",
+                params: vec![],
+                at_frame: Some(0),
+            },
+            HostCommand::Mount {
+                plugin: "tone",
+                params: vec![],
+                at_frame: Some(0),
+            },
+            HostCommand::Patch {
+                from: ("euclidean", "triggers"),
+                to: ("tone", "note"),
+                at_frame: Some(0),
+            }, // kind mismatch
+            HostCommand::Bounce {
+                frames: 512,
+                path: out.to_path_buf(),
+            },
         ]
     };
 
@@ -221,11 +333,18 @@ fn text_format_parses() {
     let commands = parse_script(text).unwrap();
     assert_eq!(commands.len(), 11);
     match &commands[8] {
-        HostCommand::SetParam { at_frame: Some(2_000), .. } => {}
+        HostCommand::SetParam {
+            at_frame: Some(2_000),
+            ..
+        } => {}
         other => panic!("expected the gain change at 2000, got {other:?}"),
     }
     match &commands[9] {
-        HostCommand::Splice { at_frame, crossfade, .. } => {
+        HostCommand::Splice {
+            at_frame,
+            crossfade,
+            ..
+        } => {
             assert_eq!(*at_frame, 4_000);
             assert_eq!(*crossfade, 512);
         }
@@ -234,7 +353,10 @@ fn text_format_parses() {
 
     // version mismatch refused
     assert!(parse_script("host v99\nbounce 100 /tmp/x.wav").is_err());
-    assert!(parse_script("mount tone\n").is_err(), "missing version line");
+    assert!(
+        parse_script("mount tone\n").is_err(),
+        "missing version line"
+    );
     // unknown names refused per slot
     assert!(parse_script("host v1\nmount reverb\n").is_err());
     assert!(parse_script("host v1\npatch tone.audio mixer.ch9\n").is_err());
@@ -253,11 +375,20 @@ fn events_and_values_are_observable() {
     write_tone(&b, 880.0, SR as u64);
     let s = run_script(&script(&a, &b, &out)).expect("script runs");
     let providers = s.providers(engine::SignalKind::Audio);
-    assert!(providers.contains(&"tone"), "the tone is an audio provider: {providers:?}");
+    assert!(
+        providers.contains(&"tone"),
+        "the tone is an audio provider: {providers:?}"
+    );
     let meters = s.meters().expect("the mixer's meters are provided");
-    assert!(meters.master_peak().is_finite(), "the master meter is readable");
+    assert!(
+        meters.master_peak().is_finite(),
+        "the master meter is readable"
+    );
     assert!(s.event_count() > 0, "the log reflects the applied commands");
-    assert!(s.media_command_count() >= 3, "play + splice + bounce are reported separately");
+    assert!(
+        s.media_command_count() >= 3,
+        "play + splice + bounce are reported separately"
+    );
     for p in [&a, &b, &out] {
         let _ = std::fs::remove_file(p);
     }
@@ -270,7 +401,8 @@ fn smoke_binary_records_and_bounces() {
     let a = tmp("smoke-a");
     let b = tmp("smoke-b");
     let out = tmp("smoke-out");
-    let script_file = std::env::temp_dir().join(format!("host-ref-script-{}.txt", std::process::id()));
+    let script_file =
+        std::env::temp_dir().join(format!("host-ref-script-{}.txt", std::process::id()));
     write_tone(&a, 440.0, SR as u64);
     write_tone(&b, 660.0, SR as u64);
     let text = format!(
@@ -286,14 +418,25 @@ fn smoke_binary_records_and_bounces() {
         .arg(&script_file)
         .output()
         .expect("run the host binary");
-    assert!(status.status.success(), "host exit: {:?}\n{}", status.status, String::from_utf8_lossy(&status.stderr));
+    assert!(
+        status.status.success(),
+        "host exit: {:?}\n{}",
+        status.status,
+        String::from_utf8_lossy(&status.stderr)
+    );
     let stdout = String::from_utf8_lossy(&status.stdout);
-    assert!(stdout.contains("bounced"), "the binary reports the bounce: {stdout}");
+    assert!(
+        stdout.contains("bounced"),
+        "the binary reports the bounce: {stdout}"
+    );
     assert!(out.exists(), "the bounce file exists");
     let mut r = WavReader::open(&out).unwrap();
     let mut back = vec![0.0f32; r.total_frames() as usize];
     r.read_into(&mut back);
-    assert!(back.iter().any(|s| *s != 0.0), "the smoke binary's bounce is audible");
+    assert!(
+        back.iter().any(|s| *s != 0.0),
+        "the smoke binary's bounce is audible"
+    );
 
     // stdin path + determinism through the binary itself
     let out2 = tmp("smoke-out2");
@@ -319,7 +462,12 @@ fn smoke_binary_records_and_bounces() {
     let bad_file = std::env::temp_dir().join(format!("host-ref-bad-{}.txt", std::process::id()));
     std::fs::write(&bad_file, "host v1\nmount reverb\n").unwrap();
     let bad = Command::new(bin).arg(&bad_file).output().expect("run");
-    assert_eq!(bad.status.code(), Some(2), "bad script exits 2: {:?}", bad.status);
+    assert_eq!(
+        bad.status.code(),
+        Some(2),
+        "bad script exits 2: {:?}",
+        bad.status
+    );
 
     for p in [&a, &b, &out, &out2, &script_file, &bad_file] {
         let _ = std::fs::remove_file(p);
@@ -338,17 +486,34 @@ fn play_after_a_render_does_not_break_the_session() {
     let out2 = tmp("b2");
 
     let script = vec![
-        HostCommand::Mount { plugin: "mixer", params: vec![("channels", 2.0)], at_frame: Some(0) },
-        HostCommand::Bounce { frames: 512, path: out1.clone() }, // materialize the mixer
-        HostCommand::Play { clip: media::ClipRef::whole(&clip).unwrap(), channel: 0, at_frame: Some(512) },
-        HostCommand::Bounce { frames: 512, path: out2.clone() }, // failed before the fix
+        HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 2.0)],
+            at_frame: Some(0),
+        },
+        HostCommand::Bounce {
+            frames: 512,
+            path: out1.clone(),
+        }, // materialize the mixer
+        HostCommand::Play {
+            clip: media::ClipRef::whole(&clip).unwrap(),
+            channel: 0,
+            at_frame: Some(512),
+        },
+        HostCommand::Bounce {
+            frames: 512,
+            path: out2.clone(),
+        }, // failed before the fix
     ];
     let sess = run_script(&script).expect("play after a render must not break the session");
     assert_eq!(sess.underruns(), 0);
     let mut r = WavReader::open(&out2).unwrap();
     let mut audio = vec![0.0f32; r.total_frames() as usize];
     let n = r.read_into(&mut audio);
-    assert!(audio[..n].iter().any(|s| s.abs() > 1e-4), "the post-play render must actually produce audio");
+    assert!(
+        audio[..n].iter().any(|s| s.abs() > 1e-4),
+        "the post-play render must actually produce audio"
+    );
 
     let _ = std::fs::remove_file(&clip);
     let _ = std::fs::remove_file(&out1);
@@ -381,8 +546,16 @@ fn params_fold_from_the_log() {
             .map(|(_, _, v)| *v)
     };
 
-    assert_eq!(get("mixer", "channels"), Some(2.0), "mount params are in the fold");
-    assert_eq!(get("mixer", "master.gain"), Some(0.5), "mount params are in the fold");
+    assert_eq!(
+        get("mixer", "channels"),
+        Some(2.0),
+        "mount params are in the fold"
+    );
+    assert_eq!(
+        get("mixer", "master.gain"),
+        Some(0.5),
+        "mount params are in the fold"
+    );
     assert_eq!(get("mixer", "ch0.gain"), Some(0.8), "the last write wins");
     assert_eq!(get("mixer", "ch1.mute"), Some(1.0));
     assert_eq!(get("mixer", "ch9.gain"), None, "nothing invented");

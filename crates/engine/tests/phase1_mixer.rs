@@ -8,8 +8,8 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::f64::consts::TAU;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use engine::*;
 
@@ -17,10 +17,30 @@ const SR: u32 = 48_000;
 
 fn engine() -> Engine {
     let mut e = Engine::new(SR, 120.0, 4);
-    e.register_factory("euclidean", plugins::euclidean_factory, plugins::euclidean::EUCLIDEAN_PORTS, &[]);
-    e.register_factory("scale", plugins::scale_factory, plugins::scale::SCALE_PORTS, &[]);
-    e.register_factory("tone", plugins::tone_factory, plugins::tone::TONE_PORTS, plugins::tone::TONE_PARAMS);
-    e.register_factory("mixer", plugins::mixer_factory, plugins::mixer::MIXER_PORTS, plugins::mixer::MIXER_PARAMS);
+    e.register_factory(
+        "euclidean",
+        plugins::euclidean_factory,
+        plugins::euclidean::EUCLIDEAN_PORTS,
+        &[],
+    );
+    e.register_factory(
+        "scale",
+        plugins::scale_factory,
+        plugins::scale::SCALE_PORTS,
+        &[],
+    );
+    e.register_factory(
+        "tone",
+        plugins::tone_factory,
+        plugins::tone::TONE_PORTS,
+        plugins::tone::TONE_PARAMS,
+    );
+    e.register_factory(
+        "mixer",
+        plugins::mixer_factory,
+        plugins::mixer::MIXER_PORTS,
+        plugins::mixer::MIXER_PARAMS,
+    );
     e
 }
 
@@ -30,13 +50,20 @@ fn engine() -> Engine {
 fn chain(e: &mut Engine) {
     e.mount(
         "euclidean",
-        &[("steps", 8.0), ("pulses", 1.0), ("rotation", 1.0), ("pulses_per_beat", 4.0)],
+        &[
+            ("steps", 8.0),
+            ("pulses", 1.0),
+            ("rotation", 1.0),
+            ("pulses_per_beat", 4.0),
+        ],
     )
     .unwrap();
     e.mount("scale", &[("root", 0.0)]).unwrap();
-    e.mount("tone", &[("gain", 0.25), ("blip_len", 1200.0)]).unwrap();
+    e.mount("tone", &[("gain", 0.25), ("blip_len", 1200.0)])
+        .unwrap();
     e.mount("mixer", &[]).unwrap();
-    e.patch(("euclidean", "triggers"), ("scale", "trigger")).unwrap();
+    e.patch(("euclidean", "triggers"), ("scale", "trigger"))
+        .unwrap();
     e.patch(("scale", "note"), ("tone", "note")).unwrap();
     e.patch(("tone", "audio"), ("mixer", "ch0")).unwrap();
 }
@@ -48,11 +75,21 @@ fn node_rig() -> (Graph, NodeId, NodeId, NodeId, Arc<MeterBank>) {
     let mut g = Graph::new();
     let s0 = g.add_node(
         NodeKind::Sine(Sine::new(440.0)),
-        vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio, channels: 1 }],
+        vec![Port {
+            name: "audio",
+            direction: Direction::Out,
+            kind: SignalKind::Audio,
+            channels: 1,
+        }],
     );
     let s1 = g.add_node(
         NodeKind::Sine(Sine::new(880.0)),
-        vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio, channels: 1 }],
+        vec![Port {
+            name: "audio",
+            direction: Direction::Out,
+            kind: SignalKind::Audio,
+            channels: 1,
+        }],
     );
     let mixer_node = MixerNode::new();
     let meters = mixer_node.meters();
@@ -88,14 +125,18 @@ fn render_node(g: &mut Graph, frames: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; frames * ch];
     let mut pos = 0u64;
     for chunk in out.chunks_mut(BLOCK * ch) {
-        g.render(chunk, RenderBlock { frame: pos, sample_rate: SR, tempo: &tempo, mode: RenderMode::Timeline });
+        g.render(
+            chunk,
+            RenderBlock {
+                frame: pos,
+                sample_rate: SR,
+                tempo: &tempo,
+                mode: RenderMode::Timeline,
+            },
+        );
         pos += (chunk.len() / ch) as u64;
     }
-    if ch >= 2 {
-        l(&out)
-    } else {
-        out
-    }
+    if ch >= 2 { l(&out) } else { out }
 }
 
 // ---------------------------------------------------------- set_param path
@@ -117,8 +158,14 @@ fn set_param_is_logged_and_replayable() {
     let mut e1 = engine();
     let out1 = run(&mut e1);
 
-    assert!(out1[6001..7000].iter().any(|s| *s != 0.0), "blip before the gain change");
-    assert!(out1[7000..].iter().all(|s| *s == 0.0), "gain 0 mutes from frame 7000");
+    assert!(
+        out1[6001..7000].iter().any(|s| *s != 0.0),
+        "blip before the gain change"
+    );
+    assert!(
+        out1[7000..].iter().all(|s| *s == 0.0),
+        "gain 0 mutes from frame 7000"
+    );
 
     // Replay the log on a fresh engine: byte-identical (on the L channel).
     let mut e2 = engine();
@@ -165,7 +212,10 @@ fn set_param_refused_for_unmounted_plugin() {
     assert!(err.contains("out of range"), "got: {err}");
 
     assert!(
-        e.log.events().iter().all(|ev| !matches!(ev, Event::SetParam { .. })),
+        e.log
+            .events()
+            .iter()
+            .all(|ev| !matches!(ev, Event::SetParam { .. })),
         "a refused set_param must never be logged"
     );
 }
@@ -180,7 +230,12 @@ fn set_param_accepts_scheduled_mount() {
     e.set_param("mixer", "master.gain", 0.5).unwrap();
     let out = e.render(512);
     assert_eq!(out.len(), 512 * 2, "the stereo master renders L+R");
-    assert!(e.log.events().iter().any(|ev| matches!(ev, Event::SetParam { .. })));
+    assert!(
+        e.log
+            .events()
+            .iter()
+            .any(|ev| matches!(ev, Event::SetParam { .. }))
+    );
 }
 
 // ----------------------------------------------------------- mixer behaviour
@@ -196,8 +251,12 @@ fn mixer_routes_channels_with_gain() {
 
     let (mut p0, mut p1) = (0.0f64, 0.0f64);
     for (i, s) in out.iter().enumerate() {
-        let expected = (sine_sample(440.0, &mut p0) * 0.5 + sine_sample(880.0, &mut p1) * 1.0) * CENTER;
-        assert!((*s - expected).abs() < 1e-6, "sample {i}: {s} vs {expected}");
+        let expected =
+            (sine_sample(440.0, &mut p0) * 0.5 + sine_sample(880.0, &mut p1) * 1.0) * CENTER;
+        assert!(
+            (*s - expected).abs() < 1e-6,
+            "sample {i}: {s} vs {expected}"
+        );
     }
 }
 
@@ -210,7 +269,10 @@ fn mixer_mute_and_solo() {
     let mut p1 = 0.0f64;
     for s in out.iter() {
         let expected = sine_sample(880.0, &mut p1) * CENTER;
-        assert!((*s - expected).abs() < 1e-6, "muted ch0 must be silent: {s} vs {expected}");
+        assert!(
+            (*s - expected).abs() < 1e-6,
+            "muted ch0 must be silent: {s} vs {expected}"
+        );
     }
 
     // Solo ch1: ch0 (unmuted, louder) must be excluded.
@@ -221,7 +283,10 @@ fn mixer_mute_and_solo() {
     let mut p1 = 0.0f64;
     for s in out.iter() {
         let expected = sine_sample(880.0, &mut p1) * CENTER;
-        assert!((*s - expected).abs() < 1e-6, "solo must exclude ch0: {s} vs {expected}");
+        assert!(
+            (*s - expected).abs() < 1e-6,
+            "solo must exclude ch0: {s} vs {expected}"
+        );
     }
 }
 
@@ -249,9 +314,19 @@ fn mixer_meters() {
     let max_out = out.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
 
     let mut p0 = 0.0f64;
-    let ch0_peak: f32 = (0..BLOCK).map(|_i| sine_sample(440.0, &mut p0).abs() * 0.5).fold(0.0, f32::max);
-    assert!((meters.channel_peak(0) - ch0_peak).abs() < 1e-6, "ch0 meter {:.6} vs {ch0_peak:.6}", meters.channel_peak(0));
-    assert!((meters.master_peak() - max_out).abs() < 1e-6, "master meter {:.6} vs {max_out:.6}", meters.master_peak());
+    let ch0_peak: f32 = (0..BLOCK)
+        .map(|_i| sine_sample(440.0, &mut p0).abs() * 0.5)
+        .fold(0.0, f32::max);
+    assert!(
+        (meters.channel_peak(0) - ch0_peak).abs() < 1e-6,
+        "ch0 meter {:.6} vs {ch0_peak:.6}",
+        meters.channel_peak(0)
+    );
+    assert!(
+        (meters.master_peak() - max_out).abs() < 1e-6,
+        "master meter {:.6} vs {max_out:.6}",
+        meters.master_peak()
+    );
 }
 
 /// The mixer owns the master bus: unmounting it silences the master even
@@ -261,7 +336,10 @@ fn mixer_owns_the_master_bus() {
     let mut e = engine();
     chain(&mut e);
     let out = l(&e.render(7000));
-    assert!(out[6001..7000].iter().any(|s| *s != 0.0), "blip routes through the mixer");
+    assert!(
+        out[6001..7000].iter().any(|s| *s != 0.0),
+        "blip routes through the mixer"
+    );
 
     e.unmount("mixer").unwrap();
     let out = e.render(2000);
@@ -312,7 +390,11 @@ fn render_path_does_not_allocate_with_mixer() {
     MEASURING.with(|m| m.set(true));
     e.render_into(&mut out);
     MEASURING.with(|m| m.set(false));
-    assert_eq!(ALLOCS.load(Ordering::Relaxed), 0, "the mixer render path must not allocate");
+    assert_eq!(
+        ALLOCS.load(Ordering::Relaxed),
+        0,
+        "the mixer render path must not allocate"
+    );
 }
 
 /// Meters are post-gain/pre-mute: a muted channel still shows its level
@@ -324,7 +406,9 @@ fn mixer_meter_points_and_mute_wins_over_solo() {
     g.set_param(mixer, "ch0.mute", 1.0);
     let out = render_node(&mut g, BLOCK);
     let mut p0 = 0.0f64;
-    let ch0_level: f32 = (0..BLOCK).map(|_i| sine_sample(440.0, &mut p0).abs()).fold(0.0, f32::max);
+    let ch0_level: f32 = (0..BLOCK)
+        .map(|_i| sine_sample(440.0, &mut p0).abs())
+        .fold(0.0, f32::max);
     assert!(
         (meters.channel_peak(0) - ch0_level).abs() < 1e-6,
         "muted ch0 must still meter (pre-mute): {:.6} vs {ch0_level:.6}",
@@ -333,7 +417,10 @@ fn mixer_meter_points_and_mute_wins_over_solo() {
     let mut p1 = 0.0f64;
     for s in out.iter() {
         let expected = sine_sample(880.0, &mut p1) * CENTER;
-        assert!((*s - expected).abs() < 1e-6, "only ch1 sounds: {s} vs {expected}");
+        assert!(
+            (*s - expected).abs() < 1e-6,
+            "only ch1 sounds: {s} vs {expected}"
+        );
     }
 
     // mute wins over solo: mute the only solo'd channel → the mix is silent
@@ -341,7 +428,10 @@ fn mixer_meter_points_and_mute_wins_over_solo() {
     g.set_param(mixer, "ch1.solo", 1.0);
     g.set_param(mixer, "ch1.mute", 1.0);
     let out = render_node(&mut g, BLOCK);
-    assert!(out.iter().all(|s| *s == 0.0), "mute is absolute — wins over solo");
+    assert!(
+        out.iter().all(|s| *s == 0.0),
+        "mute is absolute — wins over solo"
+    );
 }
 
 /// Unmounting a *middle* node rewires surviving cords' indices coherently
@@ -369,11 +459,21 @@ fn mixer_ignores_channels_beyond_the_mounted_count() {
     let mut g = Graph::new();
     let s0 = g.add_node(
         NodeKind::Sine(Sine::new(440.0)),
-        vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio, channels: 1 }],
+        vec![Port {
+            name: "audio",
+            direction: Direction::Out,
+            kind: SignalKind::Audio,
+            channels: 1,
+        }],
     );
     let s3 = g.add_node(
         NodeKind::Sine(Sine::new(880.0)),
-        vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio, channels: 1 }],
+        vec![Port {
+            name: "audio",
+            direction: Direction::Out,
+            kind: SignalKind::Audio,
+            channels: 1,
+        }],
     );
     let mixer_node = MixerNode::with_channels(2, Arc::new(MeterBank::default()));
     let mixer = g.add_node(NodeKind::Opaque(Box::new(mixer_node)), MIXER_PORTS.to_vec());
@@ -384,7 +484,10 @@ fn mixer_ignores_channels_beyond_the_mounted_count() {
     let mut p0 = 0.0f64;
     for s in out.iter() {
         let expected = sine_sample(440.0, &mut p0) * CENTER;
-        assert!((*s - expected).abs() < 1e-6, "ch3 must be ignored: {s} vs {expected}");
+        assert!(
+            (*s - expected).abs() < 1e-6,
+            "ch3 must be ignored: {s} vs {expected}"
+        );
     }
 }
 
@@ -402,7 +505,10 @@ fn mixer_meters_are_a_context_service() {
     assert_eq!(meters.master_peak(), 0.0, "no input → master meters 0");
     e.unmount("mixer").unwrap();
     e.render(512); // the scheduled unmount applies (disposer runs)
-    assert!(e.ctx.get::<Arc<MeterBank>>("mixer.meters").is_none(), "the disposer withdraws the service");
+    assert!(
+        e.ctx.get::<Arc<MeterBank>>("mixer.meters").is_none(),
+        "the disposer withdraws the service"
+    );
 }
 
 /// The graph refuses more than MAX_AUDIO_INS audio inputs loudly (kimi
@@ -419,7 +525,12 @@ fn more_than_max_audio_ins_refused() {
             channels: 1,
         })
         .collect();
-    ports.push(Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio, channels: 1 });
+    ports.push(Port {
+        name: "audio",
+        direction: Direction::Out,
+        kind: SignalKind::Audio,
+        channels: 1,
+    });
     let _ = g.add_node(NodeKind::Opaque(Box::new(MixerNode::new())), ports);
 }
 
@@ -431,15 +542,30 @@ fn mixer_adapts_to_channel_count() {
     let mut g = Graph::new();
     let s0 = g.add_node(
         NodeKind::Sine(Sine::new(440.0)),
-        vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio, channels: 1 }],
+        vec![Port {
+            name: "audio",
+            direction: Direction::Out,
+            kind: SignalKind::Audio,
+            channels: 1,
+        }],
     );
     let s1 = g.add_node(
         NodeKind::Sine(Sine::new(660.0)),
-        vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio, channels: 1 }],
+        vec![Port {
+            name: "audio",
+            direction: Direction::Out,
+            kind: SignalKind::Audio,
+            channels: 1,
+        }],
     );
     let s2 = g.add_node(
         NodeKind::Sine(Sine::new(880.0)),
-        vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio, channels: 1 }],
+        vec![Port {
+            name: "audio",
+            direction: Direction::Out,
+            kind: SignalKind::Audio,
+            channels: 1,
+        }],
     );
     let mixer_node = MixerNode::with_channels(2, Arc::new(MeterBank::default()));
     let mixer = g.add_node(NodeKind::Opaque(Box::new(mixer_node)), MIXER_PORTS.to_vec());
@@ -452,7 +578,10 @@ fn mixer_adapts_to_channel_count() {
     let (mut p0, mut p1) = (0.0f64, 0.0f64);
     for s in out.iter() {
         let expected = (sine_sample(440.0, &mut p0) + sine_sample(660.0, &mut p1)) * CENTER;
-        assert!((*s - expected).abs() < 1e-6, "ch2 must be ignored: {s} vs {expected}");
+        assert!(
+            (*s - expected).abs() < 1e-6,
+            "ch2 must be ignored: {s} vs {expected}"
+        );
     }
 }
 
@@ -472,8 +601,17 @@ fn replay_across_mixer_mount_in_one_call_advances_the_clock_exactly() {
     let mut e2 = engine();
     e2.replay_from(&e1.log).unwrap();
     let out = e2.render(2048); // ONE call spanning the mount
-    assert_eq!(e2.clock.frame(), 2048, "replay in one call must advance exactly the requested frames (got {})", e2.clock.frame());
-    assert_eq!(out.len(), 2048, "the master is mono for the whole call (the width change is parked to the next boundary)");
+    assert_eq!(
+        e2.clock.frame(),
+        2048,
+        "replay in one call must advance exactly the requested frames (got {})",
+        e2.clock.frame()
+    );
+    assert_eq!(
+        out.len(),
+        2048,
+        "the master is mono for the whole call (the width change is parked to the next boundary)"
+    );
 }
 
 /// The GLM-5.3 review test-gap: pan is asserted only at center. Verify the
@@ -484,7 +622,15 @@ fn pan_law_is_equal_power_and_hard_left_right() {
     let tempo = TempoMap::new(SR, 120.0, 4);
     let render = |g: &mut Graph| -> Vec<f32> {
         let mut out = vec![0.0f32; BLOCK * 2];
-        g.render(&mut out, RenderBlock { frame: 0, sample_rate: SR, tempo: &tempo, mode: RenderMode::Timeline });
+        g.render(
+            &mut out,
+            RenderBlock {
+                frame: 0,
+                sample_rate: SR,
+                tempo: &tempo,
+                mode: RenderMode::Timeline,
+            },
+        );
         out
     };
     let frame_of = |samples: &[f32], i: usize| (samples[2 * i], samples[2 * i + 1]);
@@ -496,7 +642,10 @@ fn pan_law_is_equal_power_and_hard_left_right() {
     g.set_param(mixer, "ch0.pan", -1.0);
     let out = render(&mut g);
     let (l, r) = frame_of(&out, 100);
-    assert!(l.abs() > 1e-3, "hard-left L must carry the signal (got {l})");
+    assert!(
+        l.abs() > 1e-3,
+        "hard-left L must carry the signal (got {l})"
+    );
     assert!(r.abs() < 1e-6, "hard-left R must be silent (got {r})");
 
     // hard right: only R.
@@ -504,11 +653,17 @@ fn pan_law_is_equal_power_and_hard_left_right() {
     let out = render(&mut g);
     let (l, r) = frame_of(&out, 100);
     assert!(l.abs() < 1e-6, "hard-right L must be silent (got {l})");
-    assert!(r.abs() > 1e-3, "hard-right R must carry the signal (got {r})");
+    assert!(
+        r.abs() > 1e-3,
+        "hard-right R must carry the signal (got {r})"
+    );
 
     // clamp: an out-of-range pan is clamped to the [-1, 1] law, not the raw value.
     g.set_param(mixer, "ch0.pan", 3.0);
     let out = render(&mut g);
     let (l, r) = frame_of(&out, 100);
-    assert!(l.abs() < 1e-6 && r.abs() > 1e-3, "pan 3.0 clamps to hard right");
+    assert!(
+        l.abs() < 1e-6 && r.abs() > 1e-3,
+        "pan 3.0 clamps to hard right"
+    );
 }

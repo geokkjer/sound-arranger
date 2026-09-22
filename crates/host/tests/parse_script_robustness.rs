@@ -41,7 +41,10 @@ fn truncated_operands_are_errs_not_panics() {
         "patch euclidean.triggers",
     ] {
         let text = format!("host v1\n{line}\n");
-        assert!(parse_script(&text).is_err(), "line '{line}' must be refused, not panic");
+        assert!(
+            parse_script(&text).is_err(),
+            "line '{line}' must be refused, not panic"
+        );
     }
 }
 

@@ -42,9 +42,15 @@ impl Header {
 
 fn read_tag(reader: &mut impl Read, tag: &[u8; 4], what: &str) -> Result<(), String> {
     let mut buf = [0u8; 4];
-    reader.read_exact(&mut buf).map_err(|e| format!("{what}: {e}"))?;
+    reader
+        .read_exact(&mut buf)
+        .map_err(|e| format!("{what}: {e}"))?;
     if &buf != tag {
-        return Err(format!("{what}: expected '{}', found {:?}", String::from_utf8_lossy(tag), buf));
+        return Err(format!(
+            "{what}: expected '{}', found {:?}",
+            String::from_utf8_lossy(tag),
+            buf
+        ));
     }
     Ok(())
 }
@@ -67,35 +73,56 @@ fn parse_header(reader: &mut (impl Read + Seek)) -> Result<Header, String> {
         if &chunk[..4] == FMT_TAG {
             let mut body = [0u8; 40];
             let n = size.min(40) as usize;
-            reader.read_exact(&mut body[..n]).map_err(|e| format!("fmt chunk: {e}"))?;
+            reader
+                .read_exact(&mut body[..n])
+                .map_err(|e| format!("fmt chunk: {e}"))?;
             if size > 40 {
-                reader.seek(SeekFrom::Current(size as i64 - n as i64)).map_err(|e| e.to_string())?;
+                reader
+                    .seek(SeekFrom::Current(size as i64 - n as i64))
+                    .map_err(|e| e.to_string())?;
             }
             let format = u16::from_le_bytes([body[0], body[1]]);
             let channels = u16::from_le_bytes([body[2], body[3]]);
             let rate = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
             let bits = u16::from_le_bytes([body[14], body[15]]);
             if format != FMT_PCM && format != FMT_FLOAT {
-                return Err(format!("unsupported WAV audio format {format} (PCM or float only)"));
+                return Err(format!(
+                    "unsupported WAV audio format {format} (PCM or float only)"
+                ));
             }
             if channels != 1 && channels != 2 {
-                return Err(format!("unsupported channel count {channels} (mono/stereo only)"));
+                return Err(format!(
+                    "unsupported channel count {channels} (mono/stereo only)"
+                ));
             }
             if bits != 16 && bits != 32 {
-                return Err(format!("unsupported bit depth {bits} (16-bit PCM or 32-bit float only)"));
+                return Err(format!(
+                    "unsupported bit depth {bits} (16-bit PCM or 32-bit float only)"
+                ));
             }
             fmt = Some((format, channels, rate, bits));
         } else if &chunk[..4] == DATA_TAG {
-            data = Some((reader.stream_position().map_err(|e| e.to_string())?, size as u32));
+            data = Some((
+                reader.stream_position().map_err(|e| e.to_string())?,
+                size as u32,
+            ));
             break; // data is the last chunk for files we write; a reader may re-seek
         } else {
-            reader.seek(SeekFrom::Current(size as i64)).map_err(|e| e.to_string())?;
+            reader
+                .seek(SeekFrom::Current(size as i64))
+                .map_err(|e| e.to_string())?;
         }
     }
 
     let (_format, channels, sample_rate, bits) = fmt.ok_or("missing fmt chunk")?;
     let (data_offset, data_bytes) = data.ok_or("missing data chunk")?;
-    Ok(Header { channels, sample_rate, bits, data_offset, data_bytes })
+    Ok(Header {
+        channels,
+        sample_rate,
+        bits,
+        data_offset,
+        data_bytes,
+    })
 }
 
 /// A chunked WAV reader (16-bit PCM + 32-bit float; mono, or stereo → channel 0).
@@ -120,7 +147,8 @@ impl WavReader {
         if h.data_offset + data_bytes > file_len {
             data_bytes = file_len - h.data_offset;
         }
-        file.seek(SeekFrom::Start(h.data_offset)).map_err(|e| e.to_string())?;
+        file.seek(SeekFrom::Start(h.data_offset))
+            .map_err(|e| e.to_string())?;
         let total_frames = data_bytes / h.block_align();
         Ok(WavReader {
             reader: BufReader::new(file),
@@ -150,7 +178,9 @@ impl WavReader {
         if n > self.total_frames {
             return Err(format!("seek_frames({n}) past end ({})", self.total_frames));
         }
-        self.reader.seek(SeekFrom::Start(self.data_offset + n * self.block_align())).map_err(|e| e.to_string())?;
+        self.reader
+            .seek(SeekFrom::Start(self.data_offset + n * self.block_align()))
+            .map_err(|e| e.to_string())?;
         self.frames_left = self.total_frames - n;
         Ok(())
     }
@@ -166,10 +196,14 @@ impl WavReader {
         const MAX_FRAMES: usize = 256;
         let mut written = 0usize;
         while written < out.len() && self.frames_left > 0 {
-            let want = (out.len() - written).min(MAX_FRAMES).min(self.frames_left as usize);
+            let want = (out.len() - written)
+                .min(MAX_FRAMES)
+                .min(self.frames_left as usize);
             let bytes = want * self.block_align() as usize;
             let mut raw = [0u8; MAX_FRAMES * 8]; // 256 frames × 2 ch × 4 bytes
-            let Ok(got) = self.reader.read(&mut raw[..bytes]) else { break };
+            let Ok(got) = self.reader.read(&mut raw[..bytes]) else {
+                break;
+            };
             if got == 0 {
                 break;
             }
@@ -218,14 +252,29 @@ impl WavWriter {
         Self::create_with(path, sample_rate, channels, true)
     }
 
-    fn create_with(path: &Path, sample_rate: u32, channels: u16, float: bool) -> Result<Self, String> {
+    fn create_with(
+        path: &Path,
+        sample_rate: u32,
+        channels: u16,
+        float: bool,
+    ) -> Result<Self, String> {
         if channels != 1 && channels != 2 {
-            return Err(format!("WAV writer supports mono/stereo, got {channels} channels"));
+            return Err(format!(
+                "WAV writer supports mono/stereo, got {channels} channels"
+            ));
         }
         let file = File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
         let mut writer = BufWriter::new(file);
         write_header(&mut writer, sample_rate, channels, float)?;
-        Ok(WavWriter { writer, sample_rate, channels, float, frames: 0, finalized: false, path: path.to_path_buf() })
+        Ok(WavWriter {
+            writer,
+            sample_rate,
+            channels,
+            float,
+            frames: 0,
+            finalized: false,
+            path: path.to_path_buf(),
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -250,7 +299,9 @@ impl WavWriter {
                 }
             }
         }
-        self.writer.write_all(&bytes).map_err(|e| format!("write {}: {e}", self.path.display()))?;
+        self.writer
+            .write_all(&bytes)
+            .map_err(|e| format!("write {}: {e}", self.path.display()))?;
         self.frames += frames as u64;
         Ok(())
     }
@@ -263,7 +314,9 @@ impl WavWriter {
     /// after every chunk so a crashed take loses nothing the writer already
     /// drained (crash recovery then finds every written frame).
     pub fn flush(&mut self) -> Result<(), String> {
-        self.writer.flush().map_err(|e| format!("flush {}: {e}", self.path.display()))
+        self.writer
+            .flush()
+            .map_err(|e| format!("flush {}: {e}", self.path.display()))
     }
 
     /// Patch the placeholder sizes and flush. Idempotent.
@@ -291,12 +344,20 @@ impl WavWriter {
         // (kimi review finding 7). Refuse a take that would overflow the u32
         // size field rather than writing a corrupt small header (>4 GiB).
         let data_bytes = data_bytes(frames, h.channels, h.bits == 32)?;
-        let mut f = File::options().write(true).open(path).map_err(|e| format!("open rw {}: {e}", path.display()))?;
-        f.seek(SeekFrom::Start(RIFF_SIZE_POS)).map_err(|e| e.to_string())?;
-        f.write_all(&(36u32 + data_bytes as u32).to_le_bytes()).map_err(|e| e.to_string())?;
-        f.seek(SeekFrom::Start(DATA_SIZE_POS)).map_err(|e| e.to_string())?;
-        f.write_all(&(data_bytes as u32).to_le_bytes()).map_err(|e| e.to_string())?;
-        f.set_len(h.data_offset + data_bytes).map_err(|e| e.to_string())?;
+        let mut f = File::options()
+            .write(true)
+            .open(path)
+            .map_err(|e| format!("open rw {}: {e}", path.display()))?;
+        f.seek(SeekFrom::Start(RIFF_SIZE_POS))
+            .map_err(|e| e.to_string())?;
+        f.write_all(&(36u32 + data_bytes as u32).to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        f.seek(SeekFrom::Start(DATA_SIZE_POS))
+            .map_err(|e| e.to_string())?;
+        f.write_all(&(data_bytes as u32).to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        f.set_len(h.data_offset + data_bytes)
+            .map_err(|e| e.to_string())?;
         f.flush().map_err(|e| e.to_string())?;
         Ok(frames)
     }
@@ -323,31 +384,54 @@ impl Drop for WavWriter {
     }
 }
 
-fn write_header(w: &mut impl Write, sample_rate: u32, channels: u16, float: bool) -> Result<(), String> {
+fn write_header(
+    w: &mut impl Write,
+    sample_rate: u32,
+    channels: u16,
+    float: bool,
+) -> Result<(), String> {
     w.write_all(RIFF_TAG).map_err(|e| e.to_string())?;
-    w.write_all(&0xFFFF_FFFFu32.to_le_bytes()).map_err(|e| e.to_string())?; // riff size placeholder
+    w.write_all(&0xFFFF_FFFFu32.to_le_bytes())
+        .map_err(|e| e.to_string())?; // riff size placeholder
     w.write_all(WAVE_TAG).map_err(|e| e.to_string())?;
     w.write_all(FMT_TAG).map_err(|e| e.to_string())?;
-    w.write_all(&16u32.to_le_bytes()).map_err(|e| e.to_string())?;
-    w.write_all(&(if float { FMT_FLOAT } else { FMT_PCM }).to_le_bytes()).map_err(|e| e.to_string())?;
-    w.write_all(&channels.to_le_bytes()).map_err(|e| e.to_string())?;
-    w.write_all(&sample_rate.to_le_bytes()).map_err(|e| e.to_string())?;
+    w.write_all(&16u32.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    w.write_all(&(if float { FMT_FLOAT } else { FMT_PCM }).to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    w.write_all(&channels.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    w.write_all(&sample_rate.to_le_bytes())
+        .map_err(|e| e.to_string())?;
     let bytes_per_sample: u16 = if float { 4 } else { 2 };
-    w.write_all(&(sample_rate * channels as u32 * bytes_per_sample as u32).to_le_bytes()).map_err(|e| e.to_string())?; // byte rate
-    w.write_all(&(channels * bytes_per_sample).to_le_bytes()).map_err(|e| e.to_string())?; // block align
-    w.write_all(&(bytes_per_sample * 8).to_le_bytes()).map_err(|e| e.to_string())?; // bits
+    w.write_all(&(sample_rate * channels as u32 * bytes_per_sample as u32).to_le_bytes())
+        .map_err(|e| e.to_string())?; // byte rate
+    w.write_all(&(channels * bytes_per_sample).to_le_bytes())
+        .map_err(|e| e.to_string())?; // block align
+    w.write_all(&(bytes_per_sample * 8).to_le_bytes())
+        .map_err(|e| e.to_string())?; // bits
     w.write_all(DATA_TAG).map_err(|e| e.to_string())?;
-    w.write_all(&0xFFFF_FFFFu32.to_le_bytes()).map_err(|e| e.to_string())?; // data size placeholder
+    w.write_all(&0xFFFF_FFFFu32.to_le_bytes())
+        .map_err(|e| e.to_string())?; // data size placeholder
     Ok(())
 }
 
-fn patch_sizes(w: &mut (impl Write + Seek), frames: u64, channels: u16, float: bool) -> Result<(), String> {
+fn patch_sizes(
+    w: &mut (impl Write + Seek),
+    frames: u64,
+    channels: u16,
+    float: bool,
+) -> Result<(), String> {
     let data_bytes = data_bytes(frames, channels, float)?;
     let data_bytes = data_bytes as u32;
-    w.seek(SeekFrom::Start(RIFF_SIZE_POS)).map_err(|e| e.to_string())?;
-    w.write_all(&(36u32 + data_bytes).to_le_bytes()).map_err(|e| e.to_string())?;
-    w.seek(SeekFrom::Start(DATA_SIZE_POS)).map_err(|e| e.to_string())?;
-    w.write_all(&data_bytes.to_le_bytes()).map_err(|e| e.to_string())?;
+    w.seek(SeekFrom::Start(RIFF_SIZE_POS))
+        .map_err(|e| e.to_string())?;
+    w.write_all(&(36u32 + data_bytes).to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    w.seek(SeekFrom::Start(DATA_SIZE_POS))
+        .map_err(|e| e.to_string())?;
+    w.write_all(&data_bytes.to_le_bytes())
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -437,8 +521,14 @@ mod tests {
             w.finalize().unwrap();
         }
         let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 36 + (n * 2) as u32);
-        assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), (n * 2) as u32);
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            36 + (n * 2) as u32
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[40..44].try_into().unwrap()),
+            (n * 2) as u32
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -498,7 +588,8 @@ mod float_tests {
     /// A crashed float take recovers to its full length like the 16-bit one.
     #[test]
     fn float_take_crash_recovers() {
-        let path = std::env::temp_dir().join(format!("media-wav-float-crash-{}.wav", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("media-wav-float-crash-{}.wav", std::process::id()));
         {
             let mut w = WavWriter::create_float(&path, 48_000, 1).unwrap();
             w.write(&vec![0.5; 777]).unwrap();
@@ -516,8 +607,14 @@ mod float_tests {
         // (+1 pad if odd)`; the guard is `> u32::MAX - 37` (conservative, covers
         // the odd-data pad even though our writers always produce even data_bytes).
         let ok_frames = (u32::MAX as u64 - 37) / 4; // data_bytes just under the bound
-        assert!(data_bytes(ok_frames, 1, true).is_ok(), "just under the boundary is ok");
+        assert!(
+            data_bytes(ok_frames, 1, true).is_ok(),
+            "just under the boundary is ok"
+        );
         let err_frames = ok_frames + 1; // data_bytes just over
-        assert!(data_bytes(err_frames, 1, true).is_err(), "just over the boundary must refuse");
+        assert!(
+            data_bytes(err_frames, 1, true).is_err(),
+            "just over the boundary must refuse"
+        );
     }
 }

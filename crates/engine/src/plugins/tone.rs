@@ -8,14 +8,32 @@ use super::{Disposer, DisposerCtx, ParamDef, Plugin, PluginApi};
 use crate::graph::{Direction, NodeId, NodeKind, Port, SignalKind, ToneGen};
 
 pub const TONE_PORTS: &[Port] = &[
-    Port { name: "note", direction: Direction::In, kind: SignalKind::Note , channels: 1 },
-    Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio , channels: 1 },
+    Port {
+        name: "note",
+        direction: Direction::In,
+        kind: SignalKind::Note,
+        channels: 1,
+    },
+    Port {
+        name: "audio",
+        direction: Direction::Out,
+        kind: SignalKind::Audio,
+        channels: 1,
+    },
 ];
 
 /// The tone's runtime parameter surface (the logged `SetParam` namespace).
 pub const TONE_PARAMS: &[ParamDef] = &[
-    ParamDef { name: "gain", min: 0.0, max: 1.0 },
-    ParamDef { name: "blip_len", min: 1.0, max: 1_000_000.0 },
+    ParamDef {
+        name: "gain",
+        min: 0.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "blip_len",
+        min: 1.0,
+        max: 1_000_000.0,
+    },
 ];
 
 /// Configurable tone plugin.

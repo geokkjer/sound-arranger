@@ -65,9 +65,7 @@ pub struct SessionLog {
 
 impl SessionLog {
     pub fn new() -> Self {
-        Self {
-            events: Vec::new(),
-        }
+        Self { events: Vec::new() }
     }
 
     pub fn push(&mut self, event: Event) {

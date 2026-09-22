@@ -6,7 +6,7 @@
 //! that panic to exercise both profiles' behavior through one code path.
 
 use std::cell::RefCell;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 use engine::{Engine, Value};
@@ -41,7 +41,8 @@ fn render_tolerating_violation(e: &mut Engine) -> Vec<f32> {
 fn render_stack_arrangement_parks_not_drops() {
     let mut e = Engine::new(48_000, 120.0, 4);
     let seen = Rc::new(RefCell::new(Vec::new()));
-    e.register_op_handler("demo.bump", recorder(seen.clone())).unwrap();
+    e.register_op_handler("demo.bump", recorder(seen.clone()))
+        .unwrap();
 
     e.render(1024); // clock advances; contract-abiding so far
     e.arrange("demo.bump", vec![("n", Value::U64(7))]).unwrap();
@@ -64,7 +65,8 @@ fn parked_misuse_is_deterministic_live_and_replayed() {
     // unwind at the same point, which the shared branch below tolerates).
     let mut a = Engine::new(48_000, 120.0, 4);
     let seen_a = Rc::new(RefCell::new(Vec::new()));
-    a.register_op_handler("demo.bump", recorder(seen_a.clone())).unwrap();
+    a.register_op_handler("demo.bump", recorder(seen_a.clone()))
+        .unwrap();
     let mut outs_a: Vec<Vec<f32>> = Vec::new();
     for i in 1..=3u64 {
         outs_a.push(a.render(512));
@@ -82,7 +84,8 @@ fn parked_misuse_is_deterministic_live_and_replayed() {
 
     let mut b = Engine::new(48_000, 120.0, 4);
     let seen_b = Rc::new(RefCell::new(Vec::new()));
-    b.register_op_handler("demo.bump", recorder(seen_b.clone())).unwrap();
+    b.register_op_handler("demo.bump", recorder(seen_b.clone()))
+        .unwrap();
     b.replay_from(&a.log).unwrap();
     let mut outs_b: Vec<Vec<f32>> = Vec::new();
     for i in 1..=3u64 {
@@ -95,7 +98,11 @@ fn parked_misuse_is_deterministic_live_and_replayed() {
     }
     b.flush_scheduled();
 
-    assert_eq!(seen_a.borrow().as_slice(), &[1, 2, 3], "misused op applies late, not never");
+    assert_eq!(
+        seen_a.borrow().as_slice(),
+        &[1, 2, 3],
+        "misused op applies late, not never"
+    );
     assert_eq!(seen_a.borrow().as_slice(), seen_b.borrow().as_slice());
     for (i, (x, y)) in outs_a.iter().zip(&outs_b).enumerate() {
         assert_eq!(x, y, "render {i} diverged between live and replay");

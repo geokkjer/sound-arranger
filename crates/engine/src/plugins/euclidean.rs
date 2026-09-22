@@ -139,7 +139,10 @@ mod tests {
             gaps.push(positions[0] + steps as usize - positions[positions.len() - 1]);
             let min = *gaps.iter().min().unwrap();
             let max = *gaps.iter().max().unwrap();
-            assert!(max - min <= 1, "E({pulses},{steps}) gaps {gaps:?} not maximally even");
+            assert!(
+                max - min <= 1,
+                "E({pulses},{steps}) gaps {gaps:?} not maximally even"
+            );
         }
     }
 

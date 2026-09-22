@@ -179,7 +179,11 @@ pub enum ArrangeOp {
 /// overflows `u64`. Used for trim arithmetic without `as i64` cast hazards.
 fn add_signed(base: u64, delta: i64) -> Option<u64> {
     let r = base as i128 + delta as i128;
-    if r < 0 || r > u64::MAX as i128 { None } else { Some(r as u64) }
+    if r < 0 || r > u64::MAX as i128 {
+        None
+    } else {
+        Some(r as u64)
+    }
 }
 
 /// Validates a clip's invariant fields; `Err` names the first violation.
@@ -224,7 +228,9 @@ impl Timeline {
 
     /// Look up a clip by id across all tracks (for uniqueness checks).
     fn clip_id_exists(&self, id: &str) -> bool {
-        self.tracks.iter().any(|t| t.clips.iter().any(|c| c.id == id))
+        self.tracks
+            .iter()
+            .any(|t| t.clips.iter().any(|c| c.id == id))
     }
 
     /// Apply an op purely: returns the updated timeline, or `Err` (never partially
@@ -249,16 +255,22 @@ impl Timeline {
                 if self.track_index(track).is_some() {
                     return Err(format!("track '{track}' already exists"));
                 }
-                self.tracks.push(Track { id: track.clone(), clips: Vec::new() });
+                self.tracks.push(Track {
+                    id: track.clone(),
+                    clips: Vec::new(),
+                });
                 Ok(())
             }
             ArrangeOp::RemoveTrack { track } => {
-                let ti = self.track_index(track).ok_or_else(|| format!("no track '{track}'"))?;
+                let ti = self
+                    .track_index(track)
+                    .ok_or_else(|| format!("no track '{track}'"))?;
                 self.tracks.remove(ti);
                 Ok(())
             }
             ArrangeOp::AddClip { track, clip } => {
-                self.track_index(track).ok_or_else(|| format!("no track '{track}'"))?;
+                self.track_index(track)
+                    .ok_or_else(|| format!("no track '{track}'"))?;
                 validate_clip(clip).map_err(|e| format!("add clip: {e}"))?;
                 if self.clip_id_exists(&clip.id) {
                     return Err(format!("clip id '{}' already exists", clip.id));
@@ -269,11 +281,19 @@ impl Timeline {
                 clips.insert(pos, clip.clone());
                 Ok(())
             }
-            ArrangeOp::RazorSplit { track, clip, new_left, new_right, at_frame } => {
+            ArrangeOp::RazorSplit {
+                track,
+                clip,
+                new_left,
+                new_right,
+                at_frame,
+            } => {
                 if new_left == new_right {
                     return Err("razor-split ids must be distinct".into());
                 }
-                let (ti, ci) = self.locate(track, clip).ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
+                let (ti, ci) = self
+                    .locate(track, clip)
+                    .ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
                 if self.clip_id_exists(new_left) || self.clip_id_exists(new_right) {
                     return Err("razor-split ids must be new".into());
                 }
@@ -282,10 +302,16 @@ impl Timeline {
                     // A looped clip cannot be cleanly split: the loop phase at the
                     // cut is not representable, and "drop the wrap" would silently
                     // change the right half's audio. Fail-loud (never logged).
-                    return Err("cannot razor-split a looped clip (loop phase is not representable)".into());
+                    return Err(
+                        "cannot razor-split a looped clip (loop phase is not representable)".into(),
+                    );
                 }
                 if *at_frame <= c.at_frame || *at_frame >= c.end() {
-                    return Err(format!("split frame {at_frame} must be strictly inside [{}, {})", c.at_frame, c.end()));
+                    return Err(format!(
+                        "split frame {at_frame} must be strictly inside [{}, {})",
+                        c.at_frame,
+                        c.end()
+                    ));
                 }
                 let split_in = at_frame - c.at_frame; // frames into the clip (guaranteed > 0)
                 let mut left = c.clone();
@@ -305,8 +331,15 @@ impl Timeline {
                 self.sort_track(ti);
                 Ok(())
             }
-            ArrangeOp::Trim { track, clip, edge, by_frames } => {
-                let (ti, ci) = self.locate(track, clip).ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
+            ArrangeOp::Trim {
+                track,
+                clip,
+                edge,
+                by_frames,
+            } => {
+                let (ti, ci) = self
+                    .locate(track, clip)
+                    .ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
                 let c = self.tracks[ti].clips[ci].clone();
                 match edge {
                     Edge::Start => {
@@ -314,9 +347,12 @@ impl Timeline {
                             return Err("cannot trim the start of a looped clip (loop phase is not representable)".into());
                         }
                         // move at_frame + src_start together; src_len shrinks/grows the same.
-                        let at = add_signed(c.at_frame, *by_frames).ok_or("trim start would move before frame 0")?;
-                        let src_start = add_signed(c.src_start, *by_frames).ok_or("trim start would move before the source start")?;
-                        let len = add_signed(c.src_len, -(*by_frames)).ok_or("trim start length out of range")?;
+                        let at = add_signed(c.at_frame, *by_frames)
+                            .ok_or("trim start would move before frame 0")?;
+                        let src_start = add_signed(c.src_start, *by_frames)
+                            .ok_or("trim start would move before the source start")?;
+                        let len = add_signed(c.src_len, -(*by_frames))
+                            .ok_or("trim start length out of range")?;
                         if len == 0 {
                             return Err("trim start would consume the whole clip".into());
                         }
@@ -330,7 +366,8 @@ impl Timeline {
                         Ok(())
                     }
                     Edge::End => {
-                        let len = add_signed(c.src_len, *by_frames).ok_or("trim end length out of range")?;
+                        let len = add_signed(c.src_len, *by_frames)
+                            .ok_or("trim end length out of range")?;
                         if len == 0 {
                             return Err("trim end would remove the whole clip".into());
                         }
@@ -342,8 +379,14 @@ impl Timeline {
                     }
                 }
             }
-            ArrangeOp::MoveClip { track, clip, at_frame } => {
-                let (ti, ci) = self.locate(track, clip).ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
+            ArrangeOp::MoveClip {
+                track,
+                clip,
+                at_frame,
+            } => {
+                let (ti, ci) = self
+                    .locate(track, clip)
+                    .ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
                 let mut n = self.tracks[ti].clips[ci].clone();
                 n.at_frame = *at_frame;
                 validate_clip(&n).map_err(|e| format!("move clip: {e}"))?;
@@ -351,9 +394,18 @@ impl Timeline {
                 self.sort_track(ti);
                 Ok(())
             }
-            ArrangeOp::MoveClipToTrack { from, clip, to, at_frame } => {
-                let (ti, ci) = self.locate(from, clip).ok_or_else(|| format!("clip '{clip}' not on track '{from}'"))?;
-                let to_ti = self.track_index(to).ok_or_else(|| format!("no track '{to}'"))?;
+            ArrangeOp::MoveClipToTrack {
+                from,
+                clip,
+                to,
+                at_frame,
+            } => {
+                let (ti, ci) = self
+                    .locate(from, clip)
+                    .ok_or_else(|| format!("clip '{clip}' not on track '{from}'"))?;
+                let to_ti = self
+                    .track_index(to)
+                    .ok_or_else(|| format!("no track '{to}'"))?;
                 let mut n = self.tracks[ti].clips[ci].clone();
                 n.at_frame = *at_frame;
                 validate_clip(&n).map_err(|e| format!("move clip: {e}"))?;
@@ -365,11 +417,17 @@ impl Timeline {
                 }
                 Ok(())
             }
-            ArrangeOp::Duplicate { track, clip, new_id } => {
+            ArrangeOp::Duplicate {
+                track,
+                clip,
+                new_id,
+            } => {
                 if new_id == clip {
                     return Err("duplicate id must differ from the source clip".into());
                 }
-                let (ti, ci) = self.locate(track, clip).ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
+                let (ti, ci) = self
+                    .locate(track, clip)
+                    .ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
                 if self.clip_id_exists(new_id) {
                     return Err(format!("duplicate id '{new_id}' already exists"));
                 }
@@ -380,7 +438,9 @@ impl Timeline {
                 Ok(())
             }
             ArrangeOp::Delete { track, clip } => {
-                let (ti, ci) = self.locate(track, clip).ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
+                let (ti, ci) = self
+                    .locate(track, clip)
+                    .ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
                 self.tracks[ti].clips.remove(ci);
                 Ok(())
             }
@@ -388,12 +448,21 @@ impl Timeline {
                 if !gain.is_finite() {
                     return Err("clip gain must be finite".into());
                 }
-                let (ti, ci) = self.locate(track, clip).ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
+                let (ti, ci) = self
+                    .locate(track, clip)
+                    .ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
                 self.tracks[ti].clips[ci].gain = *gain;
                 Ok(())
             }
-            ArrangeOp::SetClipFade { track, clip, fade_in, fade_out } => {
-                let (ti, ci) = self.locate(track, clip).ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
+            ArrangeOp::SetClipFade {
+                track,
+                clip,
+                fade_in,
+                fade_out,
+            } => {
+                let (ti, ci) = self
+                    .locate(track, clip)
+                    .ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
                 if fade_in + fade_out > self.tracks[ti].clips[ci].src_len {
                     return Err("fades exceed the clip length".into());
                 }
@@ -405,26 +474,42 @@ impl Timeline {
                 if *times == 0 {
                     return Err("loop times must be >= 1".into());
                 }
-                let (ti, ci) = self.locate(track, clip).ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
+                let (ti, ci) = self
+                    .locate(track, clip)
+                    .ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
                 let c = &mut self.tracks[ti].clips[ci];
                 let region = c.loop_len.unwrap_or(c.src_len);
-                let src_len = region.checked_mul(*times as Frame).ok_or("loop region length overflows")?;
+                let src_len = region
+                    .checked_mul(*times as Frame)
+                    .ok_or("loop region length overflows")?;
                 c.loop_len = Some(region);
                 c.src_len = src_len;
                 Ok(())
             }
-            ArrangeOp::ChopClip { track, clip, times, prefix } => {
+            ArrangeOp::ChopClip {
+                track,
+                clip,
+                times,
+                prefix,
+            } => {
                 if *times == 0 {
                     return Err("chop times must be >= 1".into());
                 }
-                let (ti, ci) = self.locate(track, clip).ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
+                let (ti, ci) = self
+                    .locate(track, clip)
+                    .ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
                 let c = self.tracks[ti].clips[ci].clone();
                 if c.loop_len.is_some() {
-                    return Err("cannot chop a looped clip (loop phase is not representable)".into());
+                    return Err(
+                        "cannot chop a looped clip (loop phase is not representable)".into(),
+                    );
                 }
                 let times_f = *times as Frame;
                 if times_f > c.src_len {
-                    return Err(format!("chop {} times exceeds src_len {}", times_f, c.src_len));
+                    return Err(format!(
+                        "chop {} times exceeds src_len {}",
+                        times_f, c.src_len
+                    ));
                 }
                 // Split the source region into `times` contiguous equal (within 1
                 // frame) pieces. Piece ids are a pure function of `prefix` + index,
@@ -487,8 +572,12 @@ mod tests {
 
     fn two_tracks() -> Timeline {
         let mut t = Timeline::new();
-        t = t.apply(&ArrangeOp::AddTrack { track: "t0".into() }).unwrap();
-        t = t.apply(&ArrangeOp::AddTrack { track: "t1".into() }).unwrap();
+        t = t
+            .apply(&ArrangeOp::AddTrack { track: "t0".into() })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::AddTrack { track: "t1".into() })
+            .unwrap();
         t
     }
 
@@ -497,55 +586,119 @@ mod tests {
         let t = two_tracks();
         assert_eq!(t.tracks.len(), 2);
         assert_eq!(t.tracks[0].id, "t0");
-        assert!(t.apply(&ArrangeOp::AddTrack { track: "t0".into() }).is_err());
+        assert!(
+            t.apply(&ArrangeOp::AddTrack { track: "t0".into() })
+                .is_err()
+        );
     }
 
     #[test]
     fn add_clip_places_and_keeps_sorted() {
         let mut t = two_tracks();
-        t = t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: clip("c2", 48000, 24000) }).unwrap();
-        t = t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: clip("c1", 0, 24000) }).unwrap();
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c2", 48000, 24000),
+            })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c1", 0, 24000),
+            })
+            .unwrap();
         let ids: Vec<_> = t.tracks[0].clips.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, vec!["c1", "c2"]);
-        assert!(t.apply(&ArrangeOp::AddClip { track: "nope".into(), clip: clip("c3", 0, 1) }).is_err());
-        assert!(t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: clip("c1", 0, 1) }).is_err());
+        assert!(
+            t.apply(&ArrangeOp::AddClip {
+                track: "nope".into(),
+                clip: clip("c3", 0, 1)
+            })
+            .is_err()
+        );
+        assert!(
+            t.apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c1", 0, 1)
+            })
+            .is_err()
+        );
     }
 
     #[test]
     fn add_clip_validates_the_clip() {
         let t = two_tracks();
         // src_len 0
-        assert!(t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", 0, 0) }).is_err());
+        assert!(
+            t.apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 0, 0)
+            })
+            .is_err()
+        );
         // NaN gain
         let mut c = clip("c0", 0, 100);
         c.gain = f32::NAN;
-        assert!(t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: c }).is_err());
+        assert!(
+            t.apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: c
+            })
+            .is_err()
+        );
         // loop_len Some(0)
         let mut c = clip("c0", 0, 100);
         c.loop_len = Some(0);
-        assert!(t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: c }).is_err());
+        assert!(
+            t.apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: c
+            })
+            .is_err()
+        );
         // span overflow
         let c = clip("c0", u64::MAX - 10, 100);
-        assert!(t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: c }).is_err());
+        assert!(
+            t.apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: c
+            })
+            .is_err()
+        );
         // fades exceed clip
         let mut c = clip("c0", 0, 100);
         c.fade_in = 60;
         c.fade_out = 60;
-        assert!(t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: c }).is_err());
+        assert!(
+            t.apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: c
+            })
+            .is_err()
+        );
     }
 
     #[test]
     fn razor_split_inside_produces_two_sorted_halves() {
         let mut t = Timeline::new();
-        t = t.apply(&ArrangeOp::AddTrack { track: "t0".into() }).unwrap();
-        t = t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", 1000, 4000) }).unwrap();
-        t = t.apply(&ArrangeOp::RazorSplit {
-            track: "t0".into(),
-            clip: "c0".into(),
-            new_left: "cL".into(),
-            new_right: "cR".into(),
-            at_frame: 3000,
-        }).unwrap();
+        t = t
+            .apply(&ArrangeOp::AddTrack { track: "t0".into() })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 1000, 4000),
+            })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::RazorSplit {
+                track: "t0".into(),
+                clip: "c0".into(),
+                new_left: "cL".into(),
+                new_right: "cR".into(),
+                at_frame: 3000,
+            })
+            .unwrap();
         let clips = &t.tracks[0].clips;
         assert_eq!(clips.len(), 2);
         assert_eq!(clips[0].id, "cL");
@@ -557,74 +710,209 @@ mod tests {
         assert_eq!(clips[1].src_start, 2000);
         assert_eq!(clips[1].src_len, 2000);
         // boundary / invalid splits
-        assert!(t.apply(&ArrangeOp::RazorSplit {
-            track: "t0".into(), clip: "cL".into(), new_left: "x".into(), new_right: "y".into(), at_frame: 1000,
-        }).is_err());
+        assert!(
+            t.apply(&ArrangeOp::RazorSplit {
+                track: "t0".into(),
+                clip: "cL".into(),
+                new_left: "x".into(),
+                new_right: "y".into(),
+                at_frame: 1000,
+            })
+            .is_err()
+        );
         // distinct split ids required
-        assert!(t.apply(&ArrangeOp::RazorSplit {
-            track: "t0".into(), clip: "cL".into(), new_left: "z".into(), new_right: "z".into(), at_frame: 1500,
-        }).is_err());
+        assert!(
+            t.apply(&ArrangeOp::RazorSplit {
+                track: "t0".into(),
+                clip: "cL".into(),
+                new_left: "z".into(),
+                new_right: "z".into(),
+                at_frame: 1500,
+            })
+            .is_err()
+        );
     }
 
     #[test]
     fn razor_split_keeps_sorted_with_overlapping_neighbor() {
         // a neighbor starts inside the split clip's span; the split must re-sort.
         let mut t = Timeline::new();
-        t = t.apply(&ArrangeOp::AddTrack { track: "t0".into() }).unwrap();
-        t = t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: clip("big", 0, 10000) }).unwrap();
-        t = t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: clip("mid", 5000, 100) }).unwrap();
-        t = t.apply(&ArrangeOp::RazorSplit {
-            track: "t0".into(), clip: "big".into(), new_left: "A".into(), new_right: "B".into(), at_frame: 8000,
-        }).unwrap();
+        t = t
+            .apply(&ArrangeOp::AddTrack { track: "t0".into() })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("big", 0, 10000),
+            })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("mid", 5000, 100),
+            })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::RazorSplit {
+                track: "t0".into(),
+                clip: "big".into(),
+                new_left: "A".into(),
+                new_right: "B".into(),
+                at_frame: 8000,
+            })
+            .unwrap();
         let ids: Vec<_> = t.tracks[0].clips.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, vec!["A", "mid", "B"]);
         let frames: Vec<_> = t.tracks[0].clips.iter().map(|c| c.at_frame).collect();
-        assert!(frames.windows(2).all(|w| w[0] <= w[1]), "clips must stay sorted: {frames:?}");
+        assert!(
+            frames.windows(2).all(|w| w[0] <= w[1]),
+            "clips must stay sorted: {frames:?}"
+        );
     }
 
     #[test]
     fn razor_split_refuses_a_looped_clip() {
         let mut t = Timeline::new();
-        t = t.apply(&ArrangeOp::AddTrack { track: "t0".into() }).unwrap();
-        t = t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", 0, 1000) }).unwrap();
-        t = t.apply(&ArrangeOp::LoopRegion { track: "t0".into(), clip: "c0".into(), times: 2 }).unwrap();
-        assert!(t.apply(&ArrangeOp::RazorSplit {
-            track: "t0".into(), clip: "c0".into(), new_left: "L".into(), new_right: "R".into(), at_frame: 500,
-        }).is_err());
-        assert!(t.apply(&ArrangeOp::Trim { track: "t0".into(), clip: "c0".into(), edge: Edge::Start, by_frames: 100 }).is_err());
+        t = t
+            .apply(&ArrangeOp::AddTrack { track: "t0".into() })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 0, 1000),
+            })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::LoopRegion {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 2,
+            })
+            .unwrap();
+        assert!(
+            t.apply(&ArrangeOp::RazorSplit {
+                track: "t0".into(),
+                clip: "c0".into(),
+                new_left: "L".into(),
+                new_right: "R".into(),
+                at_frame: 500,
+            })
+            .is_err()
+        );
+        assert!(
+            t.apply(&ArrangeOp::Trim {
+                track: "t0".into(),
+                clip: "c0".into(),
+                edge: Edge::Start,
+                by_frames: 100
+            })
+            .is_err()
+        );
     }
 
     #[test]
     fn trim_moves_at_frame_with_src_start_and_resorts() {
         let mut t = Timeline::new();
-        t = t.apply(&ArrangeOp::AddTrack { track: "t0".into() }).unwrap();
-        t = t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", 1000, 4000) }).unwrap();
-        t = t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: clip("c1", 500, 100) }).unwrap();
-        t = t.apply(&ArrangeOp::Trim { track: "t0".into(), clip: "c0".into(), edge: Edge::Start, by_frames: 500 }).unwrap();
+        t = t
+            .apply(&ArrangeOp::AddTrack { track: "t0".into() })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 1000, 4000),
+            })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c1", 500, 100),
+            })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::Trim {
+                track: "t0".into(),
+                clip: "c0".into(),
+                edge: Edge::Start,
+                by_frames: 500,
+            })
+            .unwrap();
         let c = t.tracks[0].clips.iter().find(|c| c.id == "c0").unwrap();
         assert_eq!(c.at_frame, 1500);
         assert_eq!(c.src_start, 500);
         assert_eq!(c.src_len, 3500);
         // trim start to before frame 0 is refused
-        assert!(t.apply(&ArrangeOp::Trim { track: "t0".into(), clip: "c0".into(), edge: Edge::Start, by_frames: -5000 }).is_err());
+        assert!(
+            t.apply(&ArrangeOp::Trim {
+                track: "t0".into(),
+                clip: "c0".into(),
+                edge: Edge::Start,
+                by_frames: -5000
+            })
+            .is_err()
+        );
         // order kept sorted after the move
         let frames: Vec<_> = t.tracks[0].clips.iter().map(|c| c.at_frame).collect();
-        assert!(frames.windows(2).all(|w| w[0] <= w[1]), "clips must stay sorted: {frames:?}");
+        assert!(
+            frames.windows(2).all(|w| w[0] <= w[1]),
+            "clips must stay sorted: {frames:?}"
+        );
     }
 
     #[test]
     fn move_and_cross_track_move() {
         let mut t = two_tracks();
-        t = t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", 100, 100) }).unwrap();
-        t = t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: clip("c1", 200, 100) }).unwrap();
-        t = t.apply(&ArrangeOp::MoveClip { track: "t0".into(), clip: "c0".into(), at_frame: 900 }).unwrap();
-        assert_eq!(t.tracks[0].clips.iter().find(|c| c.id == "c0").unwrap().at_frame, 900);
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 100, 100),
+            })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c1", 200, 100),
+            })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::MoveClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                at_frame: 900,
+            })
+            .unwrap();
+        assert_eq!(
+            t.tracks[0]
+                .clips
+                .iter()
+                .find(|c| c.id == "c0")
+                .unwrap()
+                .at_frame,
+            900
+        );
         // move within the same track re-sorts
         let frames: Vec<_> = t.tracks[0].clips.iter().map(|c| c.at_frame).collect();
-        assert!(frames.windows(2).all(|w| w[0] <= w[1]), "clips must stay sorted: {frames:?}");
-        t = t.apply(&ArrangeOp::MoveClipToTrack { from: "t0".into(), clip: "c0".into(), to: "t1".into(), at_frame: 50 }).unwrap();
+        assert!(
+            frames.windows(2).all(|w| w[0] <= w[1]),
+            "clips must stay sorted: {frames:?}"
+        );
+        t = t
+            .apply(&ArrangeOp::MoveClipToTrack {
+                from: "t0".into(),
+                clip: "c0".into(),
+                to: "t1".into(),
+                at_frame: 50,
+            })
+            .unwrap();
         assert!(t.tracks[0].clips.iter().all(|c| c.id != "c0"));
-        assert_eq!(t.tracks[1].clips.iter().find(|c| c.id == "c0").unwrap().at_frame, 50);
+        assert_eq!(
+            t.tracks[1]
+                .clips
+                .iter()
+                .find(|c| c.id == "c0")
+                .unwrap()
+                .at_frame,
+            50
+        );
         // cross-track move with same source+to actually moves (from != to)
         assert_eq!(t.tracks[1].clips.len(), 1);
     }
@@ -632,23 +920,68 @@ mod tests {
     #[test]
     fn duplicate_and_delete() {
         let mut t = Timeline::new();
-        t = t.apply(&ArrangeOp::AddTrack { track: "t0".into() }).unwrap();
-        t = t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", 0, 1000) }).unwrap();
-        t = t.apply(&ArrangeOp::Duplicate { track: "t0".into(), clip: "c0".into(), new_id: "c1".into() }).unwrap();
+        t = t
+            .apply(&ArrangeOp::AddTrack { track: "t0".into() })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 0, 1000),
+            })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::Duplicate {
+                track: "t0".into(),
+                clip: "c0".into(),
+                new_id: "c1".into(),
+            })
+            .unwrap();
         assert_eq!(t.tracks[0].clips.len(), 2);
-        assert!(t.apply(&ArrangeOp::Duplicate { track: "t0".into(), clip: "c0".into(), new_id: "c1".into() }).is_err());
+        assert!(
+            t.apply(&ArrangeOp::Duplicate {
+                track: "t0".into(),
+                clip: "c0".into(),
+                new_id: "c1".into()
+            })
+            .is_err()
+        );
         // duplicate with same id is refused
-        assert!(t.apply(&ArrangeOp::Duplicate { track: "t0".into(), clip: "c0".into(), new_id: "c0".into() }).is_err());
-        t = t.apply(&ArrangeOp::Delete { track: "t0".into(), clip: "c1".into() }).unwrap();
+        assert!(
+            t.apply(&ArrangeOp::Duplicate {
+                track: "t0".into(),
+                clip: "c0".into(),
+                new_id: "c0".into()
+            })
+            .is_err()
+        );
+        t = t
+            .apply(&ArrangeOp::Delete {
+                track: "t0".into(),
+                clip: "c1".into(),
+            })
+            .unwrap();
         assert_eq!(t.tracks[0].clips.len(), 1);
     }
 
     #[test]
     fn loop_region_bakes_repeats_with_wrap_len() {
         let mut t = Timeline::new();
-        t = t.apply(&ArrangeOp::AddTrack { track: "t0".into() }).unwrap();
-        t = t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", 0, 1000) }).unwrap();
-        t = t.apply(&ArrangeOp::LoopRegion { track: "t0".into(), clip: "c0".into(), times: 3 }).unwrap();
+        t = t
+            .apply(&ArrangeOp::AddTrack { track: "t0".into() })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 0, 1000),
+            })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::LoopRegion {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 3,
+            })
+            .unwrap();
         let c = &t.tracks[0].clips[0];
         assert_eq!(c.loop_len, Some(1000));
         assert_eq!(c.src_len, 3000);
@@ -661,15 +994,50 @@ mod tests {
     #[test]
     fn gain_and_fade_validate() {
         let mut t = Timeline::new();
-        t = t.apply(&ArrangeOp::AddTrack { track: "t0".into() }).unwrap();
-        t = t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", 0, 100) }).unwrap();
-        t = t.apply(&ArrangeOp::SetClipGain { track: "t0".into(), clip: "c0".into(), gain: 0.5 }).unwrap();
+        t = t
+            .apply(&ArrangeOp::AddTrack { track: "t0".into() })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 0, 100),
+            })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::SetClipGain {
+                track: "t0".into(),
+                clip: "c0".into(),
+                gain: 0.5,
+            })
+            .unwrap();
         assert_eq!(t.tracks[0].clips[0].gain, 0.5);
-        assert!(t.apply(&ArrangeOp::SetClipGain { track: "t0".into(), clip: "c0".into(), gain: f32::NAN }).is_err());
-        t = t.apply(&ArrangeOp::SetClipFade { track: "t0".into(), clip: "c0".into(), fade_in: 10, fade_out: 10 }).unwrap();
+        assert!(
+            t.apply(&ArrangeOp::SetClipGain {
+                track: "t0".into(),
+                clip: "c0".into(),
+                gain: f32::NAN
+            })
+            .is_err()
+        );
+        t = t
+            .apply(&ArrangeOp::SetClipFade {
+                track: "t0".into(),
+                clip: "c0".into(),
+                fade_in: 10,
+                fade_out: 10,
+            })
+            .unwrap();
         assert_eq!(t.tracks[0].clips[0].fade_in, 10);
         // fades exceeding the clip length are refused
-        assert!(t.apply(&ArrangeOp::SetClipFade { track: "t0".into(), clip: "c0".into(), fade_in: 80, fade_out: 80 }).is_err());
+        assert!(
+            t.apply(&ArrangeOp::SetClipFade {
+                track: "t0".into(),
+                clip: "c0".into(),
+                fade_in: 80,
+                fade_out: 80
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -677,10 +1045,27 @@ mod tests {
         let ops = [
             ArrangeOp::AddTrack { track: "t0".into() },
             ArrangeOp::AddTrack { track: "t1".into() },
-            ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", 0, 1000) },
-            ArrangeOp::LoopRegion { track: "t0".into(), clip: "c0".into(), times: 2 },
-            ArrangeOp::MoveClipToTrack { from: "t0".into(), clip: "c0".into(), to: "t1".into(), at_frame: 500 },
-            ArrangeOp::SetClipFade { track: "t1".into(), clip: "c0".into(), fade_in: 8, fade_out: 0 },
+            ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 0, 1000),
+            },
+            ArrangeOp::LoopRegion {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 2,
+            },
+            ArrangeOp::MoveClipToTrack {
+                from: "t0".into(),
+                clip: "c0".into(),
+                to: "t1".into(),
+                at_frame: 500,
+            },
+            ArrangeOp::SetClipFade {
+                track: "t1".into(),
+                clip: "c0".into(),
+                fade_in: 8,
+                fade_out: 0,
+            },
         ];
         let mut a = Timeline::new();
         let mut b = Timeline::new();
@@ -692,12 +1077,26 @@ mod tests {
     }
 
     #[test]
-            fn chop_splits_a_clip_into_contiguous_pieces() {
+    fn chop_splits_a_clip_into_contiguous_pieces() {
         let mut t = Timeline::new();
-        t = t.apply(&ArrangeOp::AddTrack { track: "t0".into() }).unwrap();
-        t = t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", 0, 4000) }).unwrap();
+        t = t
+            .apply(&ArrangeOp::AddTrack { track: "t0".into() })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 0, 4000),
+            })
+            .unwrap();
 
-        t = t.apply(&ArrangeOp::ChopClip { track: "t0".into(), clip: "c0".into(), times: 4, prefix: "slice".into() }).unwrap();
+        t = t
+            .apply(&ArrangeOp::ChopClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 4,
+                prefix: "slice".into(),
+            })
+            .unwrap();
         let track = &t.tracks[0];
         assert_eq!(track.clips.len(), 4, "chop 4 produces four pieces");
         assert_eq!(track.clips[0].id, "slice.0");
@@ -709,29 +1108,79 @@ mod tests {
             assert_eq!(c.src_start, (i as Frame) * 1000, "piece {i} source start");
             assert_eq!(c.gain, 1.0, "chop preserves the clip gain");
         }
-        assert_eq!(track.clips.last().unwrap().end(), 4000, "pieces tile the original span");
+        assert_eq!(
+            track.clips.last().unwrap().end(),
+            4000,
+            "pieces tile the original span"
+        );
     }
 
     #[test]
     fn chop_refuses_bad_inputs_and_a_looped_clip() {
         let mut t = Timeline::new();
-        t = t.apply(&ArrangeOp::AddTrack { track: "t0".into() }).unwrap();
-        t = t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", 0, 4000) }).unwrap();
+        t = t
+            .apply(&ArrangeOp::AddTrack { track: "t0".into() })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 0, 4000),
+            })
+            .unwrap();
 
         // times = 0
-        assert!(t.apply(&ArrangeOp::ChopClip { track: "t0".into(), clip: "c0".into(), times: 0, prefix: "p".into() }).is_err());
+        assert!(
+            t.apply(&ArrangeOp::ChopClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 0,
+                prefix: "p".into()
+            })
+            .is_err()
+        );
         // more slices than frames
-        assert!(t.apply(&ArrangeOp::ChopClip { track: "t0".into(), clip: "c0".into(), times: 4001, prefix: "p".into() }).is_err());
+        assert!(
+            t.apply(&ArrangeOp::ChopClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 4001,
+                prefix: "p".into()
+            })
+            .is_err()
+        );
 
         // a looped clip is not representable
         let mut t = Timeline::new();
-        t = t.apply(&ArrangeOp::AddTrack { track: "t0".into() }).unwrap();
+        t = t
+            .apply(&ArrangeOp::AddTrack { track: "t0".into() })
+            .unwrap();
         let mut lc = clip("c0", 0, 4000);
         lc.loop_len = Some(1000);
-        t = t.apply(&ArrangeOp::AddClip { track: "t0".into(), clip: lc }).unwrap();
-        assert!(t.apply(&ArrangeOp::ChopClip { track: "t0".into(), clip: "c0".into(), times: 2, prefix: "p".into() }).is_err());
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: lc,
+            })
+            .unwrap();
+        assert!(
+            t.apply(&ArrangeOp::ChopClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 2,
+                prefix: "p".into()
+            })
+            .is_err()
+        );
 
         // an unknown track / clip is refused
-        assert!(t.apply(&ArrangeOp::ChopClip { track: "nope".into(), clip: "c0".into(), times: 2, prefix: "p".into() }).is_err());
+        assert!(
+            t.apply(&ArrangeOp::ChopClip {
+                track: "nope".into(),
+                clip: "c0".into(),
+                times: 2,
+                prefix: "p".into()
+            })
+            .is_err()
+        );
     }
 }

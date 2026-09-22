@@ -48,14 +48,16 @@ use std::path::Path;
 
 pub use arranger::{ArrangerNode, PoolResolver};
 pub use capture::{Capture, CaptureNode};
-pub use clip_editor::{decode_op, encode_op, register_handlers, ClipEditor, Interner};
+pub use clip_editor::{ClipEditor, Interner, decode_op, encode_op, register_handlers};
 pub use drift::DriftCompensator;
-pub use peaks::{PeakBuilder, PeakFile, PEAK_BASE_BIN, PEAK_LEVELS};
+pub use peaks::{PEAK_BASE_BIN, PEAK_LEVELS, PeakBuilder, PeakFile};
 pub use pool::{Conform, ConformReport, Pool, PoolIndex, PoolSource, Recovery};
-pub use record::{Recorder, RecordNode, WavRecorder};
+pub use record::{RecordNode, Recorder, WavRecorder};
 pub use resample::Resampler;
 pub use ring::Spsc;
-pub use stream::{mailbox, ClipRef, FilePlayer, Mailbox, PlaybackNode, SpliceCmd, DEFAULT_RING_CAPACITY};
+pub use stream::{
+    ClipRef, DEFAULT_RING_CAPACITY, FilePlayer, Mailbox, PlaybackNode, SpliceCmd, mailbox,
+};
 pub use timeline::{ArrangeOp, Clip, Edge, Frame, Id, Timeline, Track};
 pub use wav::{WavReader, WavWriter};
 

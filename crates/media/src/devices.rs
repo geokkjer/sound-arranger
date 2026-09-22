@@ -3,8 +3,8 @@
 //! never allocate, never block. Thin and isolated here so cpal API drift
 //! (0.18.x is pre-1.0) cannot leak into the machinery the numeric tests cover.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -18,11 +18,15 @@ pub fn list_devices() -> Vec<String> {
 }
 
 pub fn default_output_name() -> Option<String> {
-    cpal::default_host().default_output_device().map(|d| format!("{d}"))
+    cpal::default_host()
+        .default_output_device()
+        .map(|d| format!("{d}"))
 }
 
 pub fn default_input_name() -> Option<String> {
-    cpal::default_host().default_input_device().map(|d| format!("{d}"))
+    cpal::default_host()
+        .default_input_device()
+        .map(|d| format!("{d}"))
 }
 
 /// An open output stream plus the negotiated rate/layout and the starve counter.
@@ -56,7 +60,9 @@ impl OutputHandle {
     /// Pause the stream — the callback stops, so an idle host does not accrue
     /// underruns on an empty ring.
     pub fn pause(&self) -> Result<(), String> {
-        self.stream.pause().map_err(|e| format!("pause output: {e}"))
+        self.stream
+            .pause()
+            .map_err(|e| format!("pause output: {e}"))
     }
 }
 
@@ -75,8 +81,12 @@ pub struct InputHandle {
 /// Notepad-12FX reports 4, the Scarlett 2i2 2).
 pub fn default_input_config() -> Result<(u32, u16), String> {
     let host = cpal::default_host();
-    let device = host.default_input_device().ok_or("no default input device")?;
-    let config = device.default_input_config().map_err(|e| format!("input config: {e}"))?;
+    let device = host
+        .default_input_device()
+        .ok_or("no default input device")?;
+    let config = device
+        .default_input_config()
+        .map_err(|e| format!("input config: {e}"))?;
     Ok((config.sample_rate(), config.channels()))
 }
 
@@ -94,7 +104,9 @@ pub fn open_output(
     requested_rate: u32,
 ) -> Result<OutputHandle, String> {
     let host = cpal::default_host();
-    let device = host.default_output_device().ok_or("no default output device")?;
+    let device = host
+        .default_output_device()
+        .ok_or("no default output device")?;
     let (config, rate_mismatch) = select_output_config(&device, requested_rate)?;
     let sample_rate = config.sample_rate();
     let channels = config.channels();
@@ -107,16 +119,29 @@ pub fn open_output(
     };
     let src = source_channels.clamp(1, MAX_SOURCE_CHANNELS as u16) as usize;
     let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => build_output::<f32>(&device, stream_config, ring, src, underruns.clone(), err_cb)?,
-        cpal::SampleFormat::I16 => build_output::<i16>(&device, stream_config, ring, src, underruns.clone(), err_cb)?,
-        cpal::SampleFormat::U16 => build_output::<u16>(&device, stream_config, ring, src, underruns.clone(), err_cb)?,
+        cpal::SampleFormat::F32 => {
+            build_output::<f32>(&device, stream_config, ring, src, underruns.clone(), err_cb)?
+        }
+        cpal::SampleFormat::I16 => {
+            build_output::<i16>(&device, stream_config, ring, src, underruns.clone(), err_cb)?
+        }
+        cpal::SampleFormat::U16 => {
+            build_output::<u16>(&device, stream_config, ring, src, underruns.clone(), err_cb)?
+        }
         other => return Err(format!("unsupported output sample format {other:?}")),
     };
     stream.play().map_err(|e| format!("play output: {e}"))?;
     if let Some(e) = err.lock().unwrap().take() {
         return Err(e);
     }
-    Ok(OutputHandle { stream, sample_rate, channels, requested_rate, rate_mismatch, underruns })
+    Ok(OutputHandle {
+        stream,
+        sample_rate,
+        channels,
+        requested_rate,
+        rate_mismatch,
+        underruns,
+    })
 }
 
 /// The most source channels `fill_output` maps (the app's master is mono or
@@ -160,7 +185,10 @@ fn select_output_config(
         .collect();
     let prefer_f32 = default.sample_format() == cpal::SampleFormat::F32;
     if let Some(idx) = best_output_range(&meta, requested_rate, default.channels(), prefer_f32) {
-        let range = ranges.into_iter().nth(idx).expect("index from the same list");
+        let range = ranges
+            .into_iter()
+            .nth(idx)
+            .expect("index from the same list");
         return Ok((range.with_sample_rate(requested_rate), false));
     }
     Ok((default, true))
@@ -178,7 +206,10 @@ fn best_output_range(
     let mut best: Option<(usize, (u16, u8))> = None;
     for (i, &(channels, min, max, is_f32)) in ranges.iter().enumerate() {
         if min <= requested && requested <= max {
-            let key = (channels.abs_diff(prefer_channels), u8::from(is_f32 != prefer_f32));
+            let key = (
+                channels.abs_diff(prefer_channels),
+                u8::from(is_f32 != prefer_f32),
+            );
             if best.is_none_or(|(_, b)| key < b) {
                 best = Some((i, key));
             }
@@ -261,8 +292,12 @@ fn fill_output<T>(
 /// to f32 and pushes it into `ring`. The stream runs until the handle drops.
 pub fn open_input(ring: Arc<Spsc<f32>>) -> Result<InputHandle, String> {
     let host = cpal::default_host();
-    let device = host.default_input_device().ok_or("no default input device")?;
-    let config = device.default_input_config().map_err(|e| format!("input config: {e}"))?;
+    let device = host
+        .default_input_device()
+        .ok_or("no default input device")?;
+    let config = device
+        .default_input_config()
+        .map_err(|e| format!("input config: {e}"))?;
     let sample_rate = config.sample_rate();
     let stream_config: cpal::StreamConfig = config.into();
     let err: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
@@ -272,16 +307,26 @@ pub fn open_input(ring: Arc<Spsc<f32>>) -> Result<InputHandle, String> {
     };
     let overruns = Arc::new(AtomicU64::new(0));
     let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => build_input::<f32>(&device, stream_config, ring, overruns.clone(), err_cb)?,
-        cpal::SampleFormat::I16 => build_input::<i16>(&device, stream_config, ring, overruns.clone(), err_cb)?,
-        cpal::SampleFormat::U16 => build_input::<u16>(&device, stream_config, ring, overruns.clone(), err_cb)?,
+        cpal::SampleFormat::F32 => {
+            build_input::<f32>(&device, stream_config, ring, overruns.clone(), err_cb)?
+        }
+        cpal::SampleFormat::I16 => {
+            build_input::<i16>(&device, stream_config, ring, overruns.clone(), err_cb)?
+        }
+        cpal::SampleFormat::U16 => {
+            build_input::<u16>(&device, stream_config, ring, overruns.clone(), err_cb)?
+        }
         other => return Err(format!("unsupported input sample format {other:?}")),
     };
     stream.play().map_err(|e| format!("play input: {e}"))?;
     if let Some(e) = err.lock().unwrap().take() {
         return Err(e);
     }
-    Ok(InputHandle { stream, sample_rate, overruns })
+    Ok(InputHandle {
+        stream,
+        sample_rate,
+        overruns,
+    })
 }
 
 fn build_input<T>(
@@ -318,7 +363,9 @@ where
 {
     let channels = channels.max(1);
     for frame in data.chunks(channels) {
-        let Some(&first) = frame.first() else { continue };
+        let Some(&first) = frame.first() else {
+            continue;
+        };
         if !ring.try_push(first.to_float_sample()) {
             overruns.fetch_add(1, Ordering::Relaxed);
         }
@@ -368,7 +415,11 @@ mod tests {
         let mut out = [0.0f32; 1];
         let u = AtomicU64::new(0);
         fill_output(&mut out, &ring, 2, 1, &u);
-        assert!((out[0] - 0.3).abs() < 1e-6, "mono device averages L/R, got {}", out[0]);
+        assert!(
+            (out[0] - 0.3).abs() < 1e-6,
+            "mono device averages L/R, got {}",
+            out[0]
+        );
     }
 
     #[test]
@@ -378,7 +429,11 @@ mod tests {
         let u = AtomicU64::new(0);
         fill_output(&mut out, &ring, 2, 2, &u);
         assert_eq!(out, [0.0; 4], "empty ring must play silence");
-        assert_eq!(u.load(Ordering::Relaxed), 2, "each starved frame is counted");
+        assert_eq!(
+            u.load(Ordering::Relaxed),
+            2,
+            "each starved frame is counted"
+        );
     }
 
     /// A partial source frame is **not** consumed: both frames starve and the
@@ -392,7 +447,11 @@ mod tests {
         fill_output(&mut out, &ring, 2, 2, &u);
         assert_eq!(out, [0.0; 4], "a partial frame plays silence");
         assert_eq!(u.load(Ordering::Relaxed), 2);
-        assert_eq!(ring.len(), 1, "the lone sample is left for a complete frame");
+        assert_eq!(
+            ring.len(),
+            1,
+            "the lone sample is left for a complete frame"
+        );
     }
 
     #[test]
@@ -419,7 +478,9 @@ mod tests {
             eprintln!("no default output device");
             return;
         };
-        let default = device.default_output_config().expect("default output config");
+        let default = device
+            .default_output_config()
+            .expect("default output config");
         eprintln!(
             "default: {} ch @ {} Hz {:?}",
             default.channels(),
@@ -452,7 +513,11 @@ mod tests {
             (64, 1, 384_000, true),
             (2, 1, 384_000, false),
         ];
-        assert_eq!(best_output_range(&ranges, 48_000, 2, true), Some(0), "2-ch F32 beats 64-ch");
+        assert_eq!(
+            best_output_range(&ranges, 48_000, 2, true),
+            Some(0),
+            "2-ch F32 beats 64-ch"
+        );
     }
 
     /// …and requires the requested rate, preferring the default's format, and
@@ -465,9 +530,21 @@ mod tests {
             (2, 44_100, 192_000, false),        // right rate, integer
             (2, 44_100, 192_000, true),         // right rate, f32  <- pick
         ];
-        assert_eq!(best_output_range(&ranges, 48_000, 2, true), Some(2), "f32 over integer");
-        assert_eq!(best_output_range(&ranges, 48_000, 2, false), Some(1), "integer when preferred");
-        assert_eq!(best_output_range(&ranges, 22_050, 2, true), None, "below every min -> fall back");
+        assert_eq!(
+            best_output_range(&ranges, 48_000, 2, true),
+            Some(2),
+            "f32 over integer"
+        );
+        assert_eq!(
+            best_output_range(&ranges, 48_000, 2, false),
+            Some(1),
+            "integer when preferred"
+        );
+        assert_eq!(
+            best_output_range(&ranges, 22_050, 2, true),
+            None,
+            "below every min -> fall back"
+        );
     }
 
     #[test]

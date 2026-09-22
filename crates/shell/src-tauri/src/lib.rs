@@ -130,7 +130,10 @@ fn to_transport_state(s: &Snapshot) -> TransportState {
         master: s.master,
         last_error: s.last_error.clone(),
         audio: s.audio.as_ref().map(AudioInfo::from_status),
-        edit: EditState { can_undo: s.can_undo, can_redo: s.can_redo },
+        edit: EditState {
+            can_undo: s.can_undo,
+            can_redo: s.can_redo,
+        },
     }
 }
 
@@ -165,7 +168,10 @@ fn to_wire(handle: &HostHandle, outcome: HostOutcome, bounce_written: bool) -> S
             playing: snap.playing,
         },
         channel_count: snap.channel_count,
-        edit: EditState { can_undo: snap.can_undo, can_redo: snap.can_redo },
+        edit: EditState {
+            can_undo: snap.can_undo,
+            can_redo: snap.can_redo,
+        },
     }
 }
 
@@ -196,7 +202,10 @@ pub fn apply_arrange(handle: &HostHandle, line: &str) -> Result<ScriptOutcome, S
 /// script, refused op) are surfaced as `Err` so the UI can show them without
 /// crashing the shell.
 #[tauri::command]
-fn run_host_script(script_text: String, host: State<'_, HostHandle>) -> Result<ScriptOutcome, String> {
+fn run_host_script(
+    script_text: String,
+    host: State<'_, HostHandle>,
+) -> Result<ScriptOutcome, String> {
     load_script(&host, &script_text)
 }
 
@@ -251,7 +260,9 @@ fn transport_state(host: State<'_, HostHandle>) -> TransportState {
 /// desktop so the window can still be moved and resized. (A user preference can
 /// replace this later; the ui-plan's `Preference` contribution is the home.)
 fn prefer_undecorated() -> bool {
-    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase();
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .to_lowercase();
     std::env::var_os("NIRI_SOCKET").is_some()                     // niri
         || std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() // Hyprland
         || std::env::var_os("SWAYSOCK").is_some()                 // sway
@@ -302,14 +313,20 @@ mod tests {
         let outcome = load_script(&host, &script).expect("script must run");
         assert!(outcome.bounce_written, "a Bounce command was in the script");
         assert_eq!(outcome.underruns, 0, "no underruns on a clean tone bounce");
-        assert_eq!(outcome.event_count, 2, "the mixer mount + the logged bounce record");
+        assert_eq!(
+            outcome.event_count, 2,
+            "the mixer mount + the logged bounce record"
+        );
         assert_eq!(outcome.media_commands, 1, "one media command (the bounce)");
         assert_eq!(
             outcome.arrangement.as_ref().map_or(0, |t| t.tracks.len()),
             0,
             "no arrangement tracks in this script"
         );
-        assert_eq!(outcome.channel_count, 4, "the mixer's channel count is reported");
+        assert_eq!(
+            outcome.channel_count, 4,
+            "the mixer's channel count is reported"
+        );
         assert!(outcome.summary.contains("underruns: 0"));
         host.shutdown();
         let _ = std::fs::remove_file(&wav);
@@ -320,7 +337,10 @@ mod tests {
     fn load_script_rejects_a_script_without_version_header() {
         let host = HostHandle::spawn();
         let err = load_script(&host, "mount mixer channels=4 @0\n").unwrap_err();
-        assert!(err.contains("host v"), "the versioned header is required: {err}");
+        assert!(
+            err.contains("host v"),
+            "the versioned header is required: {err}"
+        );
         host.shutdown();
     }
 
@@ -342,13 +362,23 @@ mod tests {
 
         let moved = apply_arrange(&host, "arrange move_clip t0 c0 9600").expect("move");
         let tl = moved.arrangement.expect("arrangement");
-        assert_eq!(tl.tracks[0].clips[0].at_frame, 9_600, "the op reached the value");
+        assert_eq!(
+            tl.tracks[0].clips[0].at_frame, 9_600,
+            "the op reached the value"
+        );
 
         // A refused op (no such clip) surfaces and changes nothing.
         let err = apply_arrange(&host, "arrange move_clip t0 nope 0").unwrap_err();
         assert!(err.contains("nope"), "the refusal names the clip: {err}");
-        let after = host.outcome().expect("outcome").arrangement.expect("arrangement");
-        assert_eq!(after.tracks[0].clips[0].at_frame, 9_600, "the refused op changed nothing");
+        let after = host
+            .outcome()
+            .expect("outcome")
+            .arrangement
+            .expect("arrangement");
+        assert_eq!(
+            after.tracks[0].clips[0].at_frame, 9_600,
+            "the refused op changed nothing"
+        );
 
         host.shutdown();
         let _ = std::fs::remove_dir_all(&pool);
@@ -380,12 +410,18 @@ mod tests {
 
         host.execute(HostCommand::Undo).expect("undo");
         let undone = host.outcome().expect("outcome").arrangement.expect("tl");
-        assert_eq!(undone.tracks[0].clips[0].at_frame, 0, "the move is reverted");
+        assert_eq!(
+            undone.tracks[0].clips[0].at_frame, 0,
+            "the move is reverted"
+        );
         assert!(host.snapshot().can_redo, "redo is available after an undo");
 
         host.execute(HostCommand::Redo).expect("redo");
         let redone = host.outcome().expect("outcome").arrangement.expect("tl");
-        assert_eq!(redone.tracks[0].clips[0].at_frame, 9_600, "redo re-applies the move");
+        assert_eq!(
+            redone.tracks[0].clips[0].at_frame, 9_600,
+            "redo re-applies the move"
+        );
         assert!(!host.snapshot().can_redo, "the redo branch is consumed");
 
         host.shutdown();
@@ -402,7 +438,11 @@ mod tests {
         std::thread::sleep(Duration::from_millis(120));
         let st = to_transport_state(&host.snapshot());
         assert!(st.position.playing, "the transport is running");
-        assert!(st.position.frame > 0, "the playhead advanced (frame={})", st.position.frame);
+        assert!(
+            st.position.frame > 0,
+            "the playhead advanced (frame={})",
+            st.position.frame
+        );
         assert_eq!(st.channel_count, 2);
         host.execute(HostCommand::TransportStop).expect("stop");
         host.shutdown();

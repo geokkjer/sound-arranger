@@ -76,7 +76,10 @@ pub fn encode_pool(i: &mut Interner, dir: &str) -> (&'static str, Vec<(&'static 
 }
 
 /// Encode a `play` request (clip region + mixer channel).
-pub fn encode_play(i: &mut Interner, p: &PlayerIntent) -> (&'static str, Vec<(&'static str, Value)>) {
+pub fn encode_play(
+    i: &mut Interner,
+    p: &PlayerIntent,
+) -> (&'static str, Vec<(&'static str, Value)>) {
     (
         OP_PLAY,
         vec![
@@ -89,7 +92,10 @@ pub fn encode_play(i: &mut Interner, p: &PlayerIntent) -> (&'static str, Vec<(&'
 }
 
 /// Encode a `splice` request (incoming clip + crossfade + absolute frame).
-pub fn encode_splice(i: &mut Interner, s: &SpliceIntent) -> (&'static str, Vec<(&'static str, Value)>) {
+pub fn encode_splice(
+    i: &mut Interner,
+    s: &SpliceIntent,
+) -> (&'static str, Vec<(&'static str, Value)>) {
     (
         OP_SPLICE,
         vec![
@@ -148,7 +154,10 @@ fn u32_field(fields: &[(&'static str, Value)], name: &str) -> Result<u32, String
 /// Register the media-op handlers on an engine. Each decodes its fields and
 /// mutates the shared [`MediaSession`] (control side — no I/O, no graph work, so
 /// `Engine::replay_from` can run them on a fresh engine).
-pub fn register_handlers(engine: &mut Engine, media: Arc<Mutex<MediaSession>>) -> Result<(), String> {
+pub fn register_handlers(
+    engine: &mut Engine,
+    media: Arc<Mutex<MediaSession>>,
+) -> Result<(), String> {
     for &op in ALL_OPS {
         let m = media.clone();
         let handler: OpHandler = Box::new(move |fields| {

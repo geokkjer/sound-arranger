@@ -5,11 +5,11 @@
 //! streams into first-class, typed, patchable outputs.
 
 pub mod euclidean;
+#[cfg(feature = "fundsp")]
+pub mod fundsp_synth;
 pub mod mixer;
 pub mod scale;
 pub mod tone;
-#[cfg(feature = "fundsp")]
-pub mod fundsp_synth;
 
 use std::ops::Range;
 
@@ -18,10 +18,13 @@ use crate::ctx::Context;
 use crate::graph::{NodeId, Port};
 use crate::render::SchedEvent;
 
-pub use euclidean::{euclid, euclidean_factory, Euclidean, Rhythm};
-pub use mixer::{mixer_factory, MixerNode, MixerPlugin, MIXER_CHANNELS, MIXER_CHANNELS_MAX, MIXER_PARAMS, MIXER_PORTS, MeterBank};
-pub use scale::{scale_factory, Scale};
-pub use tone::{tone_factory, Tone, TONE_PARAMS};
+pub use euclidean::{Euclidean, Rhythm, euclid, euclidean_factory};
+pub use mixer::{
+    MIXER_CHANNELS, MIXER_CHANNELS_MAX, MIXER_PARAMS, MIXER_PORTS, MeterBank, MixerNode,
+    MixerPlugin, mixer_factory,
+};
+pub use scale::{Scale, scale_factory};
+pub use tone::{TONE_PARAMS, Tone, tone_factory};
 
 /// What a disposer may touch to undo a plugin's contributions.
 pub struct DisposerCtx<'a> {
@@ -72,10 +75,21 @@ pub struct ParamDef {
 /// An external event entering the patch bay (MIDI, OSC, another host).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ExternalEvent {
-    NoteOn { offset: u32, pitch: f32, velocity: f32 },
-    NoteOff { offset: u32, pitch: f32 },
-    Trigger { offset: u32 },
-    Control { value: f32 },
+    NoteOn {
+        offset: u32,
+        pitch: f32,
+        velocity: f32,
+    },
+    NoteOff {
+        offset: u32,
+        pitch: f32,
+    },
+    Trigger {
+        offset: u32,
+    },
+    Control {
+        value: f32,
+    },
 }
 
 /// A source of external events for a block (seam declaration — patch-bay note

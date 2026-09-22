@@ -152,12 +152,22 @@ pub struct Port {
 impl Port {
     /// A mono audio port (the `channels` field default).
     pub fn audio(name: &'static str, direction: Direction) -> Self {
-        Port { name, direction, kind: SignalKind::Audio, channels: 1 }
+        Port {
+            name,
+            direction,
+            kind: SignalKind::Audio,
+            channels: 1,
+        }
     }
 
     /// A stereo audio port (the master bus once the mixer is the sink).
     pub fn stereo_audio(name: &'static str, direction: Direction) -> Self {
-        Port { name, direction, kind: SignalKind::Audio, channels: 2 }
+        Port {
+            name,
+            direction,
+            kind: SignalKind::Audio,
+            channels: 2,
+        }
     }
 
     /// The number of audio channels this port carries (1 for non-audio).
@@ -294,9 +304,15 @@ impl NodeKind {
         block: RenderBlock,
     ) {
         match self {
-            NodeKind::Sine(node) => node.render(io, out_audio, out_control, out_triggers, out_notes, block),
-            NodeKind::Gain(node) => node.render(io, out_audio, out_control, out_triggers, out_notes, block),
-            NodeKind::Opaque(node) => node.render(io, out_audio, out_control, out_triggers, out_notes, block),
+            NodeKind::Sine(node) => {
+                node.render(io, out_audio, out_control, out_triggers, out_notes, block)
+            }
+            NodeKind::Gain(node) => {
+                node.render(io, out_audio, out_control, out_triggers, out_notes, block)
+            }
+            NodeKind::Opaque(node) => {
+                node.render(io, out_audio, out_control, out_triggers, out_notes, block)
+            }
         }
     }
 
@@ -571,14 +587,15 @@ impl AudioNode for ToneGen {
             while self.pending_count > 0 && self.pending[self.pending_head].0 as usize <= i {
                 let (offset, len, freq) = self.pending[self.pending_head];
                 if offset as usize == i
-                    && let Some(slot) = self.blips.iter_mut().find(|b| b.is_none()) {
-                        *slot = Some(Blip {
-                            phase: 0.0,
-                            inc: TAU * freq as f64 / block.sample_rate as f64,
-                            remaining: len,
-                            len,
-                        });
-                    }
+                    && let Some(slot) = self.blips.iter_mut().find(|b| b.is_none())
+                {
+                    *slot = Some(Blip {
+                        phase: 0.0,
+                        inc: TAU * freq as f64 / block.sample_rate as f64,
+                        remaining: len,
+                        len,
+                    });
+                }
                 self.pending_head += 1;
                 self.pending_count -= 1;
             }
@@ -751,8 +768,15 @@ impl Graph {
             .count();
         // Phase-1 shape (kimi review findings 2 + 8): many audio Ins (the
         // mixer's channels), at most one audio Out — enforced loudly.
-        assert!(audio_in_ports.len() <= MAX_AUDIO_INS, "node declares {} audio inputs (max {MAX_AUDIO_INS})", audio_in_ports.len());
-        assert!(audio_out_ports <= 1, "node declares {audio_out_ports} audio outputs (max 1 in Phase 1)");
+        assert!(
+            audio_in_ports.len() <= MAX_AUDIO_INS,
+            "node declares {} audio inputs (max {MAX_AUDIO_INS})",
+            audio_in_ports.len()
+        );
+        assert!(
+            audio_out_ports <= 1,
+            "node declares {audio_out_ports} audio outputs (max 1 in Phase 1)"
+        );
         let out_ch = Self::node_out_channels(&ports);
         self.nodes.push(Node { id, kind, ports });
         self.audio_out.push(vec![0.0; out_ch * BLOCK]);
@@ -762,7 +786,8 @@ impl Graph {
         self.notes_out.push(EventBuf::new());
         self.triggers_in.push(EventBuf::new());
         self.notes_in.push(EventBuf::new());
-        self.audio_ins.push(audio_in_ports.iter().map(|_| vec![0.0; BLOCK]).collect());
+        self.audio_ins
+            .push(audio_in_ports.iter().map(|_| vec![0.0; BLOCK]).collect());
         self.audio_in_ports.push(audio_in_ports);
         self.cum.push(0);
         self.delays.push(RingDelay::with_capacity(MAX_PDC));
@@ -783,7 +808,13 @@ impl Graph {
     /// allowed for audio (summed per input port) and events (merged); control
     /// inputs are single-driver in Phase 1. Audio `In` ports may be many per
     /// node (the mixer's channels); other kinds stay one-per-node.
-    pub fn connect(&mut self, from: NodeId, from_port: &str, to: NodeId, to_port: &str) -> Result<(), String> {
+    pub fn connect(
+        &mut self,
+        from: NodeId,
+        from_port: &str,
+        to: NodeId,
+        to_port: &str,
+    ) -> Result<(), String> {
         let fi = self.index_of(from).ok_or("connect: unknown 'from' node")?;
         let ti = self.index_of(to).ok_or("connect: unknown 'to' node")?;
         if fi >= ti {
@@ -809,7 +840,10 @@ impl Graph {
             ));
         }
         if in_port.kind == SignalKind::Control
-            && self.cords.iter().any(|c| c.to.0 == ti && c.kind == SignalKind::Control)
+            && self
+                .cords
+                .iter()
+                .any(|c| c.to.0 == ti && c.kind == SignalKind::Control)
         {
             return Err("connect: control inputs are single-driver in phase 1".into());
         }
@@ -847,8 +881,15 @@ impl Graph {
     /// before the mixer, which is the last node) while satisfying the graph's
     /// forward-order `connect` rule. Does not claim the master bus (mirrors
     /// `add_node`'s fallback: only when `out_node` is still `None`).
-    pub fn insert_before(&mut self, pivot: NodeId, kind: NodeKind, ports: Vec<Port>) -> Result<NodeId, String> {
-        let idx = self.index_of(pivot).ok_or("insert_before: unknown pivot node")?;
+    pub fn insert_before(
+        &mut self,
+        pivot: NodeId,
+        kind: NodeKind,
+        ports: Vec<Port>,
+    ) -> Result<NodeId, String> {
+        let idx = self
+            .index_of(pivot)
+            .ok_or("insert_before: unknown pivot node")?;
         let audio_in_ports: Vec<usize> = ports
             .iter()
             .enumerate()
@@ -859,8 +900,15 @@ impl Graph {
             .iter()
             .filter(|p| p.direction == Direction::Out && p.kind == SignalKind::Audio)
             .count();
-        assert!(audio_in_ports.len() <= MAX_AUDIO_INS, "node declares {} audio inputs (max {MAX_AUDIO_INS})", audio_in_ports.len());
-        assert!(audio_out_ports <= 1, "node declares {audio_out_ports} audio outputs (max 1 in Phase 1)");
+        assert!(
+            audio_in_ports.len() <= MAX_AUDIO_INS,
+            "node declares {} audio inputs (max {MAX_AUDIO_INS})",
+            audio_in_ports.len()
+        );
+        assert!(
+            audio_out_ports <= 1,
+            "node declares {audio_out_ports} audio outputs (max 1 in Phase 1)"
+        );
         let out_ch = Self::node_out_channels(&ports);
         let id = NodeId(self.next_id);
         self.next_id += 1;
@@ -872,7 +920,10 @@ impl Graph {
         self.notes_out.insert(idx, EventBuf::new());
         self.triggers_in.insert(idx, EventBuf::new());
         self.notes_in.insert(idx, EventBuf::new());
-        self.audio_ins.insert(idx, audio_in_ports.iter().map(|_| vec![0.0; BLOCK]).collect());
+        self.audio_ins.insert(
+            idx,
+            audio_in_ports.iter().map(|_| vec![0.0; BLOCK]).collect(),
+        );
         self.audio_in_ports.insert(idx, audio_in_ports);
         self.cum.insert(idx, 0);
         self.delays.insert(idx, RingDelay::with_capacity(MAX_PDC));
@@ -988,7 +1039,11 @@ impl Graph {
     /// source mutes itself on the mode, so only buffered tails — and the
     /// processing chain that carries them — reach the master.
     pub fn render_drain(&mut self, out: &mut [f32], block: RenderBlock) -> bool {
-        debug_assert_eq!(block.mode, RenderMode::Drain, "render_drain needs a Drain block");
+        debug_assert_eq!(
+            block.mode,
+            RenderMode::Drain,
+            "render_drain needs a Drain block"
+        );
         self.render_inner(out, block);
         self.has_tail()
     }
@@ -1156,20 +1211,40 @@ mod tests {
         let mut g = Graph::new();
         let sine = g.add_node(
             NodeKind::Sine(Sine::new(440.0)),
-            vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio , channels: 1 }],
+            vec![Port {
+                name: "audio",
+                direction: Direction::Out,
+                kind: SignalKind::Audio,
+                channels: 1,
+            }],
         );
         let delay = g.add_node(
             NodeKind::Opaque(Box::new(TestDelay { len: 3 })),
             vec![
-                Port { name: "audio", direction: Direction::In, kind: SignalKind::Audio , channels: 1 },
-                Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio , channels: 1 },
+                Port {
+                    name: "audio",
+                    direction: Direction::In,
+                    kind: SignalKind::Audio,
+                    channels: 1,
+                },
+                Port {
+                    name: "audio",
+                    direction: Direction::Out,
+                    kind: SignalKind::Audio,
+                    channels: 1,
+                },
             ],
         );
         g.connect(sine, "audio", delay, "audio").unwrap();
         g.set_out(delay);
 
         let mut out = [0.0f32; 64];
-        let block = RenderBlock { frame: 0, sample_rate: 48_000, tempo: &tempo(), mode: RenderMode::Timeline };
+        let block = RenderBlock {
+            frame: 0,
+            sample_rate: 48_000,
+            tempo: &tempo(),
+            mode: RenderMode::Timeline,
+        };
         g.render(&mut out, block);
 
         assert_eq!(out[0], 0.0);
@@ -1184,11 +1259,21 @@ mod tests {
         let mut g = Graph::new();
         let sine = g.add_node(
             NodeKind::Sine(Sine::new(440.0)),
-            vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio , channels: 1 }],
+            vec![Port {
+                name: "audio",
+                direction: Direction::Out,
+                kind: SignalKind::Audio,
+                channels: 1,
+            }],
         );
         let delay = g.add_node(
             NodeKind::Opaque(Box::new(TestDelay { len: 0 })),
-            vec![Port { name: "audio", direction: Direction::In, kind: SignalKind::Audio , channels: 1 }],
+            vec![Port {
+                name: "audio",
+                direction: Direction::In,
+                kind: SignalKind::Audio,
+                channels: 1,
+            }],
         );
         let err = g.connect(sine, "audio", delay, "nope").unwrap_err();
         assert!(err.contains("no port 'nope'"), "got: {err}");
@@ -1204,17 +1289,34 @@ mod tests {
         let sink = g.add_node(
             NodeKind::Opaque(Box::new(TestDelay { len: 0 })),
             vec![
-                Port { name: "audio", direction: Direction::In, kind: SignalKind::Audio , channels: 1 },
-                Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio , channels: 1 },
+                Port {
+                    name: "audio",
+                    direction: Direction::In,
+                    kind: SignalKind::Audio,
+                    channels: 1,
+                },
+                Port {
+                    name: "audio",
+                    direction: Direction::Out,
+                    kind: SignalKind::Audio,
+                    channels: 1,
+                },
             ],
         );
         g.set_out(sink);
         // a source inserted *before* the sink — must satisfy forward order.
-        let src = g.insert_before(
-            sink,
-            NodeKind::Sine(Sine::new(440.0)),
-            vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio , channels: 1 }],
-        ).unwrap();
+        let src = g
+            .insert_before(
+                sink,
+                NodeKind::Sine(Sine::new(440.0)),
+                vec![Port {
+                    name: "audio",
+                    direction: Direction::Out,
+                    kind: SignalKind::Audio,
+                    channels: 1,
+                }],
+            )
+            .unwrap();
         assert_eq!(src, NodeId(1), "inserted node is a fresh id");
         // the inserted source precedes the sink in the topological order.
         g.connect(src, "audio", sink, "audio").unwrap();
@@ -1222,7 +1324,12 @@ mod tests {
         assert_eq!(g.out_node, Some(sink));
 
         let mut out = [0.0f32; 64];
-        let block = RenderBlock { frame: 0, sample_rate: 48_000, tempo: &tempo(), mode: RenderMode::Timeline };
+        let block = RenderBlock {
+            frame: 0,
+            sample_rate: 48_000,
+            tempo: &tempo(),
+            mode: RenderMode::Timeline,
+        };
         g.render(&mut out, block);
         assert!(
             out[..32].iter().any(|s| s.abs() > 1e-6),
@@ -1235,24 +1342,46 @@ mod tests {
         let mut g = Graph::new();
         let a = g.add_node(
             NodeKind::Sine(Sine::new(440.0)),
-            vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio , channels: 1 }],
+            vec![Port {
+                name: "audio",
+                direction: Direction::Out,
+                kind: SignalKind::Audio,
+                channels: 1,
+            }],
         );
         let b = g.add_node(
             NodeKind::Opaque(Box::new(TestDelay { len: 0 })),
             vec![
-                Port { name: "audio", direction: Direction::In, kind: SignalKind::Audio , channels: 1 },
-                Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio , channels: 1 },
+                Port {
+                    name: "audio",
+                    direction: Direction::In,
+                    kind: SignalKind::Audio,
+                    channels: 1,
+                },
+                Port {
+                    name: "audio",
+                    direction: Direction::Out,
+                    kind: SignalKind::Audio,
+                    channels: 1,
+                },
             ],
         );
         // a cord a -> b establishes b as the later node.
         g.connect(a, "audio", b, "audio").unwrap();
         // insert a node BEFORE a (index 0); a's index and the a->b cord must
         // both shift up by one without breaking the connect.
-        let x = g.insert_before(
-            a,
-            NodeKind::Sine(Sine::new(220.0)),
-            vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio , channels: 1 }],
-        ).unwrap();
+        let x = g
+            .insert_before(
+                a,
+                NodeKind::Sine(Sine::new(220.0)),
+                vec![Port {
+                    name: "audio",
+                    direction: Direction::Out,
+                    kind: SignalKind::Audio,
+                    channels: 1,
+                }],
+            )
+            .unwrap();
         assert_eq!(x, NodeId(2), "inserted node is a fresh id");
         // the pre-existing a->b cord is still forward-ordered after the shift.
         g.connect(a, "audio", b, "audio").unwrap();
@@ -1331,7 +1460,15 @@ mod tests {
 
         // A normal render sums both: the sine is audible alongside the tail.
         let mut normal = [0.0f32; 32];
-        g.render(&mut normal, RenderBlock { frame: 0, sample_rate: 48_000, tempo: &tempo(), mode: RenderMode::Timeline });
+        g.render(
+            &mut normal,
+            RenderBlock {
+                frame: 0,
+                sample_rate: 48_000,
+                tempo: &tempo(),
+                mode: RenderMode::Timeline,
+            },
+        );
         assert!(
             normal.iter().any(|s| (*s - 1.0).abs() > 1e-6),
             "the sine contributes in a normal render"
@@ -1339,8 +1476,19 @@ mod tests {
 
         // A drain render mutes the free-running source: only the tail's 1.0.
         let mut drain = [0.0f32; 32];
-        g.render_drain(&mut drain, RenderBlock { frame: 0, sample_rate: 48_000, tempo: &tempo(), mode: RenderMode::Drain });
-        assert_eq!(drain, [1.0f32; 32], "the source is muted; only the tail sounds");
+        g.render_drain(
+            &mut drain,
+            RenderBlock {
+                frame: 0,
+                sample_rate: 48_000,
+                tempo: &tempo(),
+                mode: RenderMode::Drain,
+            },
+        );
+        assert_eq!(
+            drain, [1.0f32; 32],
+            "the source is muted; only the tail sounds"
+        );
     }
 
     #[test]
@@ -1365,12 +1513,23 @@ mod tests {
         );
         let sink = g.add_node(
             NodeKind::Opaque(Box::new(TestDelay { len: 3 })),
-            vec![Port::audio("audio", Direction::In), Port::audio("audio", Direction::Out)],
+            vec![
+                Port::audio("audio", Direction::In),
+                Port::audio("audio", Direction::Out),
+            ],
         );
         g.connect(src, "audio", sink, "audio").unwrap();
         g.set_out(sink);
         let mut out = [0.0f32; 16];
-        g.render(&mut out, RenderBlock { frame: 0, sample_rate: 48_000, tempo: &tempo(), mode: RenderMode::Timeline });
+        g.render(
+            &mut out,
+            RenderBlock {
+                frame: 0,
+                sample_rate: 48_000,
+                tempo: &tempo(),
+                mode: RenderMode::Timeline,
+            },
+        );
         // The source's PDC delay (3) *plus* the sink's own latency (3): the
         // cumulative latency alone (3) under-flushes the chained path.
         assert_eq!(g.flush_frames(), 6);

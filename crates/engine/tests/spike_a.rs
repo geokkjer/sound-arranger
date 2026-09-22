@@ -24,10 +24,30 @@ fn l(buf: &[f32]) -> Vec<f32> {
 
 fn engine() -> Engine {
     let mut e = Engine::new(SR, 120.0, 4);
-    e.register_factory("euclidean", plugins::euclidean_factory, plugins::euclidean::EUCLIDEAN_PORTS, &[]);
-    e.register_factory("scale", plugins::scale_factory, plugins::scale::SCALE_PORTS, &[]);
-    e.register_factory("tone", plugins::tone_factory, plugins::tone::TONE_PORTS, plugins::tone::TONE_PARAMS);
-    e.register_factory("mixer", plugins::mixer_factory, plugins::mixer::MIXER_PORTS, plugins::mixer::MIXER_PARAMS);
+    e.register_factory(
+        "euclidean",
+        plugins::euclidean_factory,
+        plugins::euclidean::EUCLIDEAN_PORTS,
+        &[],
+    );
+    e.register_factory(
+        "scale",
+        plugins::scale_factory,
+        plugins::scale::SCALE_PORTS,
+        &[],
+    );
+    e.register_factory(
+        "tone",
+        plugins::tone_factory,
+        plugins::tone::TONE_PORTS,
+        plugins::tone::TONE_PARAMS,
+    );
+    e.register_factory(
+        "mixer",
+        plugins::mixer_factory,
+        plugins::mixer::MIXER_PORTS,
+        plugins::mixer::MIXER_PARAMS,
+    );
     e
 }
 
@@ -38,12 +58,20 @@ fn engine() -> Engine {
 fn mount_chain(e: &mut Engine) {
     e.mount(
         "euclidean",
-        &[("steps", 8.0), ("pulses", 3.0), ("rotation", 0.0), ("pulses_per_beat", 4.0)],
+        &[
+            ("steps", 8.0),
+            ("pulses", 3.0),
+            ("rotation", 0.0),
+            ("pulses_per_beat", 4.0),
+        ],
     )
     .unwrap();
-    e.mount("scale", &[("root", 0.0), ("note_len", 400.0)]).unwrap();
-    e.mount("tone", &[("gain", 0.2), ("blip_len", 800.0)]).unwrap();
-    e.patch(("euclidean", "triggers"), ("scale", "trigger")).unwrap();
+    e.mount("scale", &[("root", 0.0), ("note_len", 400.0)])
+        .unwrap();
+    e.mount("tone", &[("gain", 0.2), ("blip_len", 800.0)])
+        .unwrap();
+    e.patch(("euclidean", "triggers"), ("scale", "trigger"))
+        .unwrap();
     e.patch(("scale", "note"), ("tone", "note")).unwrap();
     // Phase 1: the mixer owns the master bus — the chain's audio routes
     // through it (tone.audio → mixer.ch0); the tone no longer claims the out.
@@ -58,12 +86,19 @@ fn chain_trigger_is_sample_accurate() {
     let mut e = engine();
     e.mount(
         "euclidean",
-        &[("steps", 8.0), ("pulses", 1.0), ("rotation", 1.0), ("pulses_per_beat", 4.0)],
+        &[
+            ("steps", 8.0),
+            ("pulses", 1.0),
+            ("rotation", 1.0),
+            ("pulses_per_beat", 4.0),
+        ],
     )
     .unwrap();
     e.mount("scale", &[("root", 0.0)]).unwrap();
-    e.mount("tone", &[("gain", 0.25), ("blip_len", 1200.0)]).unwrap();
-    e.patch(("euclidean", "triggers"), ("scale", "trigger")).unwrap();
+    e.mount("tone", &[("gain", 0.25), ("blip_len", 1200.0)])
+        .unwrap();
+    e.patch(("euclidean", "triggers"), ("scale", "trigger"))
+        .unwrap();
     e.patch(("scale", "note"), ("tone", "note")).unwrap();
     e.mount("mixer", &[]).unwrap();
     e.patch(("tone", "audio"), ("mixer", "ch0")).unwrap();
@@ -71,7 +106,10 @@ fn chain_trigger_is_sample_accurate() {
 
     assert_eq!(out[5999], 0.0);
     assert_eq!(out[6000], 0.0, "onset sample is sin(0)");
-    assert!(out[6001] > 0.0, "blip must begin at frame 6001 (onset at 6000)");
+    assert!(
+        out[6001] > 0.0,
+        "blip must begin at frame 6001 (onset at 6000)"
+    );
 }
 
 /// The pitch flows through the patch: changing the scale root changes the tone's
@@ -82,12 +120,19 @@ fn scale_changes_pitch() {
         let mut e = engine();
         e.mount(
             "euclidean",
-            &[("steps", 8.0), ("pulses", 1.0), ("rotation", 1.0), ("pulses_per_beat", 4.0)],
+            &[
+                ("steps", 8.0),
+                ("pulses", 1.0),
+                ("rotation", 1.0),
+                ("pulses_per_beat", 4.0),
+            ],
         )
         .unwrap();
         e.mount("scale", &[("root", root)]).unwrap();
-        e.mount("tone", &[("gain", 0.25), ("blip_len", 800.0)]).unwrap();
-        e.patch(("euclidean", "triggers"), ("scale", "trigger")).unwrap();
+        e.mount("tone", &[("gain", 0.25), ("blip_len", 800.0)])
+            .unwrap();
+        e.patch(("euclidean", "triggers"), ("scale", "trigger"))
+            .unwrap();
         e.patch(("scale", "note"), ("tone", "note")).unwrap();
         e.mount("mixer", &[]).unwrap();
         e.patch(("tone", "audio"), ("mixer", "ch0")).unwrap();
@@ -106,7 +151,11 @@ fn scale_changes_pitch() {
     let low = crossings(0.0); // A4 → 440 Hz
     let high = crossings(12.0); // octave up → 880 Hz
     assert!(low > 0 && high > 0, "both must sound");
-    assert!(high > low * 3 / 2 && high < low * 2 + 4, "an octave ≈ twice the crossings: {low} vs {high}");}
+    assert!(
+        high > low * 3 / 2 && high < low * 2 + 4,
+        "an octave ≈ twice the crossings: {low} vs {high}"
+    );
+}
 
 /// A type-mismatched patch (Trigger → Note) is refused at patch time, and so
 /// are patches referencing unknown ports, wrong directions, or unknown plugins.
@@ -116,14 +165,22 @@ fn patch_type_mismatch_refused() {
     e.mount("euclidean", &[]).unwrap();
     e.mount("tone", &[]).unwrap();
     // kinds differ: Trigger out vs Note in
-    let err = e.patch(("euclidean", "triggers"), ("tone", "note")).unwrap_err();
+    let err = e
+        .patch(("euclidean", "triggers"), ("tone", "note"))
+        .unwrap_err();
     assert!(err.contains("signal kind mismatch"), "got: {err}");
     // wrong direction: tone.audio is an Out port
-    let err = e.patch(("euclidean", "triggers"), ("tone", "audio")).unwrap_err();
+    let err = e
+        .patch(("euclidean", "triggers"), ("tone", "audio"))
+        .unwrap_err();
     assert!(err.contains("must be an Out port"), "got: {err}");
-    let err = e.patch(("euclidean", "nope"), ("tone", "note")).unwrap_err();
+    let err = e
+        .patch(("euclidean", "nope"), ("tone", "note"))
+        .unwrap_err();
     assert!(err.contains("no port 'nope'"), "got: {err}");
-    let err = e.patch(("euclidean", "triggers"), ("ghost", "note")).unwrap_err();
+    let err = e
+        .patch(("euclidean", "triggers"), ("ghost", "note"))
+        .unwrap_err();
     assert!(err.contains("unknown plugin 'ghost'"), "got: {err}");
 }
 
@@ -137,7 +194,11 @@ fn patching_is_logged_and_replayable() {
     e1.set_tempo(96.0, 4).unwrap();
     let a = e1.render(2 * 48_000);
     let log = e1.log.clone();
-    assert!(log.events().iter().any(|ev| matches!(ev, Event::Patch { .. })));
+    assert!(
+        log.events()
+            .iter()
+            .any(|ev| matches!(ev, Event::Patch { .. }))
+    );
 
     let mut e2 = engine();
     e2.replay_from(&log).expect("replay");
@@ -161,9 +222,20 @@ fn replay_is_exact_for_mid_session_tempo_change() {
     e2.replay_from(&log).unwrap();
     let b = l(&e2.render(4 * 48_000));
 
-    assert_eq!(&b[..2 * 48_000], &first[..], "pre-change segment must match");
-    assert_eq!(&b[2 * 48_000..], &second[..], "post-change segment must match");
-    assert!(b[3 * 48_000..].iter().all(|s| *s == 0.0), "silence after unmount");
+    assert_eq!(
+        &b[..2 * 48_000],
+        &first[..],
+        "pre-change segment must match"
+    );
+    assert_eq!(
+        &b[2 * 48_000..],
+        &second[..],
+        "post-change segment must match"
+    );
+    assert!(
+        b[3 * 48_000..].iter().all(|s| *s == 0.0),
+        "silence after unmount"
+    );
 }
 
 /// Replay reproduces mid-session mounts under the patched chain (silence
@@ -185,8 +257,15 @@ fn replay_is_exact_for_mid_session_mount() {
     let mut b = e2.render(48_000); // 0..48000: mono silence (no master yet)
     b.extend(l(&e2.render(48_000))); // 48000..96000: chain (stereo mixer) mounted
 
-    assert!(b[..48_000].iter().all(|s| *s == 0.0), "silence before the mount frame");
-    assert_eq!(&b[48_000..], &after[..], "audio after the mount frame must match");
+    assert!(
+        b[..48_000].iter().all(|s| *s == 0.0),
+        "silence before the mount frame"
+    );
+    assert_eq!(
+        &b[48_000..],
+        &after[..],
+        "audio after the mount frame must match"
+    );
 }
 
 /// Unmounting a provider is sample-accurate: a long-decay blip is cut exactly
@@ -196,12 +275,20 @@ fn unmount_is_sample_accurate() {
     let mut e = engine();
     e.mount(
         "euclidean",
-        &[("steps", 8.0), ("pulses", 3.0), ("rotation", 0.0), ("pulses_per_beat", 4.0)],
+        &[
+            ("steps", 8.0),
+            ("pulses", 3.0),
+            ("rotation", 0.0),
+            ("pulses_per_beat", 4.0),
+        ],
     )
     .unwrap();
-    e.mount("scale", &[("root", 0.0), ("note_len", 400.0)]).unwrap();
-    e.mount("tone", &[("gain", 0.2), ("blip_len", 20_000.0)]).unwrap();
-    e.patch(("euclidean", "triggers"), ("scale", "trigger")).unwrap();
+    e.mount("scale", &[("root", 0.0), ("note_len", 400.0)])
+        .unwrap();
+    e.mount("tone", &[("gain", 0.2), ("blip_len", 20_000.0)])
+        .unwrap();
+    e.patch(("euclidean", "triggers"), ("scale", "trigger"))
+        .unwrap();
     e.patch(("scale", "note"), ("tone", "note")).unwrap();
     e.mount("mixer", &[]).unwrap();
     e.patch(("tone", "audio"), ("mixer", "ch0")).unwrap();
@@ -215,9 +302,18 @@ fn unmount_is_sample_accurate() {
     e.schedule_unmount("tone", at);
     let out = l(&e.render((at + 64) as usize));
 
-    assert!(out[..at as usize].iter().any(|s| *s != 0.0), "sound before the unmount");
-    assert!(out[(at - 1) as usize] != 0.0, "a blip is still decaying at the boundary");
-    assert!(out[at as usize..].iter().all(|s| *s == 0.0), "exact silence from frame {at}");
+    assert!(
+        out[..at as usize].iter().any(|s| *s != 0.0),
+        "sound before the unmount"
+    );
+    assert!(
+        out[(at - 1) as usize] != 0.0,
+        "a blip is still decaying at the boundary"
+    );
+    assert!(
+        out[at as usize..].iter().all(|s| *s == 0.0),
+        "exact silence from frame {at}"
+    );
 }
 
 /// Unmounting the whole chain leaves no residual sound.
@@ -289,7 +385,8 @@ fn plugins_cooperate_via_service_key() {
     assert!(e.log.is_empty(), "a refused mount must not be logged");
     e.mount("euclidean", &[]).unwrap();
     e.render(1);
-    e.mount("bass", &[]).expect("bass mounts once euclidean provides rhythm");
+    e.mount("bass", &[])
+        .expect("bass mounts once euclidean provides rhythm");
 }
 
 /// Fail-loud inject: a plugin requiring a missing service is refused at mount.
@@ -324,19 +421,29 @@ fn tempo_change_moves_triggers() {
     let mut e = engine();
     e.mount(
         "euclidean",
-        &[("steps", 8.0), ("pulses", 3.0), ("rotation", 1.0), ("pulses_per_beat", 4.0)],
+        &[
+            ("steps", 8.0),
+            ("pulses", 3.0),
+            ("rotation", 1.0),
+            ("pulses_per_beat", 4.0),
+        ],
     )
     .unwrap();
     e.mount("scale", &[("root", 0.0)]).unwrap();
-    e.mount("tone", &[("gain", 0.25), ("blip_len", 1200.0)]).unwrap();
-    e.patch(("euclidean", "triggers"), ("scale", "trigger")).unwrap();
+    e.mount("tone", &[("gain", 0.25), ("blip_len", 1200.0)])
+        .unwrap();
+    e.patch(("euclidean", "triggers"), ("scale", "trigger"))
+        .unwrap();
     e.patch(("scale", "note"), ("tone", "note")).unwrap();
     e.mount("mixer", &[]).unwrap();
     e.patch(("tone", "audio"), ("mixer", "ch0")).unwrap();
     e.set_tempo(240.0, 4).unwrap();
     let out = l(&e.render(5000));
     assert_eq!(out[2999], 0.0);
-    assert!(out[3001] > 0.0, "pulse must land at frame 3000 under 240bpm");
+    assert!(
+        out[3001] > 0.0,
+        "pulse must land at frame 3000 under 240bpm"
+    );
 }
 
 /// The patch-bay registry: an external source (here a fake OSC-style plugin)
@@ -370,17 +477,33 @@ fn providers_of_lists_external_sources() {
             &[]
         }
         fn ports(&self) -> &'static [Port] {
-            &[Port { name: "triggers", direction: Direction::Out, kind: SignalKind::Trigger, channels: 1 }]
+            &[Port {
+                name: "triggers",
+                direction: Direction::Out,
+                kind: SignalKind::Trigger,
+                channels: 1,
+            }]
         }
         fn apply(&mut self, api: &mut PluginApi) -> Result<(NodeId, Disposer), String> {
-            let node = api.graph.add_node(NodeKind::Opaque(Box::new(FakeOscNode)), self.ports().to_vec());
-            Ok((node, Box::new(move |dis| {
-                dis.graph.remove_node(node);
-            })))
+            let node = api.graph.add_node(
+                NodeKind::Opaque(Box::new(FakeOscNode)),
+                self.ports().to_vec(),
+            );
+            Ok((
+                node,
+                Box::new(move |dis| {
+                    dis.graph.remove_node(node);
+                }),
+            ))
         }
     }
     let osc_factory: PluginFactory = |_| Ok(Box::new(FakeOsc));
-    let osc_ports: &'static [Port] = &[Port { name: "triggers", direction: Direction::Out, kind: SignalKind::Trigger, channels: 1 }];
+    let osc_ports: &'static [Port] = &[Port {
+        name: "triggers",
+        direction: Direction::Out,
+        kind: SignalKind::Trigger,
+        channels: 1,
+    }];
 
     let mut e = engine();
     e.register_factory("fakeosc", osc_factory, osc_ports, &[]);
@@ -389,10 +512,17 @@ fn providers_of_lists_external_sources() {
     e.render(1); // apply
 
     let providers = e.providers_of(SignalKind::Trigger);
-    assert_eq!(providers.len(), 2, "euclidean + fakeosc both provide triggers");
+    assert_eq!(
+        providers.len(),
+        2,
+        "euclidean + fakeosc both provide triggers"
+    );
     assert!(providers.iter().all(|(_, name)| *name == "triggers"));
     let notes = e.providers_of(SignalKind::Note);
-    assert!(notes.is_empty(), "no note providers yet — scale not mounted");
+    assert!(
+        notes.is_empty(),
+        "no note providers yet — scale not mounted"
+    );
     e.mount("scale", &[]).unwrap();
     e.render(1);
     assert_eq!(e.providers_of(SignalKind::Note).len(), 1);
@@ -431,17 +561,33 @@ fn fan_in_merges_events_sorted() {
             &[]
         }
         fn ports(&self) -> &'static [Port] {
-            &[Port { name: "triggers", direction: Direction::Out, kind: SignalKind::Trigger, channels: 1 }]
+            &[Port {
+                name: "triggers",
+                direction: Direction::Out,
+                kind: SignalKind::Trigger,
+                channels: 1,
+            }]
         }
         fn apply(&mut self, api: &mut PluginApi) -> Result<(NodeId, Disposer), String> {
-            let node = api.graph.add_node(NodeKind::Opaque(Box::new(FakeOscNode)), self.ports().to_vec());
-            Ok((node, Box::new(move |dis| {
-                dis.graph.remove_node(node);
-            })))
+            let node = api.graph.add_node(
+                NodeKind::Opaque(Box::new(FakeOscNode)),
+                self.ports().to_vec(),
+            );
+            Ok((
+                node,
+                Box::new(move |dis| {
+                    dis.graph.remove_node(node);
+                }),
+            ))
         }
     }
     let osc_factory: PluginFactory = |_| Ok(Box::new(FakeOsc));
-    let osc_ports: &'static [Port] = &[Port { name: "triggers", direction: Direction::Out, kind: SignalKind::Trigger, channels: 1 }];
+    let osc_ports: &'static [Port] = &[Port {
+        name: "triggers",
+        direction: Direction::Out,
+        kind: SignalKind::Trigger,
+        channels: 1,
+    }];
 
     let mut e = engine();
     e.register_factory("fakeosc", osc_factory, osc_ports, &[]);
@@ -449,22 +595,36 @@ fn fan_in_merges_events_sorted() {
     // offset first into the merge, exercising the sorted insert.
     e.mount(
         "euclidean",
-        &[("steps", 8.0), ("pulses", 1.0), ("rotation", 1.0), ("pulses_per_beat", 4.0)],
+        &[
+            ("steps", 8.0),
+            ("pulses", 1.0),
+            ("rotation", 1.0),
+            ("pulses_per_beat", 4.0),
+        ],
     )
     .unwrap();
     e.mount("fakeosc", &[]).unwrap();
     e.mount("scale", &[("root", 0.0)]).unwrap();
-    e.mount("tone", &[("gain", 0.25), ("blip_len", 1200.0)]).unwrap();
-    e.patch(("euclidean", "triggers"), ("scale", "trigger")).unwrap();
-    e.patch(("fakeosc", "triggers"), ("scale", "trigger")).unwrap();
+    e.mount("tone", &[("gain", 0.25), ("blip_len", 1200.0)])
+        .unwrap();
+    e.patch(("euclidean", "triggers"), ("scale", "trigger"))
+        .unwrap();
+    e.patch(("fakeosc", "triggers"), ("scale", "trigger"))
+        .unwrap();
     e.patch(("scale", "note"), ("tone", "note")).unwrap();
     e.mount("mixer", &[]).unwrap();
     e.patch(("tone", "audio"), ("mixer", "ch0")).unwrap();
 
     let out = l(&e.render(7000));
-    assert!(out[101] > 0.0, "fakeosc blip must fire at frame 101 (offset 100)");
+    assert!(
+        out[101] > 0.0,
+        "fakeosc blip must fire at frame 101 (offset 100)"
+    );
     assert_eq!(out[5999], 0.0);
-    assert!(out[6001] > 0.0, "euclidean blip must still fire at 6001 — sorted merge");
+    assert!(
+        out[6001] > 0.0,
+        "euclidean blip must still fire at 6001 — sorted merge"
+    );
 }
 
 /// A patch for a plugin that is neither scheduled nor mounted is refused at
@@ -472,7 +632,9 @@ fn fan_in_merges_events_sorted() {
 #[test]
 fn patch_before_mount_refused() {
     let mut e = engine();
-    let err = e.patch(("euclidean", "triggers"), ("scale", "trigger")).unwrap_err();
+    let err = e
+        .patch(("euclidean", "triggers"), ("scale", "trigger"))
+        .unwrap_err();
     assert!(err.contains("neither scheduled nor mounted"), "got: {err}");
     assert!(e.log.is_empty(), "a refused patch must not be logged");
 }
@@ -502,13 +664,28 @@ fn render_path_does_not_allocate_with_latency() {
     let mut e = Engine::new(SR, 120.0, 4);
     let sine = e.graph.add_node(
         NodeKind::Sine(Sine::new(440.0)),
-        vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio, channels: 1 }],
+        vec![Port {
+            name: "audio",
+            direction: Direction::Out,
+            kind: SignalKind::Audio,
+            channels: 1,
+        }],
     );
     let delay = e.graph.add_node(
         NodeKind::Opaque(Box::new(TestDelay)),
         vec![
-            Port { name: "audio", direction: Direction::In, kind: SignalKind::Audio, channels: 1 },
-            Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio, channels: 1 },
+            Port {
+                name: "audio",
+                direction: Direction::In,
+                kind: SignalKind::Audio,
+                channels: 1,
+            },
+            Port {
+                name: "audio",
+                direction: Direction::Out,
+                kind: SignalKind::Audio,
+                channels: 1,
+            },
         ],
     );
     e.graph.connect(sine, "audio", delay, "audio").unwrap();
@@ -535,7 +712,12 @@ fn provider_names_and_osc_seam() {
     e.register_factory(
         "fakeosc",
         |_| Ok(Box::new(ProviderNamesFakeOsc)),
-        &[Port { name: "triggers", direction: Direction::Out, kind: SignalKind::Trigger, channels: 1 }],
+        &[Port {
+            name: "triggers",
+            direction: Direction::Out,
+            kind: SignalKind::Trigger,
+            channels: 1,
+        }],
         &[],
     );
     e.mount("euclidean", &[]).unwrap();
@@ -544,7 +726,10 @@ fn provider_names_and_osc_seam() {
     e.render(1);
 
     let names = e.provider_names_of(SignalKind::Trigger);
-    assert!(names.contains(&"euclidean") && names.contains(&"fakeosc"), "got {names:?}");
+    assert!(
+        names.contains(&"euclidean") && names.contains(&"fakeosc"),
+        "got {names:?}"
+    );
     assert_eq!(e.provider_names_of(SignalKind::Note), vec!["scale"]);
 }
 
@@ -557,13 +742,24 @@ impl Plugin for ProviderNamesFakeOsc {
         &[]
     }
     fn ports(&self) -> &'static [Port] {
-        &[Port { name: "triggers", direction: Direction::Out, kind: SignalKind::Trigger, channels: 1 }]
+        &[Port {
+            name: "triggers",
+            direction: Direction::Out,
+            kind: SignalKind::Trigger,
+            channels: 1,
+        }]
     }
     fn apply(&mut self, api: &mut PluginApi) -> Result<(NodeId, Disposer), String> {
-        let node = api.graph.add_node(NodeKind::Opaque(Box::new(SeamOscNode)), self.ports().to_vec());
-        Ok((node, Box::new(move |dis| {
-            dis.graph.remove_node(node);
-        })))
+        let node = api.graph.add_node(
+            NodeKind::Opaque(Box::new(SeamOscNode)),
+            self.ports().to_vec(),
+        );
+        Ok((
+            node,
+            Box::new(move |dis| {
+                dis.graph.remove_node(node);
+            }),
+        ))
     }
 }
 

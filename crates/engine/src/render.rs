@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 
 use crate::clock::{Clock, Scheduler};
-use crate::graph::{Graph, NodeId, Port, RenderBlock, RenderMode, SignalKind, BLOCK};
+use crate::graph::{BLOCK, Graph, NodeId, Port, RenderBlock, RenderMode, SignalKind};
 use crate::log::{Event, SessionLog};
 use crate::plugins::{Disposer, DisposerCtx, ParamDef, Plugin, PluginApi};
 use crate::value::Value;
@@ -34,14 +34,19 @@ pub enum SchedEvent {
         plugin: &'static str,
         params: Vec<(&'static str, f32)>,
     },
-    Unmount { plugin: &'static str },
+    Unmount {
+        plugin: &'static str,
+    },
     Patch {
         from_plugin: &'static str,
         from_port: &'static str,
         to_plugin: &'static str,
         to_port: &'static str,
     },
-    SetTempo { bpm: f64, beats_per_bar: u32 },
+    SetTempo {
+        bpm: f64,
+        beats_per_bar: u32,
+    },
     SetParam {
         plugin: &'static str,
         param: &'static str,
@@ -163,7 +168,11 @@ impl Engine {
 
     /// Mount a plugin at the current frame: validated synchronously (fail-loud),
     /// logged with its frame, then applied by the render loop at that frame.
-    pub fn mount(&mut self, name: &'static str, params: &[(&'static str, f32)]) -> Result<(), String> {
+    pub fn mount(
+        &mut self,
+        name: &'static str,
+        params: &[(&'static str, f32)],
+    ) -> Result<(), String> {
         self.validate_mount(name, params)?;
         let at_frame = self.clock.frame();
         self.log.push(Event::Mount {
@@ -184,9 +193,15 @@ impl Engine {
 
     /// Synchronous, side-effect-free validation: known plugin, declared services
     /// all provided (core or ctx), one instance per name.
-    fn validate_mount(&self, name: &'static str, params: &[(&'static str, f32)]) -> Result<(), String> {
+    fn validate_mount(
+        &self,
+        name: &'static str,
+        params: &[(&'static str, f32)],
+    ) -> Result<(), String> {
         if self.disposers.contains_key(name) || self.scheduled.contains(name) {
-            return Err(format!("plugin '{name}' is already mounted (one instance per name in spike A.5)"));
+            return Err(format!(
+                "plugin '{name}' is already mounted (one instance per name in spike A.5)"
+            ));
         }
         // Mount params get a finiteness check (GLM-5.3 #9): `set_param` has one,
         // but a `mount ... NaN` would otherwise reach the plugin's apply silently.
@@ -205,11 +220,19 @@ impl Engine {
                 return Err(format!("plugin '{name}' requires missing service '{key}'"));
             }
         }
-        debug_assert_eq!(plugin.ports(), self.port_table[name], "registered ports must match the plugin");
+        debug_assert_eq!(
+            plugin.ports(),
+            self.port_table[name],
+            "registered ports must match the plugin"
+        );
         Ok(())
     }
 
-    fn apply_mount(&mut self, name: &'static str, params: &[(&'static str, f32)]) -> Result<(), String> {
+    fn apply_mount(
+        &mut self,
+        name: &'static str,
+        params: &[(&'static str, f32)],
+    ) -> Result<(), String> {
         let factory = *self
             .factories
             .get(name)
@@ -267,7 +290,11 @@ impl Engine {
         Ok(())
     }
 
-    fn validate_patch(&self, from: (&'static str, &'static str), to: (&'static str, &'static str)) -> Result<(), String> {
+    fn validate_patch(
+        &self,
+        from: (&'static str, &'static str),
+        to: (&'static str, &'static str),
+    ) -> Result<(), String> {
         let (fp, tp) = (from.0, to.0);
         if !self.factories.contains_key(fp) {
             return Err(format!("unknown plugin '{fp}'"));
@@ -315,13 +342,25 @@ impl Engine {
     /// order, single-driver control), the intent stays in the log and the
     /// refusal is asserted in debug — no audio-thread crash, no silent
     /// divergence (replay reproduces the same refused state).
-    fn apply_patch(&mut self, from: (&'static str, &'static str), to: (&'static str, &'static str)) {
+    fn apply_patch(
+        &mut self,
+        from: (&'static str, &'static str),
+        to: (&'static str, &'static str),
+    ) {
         let Some(&from_node) = self.node_of.get(from.0) else {
-            debug_assert!(false, "patch endpoint '{}' not mounted at apply (log-order error)", from.0);
+            debug_assert!(
+                false,
+                "patch endpoint '{}' not mounted at apply (log-order error)",
+                from.0
+            );
             return;
         };
         let Some(&to_node) = self.node_of.get(to.0) else {
-            debug_assert!(false, "patch endpoint '{}' not mounted at apply (log-order error)", to.0);
+            debug_assert!(
+                false,
+                "patch endpoint '{}' not mounted at apply (log-order error)",
+                to.0
+            );
             return;
         };
         if let Err(e) = self.graph.connect(from_node, from.1, to_node, to.1) {
@@ -357,8 +396,17 @@ impl Engine {
         self.scheduled.remove(name);
         if let Some(disposer) = self.disposers.remove(name) {
             self.node_of.remove(name);
-            let Engine { ctx, scheduler, graph, .. } = self;
-            disposer(&mut DisposerCtx { ctx, scheduler, graph });
+            let Engine {
+                ctx,
+                scheduler,
+                graph,
+                ..
+            } = self;
+            disposer(&mut DisposerCtx {
+                ctx,
+                scheduler,
+                graph,
+            });
         }
     }
 
@@ -387,12 +435,19 @@ impl Engine {
     /// replayable (Phase 1: the generic control path for the mixer's
     /// gain/mute/solo/fader). A refused call is never logged; automation
     /// curves are a later event type.
-    pub fn set_param(&mut self, plugin: &'static str, param: &'static str, value: f32) -> Result<(), String> {
+    pub fn set_param(
+        &mut self,
+        plugin: &'static str,
+        param: &'static str,
+        value: f32,
+    ) -> Result<(), String> {
         if !self.factories.contains_key(plugin) {
             return Err(format!("unknown plugin '{plugin}'"));
         }
         if !(self.node_of.contains_key(plugin) || self.scheduled.contains(plugin)) {
-            return Err(format!("plugin '{plugin}' is neither scheduled nor mounted"));
+            return Err(format!(
+                "plugin '{plugin}' is neither scheduled nor mounted"
+            ));
         }
         let declared = self.params_table.get(plugin).copied().unwrap_or(&[]);
         let Some(def) = declared.iter().find(|d| d.name == param) else {
@@ -402,7 +457,10 @@ impl Engine {
             return Err(format!("parameter '{param}' must be finite, got {value}"));
         }
         if value < def.min || value > def.max {
-            return Err(format!("parameter '{param}' out of range [{}, {}]: {value}", def.min, def.max));
+            return Err(format!(
+                "parameter '{param}' out of range [{}, {}]: {value}",
+                def.min, def.max
+            ));
         }
         let at_frame = self.clock.frame();
         self.log.push(Event::SetParam {
@@ -425,7 +483,11 @@ impl Engine {
     /// Register a plugin-message handler for an op name. Called by a plugin on
     /// mount (its `apply`); the engine logs `arrange` ops and dispatches them
     /// here. Fail-loud when the op is already claimed.
-    pub fn register_op_handler(&mut self, op: &'static str, handler: OpHandler) -> Result<(), String> {
+    pub fn register_op_handler(
+        &mut self,
+        op: &'static str,
+        handler: OpHandler,
+    ) -> Result<(), String> {
         if self.op_handlers.contains_key(op) {
             return Err(format!("op '{op}' already has a handler"));
         }
@@ -440,7 +502,11 @@ impl Engine {
 
     /// Validate a plugin-message op: a handler registered and every `F32` field
     /// finite (fail-loud; a refused op is never logged).
-    fn validate_op(&self, op: &'static str, fields: &[(&'static str, Value)]) -> Result<(), String> {
+    fn validate_op(
+        &self,
+        op: &'static str,
+        fields: &[(&'static str, Value)],
+    ) -> Result<(), String> {
         if !self.op_handlers.contains_key(op) {
             return Err(format!("no handler registered for op '{op}'"));
         }
@@ -460,7 +526,11 @@ impl Engine {
     /// clip editor; `replay_from` re-schedules the logged op to reconstruct it).
     fn log_arrangement(&mut self, op: &'static str, fields: Vec<(&'static str, Value)>) -> u64 {
         let at_frame = self.clock.frame();
-        self.log.push(Event::Arrangement { op, fields, at_frame });
+        self.log.push(Event::Arrangement {
+            op,
+            fields,
+            at_frame,
+        });
         at_frame
     }
 
@@ -472,10 +542,15 @@ impl Engine {
     /// Note: a handler is registered when the plugin's mount is *applied*, so
     /// call `flush_scheduled()` between mounting the plugin and the first
     /// `arrange` of its ops (or the op is refused as unregistered).
-    pub fn arrange(&mut self, op: &'static str, fields: Vec<(&'static str, Value)>) -> Result<(), String> {
+    pub fn arrange(
+        &mut self,
+        op: &'static str,
+        fields: Vec<(&'static str, Value)>,
+    ) -> Result<(), String> {
         self.validate_op(op, &fields)?;
         let at_frame = self.log_arrangement(op, fields.clone());
-        self.scheduler.schedule(at_frame, SchedEvent::Arrangement { op, fields });
+        self.scheduler
+            .schedule(at_frame, SchedEvent::Arrangement { op, fields });
         Ok(())
     }
 
@@ -483,7 +558,11 @@ impl Engine {
     /// value-level arrangement ops whose live value is applied eagerly by the
     /// clip editor (so they never touch the scheduler and cannot flush the mixer
     /// early); `replay_from` re-schedules them to reconstruct the value.
-    pub fn arrange_logged(&mut self, op: &'static str, fields: Vec<(&'static str, Value)>) -> Result<(), String> {
+    pub fn arrange_logged(
+        &mut self,
+        op: &'static str,
+        fields: Vec<(&'static str, Value)>,
+    ) -> Result<(), String> {
         self.validate_op(op, &fields)?;
         self.log_arrangement(op, fields);
         Ok(())
@@ -560,7 +639,11 @@ impl Engine {
                         },
                     );
                 }
-                Event::Arrangement { op, fields, at_frame } => {
+                Event::Arrangement {
+                    op,
+                    fields,
+                    at_frame,
+                } => {
                     // Fail loud: replaying into an engine without the op's handler
                     // would otherwise schedule an op that is silently dropped at
                     // apply (release: `debug_assert` only), yielding a session
@@ -628,7 +711,9 @@ impl Engine {
                 // debug-asserted, skipped in release, replay reproduces it.
                 match self.node_of.get(plugin) {
                     Some(&node) => self.graph.set_param(node, param, value),
-                    None => debug_assert!(false, "set_param endpoint '{plugin}' not mounted at apply"),
+                    None => {
+                        debug_assert!(false, "set_param endpoint '{plugin}' not mounted at apply")
+                    }
                 }
             }
             SchedEvent::Arrangement { op, fields } => {
@@ -641,7 +726,10 @@ impl Engine {
                             debug_assert!(false, "arrangement op '{op}' refused at apply: {e}");
                         }
                     }
-                    None => debug_assert!(false, "arrangement op '{op}' has no registered handler at apply"),
+                    None => debug_assert!(
+                        false,
+                        "arrangement op '{op}' has no registered handler at apply"
+                    ),
                 }
             }
         }
@@ -706,7 +794,13 @@ impl Engine {
     /// a stereo master, so a mixer Mount/Unmount is exactly the class that a
     /// fixed-width output buffer cannot represent mid-call.
     fn changes_master_width(event: &SchedEvent) -> bool {
-        matches!(event, SchedEvent::Mount { plugin: "mixer", .. } | SchedEvent::Unmount { plugin: "mixer" })
+        matches!(
+            event,
+            SchedEvent::Mount {
+                plugin: "mixer",
+                ..
+            } | SchedEvent::Unmount { plugin: "mixer" }
+        )
     }
 
     /// Render `frames` samples (frames * channels, interleaved) into a fresh
@@ -790,7 +884,13 @@ impl Engine {
             }
         }
         let tail_frames = (tail.len() / ch) as u64;
-        (tail, DrainOutcome { tail_frames, capped })
+        (
+            tail,
+            DrainOutcome {
+                tail_frames,
+                capped,
+            },
+        )
     }
 
     /// Render into a caller-provided buffer, in fixed-size blocks.
@@ -833,7 +933,11 @@ impl Engine {
         let mut pos = self.clock.frame();
         let mut written = 0usize;
         loop {
-            let next = self.scheduler.peek_frame().filter(|f| *f < f1).unwrap_or(f1);
+            let next = self
+                .scheduler
+                .peek_frame()
+                .filter(|f| *f < f1)
+                .unwrap_or(f1);
             if next > pos {
                 let flen = (next - pos) as usize;
                 let slen = flen * ch;
@@ -863,7 +967,10 @@ impl Engine {
                             // apply it). The debug assert keeps the contract
                             // violation loud in development.
                             self.parked.push(event);
-                            debug_assert!(false, "an arrangement op reached the render stack; flush_scheduled before rendering");
+                            debug_assert!(
+                                false,
+                                "an arrangement op reached the render stack; flush_scheduled before rendering"
+                            );
                             continue;
                         }
                         if Self::changes_master_width(&event) {

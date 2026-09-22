@@ -54,7 +54,11 @@ impl DriftCompensator {
             }
             let frac = (self.pos - i as f64) as f32;
             let a = self.pending[i];
-            let b = if i + 1 < self.pending.len() { self.pending[i + 1] } else { a };
+            let b = if i + 1 < self.pending.len() {
+                self.pending[i + 1]
+            } else {
+                a
+            };
             out[written] = a + (b - a) * frac;
             written += 1;
             self.pos += self.ratio;
@@ -112,7 +116,16 @@ mod tests {
 
     impl Device {
         fn new(in_rate: u32, out_rate: u32) -> Self {
-            Device { in_rate, out_rate, acc: 0.0, fed: 0, tone: Tone { rate: in_rate, phase: 0.0 } }
+            Device {
+                in_rate,
+                out_rate,
+                acc: 0.0,
+                fed: 0,
+                tone: Tone {
+                    rate: in_rate,
+                    phase: 0.0,
+                },
+            }
         }
 
         /// Feed the compensator the frames the device delivered for one output
@@ -130,7 +143,11 @@ mod tests {
     /// Run `blocks` output blocks with the device delivering exactly
     /// in_rate/out_rate frames per output frame. Returns (total pulled,
     /// pending left, min pull, max pull).
-    fn run(c: &mut DriftCompensator, dev: &mut Device, blocks: usize) -> (usize, usize, usize, usize) {
+    fn run(
+        c: &mut DriftCompensator,
+        dev: &mut Device,
+        blocks: usize,
+    ) -> (usize, usize, usize, usize) {
         let mut out = vec![0.0f32; 512];
         let (mut total, mut min_pull, mut max_pull) = (0usize, usize::MAX, 0usize);
         for _ in 0..blocks {

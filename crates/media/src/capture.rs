@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use engine::{AudioNode, EventBuf, NodeIO, NoteEvent, RenderBlock, Trigger, CAP_EVENTS};
+use engine::{AudioNode, CAP_EVENTS, EventBuf, NodeIO, NoteEvent, RenderBlock, Trigger};
 
 use crate::peaks::{PeakBuilder, PeakFile};
 use crate::ring::Spsc;
@@ -60,12 +60,18 @@ impl Capture {
         if !(1..=8).contains(&channels) {
             return Err(format!("capture channels must be 1..=8, got {channels}"));
         }
-        if !take_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-            return Err(format!("take id '{take_id}' must be [A-Za-z0-9_-]+ (it goes into filenames)"));
+        if !take_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(format!(
+                "take id '{take_id}' must be [A-Za-z0-9_-]+ (it goes into filenames)"
+            ));
         }
         std::fs::create_dir_all(pool_dir).map_err(|e| format!("pool dir: {e}"))?;
-        let channel_rings: Vec<Arc<Spsc<f32>>> =
-            (0..channels).map(|_| Arc::new(Spsc::new(1 << 16))).collect();
+        let channel_rings: Vec<Arc<Spsc<f32>>> = (0..channels)
+            .map(|_| Arc::new(Spsc::new(1 << 16)))
+            .collect();
         let stop = Arc::new(AtomicBool::new(false));
         let err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let frames = Arc::new(AtomicU64::new(0));
@@ -81,7 +87,12 @@ impl Capture {
         // not silently record nothing).
         let mut writers: Vec<Option<ChannelWriter>> = Vec::with_capacity(channels);
         for k in 0..channels {
-            writers.push(Some(ChannelWriter::open(&pool_dir, &take_id, k, sample_rate)?));
+            writers.push(Some(ChannelWriter::open(
+                &pool_dir,
+                &take_id,
+                k,
+                sample_rate,
+            )?));
         }
 
         // One drift compensator per channel (it is mono): convert the device
@@ -116,7 +127,8 @@ impl Capture {
                             if !buf.is_empty() {
                                 *err2.lock().unwrap() = Some(format!(
                                     "capture stopped with a partial frame ({}/{} samples) dropped",
-                                    buf.len() % channels, channels
+                                    buf.len() % channels,
+                                    channels
                                 ));
                             }
                             break;
@@ -247,7 +259,13 @@ impl ChannelWriter {
         Ok(())
     }
 
-    fn finish(mut self, pool_dir: &Path, take_id: &str, k: usize, sample_rate: u32) -> Result<(), String> {
+    fn finish(
+        mut self,
+        pool_dir: &Path,
+        take_id: &str,
+        k: usize,
+        sample_rate: u32,
+    ) -> Result<(), String> {
         self.writer.finalize()?;
         let peaks_path = pool_dir.join(format!("{take_id}.ch{k}.peaks"));
         PeakFile::write(&peaks_path, &mut self.peaks, sample_rate)?;
@@ -375,7 +393,15 @@ mod tests {
         let channels = 1u32;
         let dev_frames = session_sr as u64; // 1 s of device frames
         let source = Arc::new(Spsc::new(1 << 18));
-        let cap = Capture::start(&dir, "drift1", channels as usize, session_sr, input_sr, source.clone()).unwrap();
+        let cap = Capture::start(
+            &dir,
+            "drift1",
+            channels as usize,
+            session_sr,
+            input_sr,
+            source.clone(),
+        )
+        .unwrap();
 
         // feed a 440 Hz tone at the DEVICE clock
         let mut phase = 0.0f64;
@@ -397,11 +423,17 @@ mod tests {
         // remainder; ± a couple for the batch-pull tail).
         let expected = (dev_frames as f64 * session_sr as f64 / input_sr as f64).round() as i64;
         let got = r.total_frames() as i64;
-        assert!((got - expected).abs() <= 4, "drifted take must land in session frames, got {got} (expected ~{expected})");
+        assert!(
+            (got - expected).abs() <= 4,
+            "drifted take must land in session frames, got {got} (expected ~{expected})"
+        );
         // pitch preserved: zero-crossings over the recorded span ≈ 440 * seconds * 2
         let mut back = vec![0.0f32; r.total_frames() as usize];
         let n = r.read_into(&mut back);
-        let crossings = back[..n].windows(2).filter(|w| (w[0] > 0.0) != (w[1] > 0.0)).count();
+        let crossings = back[..n]
+            .windows(2)
+            .filter(|w| (w[0] > 0.0) != (w[1] > 0.0))
+            .count();
         let expect_cross = 440.0 * (got as f64 / session_sr as f64) * 2.0;
         assert!(
             (crossings as f64 - expect_cross).abs() < expect_cross * 0.02,

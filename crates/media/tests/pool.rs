@@ -4,9 +4,9 @@
 use std::mem;
 use std::path::PathBuf;
 
+use media::Pool;
 use media::peaks::PeakFile;
 use media::wav::{WavReader, WavWriter};
-use media::Pool;
 
 fn tmp_dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("media-pool-{name}-{}", std::process::id()));
@@ -173,7 +173,12 @@ fn import_converts_a_foreign_rate_once() {
         "440 Hz over 1 s should cross zero ~880 times, got {crossings}"
     );
     let middle = &audio[256..audio.len() - 256];
-    let rms = (middle.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>() / middle.len() as f64).sqrt();
+    let rms = (middle
+        .iter()
+        .map(|s| (*s as f64) * (*s as f64))
+        .sum::<f64>()
+        / middle.len() as f64)
+        .sqrt();
     assert!(
         (rms - 0.5 / std::f64::consts::SQRT_2).abs() < 0.01,
         "level changed on import: rms {rms:.4}"
@@ -215,7 +220,11 @@ fn conform_brings_a_hand_filled_pool_to_the_session_rate() {
     let pool = Pool::open(&dir).unwrap();
     let report = pool.conform(48_000).unwrap();
 
-    assert_eq!(report.converted.len(), 1, "only the foreign source is touched");
+    assert_eq!(
+        report.converted.len(),
+        1,
+        "only the foreign source is touched"
+    );
     let done = &report.converted[0];
     assert_eq!(done.id, "old.ch0");
     assert_eq!((done.from_rate, done.to_rate), (44_100, 48_000));
@@ -229,7 +238,11 @@ fn conform_brings_a_hand_filled_pool_to_the_session_rate() {
 
     // The pool now reads as one rate, with peaks rebuilt for the new length.
     let index = pool.list().unwrap();
-    assert_eq!(index.sources.len(), 2, "the preserved original is not a source");
+    assert_eq!(
+        index.sources.len(),
+        2,
+        "the preserved original is not a source"
+    );
     assert!(index.sources.iter().all(|s| s.sample_rate == 48_000));
     let (_, _, frames, rate, _) = PeakFile::read(&dir.join("old.ch0.peaks")).unwrap();
     assert_eq!((frames, rate), (48_000, 48_000));
@@ -248,8 +261,14 @@ fn import_and_conform_refuse_what_they_cannot_do() {
     write_finalized(&dir, "s1", 1000, 44_100, 0.1); // foreign, so conform has work
     let pool = Pool::open(&dir).unwrap();
 
-    assert!(pool.import(&dir.join("s1.wav"), 0).is_err(), "zero session rate");
-    assert!(pool.import(&dir.join("missing.wav"), 48_000).is_err(), "missing source");
+    assert!(
+        pool.import(&dir.join("s1.wav"), 0).is_err(),
+        "zero session rate"
+    );
+    assert!(
+        pool.import(&dir.join("missing.wav"), 48_000).is_err(),
+        "missing source"
+    );
     assert!(pool.conform(0).is_err(), "zero session rate");
 
     // An unreadable file is reported, not fatal: the readable one still conforms.

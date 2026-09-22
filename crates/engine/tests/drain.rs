@@ -15,20 +15,52 @@ const SR: u32 = 48_000;
 
 fn engine() -> Engine {
     let mut e = Engine::new(SR, 120.0, 4);
-    e.register_factory("euclidean", plugins::euclidean_factory, plugins::euclidean::EUCLIDEAN_PORTS, &[]);
-    e.register_factory("scale", plugins::scale_factory, plugins::scale::SCALE_PORTS, &[]);
-    e.register_factory("tone", plugins::tone_factory, plugins::tone::TONE_PORTS, plugins::tone::TONE_PARAMS);
-    e.register_factory("mixer", plugins::mixer_factory, plugins::mixer::MIXER_PORTS, plugins::mixer::MIXER_PARAMS);
+    e.register_factory(
+        "euclidean",
+        plugins::euclidean_factory,
+        plugins::euclidean::EUCLIDEAN_PORTS,
+        &[],
+    );
+    e.register_factory(
+        "scale",
+        plugins::scale_factory,
+        plugins::scale::SCALE_PORTS,
+        &[],
+    );
+    e.register_factory(
+        "tone",
+        plugins::tone_factory,
+        plugins::tone::TONE_PORTS,
+        plugins::tone::TONE_PARAMS,
+    );
+    e.register_factory(
+        "mixer",
+        plugins::mixer_factory,
+        plugins::mixer::MIXER_PORTS,
+        plugins::mixer::MIXER_PARAMS,
+    );
     e
 }
 
 /// euclidean → scale → tone → mixer.ch0 (the blip chain).
 fn mount_blip_chain(e: &mut Engine, blip_len: f32) {
-    e.mount("euclidean", &[("steps", 8.0), ("pulses", 1.0), ("rotation", 0.0), ("pulses_per_beat", 4.0)]).unwrap();
-    e.mount("scale", &[("root", 0.0), ("note_len", 2_400.0)]).unwrap();
-    e.mount("tone", &[("gain", 0.9), ("blip_len", blip_len)]).unwrap();
+    e.mount(
+        "euclidean",
+        &[
+            ("steps", 8.0),
+            ("pulses", 1.0),
+            ("rotation", 0.0),
+            ("pulses_per_beat", 4.0),
+        ],
+    )
+    .unwrap();
+    e.mount("scale", &[("root", 0.0), ("note_len", 2_400.0)])
+        .unwrap();
+    e.mount("tone", &[("gain", 0.9), ("blip_len", blip_len)])
+        .unwrap();
     e.mount("mixer", &[]).unwrap();
-    e.patch(("euclidean", "triggers"), ("scale", "trigger")).unwrap();
+    e.patch(("euclidean", "triggers"), ("scale", "trigger"))
+        .unwrap();
     e.patch(("scale", "note"), ("tone", "note")).unwrap();
     e.patch(("tone", "audio"), ("mixer", "ch0")).unwrap();
 }
@@ -43,7 +75,10 @@ fn engine_with_a_live_blip(blip_len: f32) -> Engine {
         e.render(256);
         rendered += 256;
     }
-    assert!(e.graph.has_tail(), "the blip chain must start a blip within 4 s");
+    assert!(
+        e.graph.has_tail(),
+        "the blip chain must start a blip within 4 s"
+    );
     e
 }
 
@@ -53,7 +88,10 @@ fn drain_emits_the_blip_tail_that_a_hard_cut_drops() {
     let ch = e.graph.out_channels().max(1);
 
     let (out, outcome) = e.render_with_drain(1_000, DrainPolicy::Tails, MAX_DRAIN_FRAMES);
-    assert!(outcome.tail_frames > 0, "a sounding blip must produce a tail");
+    assert!(
+        outcome.tail_frames > 0,
+        "a sounding blip must produce a tail"
+    );
     assert!(!outcome.capped, "a 20k blip drains well inside the bound");
     assert_eq!(out.len(), (1_000 + outcome.tail_frames as usize) * ch);
 
@@ -71,7 +109,11 @@ fn hard_cut_keeps_the_pre_drain_behaviour() {
     let ch = e.graph.out_channels().max(1);
 
     let (out, outcome) = e.render_with_drain(1_000, DrainPolicy::HardCut, MAX_DRAIN_FRAMES);
-    assert_eq!(outcome, DrainOutcome::default(), "a hard cut drains nothing");
+    assert_eq!(
+        outcome,
+        DrainOutcome::default(),
+        "a hard cut drains nothing"
+    );
     assert_eq!(out.len(), 1_000 * ch, "the buffer is exactly the timeline");
 }
 
@@ -84,7 +126,10 @@ fn drain_is_bounded_and_reports_the_cap() {
 
     let (out, outcome) = e.render_with_drain(100, DrainPolicy::Tails, 4_096);
     assert!(outcome.capped, "a tail beyond the bound must report capped");
-    assert_eq!(outcome.tail_frames, 4_096, "the drain stops exactly at the bound");
+    assert_eq!(
+        outcome.tail_frames, 4_096,
+        "the drain stops exactly at the bound"
+    );
     assert_eq!(out.len(), (100 + 4_096) * ch);
 }
 
@@ -96,7 +141,8 @@ fn a_drained_render_is_deterministic() {
     // logging — the drain is not yet a logged event.)
     let run = || {
         let mut e = engine_with_a_live_blip(20_000.0);
-        e.render_with_drain(1_000, DrainPolicy::Tails, MAX_DRAIN_FRAMES).0
+        e.render_with_drain(1_000, DrainPolicy::Tails, MAX_DRAIN_FRAMES)
+            .0
     };
     assert_eq!(run(), run(), "a drained render must be deterministic");
 }
@@ -152,12 +198,19 @@ fn drain_flushes_in_flight_pdc_samples() {
         .insert_before(
             mixer,
             NodeKind::Opaque(Box::new(LatencyOnly)),
-            vec![Port::audio("in", Direction::In), Port::audio("audio", Direction::Out)],
+            vec![
+                Port::audio("in", Direction::In),
+                Port::audio("audio", Direction::Out),
+            ],
         )
         .unwrap();
     let src = e
         .graph
-        .insert_before(lat, NodeKind::Sine(Sine::new(440.0)), vec![Port::audio("audio", Direction::Out)])
+        .insert_before(
+            lat,
+            NodeKind::Sine(Sine::new(440.0)),
+            vec![Port::audio("audio", Direction::Out)],
+        )
         .unwrap();
     e.graph.connect(src, "audio", lat, "in").unwrap();
     e.graph.connect(lat, "audio", mixer, "ch0").unwrap();
@@ -168,7 +221,10 @@ fn drain_flushes_in_flight_pdc_samples() {
 
     let ch = e.graph.out_channels().max(1);
     let (tail, outcome) = e.drain(MAX_DRAIN_FRAMES);
-    assert!(outcome.tail_frames > 0, "in-flight samples must not be dropped");
+    assert!(
+        outcome.tail_frames > 0,
+        "in-flight samples must not be dropped"
+    );
     assert!(!outcome.capped);
     assert_eq!(tail.len(), outcome.tail_frames as usize * ch);
     assert!(

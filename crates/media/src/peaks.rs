@@ -169,13 +169,18 @@ impl PeakFile {
         builder.finalize();
         let tmp = PathBuf::from(format!("{}.tmp", path.display()));
         let write = || -> Result<(), String> {
-            let file = File::create(&tmp).map_err(|e| format!("peaks create {}: {e}", tmp.display()))?;
+            let file =
+                File::create(&tmp).map_err(|e| format!("peaks create {}: {e}", tmp.display()))?;
             let mut w = BufWriter::new(file);
             w.write_all(PEAK_MAGIC).map_err(|e| e.to_string())?;
-            w.write_all(&(PEAK_BASE_BIN as u32).to_le_bytes()).map_err(|e| e.to_string())?;
-            w.write_all(&(PEAK_LEVELS as u8).to_le_bytes()).map_err(|e| e.to_string())?;
-            w.write_all(&builder.frames().to_le_bytes()).map_err(|e| e.to_string())?;
-            w.write_all(&sample_rate.to_le_bytes()).map_err(|e| e.to_string())?;
+            w.write_all(&(PEAK_BASE_BIN as u32).to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            w.write_all(&(PEAK_LEVELS as u8).to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            w.write_all(&builder.frames().to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            w.write_all(&sample_rate.to_le_bytes())
+                .map_err(|e| e.to_string())?;
             let mut level_min = builder.base_min.clone();
             let mut level_max = builder.base_max.clone();
             for _ in 0..PEAK_LEVELS {
@@ -224,7 +229,9 @@ impl PeakFile {
             f.read_exact(&mut u32b).map_err(|e| e.to_string())?;
             let n = u32::from_le_bytes(u32b) as usize;
             if n > max_bins {
-                return Err(format!("peaks level length {n} exceeds the source's frame count"));
+                return Err(format!(
+                    "peaks level length {n} exceeds the source's frame count"
+                ));
             }
             let mut mn = vec![0.0f32; n];
             let mut mx = vec![0.0f32; n];
@@ -243,22 +250,29 @@ impl PeakFile {
 }
 
 fn write_level(w: &mut impl Write, mn: &[f32], mx: &[f32]) -> Result<(), String> {
-    w.write_all(&(mn.len() as u32).to_le_bytes()).map_err(|e| e.to_string())?;
+    w.write_all(&(mn.len() as u32).to_le_bytes())
+        .map_err(|e| e.to_string())?;
     for v in mn {
-        w.write_all(&v.to_bits().to_le_bytes()).map_err(|e| e.to_string())?;
+        w.write_all(&v.to_bits().to_le_bytes())
+            .map_err(|e| e.to_string())?;
     }
     for v in mx {
-        w.write_all(&v.to_bits().to_le_bytes()).map_err(|e| e.to_string())?;
+        w.write_all(&v.to_bits().to_le_bytes())
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
 
 fn pair_min(v: &[f32]) -> Vec<f32> {
-    v.chunks(2).map(|p| p.iter().copied().fold(f32::INFINITY, f32::min)).collect()
+    v.chunks(2)
+        .map(|p| p.iter().copied().fold(f32::INFINITY, f32::min))
+        .collect()
 }
 
 fn pair_max(v: &[f32]) -> Vec<f32> {
-    v.chunks(2).map(|p| p.iter().copied().fold(f32::NEG_INFINITY, f32::max)).collect()
+    v.chunks(2)
+        .map(|p| p.iter().copied().fold(f32::NEG_INFINITY, f32::max))
+        .collect()
 }
 
 #[cfg(test)]
@@ -286,9 +300,17 @@ mod tests {
             let window = &samples[bin * PEAK_BASE_BIN..(bin + 1) * PEAK_BASE_BIN];
             let expect_min = window.iter().copied().fold(f32::INFINITY, f32::min);
             let expect_max = window.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let Some((lo, hi)) = b.base_minmax(bin) else { panic!("bin {bin} should exist") };
-            assert!((lo - expect_min).abs() < 1e-7, "bin {bin} min {lo} vs {expect_min}");
-            assert!((hi - expect_max).abs() < 1e-7, "bin {bin} max {hi} vs {expect_max}");
+            let Some((lo, hi)) = b.base_minmax(bin) else {
+                panic!("bin {bin} should exist")
+            };
+            assert!(
+                (lo - expect_min).abs() < 1e-7,
+                "bin {bin} min {lo} vs {expect_min}"
+            );
+            assert!(
+                (hi - expect_max).abs() < 1e-7,
+                "bin {bin} max {hi} vs {expect_max}"
+            );
         }
     }
 
@@ -298,7 +320,10 @@ mod tests {
         let mut phase = 0.0f64;
         b.push(&sine_block(440.0, 48_000, 4096, &mut phase));
         let (lo, hi) = b.range_minmax(1000, 2000).unwrap();
-        assert!(lo < 0.0 && hi > 0.0, "a sine crosses zero in any window: {lo}..{hi}");
+        assert!(
+            lo < 0.0 && hi > 0.0,
+            "a sine crosses zero in any window: {lo}..{hi}"
+        );
     }
 
     #[test]
@@ -310,8 +335,16 @@ mod tests {
         // level k+1 min <= level k min over the same footprint (never tighter)
         for (k, (mn, mx)) in levels.iter().enumerate().take(PEAK_LEVELS - 1) {
             for i in 0..levels[k + 1].0.len() {
-                assert!(levels[k + 1].0[i] <= mn[i * 2], "level {} min must be <= level {k}", k + 1);
-                assert!(levels[k + 1].1[i] >= mx[i * 2], "level {} max must be >= level {k}", k + 1);
+                assert!(
+                    levels[k + 1].0[i] <= mn[i * 2],
+                    "level {} min must be <= level {k}",
+                    k + 1
+                );
+                assert!(
+                    levels[k + 1].1[i] >= mx[i * 2],
+                    "level {} max must be >= level {k}",
+                    k + 1
+                );
             }
         }
     }

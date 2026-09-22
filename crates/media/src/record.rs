@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use engine::{AudioNode, EventBuf, NodeIO, NoteEvent, RenderBlock, Trigger, CAP_EVENTS};
+use engine::{AudioNode, CAP_EVENTS, EventBuf, NodeIO, NoteEvent, RenderBlock, Trigger};
 
 use crate::ring::Spsc;
 use crate::stream::DEFAULT_RING_CAPACITY;
@@ -83,13 +83,17 @@ impl WavRecorder {
                             None => break,
                         }
                     }
-                    if n > 0 && let Err(e) = writer.write(&buf[..n]) {
+                    if n > 0
+                        && let Err(e) = writer.write(&buf[..n])
+                    {
                         *err2.lock().unwrap() = Some(e);
                         return;
                     }
                     // Flush every chunk: a crashed take (no finalize) must not
                     // lose the tail sitting in the writer's buffer.
-                    if n > 0 && let Err(e) = writer.flush() {
+                    if n > 0
+                        && let Err(e) = writer.flush()
+                    {
                         *err2.lock().unwrap() = Some(e);
                         return;
                     }
@@ -226,7 +230,10 @@ mod tests {
         rec.stop().unwrap();
         drop(rec);
 
-        assert_eq!(crate::wav::WavReader::open(&path).unwrap().total_frames(), n);
+        assert_eq!(
+            crate::wav::WavReader::open(&path).unwrap().total_frames(),
+            n
+        );
         let mut r = crate::wav::WavReader::open(&path).unwrap();
         let mut back = vec![0.0f32; n as usize];
         assert_eq!(r.read_into(&mut back), n as usize);
@@ -238,7 +245,8 @@ mod tests {
 
     #[test]
     fn recorder_ignores_pushes_after_stop() {
-        let path = std::env::temp_dir().join(format!("media-record-stop-{}.wav", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("media-record-stop-{}.wav", std::process::id()));
         let rec: Arc<dyn Recorder> = Arc::new(WavRecorder::start(&path, 48_000).unwrap());
         for _ in 0..100 {
             rec.push(0.25);
@@ -246,7 +254,10 @@ mod tests {
         rec.stop().unwrap();
         rec.push(0.5); // must be ignored
         drop(rec);
-        assert_eq!(crate::wav::WavReader::open(&path).unwrap().total_frames(), 100);
+        assert_eq!(
+            crate::wav::WavReader::open(&path).unwrap().total_frames(),
+            100
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -46,21 +46,33 @@ fn media_commands_are_logged_in_the_session_log() {
     let out = dir.join("out.wav");
 
     let mut s = HostSession::new();
-    s.execute(&HostCommand::Mount { plugin: "mixer", params: vec![("channels", 2.0)], at_frame: None })
-        .expect("mount mixer");
-    s.execute(&HostCommand::Pool { dir: dir.clone() }).expect("pool");
+    s.execute(&HostCommand::Mount {
+        plugin: "mixer",
+        params: vec![("channels", 2.0)],
+        at_frame: None,
+    })
+    .expect("mount mixer");
+    s.execute(&HostCommand::Pool { dir: dir.clone() })
+        .expect("pool");
     s.execute(&HostCommand::Play {
         clip: media::ClipRef::whole(&clip).expect("clip"),
         channel: 0,
         at_frame: None,
     })
     .expect("play");
-    s.execute(&HostCommand::Bounce { frames: 512, path: out.clone() }).expect("bounce");
+    s.execute(&HostCommand::Bounce {
+        frames: 512,
+        path: out.clone(),
+    })
+    .expect("bounce");
 
     let ops = arranges(&s);
     assert!(ops.contains(&"MediaPool"), "pool must be logged: {ops:?}");
     assert!(ops.contains(&"MediaPlay"), "play must be logged: {ops:?}");
-    assert!(ops.contains(&"MediaBounce"), "bounce records must be logged: {ops:?}");
+    assert!(
+        ops.contains(&"MediaBounce"),
+        "bounce records must be logged: {ops:?}"
+    );
     // The log and the host's media counter agree (one record per command).
     assert_eq!(ops.len(), s.media_command_count());
 }
@@ -104,15 +116,21 @@ fn replay_rejects_a_media_op_with_no_registered_handler() {
         at_frame: 0,
     });
     let mut engine = engine::Engine::new(SR, 120.0, 4);
-    let err = engine.replay_from(&log).expect_err("a handler-less op must be refused");
+    let err = engine
+        .replay_from(&log)
+        .expect_err("a handler-less op must be refused");
     assert!(err.contains("no handler"), "got: {err}");
 }
 
 #[test]
 fn backward_seek_lands_before_a_later_state_change() {
     let mut s = HostSession::new();
-    s.execute(&HostCommand::Mount { plugin: "mixer", params: vec![("channels", 2.0)], at_frame: None })
-        .expect("mount mixer");
+    s.execute(&HostCommand::Mount {
+        plugin: "mixer",
+        params: vec![("channels", 2.0)],
+        at_frame: None,
+    })
+    .expect("mount mixer");
     // A state command that takes effect at frame 5000 (it renders the clock there).
     s.execute(&HostCommand::SetParam {
         plugin: "mixer",
@@ -125,6 +143,11 @@ fn backward_seek_lands_before_a_later_state_change() {
 
     // Seeking back before it must land at the target, not be a no-op forced
     // forward by the later command's frame.
-    s.execute(&HostCommand::TransportSeek { frame: 1_000 }).expect("seek");
-    assert_eq!(s.position().frame, 1_000, "a backward seek must land at its target");
+    s.execute(&HostCommand::TransportSeek { frame: 1_000 })
+        .expect("seek");
+    assert_eq!(
+        s.position().frame,
+        1_000,
+        "a backward seek must land at its target"
+    );
 }

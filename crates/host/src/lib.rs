@@ -29,7 +29,9 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use engine::*;
-use media::{ClipRef, FilePlayer, Interner, Mailbox, PlaybackNode, SpliceCmd, DEFAULT_RING_CAPACITY};
+use media::{
+    ClipRef, DEFAULT_RING_CAPACITY, FilePlayer, Interner, Mailbox, PlaybackNode, SpliceCmd,
+};
 
 pub mod live;
 pub mod media_ops;
@@ -47,12 +49,48 @@ pub const HOST_PORTS: &[&str] = &[
     "triggers", "trigger", "note", "audio", "ch0", "ch1", "ch2", "ch3", "ch4", "ch5", "ch6", "ch7",
 ];
 pub const HOST_PARAMS: &[&str] = &[
-    "steps", "pulses", "rotation", "pulses_per_beat", "root", "note_len", "gain", "blip_len",
-    "channels", "master.gain",
-    "ch0.gain", "ch0.mute", "ch0.solo", "ch0.pan", "ch1.gain", "ch1.mute", "ch1.solo", "ch1.pan",
-    "ch2.gain", "ch2.mute", "ch2.solo", "ch2.pan", "ch3.gain", "ch3.mute", "ch3.solo", "ch3.pan",
-    "ch4.gain", "ch4.mute", "ch4.solo", "ch4.pan", "ch5.gain", "ch5.mute", "ch5.solo", "ch5.pan",
-    "ch6.gain", "ch6.mute", "ch6.solo", "ch6.pan", "ch7.gain", "ch7.mute", "ch7.solo", "ch7.pan",
+    "steps",
+    "pulses",
+    "rotation",
+    "pulses_per_beat",
+    "root",
+    "note_len",
+    "gain",
+    "blip_len",
+    "channels",
+    "master.gain",
+    "ch0.gain",
+    "ch0.mute",
+    "ch0.solo",
+    "ch0.pan",
+    "ch1.gain",
+    "ch1.mute",
+    "ch1.solo",
+    "ch1.pan",
+    "ch2.gain",
+    "ch2.mute",
+    "ch2.solo",
+    "ch2.pan",
+    "ch3.gain",
+    "ch3.mute",
+    "ch3.solo",
+    "ch3.pan",
+    "ch4.gain",
+    "ch4.mute",
+    "ch4.solo",
+    "ch4.pan",
+    "ch5.gain",
+    "ch5.mute",
+    "ch5.solo",
+    "ch5.pan",
+    "ch6.gain",
+    "ch6.mute",
+    "ch6.solo",
+    "ch6.pan",
+    "ch7.gain",
+    "ch7.mute",
+    "ch7.solo",
+    "ch7.pan",
 ];
 
 fn in_list(list: &'static [&str], s: &str, what: &str) -> Result<&'static str, String> {
@@ -127,9 +165,7 @@ pub enum HostCommand {
     /// Capture device input into a take (declared for the device path; the
     /// device input path is not wired into the reference host — its refusal
     /// names the gap).
-    Record {
-        take_id: String,
-    },
+    Record { take_id: String },
     /// An arrangement edit (the clip editor's ACID op) — a **logged command**
     /// carrying `at_frame`. The host applies it to the clip editor's value and
     /// wires the arrangement nodes into the mixer before rendering. This is the
@@ -141,15 +177,10 @@ pub enum HostCommand {
     },
     /// Point the host at the media pool (where arrangement clip source paths
     /// resolve). Part of the script so it is self-describing.
-    Pool {
-        dir: PathBuf,
-    },
+    Pool { dir: PathBuf },
     /// Render `frames` from the current position and write the master to a
     /// 16-bit WAV.
-    Bounce {
-        frames: usize,
-        path: PathBuf,
-    },
+    Bounce { frames: usize, path: PathBuf },
 }
 
 impl HostCommand {
@@ -259,10 +290,30 @@ impl HostSession {
     /// incrementally via [`execute`](Self::execute).
     pub fn new() -> Self {
         let mut engine = Engine::new(48_000, 120.0, 4);
-        engine.register_factory("euclidean", plugins::euclidean_factory, plugins::euclidean::EUCLIDEAN_PORTS, &[]);
-        engine.register_factory("scale", plugins::scale_factory, plugins::scale::SCALE_PORTS, &[]);
-        engine.register_factory("tone", plugins::tone_factory, plugins::tone::TONE_PORTS, plugins::tone::TONE_PARAMS);
-        engine.register_factory("mixer", plugins::mixer_factory, plugins::mixer::MIXER_PORTS, plugins::mixer::MIXER_PARAMS);
+        engine.register_factory(
+            "euclidean",
+            plugins::euclidean_factory,
+            plugins::euclidean::EUCLIDEAN_PORTS,
+            &[],
+        );
+        engine.register_factory(
+            "scale",
+            plugins::scale_factory,
+            plugins::scale::SCALE_PORTS,
+            &[],
+        );
+        engine.register_factory(
+            "tone",
+            plugins::tone_factory,
+            plugins::tone::TONE_PORTS,
+            plugins::tone::TONE_PARAMS,
+        );
+        engine.register_factory(
+            "mixer",
+            plugins::mixer_factory,
+            plugins::mixer::MIXER_PORTS,
+            plugins::mixer::MIXER_PARAMS,
+        );
         let media: Arc<Mutex<MediaSession>> = Arc::new(Mutex::new(MediaSession::default()));
         media_ops::register_handlers(&mut engine, media.clone())
             .expect("media op handlers register once on a fresh engine");
@@ -546,7 +597,8 @@ impl HostSession {
             return Ok(());
         }
         self.engine.flush_scheduled();
-        let mixer = self.engine
+        let mixer = self
+            .engine
             .graph
             .out_node
             .ok_or("play requires the mixer to be mounted (mount mixer first)")?;
@@ -583,8 +635,12 @@ impl HostSession {
         if !self.arrange_dirty {
             return Ok(());
         }
-        let Some(resolver) = self.pool_resolver.clone() else { return Ok(()) };
-        let Some(editor) = &self.editor else { return Ok(()) };
+        let Some(resolver) = self.pool_resolver.clone() else {
+            return Ok(());
+        };
+        let Some(editor) = &self.editor else {
+            return Ok(());
+        };
         let timeline = editor.snapshot()?;
         let channels = self.mixer_channels.unwrap_or(4);
         let from_frame = self.engine.clock.frame();
@@ -612,9 +668,18 @@ impl HostSession {
         let mut built: Vec<(String, usize, media::ArrangerNode)> = Vec::new();
         for (ti, track) in timeline.tracks.iter().enumerate() {
             if ti >= channels {
-                return Err(format!("track '{}' has no mixer channel ch{ti} (channels={channels})", track.id));
+                return Err(format!(
+                    "track '{}' has no mixer channel ch{ti} (channels={channels})",
+                    track.id
+                ));
             }
-            let node = media::ArrangerNode::new(track.clone(), &resolver, media::DEFAULT_RING_CAPACITY, self.engine.clock.sample_rate, from_frame)?;
+            let node = media::ArrangerNode::new(
+                track.clone(),
+                &resolver,
+                media::DEFAULT_RING_CAPACITY,
+                self.engine.clock.sample_rate,
+                from_frame,
+            )?;
             // Keep a handle to the node's underrun counter so the host can
             // surface a reader slip even after the node is moved into the graph.
             self.arranger_underruns.push(node.underruns_arc());
@@ -633,7 +698,12 @@ impl HostSession {
             let id = self.engine.graph.insert_before(
                 mixer,
                 engine::NodeKind::Opaque(Box::new(node)),
-                vec![engine::Port { name: "audio", direction: engine::Direction::Out, kind: engine::SignalKind::Audio , channels: 1 }],
+                vec![engine::Port {
+                    name: "audio",
+                    direction: engine::Direction::Out,
+                    kind: engine::SignalKind::Audio,
+                    channels: 1,
+                }],
             )?;
             self.engine
                 .graph
@@ -679,7 +749,10 @@ impl HostSession {
             .saturating_mul(std::mem::size_of::<f32>())
             .saturating_mul(2);
         if budget > Self::MAX_BOUNCE_BYTES {
-            return Err(format!("bounce of {frames} frames exceeds the ~{:.0} MiB budget", Self::MAX_BOUNCE_BYTES / (1 << 20)));
+            return Err(format!(
+                "bounce of {frames} frames exceeds the ~{:.0} MiB budget",
+                Self::MAX_BOUNCE_BYTES / (1 << 20)
+            ));
         }
         Ok(())
     }
@@ -796,7 +869,10 @@ impl HostSession {
     /// The mixer's meters (an "event" the host renders — a shell reads the
     /// same accessor; nothing is computed host-side).
     pub fn meters(&self) -> Option<std::sync::Arc<MeterBank>> {
-        self.engine.ctx.get::<std::sync::Arc<MeterBank>>("mixer.meters").cloned()
+        self.engine
+            .ctx
+            .get::<std::sync::Arc<MeterBank>>("mixer.meters")
+            .cloned()
     }
 
     /// The patch bay's provider registry (a "value" the host interprets —
@@ -960,7 +1036,9 @@ impl HostSession {
 
     /// Whether there is an arrangement edit to undo — the shell's `⟲` button.
     pub fn can_undo(&self) -> bool {
-        self.history.iter().any(|c| matches!(c, HostCommand::Arrange { .. }))
+        self.history
+            .iter()
+            .any(|c| matches!(c, HostCommand::Arrange { .. }))
     }
 
     /// Whether there is an undone edit to redo — the shell's `⟳` button.
@@ -974,7 +1052,12 @@ impl HostSession {
     /// diverge from the one-shot path.
     fn process(&mut self, cmd: &HostCommand) -> Result<(), String> {
         let mut pending_mixer_channels = None;
-        if let HostCommand::Mount { plugin: "mixer", params, .. } = cmd {
+        if let HostCommand::Mount {
+            plugin: "mixer",
+            params,
+            ..
+        } = cmd
+        {
             // The mixer's channel count is the contract's own state. A fraction
             // (e.g. channels=4.5) must be refused, not silently truncated (the
             // review's "float cast" nit), and it must be a sane positive count.
@@ -983,14 +1066,18 @@ impl HostSession {
                 .find(|(name, _)| *name == "channels")
                 .map(|(_, v)| {
                     if !v.is_finite() || *v <= 0.0 || v.fract() != 0.0 {
-                        return Err(format!("mixer channels must be a positive whole number, got {v}"));
+                        return Err(format!(
+                            "mixer channels must be a positive whole number, got {v}"
+                        ));
                     }
                     Ok(*v as usize)
                 })
                 .transpose()?
                 .unwrap_or(4);
             if channels > MIXER_CHANNELS_MAX {
-                return Err(format!("mixer channels {channels} exceeds the max {MIXER_CHANNELS_MAX}"));
+                return Err(format!(
+                    "mixer channels {channels} exceeds the max {MIXER_CHANNELS_MAX}"
+                ));
             }
             // Defer committing the channel count until apply succeeds: a refused
             // re-mount must not overwrite the live mixer's channel count (a
@@ -1064,7 +1151,9 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
     };
     let expected = format!("host v{HOST_API_VERSION}");
     if version_line != expected {
-        return Err(format!("bad version line '{version_line}' (want '{expected}')"));
+        return Err(format!(
+            "bad version line '{version_line}' (want '{expected}')"
+        ));
     }
 
     for (lineno, raw) in lines.enumerate() {
@@ -1094,10 +1183,16 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
                     let Some((k, v)) = w.split_once('=') else {
                         return Err(format!("line {at}: bad param '{w}' (want k=v)"));
                     };
-                    let value = v.parse::<f32>().map_err(|_| format!("line {at}: bad value '{v}'"))?;
+                    let value = v
+                        .parse::<f32>()
+                        .map_err(|_| format!("line {at}: bad value '{v}'"))?;
                     params.push((in_list(HOST_PARAMS, k, "param")?, value));
                 }
-                commands.push(HostCommand::Mount { plugin, params, at_frame });
+                commands.push(HostCommand::Mount {
+                    plugin,
+                    params,
+                    at_frame,
+                });
             }
             "patch" => {
                 let from = port_ref(&words, 1, at)?;
@@ -1107,13 +1202,28 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
             "set_param" => {
                 let plugin = in_list(HOST_PLUGINS, word(&words, 1, at)?, "plugin")?;
                 let param = in_list(HOST_PARAMS, word(&words, 2, at)?, "param")?;
-                let value = word(&words, 3, at)?.parse::<f32>().map_err(|_| format!("line {at}: bad value"))?;
-                commands.push(HostCommand::SetParam { plugin, param, value, at_frame });
+                let value = word(&words, 3, at)?
+                    .parse::<f32>()
+                    .map_err(|_| format!("line {at}: bad value"))?;
+                commands.push(HostCommand::SetParam {
+                    plugin,
+                    param,
+                    value,
+                    at_frame,
+                });
             }
             "set_tempo" => {
-                let bpm = word(&words, 1, at)?.parse().map_err(|_| format!("line {at}: bad bpm"))?;
-                let beats = word(&words, 2, at)?.parse().map_err(|_| format!("line {at}: bad beats"))?;
-                commands.push(HostCommand::SetTempo { bpm, beats_per_bar: beats, at_frame });
+                let bpm = word(&words, 1, at)?
+                    .parse()
+                    .map_err(|_| format!("line {at}: bad bpm"))?;
+                let beats = word(&words, 2, at)?
+                    .parse()
+                    .map_err(|_| format!("line {at}: bad beats"))?;
+                commands.push(HostCommand::SetTempo {
+                    bpm,
+                    beats_per_bar: beats,
+                    at_frame,
+                });
             }
             "unmount" => {
                 let plugin = in_list(HOST_PLUGINS, word(&words, 1, at)?, "plugin")?;
@@ -1133,28 +1243,52 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
                     other => {
                         return Err(format!(
                             "line {at}: unknown transport '{other}' (want play|stop|seek)"
-                        ))
+                        ));
                     }
                 }
             }
             "undo" => commands.push(HostCommand::Undo),
             "redo" => commands.push(HostCommand::Redo),
             "play" => {
-                let clip = ClipRef { path: PathBuf::from(word(&words, 1, at)?), start: 0, len: 0 };
+                let clip = ClipRef {
+                    path: PathBuf::from(word(&words, 1, at)?),
+                    start: 0,
+                    len: 0,
+                };
                 let channel = channel_of(word(&words, 2, at)?, at)?;
-                commands.push(HostCommand::Play { clip, channel, at_frame });
+                commands.push(HostCommand::Play {
+                    clip,
+                    channel,
+                    at_frame,
+                });
             }
             "splice" => {
-                let at_frame = word(&words, 1, at)?.parse().map_err(|_| format!("line {at}: bad frame"))?;
-                let clip = ClipRef { path: PathBuf::from(word(&words, 2, at)?), start: 0, len: 0 };
-                let crossfade = word(&words, 3, at)?.parse().map_err(|_| format!("line {at}: bad crossfade"))?;
-                commands.push(HostCommand::Splice { at_frame, clip, crossfade });
+                let at_frame = word(&words, 1, at)?
+                    .parse()
+                    .map_err(|_| format!("line {at}: bad frame"))?;
+                let clip = ClipRef {
+                    path: PathBuf::from(word(&words, 2, at)?),
+                    start: 0,
+                    len: 0,
+                };
+                let crossfade = word(&words, 3, at)?
+                    .parse()
+                    .map_err(|_| format!("line {at}: bad crossfade"))?;
+                commands.push(HostCommand::Splice {
+                    at_frame,
+                    clip,
+                    crossfade,
+                });
             }
             "record" => {
-                commands.push(HostCommand::Record { take_id: word(&words, 1, at)?.to_string() });
+                commands.push(HostCommand::Record {
+                    take_id: word(&words, 1, at)?.to_string(),
+                });
             }
             "bounce" => {
-                let frames = word(&words, 1, at)?.parse().map_err(|_| format!("line {at}: bad frames"))?;
+                let frames = word(&words, 1, at)?
+                    .parse()
+                    .map_err(|_| format!("line {at}: bad frames"))?;
                 let path = PathBuf::from(word(&words, 2, at)?);
                 commands.push(HostCommand::Bounce { frames, path });
             }
@@ -1199,7 +1333,11 @@ pub fn parse_arrange_line(line: &str) -> Result<(media::ArrangeOp, Option<u64>),
         }
         _ => None,
     };
-    let operands = if words.first() == Some(&"arrange") { &words[1..] } else { &words[..] };
+    let operands = if words.first() == Some(&"arrange") {
+        &words[1..]
+    } else {
+        &words[..]
+    };
     let op = parse_arrange(operands, 1)?;
     Ok((op, at_frame))
 }
@@ -1222,24 +1360,38 @@ pub fn parse_arrange_line(line: &str) -> Result<(media::ArrangeOp, Option<u64>),
 /// arrange chop t0 c0 4 pre @0    # split c0 into 4 contiguous pieces (ids pre.0..pre.3)
 /// ```
 fn parse_arrange(words: &[&str], at: usize) -> Result<media::ArrangeOp, String> {
-    let op = words.first().copied().ok_or_else(|| format!("line {at}: arrange needs an op"))?;
+    let op = words
+        .first()
+        .copied()
+        .ok_or_else(|| format!("line {at}: arrange needs an op"))?;
     // helpers: operand i is `words[i]` — `words[0]` is the op name, so the first
     // real operand (e.g. add_track's track) is `words[1]` = operand 1. Error
     // messages number operands the way a script author counts them (`i`, not i+1).
     let s = |i: usize| -> Result<String, String> {
-        words.get(i).copied().map(str::to_owned)
+        words
+            .get(i)
+            .copied()
+            .map(str::to_owned)
             .ok_or_else(|| format!("line {at}: arrange {op} missing operand {i}"))
     };
     let u = |i: usize| -> Result<u64, String> {
-        s(i)?.parse().map_err(|_| format!("line {at}: arrange {op} operand {i} must be a frame/count"))
+        s(i)?
+            .parse()
+            .map_err(|_| format!("line {at}: arrange {op} operand {i} must be a frame/count"))
     };
     let i64 = |i: usize| -> Result<i64, String> {
-        s(i)?.parse().map_err(|_| format!("line {at}: arrange {op} operand {i} must be an integer"))
+        s(i)?
+            .parse()
+            .map_err(|_| format!("line {at}: arrange {op} operand {i} must be an integer"))
     };
     let f = |i: usize| -> Result<f32, String> {
-        let v: f32 = s(i)?.parse().map_err(|_| format!("line {at}: arrange {op} operand {i} must be a number"))?;
+        let v: f32 = s(i)?
+            .parse()
+            .map_err(|_| format!("line {at}: arrange {op} operand {i} must be a number"))?;
         if !v.is_finite() {
-            return Err(format!("line {at}: arrange {op} operand {i} must be finite (a NaN/inf gain or count reaches the audio path)"));
+            return Err(format!(
+                "line {at}: arrange {op} operand {i} must be finite (a NaN/inf gain or count reaches the audio path)"
+            ));
         }
         Ok(v)
     };
@@ -1248,20 +1400,32 @@ fn parse_arrange(words: &[&str], at: usize) -> Result<media::ArrangeOp, String> 
     // documented optional trailing operand.
     let arity = |n: usize| -> Result<(), String> {
         if words.len() != n {
-            return Err(format!("line {at}: arrange {op} expects {n} words (op + operands), got {}", words.len()));
+            return Err(format!(
+                "line {at}: arrange {op} expects {n} words (op + operands), got {}",
+                words.len()
+            ));
         }
         Ok(())
     };
 
     match op {
-        "add_track" => { arity(2)?; Ok(media::ArrangeOp::AddTrack { track: s(1)? }) }
-        "remove_track" => { arity(2)?; Ok(media::ArrangeOp::RemoveTrack { track: s(1)? }) }
+        "add_track" => {
+            arity(2)?;
+            Ok(media::ArrangeOp::AddTrack { track: s(1)? })
+        }
+        "remove_track" => {
+            arity(2)?;
+            Ok(media::ArrangeOp::RemoveTrack { track: s(1)? })
+        }
         "add_clip" => {
             // add_clip track c0 source src_start src_len at_frame fade_in fade_out gain [loop_len]
             // operands (words[0]=op): track(1) id(2) source(3) src_start(4) src_len(5)
             //                       at_frame(6) fade_in(7) fade_out(8) gain(9) loop_len(10)
             if !(10..=11).contains(&words.len()) {
-                return Err(format!("line {at}: arrange add_clip expects 10 or 11 words (op + 9 operands + optional loop_len), got {}", words.len()));
+                return Err(format!(
+                    "line {at}: arrange add_clip expects 10 or 11 words (op + 9 operands + optional loop_len), got {}",
+                    words.len()
+                ));
             }
             let clip = media::Clip {
                 id: s(2)?,
@@ -1272,33 +1436,112 @@ fn parse_arrange(words: &[&str], at: usize) -> Result<media::ArrangeOp, String> 
                 fade_in: u(7)?,
                 fade_out: u(8)?,
                 gain: f(9)?,
-                loop_len: words.get(10).map(|x| x.parse::<u64>()).transpose().map_err(|_| format!("line {at}: arrange add_clip loop_len must be a count"))?.filter(|v| *v != 0),
+                loop_len: words
+                    .get(10)
+                    .map(|x| x.parse::<u64>())
+                    .transpose()
+                    .map_err(|_| format!("line {at}: arrange add_clip loop_len must be a count"))?
+                    .filter(|v| *v != 0),
             };
             Ok(media::ArrangeOp::AddClip { track: s(1)?, clip })
         }
-        "razor_split" => { arity(6)?; Ok(media::ArrangeOp::RazorSplit {
-            track: s(1)?, clip: s(2)?, new_left: s(3)?, new_right: s(4)?, at_frame: u(5)?,
-        }) }
-        "trim" => { arity(5)?; Ok(media::ArrangeOp::Trim {
-            track: s(1)?, clip: s(2)?,
-            edge: match s(3)?.as_str() { "start" => media::Edge::Start, "end" => media::Edge::End, other => return Err(format!("line {at}: arrange trim edge must be start|end, got '{other}'")) },
-            by_frames: i64(4)?,
-        }) }
-        "move_clip" => { arity(4)?; Ok(media::ArrangeOp::MoveClip { track: s(1)?, clip: s(2)?, at_frame: u(3)? }) }
-        "move_clip_to_track" => { arity(5)?; Ok(media::ArrangeOp::MoveClipToTrack { from: s(1)?, clip: s(2)?, to: s(3)?, at_frame: u(4)? }) }
-        "duplicate" => { arity(4)?; Ok(media::ArrangeOp::Duplicate { track: s(1)?, clip: s(2)?, new_id: s(3)? }) }
-        "delete" => { arity(3)?; Ok(media::ArrangeOp::Delete { track: s(1)?, clip: s(2)? }) }
-        "set_clip_gain" => { arity(4)?; Ok(media::ArrangeOp::SetClipGain { track: s(1)?, clip: s(2)?, gain: f(3)? }) }
-        "set_clip_fade" => { arity(5)?; Ok(media::ArrangeOp::SetClipFade { track: s(1)?, clip: s(2)?, fade_in: u(3)?, fade_out: u(4)? }) }
-        "loop_region" => { arity(4)?; Ok(media::ArrangeOp::LoopRegion {
-            track: s(1)?, clip: s(2)?,
-            times: u32::try_from(u(3)?).map_err(|_| format!("line {at}: arrange loop_region operand 3 must fit a u32 (times)"))?,
-        }) }
-        "chop" => { arity(5)?; Ok(media::ArrangeOp::ChopClip {
-            track: s(1)?, clip: s(2)?,
-            times: u32::try_from(u(3)?).map_err(|_| format!("line {at}: arrange chop operand 3 must fit a u32 (times)"))?,
-            prefix: s(4)?,
-        }) }
+        "razor_split" => {
+            arity(6)?;
+            Ok(media::ArrangeOp::RazorSplit {
+                track: s(1)?,
+                clip: s(2)?,
+                new_left: s(3)?,
+                new_right: s(4)?,
+                at_frame: u(5)?,
+            })
+        }
+        "trim" => {
+            arity(5)?;
+            Ok(media::ArrangeOp::Trim {
+                track: s(1)?,
+                clip: s(2)?,
+                edge: match s(3)?.as_str() {
+                    "start" => media::Edge::Start,
+                    "end" => media::Edge::End,
+                    other => {
+                        return Err(format!(
+                            "line {at}: arrange trim edge must be start|end, got '{other}'"
+                        ));
+                    }
+                },
+                by_frames: i64(4)?,
+            })
+        }
+        "move_clip" => {
+            arity(4)?;
+            Ok(media::ArrangeOp::MoveClip {
+                track: s(1)?,
+                clip: s(2)?,
+                at_frame: u(3)?,
+            })
+        }
+        "move_clip_to_track" => {
+            arity(5)?;
+            Ok(media::ArrangeOp::MoveClipToTrack {
+                from: s(1)?,
+                clip: s(2)?,
+                to: s(3)?,
+                at_frame: u(4)?,
+            })
+        }
+        "duplicate" => {
+            arity(4)?;
+            Ok(media::ArrangeOp::Duplicate {
+                track: s(1)?,
+                clip: s(2)?,
+                new_id: s(3)?,
+            })
+        }
+        "delete" => {
+            arity(3)?;
+            Ok(media::ArrangeOp::Delete {
+                track: s(1)?,
+                clip: s(2)?,
+            })
+        }
+        "set_clip_gain" => {
+            arity(4)?;
+            Ok(media::ArrangeOp::SetClipGain {
+                track: s(1)?,
+                clip: s(2)?,
+                gain: f(3)?,
+            })
+        }
+        "set_clip_fade" => {
+            arity(5)?;
+            Ok(media::ArrangeOp::SetClipFade {
+                track: s(1)?,
+                clip: s(2)?,
+                fade_in: u(3)?,
+                fade_out: u(4)?,
+            })
+        }
+        "loop_region" => {
+            arity(4)?;
+            Ok(media::ArrangeOp::LoopRegion {
+                track: s(1)?,
+                clip: s(2)?,
+                times: u32::try_from(u(3)?).map_err(|_| {
+                    format!("line {at}: arrange loop_region operand 3 must fit a u32 (times)")
+                })?,
+            })
+        }
+        "chop" => {
+            arity(5)?;
+            Ok(media::ArrangeOp::ChopClip {
+                track: s(1)?,
+                clip: s(2)?,
+                times: u32::try_from(u(3)?).map_err(|_| {
+                    format!("line {at}: arrange chop operand 3 must fit a u32 (times)")
+                })?,
+                prefix: s(4)?,
+            })
+        }
         other => Err(format!("line {at}: unknown arrange op '{other}'")),
     }
 }
@@ -1314,18 +1557,27 @@ fn word<'a>(words: &'a [&str], idx: usize, at: usize) -> Result<&'a str, String>
 }
 
 fn port_ref(words: &[&str], idx: usize, at: usize) -> Result<(&'static str, &'static str), String> {
-    let s = words.get(idx).ok_or_else(|| format!("line {at}: expected a plugin.port reference"))?;
+    let s = words
+        .get(idx)
+        .ok_or_else(|| format!("line {at}: expected a plugin.port reference"))?;
     let Some((plugin, port)) = s.split_once('.') else {
-        return Err(format!("line {at}: bad port reference '{s}' (want plugin.port)"));
+        return Err(format!(
+            "line {at}: bad port reference '{s}' (want plugin.port)"
+        ));
     };
-    Ok((in_list(HOST_PLUGINS, plugin, "plugin")?, in_list(HOST_PORTS, port, "port")?))
+    Ok((
+        in_list(HOST_PLUGINS, plugin, "plugin")?,
+        in_list(HOST_PORTS, port, "port")?,
+    ))
 }
 
 fn channel_of(s: &str, at: usize) -> Result<usize, String> {
     let Some(idx) = s.strip_prefix("ch") else {
         return Err(format!("line {at}: bad channel '{s}' (want ch0..ch7)"));
     };
-    let n: usize = idx.parse().map_err(|_| format!("line {at}: bad channel '{s}'"))?;
+    let n: usize = idx
+        .parse()
+        .map_err(|_| format!("line {at}: bad channel '{s}'"))?;
     if n > 7 {
         return Err(format!("line {at}: channel ch{n} out of range (ch0..ch7)"));
     }
@@ -1354,7 +1606,7 @@ mod tests {
     // Only used by the debug-gated poisoning test; gate the import so release
     // clippy (-D warnings) doesn't flag them as unused.
     #[cfg(debug_assertions)]
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     /// No `Arrange` command has run, so there is no editor: `arrangement()` is
     /// `Ok(default)` — the legitimate "nothing built yet" case, never an error.
@@ -1362,7 +1614,9 @@ mod tests {
     fn arrangement_without_an_editor_is_ok_default() {
         let session = HostSession::new();
         assert_eq!(
-            session.arrangement().expect("no editor must be Ok, never Err"),
+            session
+                .arrangement()
+                .expect("no editor must be Ok, never Err"),
             media::Timeline::default(),
             "no editor → the default (empty) timeline"
         );
@@ -1383,15 +1637,23 @@ mod tests {
     #[cfg(debug_assertions)]
     fn arrangement_propagates_an_errored_snapshot_instead_of_an_empty_value() {
         let mut session = HostSession::new();
-        session.ensure_editor().expect("the editor registers its op handlers");
-        let editor = session.editor.as_mut().expect("ensure_editor built the editor");
+        session
+            .ensure_editor()
+            .expect("the editor registers its op handlers");
+        let editor = session
+            .editor
+            .as_mut()
+            .expect("ensure_editor built the editor");
 
         // A valid track + clip so the overflowing SetClipFade reaches the
         // overflow add (an absent clip would refuse before it).
         let mut engine = Engine::new(48_000, 120.0, 4);
         editor.register(&mut engine).expect("register op handlers");
         editor
-            .apply(&mut engine, &media::ArrangeOp::AddTrack { track: "t0".into() })
+            .apply(
+                &mut engine,
+                &media::ArrangeOp::AddTrack { track: "t0".into() },
+            )
             .expect("add track");
         editor
             .apply(
@@ -1426,14 +1688,20 @@ mod tests {
             );
         }))
         .is_err();
-        assert!(poisoned, "the overflowing SetClipFade must panic (overflow check) to poison the lock");
+        assert!(
+            poisoned,
+            "the overflowing SetClipFade must panic (overflow check) to poison the lock"
+        );
 
         // The session survived the contained panic; its snapshot now errors and
         // arrangement() must propagate that Err — never Ok(empty).
         let err = session
             .arrangement()
             .expect_err("a poisoned editor must Err, not return an empty Timeline");
-        assert!(err.contains("poison"), "the error is the snapshot poison, got: {err}");
+        assert!(
+            err.contains("poison"),
+            "the error is the snapshot poison, got: {err}"
+        );
     }
 
     /// Transport play/stop toggles the playing flag; the offline host records
@@ -1455,12 +1723,16 @@ mod tests {
     #[test]
     fn transport_seek_forward_renders_to_target() {
         let mut s = HostSession::new();
-        s.execute(&HostCommand::TransportSeek { frame: 4_800 }).expect("seek");
+        s.execute(&HostCommand::TransportSeek { frame: 4_800 })
+            .expect("seek");
         let p = s.position();
         assert_eq!(p.frame, 4_800, "seek forward renders to the target");
         assert!((p.seconds - 0.1).abs() < 1e-9, "4800 frames @48k = 0.1 s");
         assert!((p.beat - 0.2).abs() < 1e-6, "120 bpm, 0.1 s = 0.2 beats");
-        assert!((p.bpm - 120.0).abs() < 1e-9, "the tempo map reports 120 bpm");
+        assert!(
+            (p.bpm - 120.0).abs() < 1e-9,
+            "the tempo map reports 120 bpm"
+        );
     }
 
     /// Backward seek rebuilds from the state-command history (the core clock
@@ -1476,17 +1748,24 @@ mod tests {
             at_frame: Some(0),
         })
         .expect("mount mixer");
-        s.execute(&HostCommand::Pool { dir: pool.clone() }).expect("pool");
+        s.execute(&HostCommand::Pool { dir: pool.clone() })
+            .expect("pool");
         s.execute(&HostCommand::Arrange {
             op: media::ArrangeOp::AddTrack { track: "t0".into() },
             at_frame: Some(0),
         })
         .expect("add track");
 
-        s.execute(&HostCommand::TransportSeek { frame: 9_600 }).expect("seek forward");
+        s.execute(&HostCommand::TransportSeek { frame: 9_600 })
+            .expect("seek forward");
         assert_eq!(s.position().frame, 9_600);
-        s.execute(&HostCommand::TransportSeek { frame: 1_000 }).expect("seek backward");
-        assert_eq!(s.position().frame, 1_000, "backward seek rebuilds to the target");
+        s.execute(&HostCommand::TransportSeek { frame: 1_000 })
+            .expect("seek backward");
+        assert_eq!(
+            s.position().frame,
+            1_000,
+            "backward seek rebuilds to the target"
+        );
         assert_eq!(
             s.arrangement().expect("arrangement").tracks.len(),
             1,
@@ -1500,15 +1779,31 @@ mod tests {
     #[test]
     fn parse_arrange_line_takes_the_op_and_an_optional_frame() {
         let (op, at) = parse_arrange_line("arrange move_clip t0 c0 9600 @48000").expect("parse");
-        assert!(matches!(op, media::ArrangeOp::MoveClip { at_frame: 9_600, .. }));
+        assert!(matches!(
+            op,
+            media::ArrangeOp::MoveClip {
+                at_frame: 9_600,
+                ..
+            }
+        ));
         assert_eq!(at, Some(48_000));
 
-        let (op, at) = parse_arrange_line("trim t0 c0 end -24000").expect("parse without the keyword");
-        assert!(matches!(op, media::ArrangeOp::Trim { by_frames: -24_000, .. }));
+        let (op, at) =
+            parse_arrange_line("trim t0 c0 end -24000").expect("parse without the keyword");
+        assert!(matches!(
+            op,
+            media::ArrangeOp::Trim {
+                by_frames: -24_000,
+                ..
+            }
+        ));
         assert_eq!(at, None);
 
         assert!(parse_arrange_line("").is_err(), "an empty line is refused");
-        assert!(parse_arrange_line("arrange nonsense t0").is_err(), "an unknown op is refused");
+        assert!(
+            parse_arrange_line("arrange nonsense t0").is_err(),
+            "an unknown op is refused"
+        );
     }
 
     // ---- undo/redo fixtures ----
@@ -1539,7 +1834,11 @@ mod tests {
     }
 
     fn move_clip(id: &str, at: u64) -> media::ArrangeOp {
-        media::ArrangeOp::MoveClip { track: "t0".into(), clip: id.into(), at_frame: at }
+        media::ArrangeOp::MoveClip {
+            track: "t0".into(),
+            clip: id.into(),
+            at_frame: at,
+        }
     }
 
     /// Undo drops the most recent arrangement edit and rebuilds **to the current
@@ -1556,31 +1855,49 @@ mod tests {
             at_frame: Some(0),
         })
         .expect("mount mixer");
-        s.execute(&HostCommand::Pool { dir: pool.clone() }).expect("pool");
+        s.execute(&HostCommand::Pool { dir: pool.clone() })
+            .expect("pool");
         s.execute(&HostCommand::Arrange {
             op: media::ArrangeOp::AddTrack { track: "t0".into() },
             at_frame: None,
         })
         .expect("add track");
-        s.execute(&HostCommand::Arrange { op: add_clip("c0", 0), at_frame: None })
-            .expect("add clip");
+        s.execute(&HostCommand::Arrange {
+            op: add_clip("c0", 0),
+            at_frame: None,
+        })
+        .expect("add clip");
 
         assert!(s.can_undo(), "edits are undoable");
         assert!(!s.can_redo(), "nothing is undone yet");
 
         // Play to 9600 so we can prove an undo does not rewind the playhead.
-        s.execute(&HostCommand::TransportSeek { frame: 9_600 }).expect("seek");
-        s.execute(&HostCommand::Arrange { op: move_clip("c0", 4_800), at_frame: None })
-            .expect("move");
-        assert_eq!(s.arrangement().expect("tl").tracks[0].clips[0].at_frame, 4_800);
+        s.execute(&HostCommand::TransportSeek { frame: 9_600 })
+            .expect("seek");
+        s.execute(&HostCommand::Arrange {
+            op: move_clip("c0", 4_800),
+            at_frame: None,
+        })
+        .expect("move");
+        assert_eq!(
+            s.arrangement().expect("tl").tracks[0].clips[0].at_frame,
+            4_800
+        );
 
-        assert!(s.undo().expect("undo works"), "undo reports an edit was undone");
+        assert!(
+            s.undo().expect("undo works"),
+            "undo reports an edit was undone"
+        );
         assert_eq!(
             s.arrangement().expect("tl").tracks[0].clips[0].at_frame,
             0,
             "the move is reverted"
         );
-        assert_eq!(s.position().frame, 9_600, "undo keeps the playhead where it was");
+        assert_eq!(
+            s.position().frame,
+            9_600,
+            "undo keeps the playhead where it was"
+        );
         assert!(s.can_redo(), "the undone edit can be redone");
 
         assert!(s.redo().expect("redo works"));
@@ -1594,8 +1911,11 @@ mod tests {
         // A new edit discards the redo branch.
         s.undo().expect("undo again");
         assert!(s.can_redo());
-        s.execute(&HostCommand::Arrange { op: move_clip("c0", 20_000), at_frame: None })
-            .expect("a new edit");
+        s.execute(&HostCommand::Arrange {
+            op: move_clip("c0", 20_000),
+            at_frame: None,
+        })
+        .expect("a new edit");
         assert!(!s.can_redo(), "a new edit clears the redo branch");
 
         let _ = std::fs::remove_dir_all(&pool);
@@ -1627,7 +1947,8 @@ mod tests {
 
     /// The transport text grammar parses play / seek / stop.
     #[test]
-    fn transport_lines_parse() {        let cmds = parse_script("host v1\ntransport play\ntransport seek 4800\ntransport stop\n")
+    fn transport_lines_parse() {
+        let cmds = parse_script("host v1\ntransport play\ntransport seek 4800\ntransport stop\n")
             .expect("transport lines parse");
         assert!(matches!(&cmds[0], HostCommand::TransportPlay));
         assert!(matches!(&cmds[2], HostCommand::TransportStop));

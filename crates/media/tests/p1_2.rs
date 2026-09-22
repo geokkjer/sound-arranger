@@ -8,8 +8,8 @@
 //! - the real-hardware device path captures the default input's channels.
 
 use std::f64::consts::TAU;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use engine::*;
@@ -23,10 +23,30 @@ const CENTER: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
 fn engine() -> Engine {
     let mut e = Engine::new(SR, 120.0, 4);
-    e.register_factory("euclidean", plugins::euclidean_factory, plugins::euclidean::EUCLIDEAN_PORTS, &[]);
-    e.register_factory("scale", plugins::scale_factory, plugins::scale::SCALE_PORTS, &[]);
-    e.register_factory("tone", plugins::tone_factory, plugins::tone::TONE_PORTS, plugins::tone::TONE_PARAMS);
-    e.register_factory("mixer", plugins::mixer_factory, plugins::mixer::MIXER_PORTS, plugins::mixer::MIXER_PARAMS);
+    e.register_factory(
+        "euclidean",
+        plugins::euclidean_factory,
+        plugins::euclidean::EUCLIDEAN_PORTS,
+        &[],
+    );
+    e.register_factory(
+        "scale",
+        plugins::scale_factory,
+        plugins::scale::SCALE_PORTS,
+        &[],
+    );
+    e.register_factory(
+        "tone",
+        plugins::tone_factory,
+        plugins::tone::TONE_PORTS,
+        plugins::tone::TONE_PARAMS,
+    );
+    e.register_factory(
+        "mixer",
+        plugins::mixer_factory,
+        plugins::mixer::MIXER_PORTS,
+        plugins::mixer::MIXER_PARAMS,
+    );
     e
 }
 
@@ -39,7 +59,9 @@ struct Device {
 
 impl Device {
     fn new() -> Self {
-        Device { phase: [0.0; CHANNELS] }
+        Device {
+            phase: [0.0; CHANNELS],
+        }
     }
 
     /// Push one interleaved frame (blocks until the source accepts).
@@ -75,7 +97,12 @@ fn capture_into_adaptable_mixer_and_pool() {
         underruns.push(node.underrun_counter());
         capture_ids.push(e.graph.add_node(
             NodeKind::Opaque(Box::new(node)),
-            vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio, channels: 1 }],
+            vec![Port {
+                name: "audio",
+                direction: Direction::Out,
+                kind: SignalKind::Audio,
+                channels: 1,
+            }],
         ));
     }
     // The adaptable mixer (channels = the device's 4) claims the bus.
@@ -83,7 +110,9 @@ fn capture_into_adaptable_mixer_and_pool() {
     e.render(BLOCK); // applies the mixer mount
     let mixer_id = e.graph.out_node.expect("the mixer claims the master bus");
     for (k, id) in capture_ids.iter().enumerate() {
-        e.graph.connect(*id, "audio", mixer_id, &format!("ch{k}")).unwrap();
+        e.graph
+            .connect(*id, "audio", mixer_id, &format!("ch{k}"))
+            .unwrap();
     }
     // The setup render above popped the still-empty rings; the glitch-free
     // claim covers the paced run only.
@@ -150,14 +179,21 @@ fn capture_into_adaptable_mixer_and_pool() {
         assert!(wav_path.exists(), "pool source ch{k}");
         assert!(peaks_path.exists(), "peaks sidecar ch{k}");
         let mut r = WavReader::open(&wav_path).unwrap();
-        assert_eq!(r.total_frames(), fed_frames as u64, "pool source ch{k} holds every fed frame");
+        assert_eq!(
+            r.total_frames(),
+            fed_frames as u64,
+            "pool source ch{k} holds every fed frame"
+        );
         let mut back = vec![0.0f32; fed_frames];
         r.read_into(&mut back);
         let mut phase = 0.0f64;
         for (i, s) in back.iter().enumerate() {
             let expected = (TAU * phase).sin() as f32 * 0.5;
             phase += *freq as f64 / SR as f64;
-            assert_eq!(*s, expected, "pool ch{k} sample {i} round-trips exactly (float)");
+            assert_eq!(
+                *s, expected,
+                "pool ch{k} sample {i} round-trips exactly (float)"
+            );
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -170,13 +206,20 @@ fn mixer_channel_param_is_replayable() {
     let chain = |e: &mut Engine| {
         e.mount(
             "euclidean",
-            &[("steps", 8.0), ("pulses", 1.0), ("rotation", 1.0), ("pulses_per_beat", 4.0)],
+            &[
+                ("steps", 8.0),
+                ("pulses", 1.0),
+                ("rotation", 1.0),
+                ("pulses_per_beat", 4.0),
+            ],
         )
         .unwrap();
         e.mount("scale", &[("root", 0.0)]).unwrap();
-        e.mount("tone", &[("gain", 0.25), ("blip_len", 1200.0)]).unwrap();
+        e.mount("tone", &[("gain", 0.25), ("blip_len", 1200.0)])
+            .unwrap();
         e.mount("mixer", &[("channels", 2.0)]).unwrap();
-        e.patch(("euclidean", "triggers"), ("scale", "trigger")).unwrap();
+        e.patch(("euclidean", "triggers"), ("scale", "trigger"))
+            .unwrap();
         e.patch(("scale", "note"), ("tone", "note")).unwrap();
         e.patch(("tone", "audio"), ("mixer", "ch0")).unwrap();
     };
@@ -184,12 +227,18 @@ fn mixer_channel_param_is_replayable() {
     let mut e1 = engine();
     chain(&mut e1);
     let out1 = e1.render(10_000);
-    assert!(out1[6001..].iter().any(|s| *s != 0.0), "the chain sounds through the 2-ch mixer");
+    assert!(
+        out1[6001..].iter().any(|s| *s != 0.0),
+        "the chain sounds through the 2-ch mixer"
+    );
 
     let mut e2 = engine();
     e2.replay_from(&e1.log).unwrap();
     let out2 = e2.render(10_000);
-    assert_eq!(out1, out2, "the channels param must replay byte-identically");
+    assert_eq!(
+        out1, out2,
+        "the channels param must replay byte-identically"
+    );
 }
 
 /// Real hardware: capture the default input's channels for a moment and land
@@ -217,11 +266,18 @@ fn hardware_capture_lands_pool_sources() {
         let mut r = WavReader::open(&wav_path).unwrap();
         assert!(r.total_frames() > 0, "hardware capture ch{k} holds samples");
         let mut back = vec![0.0f32; r.total_frames() as usize];
-        assert!(r.read_into(&mut back) > 0, "hardware capture ch{k} reads back");
+        assert!(
+            r.read_into(&mut back) > 0,
+            "hardware capture ch{k} reads back"
+        );
         let peaks_path = dir.join(format!("hw.ch{k}.peaks"));
         assert!(peaks_path.exists(), "hardware capture ch{k} peaks");
         let (base_bin, levels, frames, sr, _) = PeakFile::read(&peaks_path).unwrap();
-        assert_eq!((base_bin, sr), (256, rate), "peaks header matches the device");
+        assert_eq!(
+            (base_bin, sr),
+            (256, rate),
+            "peaks header matches the device"
+        );
         assert_eq!(levels, PEAK_LEVELS);
         assert!(frames > 0, "peaks sidecar carries frames");
     }
@@ -301,7 +357,12 @@ fn capture_to_mixer_render_path_does_not_allocate() {
     for k in 0..CHANNELS {
         let id = e.graph.add_node(
             NodeKind::Opaque(Box::new(CaptureNode::new(cap.channel_ring(k)))),
-            vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio, channels: 1 }],
+            vec![Port {
+                name: "audio",
+                direction: Direction::Out,
+                kind: SignalKind::Audio,
+                channels: 1,
+            }],
         );
         capture_ids.push(id);
     }
@@ -309,7 +370,9 @@ fn capture_to_mixer_render_path_does_not_allocate() {
     e.render(BLOCK);
     let mixer = e.graph.out_node.unwrap();
     for (k, id) in capture_ids.iter().enumerate() {
-        e.graph.connect(*id, "audio", mixer, &format!("ch{k}")).unwrap();
+        e.graph
+            .connect(*id, "audio", mixer, &format!("ch{k}"))
+            .unwrap();
     }
 
     let mut out = vec![0.0f32; 8192];
@@ -318,6 +381,10 @@ fn capture_to_mixer_render_path_does_not_allocate() {
     MEASURING.with(|m| m.set(true));
     e.render_into(&mut out);
     MEASURING.with(|m| m.set(false));
-    assert_eq!(ALLOCS.load(Ordering::Relaxed), 0, "capture→mixer render must not allocate");
+    assert_eq!(
+        ALLOCS.load(Ordering::Relaxed),
+        0,
+        "capture→mixer render must not allocate"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

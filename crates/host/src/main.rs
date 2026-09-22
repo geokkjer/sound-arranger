@@ -50,7 +50,11 @@ fn main() {
         .filter(|p| p.exists());
 
     match bounce_path {
-        Some(p) => println!("host: bounced {} bytes to {}", std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0), p.display()),
+        Some(p) => println!(
+            "host: bounced {} bytes to {}",
+            std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0),
+            p.display()
+        ),
         None => eprintln!("host: no bounce written (no Bounce command or it failed)"),
     }
     print!("{}", summarize(&session));

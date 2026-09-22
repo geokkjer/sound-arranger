@@ -39,6 +39,8 @@ impl Context {
     }
 
     pub fn get<T: Any>(&self, key: &'static str) -> Option<&T> {
-        self.services.get(key).and_then(|boxed| boxed.downcast_ref())
+        self.services
+            .get(key)
+            .and_then(|boxed| boxed.downcast_ref())
     }
 }

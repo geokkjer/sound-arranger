@@ -14,22 +14,40 @@
 
 use super::{Disposer, DisposerCtx, ParamDef, Plugin, PluginApi};
 use crate::graph::{
-    AudioNode, Direction, EventBuf, NodeId, NodeIO, NodeKind, NoteEvent, Port, RenderBlock,
-    SignalKind, Trigger, CAP_EVENTS,
+    AudioNode, CAP_EVENTS, Direction, EventBuf, NodeIO, NodeId, NodeKind, NoteEvent, Port,
+    RenderBlock, SignalKind, Trigger,
 };
 use fundsp::prelude32::*;
 
 pub const FUNDSP_PORTS: &[Port] = &[
-    Port { name: "note", direction: Direction::In, kind: SignalKind::Note , channels: 1 },
-    Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio , channels: 1 },
+    Port {
+        name: "note",
+        direction: Direction::In,
+        kind: SignalKind::Note,
+        channels: 1,
+    },
+    Port {
+        name: "audio",
+        direction: Direction::Out,
+        kind: SignalKind::Audio,
+        channels: 1,
+    },
 ];
 
 /// Runtime parameter surface (the logged `SetParam` namespace). These are the
 /// voice-layer params our wrapper applies with zero allocation; the filter
 /// cutoff is a construction (mount) param baked into the fundsp graph.
 pub const FUNDSP_PARAMS: &[ParamDef] = &[
-    ParamDef { name: "gain", min: 0.0, max: 1.0 },
-    ParamDef { name: "env_len", min: 1.0, max: 1_000_000.0 },
+    ParamDef {
+        name: "gain",
+        min: 0.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "env_len",
+        min: 1.0,
+        max: 1_000_000.0,
+    },
 ];
 
 /// The fundsp voice node. `Box<dyn AudioUnit>` is fundsp's dynamic (object-safe)

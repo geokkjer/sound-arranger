@@ -32,14 +32,26 @@ unsafe impl<T: Send> Sync for Spsc<T> {}
 // Compile-time check that the cache-line isolation actually holds (the hand-rolled
 // pads are layout-dependent; this pins it for the targets we build on).
 const _: () = {
-    assert!(std::mem::offset_of!(Spsc<f32>, head) % 64 == 0, "Spsc head not cache-line-aligned");
-    assert!(std::mem::offset_of!(Spsc<f32>, tail) % 64 == 0, "Spsc tail not cache-line-aligned");
-    assert!(std::mem::offset_of!(Spsc<f32>, count) % 64 == 0, "Spsc count not cache-line-aligned");
+    assert!(
+        std::mem::offset_of!(Spsc<f32>, head) % 64 == 0,
+        "Spsc head not cache-line-aligned"
+    );
+    assert!(
+        std::mem::offset_of!(Spsc<f32>, tail) % 64 == 0,
+        "Spsc tail not cache-line-aligned"
+    );
+    assert!(
+        std::mem::offset_of!(Spsc<f32>, count) % 64 == 0,
+        "Spsc count not cache-line-aligned"
+    );
 };
 
 impl<T> Spsc<T> {
     pub fn new(capacity: usize) -> Self {
-        assert!(capacity.is_power_of_two() && capacity > 0, "Spsc capacity must be a power of two");
+        assert!(
+            capacity.is_power_of_two() && capacity > 0,
+            "Spsc capacity must be a power of two"
+        );
         Spsc {
             head: AtomicUsize::new(0),
             _pad0: [0; 56],

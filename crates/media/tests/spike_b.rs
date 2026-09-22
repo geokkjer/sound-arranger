@@ -17,8 +17,8 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::f64::consts::TAU;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use engine::*;
@@ -85,10 +85,22 @@ fn rig_with_player(clip: ClipRef) -> Rig {
     let deferred = node.deferred_counter();
     let player_id = e.graph.add_node(
         NodeKind::Opaque(Box::new(node)),
-        vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio, channels: 1 }],
+        vec![Port {
+            name: "audio",
+            direction: Direction::Out,
+            kind: SignalKind::Audio,
+            channels: 1,
+        }],
     );
     e.graph.set_out(player_id);
-    Rig { e, player_id, mbox, underruns, deferred, recorder: None }
+    Rig {
+        e,
+        player_id,
+        mbox,
+        underruns,
+        deferred,
+        recorder: None,
+    }
 }
 
 /// Wait until the player's ring is full (or the clip is done) instead of a
@@ -97,7 +109,10 @@ fn rig_with_player(clip: ClipRef) -> Rig {
 fn warm_player(player: &FilePlayer) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while player.produced() < DEFAULT_RING_CAPACITY as u64 && !player.eof() {
-        assert!(std::time::Instant::now() < deadline, "reader did not warm up in 10 s");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "reader did not warm up in 10 s"
+        );
         std::thread::sleep(Duration::from_millis(2));
     }
 }
@@ -108,9 +123,17 @@ fn add_recorder(rig: &mut Rig, path: &Path) -> Arc<WavRecorder> {
     let rec = Arc::new(WavRecorder::start(path, SR).unwrap());
     let id = rig.e.graph.add_node(
         NodeKind::Opaque(Box::new(RecordNode::new(rec.clone()))),
-        vec![Port { name: "audio", direction: Direction::In, kind: SignalKind::Audio, channels: 1 }],
+        vec![Port {
+            name: "audio",
+            direction: Direction::In,
+            kind: SignalKind::Audio,
+            channels: 1,
+        }],
     );
-    rig.e.graph.connect(rig.player_id, "audio", id, "audio").unwrap();
+    rig.e
+        .graph
+        .connect(rig.player_id, "audio", id, "audio")
+        .unwrap();
     rig.recorder = Some(rec.clone());
     rec
 }
@@ -118,7 +141,11 @@ fn add_recorder(rig: &mut Rig, path: &Path) -> Arc<WavRecorder> {
 fn schedule_splice(rig: &Rig, at_frame: u64, clip: ClipRef, crossfade: u32) {
     let incoming = FilePlayer::start(clip, DEFAULT_RING_CAPACITY).unwrap();
     warm_player(&incoming); // the fade window must be fed the moment it opens
-    rig.mbox.lock().unwrap().push_back(SpliceCmd { at_frame, incoming, crossfade });
+    rig.mbox.lock().unwrap().push_back(SpliceCmd {
+        at_frame,
+        incoming,
+        crossfade,
+    });
 }
 
 /// Render `frames` in blocks, sleeping `per_block` between blocks. The offline
@@ -151,14 +178,28 @@ fn playback_streams_a_long_file_glitch_free() {
     write_tone(&path, 440.0, frames);
 
     let mut rig = rig_with_player(ClipRef::whole(&path).unwrap());
-    let out = render_paced(&mut rig.e, frames as usize + engine::BLOCK, Duration::from_millis(1));
+    let out = render_paced(
+        &mut rig.e,
+        frames as usize + engine::BLOCK,
+        Duration::from_millis(1),
+    );
 
-    assert_eq!(rig.underruns.load(Ordering::Relaxed), 0, "no underruns on a warm cached file");
+    assert_eq!(
+        rig.underruns.load(Ordering::Relaxed),
+        0,
+        "no underruns on a warm cached file"
+    );
     let expected = read_all(&path);
     for (a, b) in expected.iter().zip(&out[..frames as usize]) {
-        assert_eq!(*a, *b, "streamed content must equal the file sample-for-sample");
+        assert_eq!(
+            *a, *b,
+            "streamed content must equal the file sample-for-sample"
+        );
     }
-    assert!(out[frames as usize..].iter().all(|s| *s == 0.0), "tail must be silence");
+    assert!(
+        out[frames as usize..].iter().all(|s| *s == 0.0),
+        "tail must be silence"
+    );
     let _ = std::fs::remove_file(&path);
 }
 
@@ -180,8 +221,16 @@ fn splice_during_playback_is_sample_accurate() {
 
     let total = (f + xf as u64 + 10_000) as usize;
     let out = render_paced(&mut rig.e, total, Duration::from_millis(1));
-    assert_eq!(rig.underruns.load(Ordering::Relaxed), 0, "no underruns across the splice");
-    assert_eq!(rig.deferred.load(Ordering::Relaxed), 0, "the splice applies at its exact frame");
+    assert_eq!(
+        rig.underruns.load(Ordering::Relaxed),
+        0,
+        "no underruns across the splice"
+    );
+    assert_eq!(
+        rig.deferred.load(Ordering::Relaxed),
+        0,
+        "the splice applies at its exact frame"
+    );
 
     let fa = read_all(&a);
     let fb = read_all(&b);
@@ -197,11 +246,21 @@ fn splice_during_playback_is_sample_accurate() {
         .zip(&fa[f as usize..f as usize + xf as usize])
         .map(|(x, a)| (x - a).abs())
         .sum();
-    let diff_b: f32 = win.iter().zip(&fb[..xf as usize]).map(|(x, b)| (x - b).abs()).sum();
-    assert!(diff_a > 1.0, "the fade must move away from pure A: {diff_a}");
+    let diff_b: f32 = win
+        .iter()
+        .zip(&fb[..xf as usize])
+        .map(|(x, b)| (x - b).abs())
+        .sum();
+    assert!(
+        diff_a > 1.0,
+        "the fade must move away from pure A: {diff_a}"
+    );
     assert!(diff_b > 1.0, "the fade must bring B in: {diff_b}");
     // post-fade is pure B, aligned to the splice frame, sample-exact
-    for (x, s) in fb[xf as usize..].iter().zip(&out[(f + xf as u64) as usize..]) {
+    for (x, s) in fb[xf as usize..]
+        .iter()
+        .zip(&out[(f + xf as u64) as usize..])
+    {
         assert_eq!(*x, *s, "post-fade must equal clip B");
     }
 
@@ -238,7 +297,10 @@ fn bounce_is_byte_identical_on_replay() {
     assert_eq!(out1, out2, "the same media script must render identically");
     let bytes1 = std::fs::read(&rec1).unwrap();
     let bytes2 = std::fs::read(&rec2).unwrap();
-    assert_eq!(bytes1, bytes2, "the same media script must bounce byte-identically");
+    assert_eq!(
+        bytes1, bytes2,
+        "the same media script must bounce byte-identically"
+    );
 
     for p in [&a, &b, &rec1, &rec2] {
         let _ = std::fs::remove_file(p);
@@ -262,7 +324,11 @@ fn record_roundtrip_matches_the_master() {
     assert_eq!(rig.underruns.load(Ordering::Relaxed), 0);
     assert_eq!(rig.recorder.as_ref().unwrap().overruns(), 0);
     let recorded = read_all(&rec_path);
-    assert_eq!(recorded.len(), frames as usize, "the take holds every session frame");
+    assert_eq!(
+        recorded.len(),
+        frames as usize,
+        "the take holds every session frame"
+    );
     for (a, b) in out.iter().zip(&recorded) {
         assert!((a - b).abs() < 2e-4, "master {a} vs take {b}");
     }
@@ -292,7 +358,11 @@ fn crashed_take_is_recovered() {
     // wait for the writer to finish draining (it is a separate thread)
     let expected_bytes = 44 + frames as usize * 2;
     for _ in 0..500 {
-        if std::fs::metadata(&rec_path).map(|m| m.len() as usize).unwrap_or(0) >= expected_bytes {
+        if std::fs::metadata(&rec_path)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0)
+            >= expected_bytes
+        {
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -323,7 +393,12 @@ fn drift_keeps_the_recorded_timeline_in_session_frames() {
     }
     impl DriftSource {
         fn new(rate: u32) -> Self {
-            DriftSource { rate, phase: 0.0, acc: 0.0, fed: 0 }
+            DriftSource {
+                rate,
+                phase: 0.0,
+                acc: 0.0,
+                fed: 0,
+            }
         }
         /// Feed the compensator the frames the device delivered for one
         /// 512-frame output block.
@@ -364,7 +439,11 @@ fn drift_keeps_the_recorded_timeline_in_session_frames() {
         std::thread::sleep(Duration::from_micros(500)); // pace the fast-forward consumer
     }
     rec.stop().unwrap();
-    assert_eq!(rec.overruns(), 0, "the recorder must not drop drift-fed frames");
+    assert_eq!(
+        rec.overruns(),
+        0,
+        "the recorder must not drop drift-fed frames"
+    );
     drop(rec);
 
     let recorded = read_all(&rec_path);
@@ -436,7 +515,11 @@ fn render_path_does_not_allocate_with_media_nodes() {
     MEASURING.with(|m| m.set(true));
     rig.e.render_into(&mut out);
     MEASURING.with(|m| m.set(false));
-    assert_eq!(ALLOCS.load(Ordering::Relaxed), 0, "the media render path must not allocate");
+    assert_eq!(
+        ALLOCS.load(Ordering::Relaxed),
+        0,
+        "the media render path must not allocate"
+    );
 
     rig.recorder.as_ref().unwrap().stop().unwrap();
     let _ = std::fs::remove_file(&src);
@@ -469,22 +552,41 @@ fn soak_25_minutes_stream_record_splice_bounce() {
     let _out = render_paced(&mut rig.e, total as usize, Duration::from_micros(200));
     rig.recorder.as_ref().unwrap().stop().unwrap();
 
-    assert_eq!(rig.underruns.load(Ordering::Relaxed), 0, "no underruns over 25 minutes");
+    assert_eq!(
+        rig.underruns.load(Ordering::Relaxed),
+        0,
+        "no underruns over 25 minutes"
+    );
     assert_eq!(rec.overruns(), 0, "no recorder overruns over 25 minutes");
     let recorded = read_all(&rec_path);
-    assert_eq!(recorded.len(), total as usize, "the take holds every session frame");
+    assert_eq!(
+        recorded.len(),
+        total as usize,
+        "the take holds every session frame"
+    );
 
     // spot checks: pre-splice is A, post-splice (after the fade) is B, and
     // the take is still audio at the very end.
     let pre = read_at(&a, splice_at - 1, 1);
     let post = read_at(&b, 512, 1);
-    assert_eq!(recorded[splice_at as usize - 1], pre[0], "pre-splice must be clip A");
-    assert_eq!(recorded[splice_at as usize + 512], post[0], "post-fade must be clip B");
+    assert_eq!(
+        recorded[splice_at as usize - 1],
+        pre[0],
+        "pre-splice must be clip A"
+    );
+    assert_eq!(
+        recorded[splice_at as usize + 512],
+        post[0],
+        "post-fade must be clip B"
+    );
     let tail_max = recorded[total as usize - SR as usize..]
         .iter()
         .map(|s| s.abs())
         .fold(0.0f32, f32::max);
-    assert!(tail_max > 0.1, "audio still playing at the end (max {tail_max})");
+    assert!(
+        tail_max > 0.1,
+        "audio still playing at the end (max {tail_max})"
+    );
 
     for p in [&a, &b, &rec_path] {
         let _ = std::fs::remove_file(p);
@@ -530,7 +632,10 @@ fn devices_open_and_run() {
         }
         std::thread::sleep(Duration::from_millis(1200));
         let remaining = ring.len();
-        assert!(remaining < n / 2, "{name}: device consumed the tone (left {remaining} of {n})");
+        assert!(
+            remaining < n / 2,
+            "{name}: device consumed the tone (left {remaining} of {n})"
+        );
         drop(handle);
     }
 

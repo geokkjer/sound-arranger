@@ -2077,10 +2077,7 @@ mod tests {
     /// its session pool at the session rate, so the clip is a straight read.
     #[test]
     fn a_forty_four_one_khz_file_is_imported_at_the_session_rate() {
-        let path = std::env::temp_dir().join(format!(
-            "tui-shell-44100-{}.wav",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("tui-shell-44100-{}.wav", std::process::id()));
         let rate = 44_100u32;
         let frames = rate as usize;
         let mut writer =

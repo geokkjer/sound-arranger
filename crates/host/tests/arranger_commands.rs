@@ -73,18 +73,49 @@ fn removed_track_does_not_ghost_audio_on_rewire() {
 
     let script: Vec<HostCommand> = {
         let mut s = vec![
-            HostCommand::Mount { plugin: "mixer", params: vec![("channels", 2.0)], at_frame: Some(0) },
+            HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(0),
+            },
             HostCommand::Pool { dir: pool.clone() },
         ];
-        s.push(HostCommand::Arrange { op: ArrangeOp::AddTrack { track: "t0".into() }, at_frame: Some(0) });
-        s.push(HostCommand::Arrange { op: ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", 0, 8000) }, at_frame: Some(0) });
-        s.push(HostCommand::Arrange { op: ArrangeOp::AddTrack { track: "t1".into() }, at_frame: Some(0) });
-        s.push(HostCommand::Arrange { op: ArrangeOp::AddClip { track: "t1".into(), clip: clip("c1", 0, 1000) }, at_frame: Some(0) });
-        s.push(HostCommand::Bounce { frames: 4000, path: a.clone() });
+        s.push(HostCommand::Arrange {
+            op: ArrangeOp::AddTrack { track: "t0".into() },
+            at_frame: Some(0),
+        });
+        s.push(HostCommand::Arrange {
+            op: ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 0, 8000),
+            },
+            at_frame: Some(0),
+        });
+        s.push(HostCommand::Arrange {
+            op: ArrangeOp::AddTrack { track: "t1".into() },
+            at_frame: Some(0),
+        });
+        s.push(HostCommand::Arrange {
+            op: ArrangeOp::AddClip {
+                track: "t1".into(),
+                clip: clip("c1", 0, 1000),
+            },
+            at_frame: Some(0),
+        });
+        s.push(HostCommand::Bounce {
+            frames: 4000,
+            path: a.clone(),
+        });
         // remove t0, then render the *next* 4000 frames — t0's clip spans
         // [0,8000), so it would still be playing here if its node were mounted.
-        s.push(HostCommand::Arrange { op: ArrangeOp::RemoveTrack { track: "t0".into() }, at_frame: Some(4000) });
-        s.push(HostCommand::Bounce { frames: 4000, path: out_dir.join("b.wav") });
+        s.push(HostCommand::Arrange {
+            op: ArrangeOp::RemoveTrack { track: "t0".into() },
+            at_frame: Some(4000),
+        });
+        s.push(HostCommand::Bounce {
+            frames: 4000,
+            path: out_dir.join("b.wav"),
+        });
         s
     };
 
@@ -94,7 +125,10 @@ fn removed_track_does_not_ghost_audio_on_rewire() {
     let mut r = media::WavReader::open(&a).unwrap();
     let mut audio = vec![0.0f32; r.total_frames() as usize];
     let n = r.read_into(&mut audio);
-    assert!(audio[..n].iter().any(|s| s.abs() > 1e-4), "t0 must be audible in the first render");
+    assert!(
+        audio[..n].iter().any(|s| s.abs() > 1e-4),
+        "t0 must be audible in the first render"
+    );
 
     // The second render (frames 4000..8000) must be silent: t0 is gone and t1's
     // clip ended at 1000. If t0's node ghost-plays, these frames are non-silent.
@@ -128,14 +162,40 @@ fn edit_to_a_wired_track_continues_the_clip_not_restarts_it() {
     // build, render [0,4000), edit gain to g, render [4000,8000).
     let script = |gain: f32, tag: &str| -> Vec<HostCommand> {
         let mut s = vec![
-            HostCommand::Mount { plugin: "mixer", params: vec![("channels", 2.0)], at_frame: Some(0) },
+            HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(0),
+            },
             HostCommand::Pool { dir: pool.clone() },
         ];
-        s.push(HostCommand::Arrange { op: ArrangeOp::AddTrack { track: "t0".into() }, at_frame: Some(0) });
-        s.push(HostCommand::Arrange { op: ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", 0, 8000) }, at_frame: Some(0) });
-        s.push(HostCommand::Bounce { frames: 4000, path: out_dir.join(format!("{tag}-a.wav")) });
-        s.push(HostCommand::Arrange { op: ArrangeOp::SetClipGain { track: "t0".into(), clip: "c0".into(), gain }, at_frame: Some(4000) });
-        s.push(HostCommand::Bounce { frames: 4000, path: out_dir.join(format!("{tag}-b.wav")) });
+        s.push(HostCommand::Arrange {
+            op: ArrangeOp::AddTrack { track: "t0".into() },
+            at_frame: Some(0),
+        });
+        s.push(HostCommand::Arrange {
+            op: ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 0, 8000),
+            },
+            at_frame: Some(0),
+        });
+        s.push(HostCommand::Bounce {
+            frames: 4000,
+            path: out_dir.join(format!("{tag}-a.wav")),
+        });
+        s.push(HostCommand::Arrange {
+            op: ArrangeOp::SetClipGain {
+                track: "t0".into(),
+                clip: "c0".into(),
+                gain,
+            },
+            at_frame: Some(4000),
+        });
+        s.push(HostCommand::Bounce {
+            frames: 4000,
+            path: out_dir.join(format!("{tag}-b.wav")),
+        });
         s
     };
 
@@ -191,14 +251,40 @@ fn edit_then_rewire_replays_byte_identically() {
 
     let script = |out: &Path, tag: &str| -> Vec<HostCommand> {
         let mut s = vec![
-            HostCommand::Mount { plugin: "mixer", params: vec![("channels", 2.0)], at_frame: Some(0) },
+            HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(0),
+            },
             HostCommand::Pool { dir: pool.clone() },
         ];
-        s.push(HostCommand::Arrange { op: ArrangeOp::AddTrack { track: "t0".into() }, at_frame: Some(0) });
-        s.push(HostCommand::Arrange { op: ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", 0, 8000) }, at_frame: Some(0) });
-        s.push(HostCommand::Bounce { frames: 4000, path: out_dir.join(format!("{tag}-a.wav")) });
-        s.push(HostCommand::Arrange { op: ArrangeOp::SetClipGain { track: "t0".into(), clip: "c0".into(), gain: 0.7 }, at_frame: Some(4000) });
-        s.push(HostCommand::Bounce { frames: 4000, path: out.to_path_buf() });
+        s.push(HostCommand::Arrange {
+            op: ArrangeOp::AddTrack { track: "t0".into() },
+            at_frame: Some(0),
+        });
+        s.push(HostCommand::Arrange {
+            op: ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 0, 8000),
+            },
+            at_frame: Some(0),
+        });
+        s.push(HostCommand::Bounce {
+            frames: 4000,
+            path: out_dir.join(format!("{tag}-a.wav")),
+        });
+        s.push(HostCommand::Arrange {
+            op: ArrangeOp::SetClipGain {
+                track: "t0".into(),
+                clip: "c0".into(),
+                gain: 0.7,
+            },
+            at_frame: Some(4000),
+        });
+        s.push(HostCommand::Bounce {
+            frames: 4000,
+            path: out.to_path_buf(),
+        });
         s
     };
 
@@ -231,13 +317,27 @@ fn clip(id: &str, at: u64, len: u64) -> Clip {
 }
 
 fn arrange_ops() -> Vec<HostCommand> {
-    let arrange = |op: ArrangeOp| HostCommand::Arrange { op, at_frame: Some(0) };
+    let arrange = |op: ArrangeOp| HostCommand::Arrange {
+        op,
+        at_frame: Some(0),
+    };
     vec![
         arrange(ArrangeOp::AddTrack { track: "t0".into() }),
-        arrange(ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", 0, 4000) }),
+        arrange(ArrangeOp::AddClip {
+            track: "t0".into(),
+            clip: clip("c0", 0, 4000),
+        }),
         arrange(ArrangeOp::AddTrack { track: "t1".into() }),
-        arrange(ArrangeOp::AddClip { track: "t1".into(), clip: clip("c1", 500, 1500) }),
-        arrange(ArrangeOp::SetClipFade { track: "t1".into(), clip: "c1".into(), fade_in: 64, fade_out: 128 }),
+        arrange(ArrangeOp::AddClip {
+            track: "t1".into(),
+            clip: clip("c1", 500, 1500),
+        }),
+        arrange(ArrangeOp::SetClipFade {
+            track: "t1".into(),
+            clip: "c1".into(),
+            fade_in: 64,
+            fade_out: 128,
+        }),
     ]
 }
 
@@ -248,7 +348,11 @@ fn arrange_commands_build_the_logged_value_and_replay_identically() {
 
     let script: Vec<HostCommand> = {
         let mut s = vec![
-            HostCommand::Mount { plugin: "mixer", params: vec![("channels", 2.0)], at_frame: Some(0) },
+            HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(0),
+            },
             HostCommand::Pool { dir: pool.clone() },
         ];
         s.extend(arrange_ops());
@@ -257,8 +361,14 @@ fn arrange_commands_build_the_logged_value_and_replay_identically() {
 
     // live: the Arrange commands build the arrangement value.
     let sess = run_script(&script).unwrap();
-    let value = sess.arrangement().expect("the live arrangement must snapshot");
-    assert_eq!(value.tracks.len(), 2, "two tracks built by the arrange commands");
+    let value = sess
+        .arrangement()
+        .expect("the live arrangement must snapshot");
+    assert_eq!(
+        value.tracks.len(),
+        2,
+        "two tracks built by the arrange commands"
+    );
     assert_eq!(value.tracks[0].clips.len(), 1, "t0 has one clip");
     assert_eq!(value.tracks[0].clips[0].src_len, 4000);
     assert_eq!(value.tracks[1].clips[0].fade_out, 128);
@@ -268,7 +378,9 @@ fn arrange_commands_build_the_logged_value_and_replay_identically() {
     let sess2 = run_script(&script).unwrap();
     assert_eq!(
         value,
-        sess2.arrangement().expect("the replayed arrangement must snapshot"),
+        sess2
+            .arrangement()
+            .expect("the replayed arrangement must snapshot"),
         "replay must reconstruct the identical value"
     );
 
@@ -281,10 +393,20 @@ fn arrange_without_pool_is_refused() {
     write_source(&pool, "s1", 100);
     // No `Pool` command first → the arrange command fails loudly.
     let script = vec![
-        HostCommand::Mount { plugin: "mixer", params: vec![("channels", 1.0)], at_frame: Some(0) },
-        HostCommand::Arrange { op: ArrangeOp::AddTrack { track: "t0".into() }, at_frame: Some(0) },
+        HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 1.0)],
+            at_frame: Some(0),
+        },
+        HostCommand::Arrange {
+            op: ArrangeOp::AddTrack { track: "t0".into() },
+            at_frame: Some(0),
+        },
     ];
-    assert!(run_script(&script).is_err(), "arrange requires set_pool first");
+    assert!(
+        run_script(&script).is_err(),
+        "arrange requires set_pool first"
+    );
     let _ = std::fs::remove_dir_all(&pool);
 }
 
@@ -294,11 +416,21 @@ fn bounce_over_byte_budget_is_refused() {
     write_source(&pool, "s1", 100);
     let out = tmp_dir("o").join("o.wav");
     let script = vec![
-        HostCommand::Mount { plugin: "mixer", params: vec![("channels", 1.0)], at_frame: Some(0) },
+        HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 1.0)],
+            at_frame: Some(0),
+        },
         HostCommand::Pool { dir: pool.clone() },
-        HostCommand::Bounce { frames: 1 << 40, path: out }, // ~4 TB of f32
+        HostCommand::Bounce {
+            frames: 1 << 40,
+            path: out,
+        }, // ~4 TB of f32
     ];
-    assert!(run_script(&script).is_err(), "a bounce over the byte budget must be refused");
+    assert!(
+        run_script(&script).is_err(),
+        "a bounce over the byte budget must be refused"
+    );
     let _ = std::fs::remove_dir_all(&pool);
 }
 
@@ -307,22 +439,43 @@ fn fractional_or_zero_mixer_channels_is_refused() {
     let pool = tmp_dir("channels");
     // a fraction (4.5) must not be silently truncated to 4
     let frac = vec![
-        HostCommand::Mount { plugin: "mixer", params: vec![("channels", 4.5)], at_frame: Some(0) },
+        HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 4.5)],
+            at_frame: Some(0),
+        },
         HostCommand::Pool { dir: pool.clone() },
     ];
-    assert!(run_script(&frac).is_err(), "fractional mixer channels must be refused");
+    assert!(
+        run_script(&frac).is_err(),
+        "fractional mixer channels must be refused"
+    );
     // zero / negative refused
     let zero = vec![
-        HostCommand::Mount { plugin: "mixer", params: vec![("channels", 0.0)], at_frame: Some(0) },
+        HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 0.0)],
+            at_frame: Some(0),
+        },
         HostCommand::Pool { dir: pool.clone() },
     ];
-    assert!(run_script(&zero).is_err(), "zero mixer channels must be refused");
+    assert!(
+        run_script(&zero).is_err(),
+        "zero mixer channels must be refused"
+    );
     // over the max (8) refused
     let big = vec![
-        HostCommand::Mount { plugin: "mixer", params: vec![("channels", 9.0)], at_frame: Some(0) },
+        HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 9.0)],
+            at_frame: Some(0),
+        },
         HostCommand::Pool { dir: pool.clone() },
     ];
-    assert!(run_script(&big).is_err(), "channels over the mixer max must be refused");
+    assert!(
+        run_script(&big).is_err(),
+        "channels over the mixer max must be refused"
+    );
     let _ = std::fs::remove_dir_all(&pool);
 }
 
@@ -336,8 +489,9 @@ fn text_format_pool_and_arrange_run_byte_identically() {
     let a = out_dir.join("a.wav");
     let b = out_dir.join("b.wav");
 
-    let script = |out: &std::path::Path| format!(
-        "host v1\n\
+    let script = |out: &std::path::Path| {
+        format!(
+            "host v1\n\
          mount mixer channels=2 @0\n\
          pool {}\n\
          arrange add_track t0 @0\n\
@@ -345,8 +499,10 @@ fn text_format_pool_and_arrange_run_byte_identically() {
          arrange add_track t1 @0\n\
          arrange add_clip t1 c1 s1 0 1500 500 64 128 1.0 @0\n\
          bounce 6000 {}\n",
-        pool.display(), out.display()
-    );
+            pool.display(),
+            out.display()
+        )
+    };
 
     let script_a = host::parse_script(&script(&a)).unwrap();
     let sess = host::run_script(&script_a).unwrap();
@@ -355,9 +511,15 @@ fn text_format_pool_and_arrange_run_byte_identically() {
     let mut r = media::WavReader::open(&a).unwrap();
     let mut audio = vec![0.0f32; r.total_frames() as usize];
     let n = r.read_into(&mut audio);
-    assert!(audio[..n].iter().any(|s| s.abs() > 1e-4), "must produce audio");
+    assert!(
+        audio[..n].iter().any(|s| s.abs() > 1e-4),
+        "must produce audio"
+    );
     assert_eq!(
-        sess.arrangement().expect("the text-format arrangement must snapshot").tracks.len(),
+        sess.arrangement()
+            .expect("the text-format arrangement must snapshot")
+            .tracks
+            .len(),
         2
     );
 
@@ -365,7 +527,10 @@ fn text_format_pool_and_arrange_run_byte_identically() {
     let script_b = host::parse_script(&script(&b)).unwrap();
     let _ = host::run_script(&script_b).unwrap();
     let frames_b = std::fs::read(&b).unwrap();
-    assert_eq!(frames_a, frames_b, "text-format arrangement must replay byte-identically");
+    assert_eq!(
+        frames_a, frames_b,
+        "text-format arrangement must replay byte-identically"
+    );
 
     let _ = std::fs::remove_dir_all(&pool);
     let _ = std::fs::remove_dir_all(&out_dir);
@@ -414,11 +579,18 @@ fn arrangement_bounces_audio_and_replays_byte_identically() {
 
     let script = |out: &Path| -> Vec<HostCommand> {
         let mut s = vec![
-            HostCommand::Mount { plugin: "mixer", params: vec![("channels", 2.0)], at_frame: Some(0) },
+            HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(0),
+            },
             HostCommand::Pool { dir: pool.clone() },
         ];
         s.extend(arrange_ops());
-        s.push(HostCommand::Bounce { frames: 6000, path: out.to_path_buf() });
+        s.push(HostCommand::Bounce {
+            frames: 6000,
+            path: out.to_path_buf(),
+        });
         s
     };
 
@@ -428,8 +600,17 @@ fn arrangement_bounces_audio_and_replays_byte_identically() {
     let mut r = media::WavReader::open(&a).unwrap();
     let mut audio = vec![0.0f32; r.total_frames() as usize];
     let n = r.read_into(&mut audio);
-    assert!(audio[..n].iter().any(|s| s.abs() > 1e-4), "the arrangement must produce audio");
-    assert_eq!(sess.arrangement().expect("the arrangement must snapshot").tracks.len(), 2);
+    assert!(
+        audio[..n].iter().any(|s| s.abs() > 1e-4),
+        "the arrangement must produce audio"
+    );
+    assert_eq!(
+        sess.arrangement()
+            .expect("the arrangement must snapshot")
+            .tracks
+            .len(),
+        2
+    );
 
     // replay: a fresh host, same script → byte-identical bounce.
     let _ = run_script(&script(&b)).unwrap();
@@ -453,27 +634,68 @@ fn incremental_session_applies_edits_and_reports_arrangement() {
 
     let mut s = HostSession::new();
     s.set_pool(&pool).unwrap();
-    s.execute(&HostCommand::Mount { plugin: "mixer", params: vec![("channels", 2.0)], at_frame: Some(0) }).unwrap();
+    s.execute(&HostCommand::Mount {
+        plugin: "mixer",
+        params: vec![("channels", 2.0)],
+        at_frame: Some(0),
+    })
+    .unwrap();
     s.execute(&HostCommand::Pool { dir: pool.clone() }).unwrap();
-    s.execute(&HostCommand::Arrange { op: ArrangeOp::AddTrack { track: "t0".into() }, at_frame: Some(0) }).unwrap();
-    s.execute(&HostCommand::Arrange { op: ArrangeOp::AddClip { track: "t0".into(), clip: clip("c0", 0, 4000) }, at_frame: Some(0) }).unwrap();
-    s.execute(&HostCommand::Bounce { frames: 4000, path: out.clone() }).unwrap();
+    s.execute(&HostCommand::Arrange {
+        op: ArrangeOp::AddTrack { track: "t0".into() },
+        at_frame: Some(0),
+    })
+    .unwrap();
+    s.execute(&HostCommand::Arrange {
+        op: ArrangeOp::AddClip {
+            track: "t0".into(),
+            clip: clip("c0", 0, 4000),
+        },
+        at_frame: Some(0),
+    })
+    .unwrap();
+    s.execute(&HostCommand::Bounce {
+        frames: 4000,
+        path: out.clone(),
+    })
+    .unwrap();
 
     let timeline = s.arrangement().expect("a persisted session has a value");
-    assert_eq!(timeline.tracks.len(), 1, "one track from the incremental AddTrack");
-    assert_eq!(timeline.tracks[0].clips.len(), 1, "one clip from the incremental AddClip");
+    assert_eq!(
+        timeline.tracks.len(),
+        1,
+        "one track from the incremental AddTrack"
+    );
+    assert_eq!(
+        timeline.tracks[0].clips.len(),
+        1,
+        "one clip from the incremental AddClip"
+    );
     assert_eq!(timeline.tracks[0].clips[0].id, "c0");
-    assert_eq!(s.underruns(), 0, "no underruns on a clean incremental bounce");
+    assert_eq!(
+        s.underruns(),
+        0,
+        "no underruns on a clean incremental bounce"
+    );
 
     let mut r = media::WavReader::open(&out).unwrap();
     let mut audio = vec![0.0f32; r.total_frames() as usize];
     let n = r.read_into(&mut audio);
-    assert!(audio[..n].iter().any(|s| s.abs() > 1e-4), "the incremental session renders audio");
+    assert!(
+        audio[..n].iter().any(|s| s.abs() > 1e-4),
+        "the incremental session renders audio"
+    );
 
     // A refused op (bad pool dir) fails the session without breaking it.
-    let bad = s.execute(&HostCommand::Pool { dir: PathBuf::from("/no/such/pool") });
+    let bad = s.execute(&HostCommand::Pool {
+        dir: PathBuf::from("/no/such/pool"),
+    });
     assert!(bad.is_err(), "a bad Pool is refused, never a panic");
-    assert_eq!(s.arrangement().unwrap().tracks.len(), 1, "a refused op changes nothing");
+    assert_eq!(
+        s.arrangement().unwrap().tracks.len(),
+        1,
+        "a refused op changes nothing"
+    );
 
     let _ = std::fs::remove_dir_all(&pool);
     let _ = std::fs::remove_dir_all(&out_dir);
@@ -491,7 +713,8 @@ fn chop_text_format_splits_a_clip_and_renders() {
 
     let script_text = format!(
         "host v1\nmount mixer channels=2 @0\npool {}\narrange add_track t0 @0\narrange add_clip t0 c0 s1 0 4000 0 0 0 1.0 @0\narrange chop t0 c0 4 pre @0\nbounce 4000 {}\n",
-        pool.display(), out.display()
+        pool.display(),
+        out.display()
     );
     let cmds = host::parse_script(&script_text).expect("script parses");
     let sess = host::run_script(&cmds).unwrap();
@@ -505,7 +728,10 @@ fn chop_text_format_splits_a_clip_and_renders() {
     let mut r = media::WavReader::open(&out).unwrap();
     let mut audio = vec![0.0f32; r.total_frames() as usize];
     let n = r.read_into(&mut audio);
-    assert!(audio[..n].iter().any(|s| s.abs() > 1e-4), "chopped pieces render audio");
+    assert!(
+        audio[..n].iter().any(|s| s.abs() > 1e-4),
+        "chopped pieces render audio"
+    );
 
     let _ = std::fs::remove_dir_all(&pool);
     let _ = std::fs::remove_dir_all(&out_dir);
@@ -530,16 +756,26 @@ fn adopting_a_pool_converts_a_foreign_rate() {
     let out = out_dir.join("out.wav");
 
     let mut s = HostSession::new();
-    s.execute(&HostCommand::Mount { plugin: "mixer", params: vec![("channels", 2.0)], at_frame: Some(0) })
-        .unwrap();
+    s.execute(&HostCommand::Mount {
+        plugin: "mixer",
+        params: vec![("channels", 2.0)],
+        at_frame: Some(0),
+    })
+    .unwrap();
     s.execute(&HostCommand::Pool { dir: pool.clone() }).unwrap();
 
     // The pool pass converted it, and the session says so (a shell shows this).
     let conformed = s.pool_conformed();
     assert_eq!(conformed.len(), 1, "one source was converted");
     assert_eq!(conformed[0].id, "s1");
-    assert_eq!((conformed[0].from_rate, conformed[0].to_rate), (44_100, 48_000));
-    assert_eq!((conformed[0].frames_in, conformed[0].frames_out), (44_100, 48_000));
+    assert_eq!(
+        (conformed[0].from_rate, conformed[0].to_rate),
+        (44_100, 48_000)
+    );
+    assert_eq!(
+        (conformed[0].frames_in, conformed[0].frames_out),
+        (44_100, 48_000)
+    );
     assert!(conformed[0].converted);
     assert!(
         pool.join("s1.wav.pre44100").is_file(),
@@ -557,13 +793,28 @@ fn adopting_a_pool_converts_a_foreign_rate() {
     assert!(s.pool_conformed().is_empty(), "conform is idempotent");
 
     // …and the clip that spans it renders audio instead of refusing the transport.
-    s.execute(&HostCommand::Arrange { op: ArrangeOp::AddTrack { track: "t0".into() }, at_frame: Some(0) })
-        .unwrap();
-    let foreign = Clip { src_len: SR as u64, ..clip("c0", 0, SR as u64) };
-    s.execute(&HostCommand::Arrange { op: ArrangeOp::AddClip { track: "t0".into(), clip: foreign }, at_frame: Some(0) })
-        .unwrap();
-    s.execute(&HostCommand::Bounce { frames: 4800, path: out.clone() })
-        .expect("the converted source plays");
+    s.execute(&HostCommand::Arrange {
+        op: ArrangeOp::AddTrack { track: "t0".into() },
+        at_frame: Some(0),
+    })
+    .unwrap();
+    let foreign = Clip {
+        src_len: SR as u64,
+        ..clip("c0", 0, SR as u64)
+    };
+    s.execute(&HostCommand::Arrange {
+        op: ArrangeOp::AddClip {
+            track: "t0".into(),
+            clip: foreign,
+        },
+        at_frame: Some(0),
+    })
+    .unwrap();
+    s.execute(&HostCommand::Bounce {
+        frames: 4800,
+        path: out.clone(),
+    })
+    .expect("the converted source plays");
 
     let mut r = media::WavReader::open(&out).unwrap();
     assert_eq!(r.sample_rate(), SR);

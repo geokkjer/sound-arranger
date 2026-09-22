@@ -11,11 +11,14 @@
 //! provider wins" limitation. Mono in Phase 1 (the graph is mono; pan arrives
 //! with stereo).
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::{Disposer, ParamDef, Plugin, PluginApi};
-use crate::graph::{AudioNode, Direction, EventBuf, NodeId, NodeIO, NodeKind, NoteEvent, Port, RenderBlock, SignalKind, Trigger, CAP_EVENTS};
+use crate::graph::{
+    AudioNode, CAP_EVENTS, Direction, EventBuf, NodeIO, NodeId, NodeKind, NoteEvent, Port,
+    RenderBlock, SignalKind, Trigger,
+};
 
 /// Maximum mixer channels (bounded by the graph's [`MAX_AUDIO_INS`]); the
 /// declared port/parameter surfaces cover this maximum.
@@ -27,53 +30,230 @@ pub const MIXER_CHANNELS: usize = 4;
 /// [`MIXER_CHANNELS_MAX`]) + the master audio output. Patches to channels
 /// beyond the mounted `channels` count are accepted but ignored (documented).
 pub const MIXER_PORTS: &[Port] = &[
-    Port { name: "ch0", direction: Direction::In, kind: SignalKind::Audio , channels: 1 },
-    Port { name: "ch1", direction: Direction::In, kind: SignalKind::Audio , channels: 1 },
-    Port { name: "ch2", direction: Direction::In, kind: SignalKind::Audio , channels: 1 },
-    Port { name: "ch3", direction: Direction::In, kind: SignalKind::Audio , channels: 1 },
-    Port { name: "ch4", direction: Direction::In, kind: SignalKind::Audio , channels: 1 },
-    Port { name: "ch5", direction: Direction::In, kind: SignalKind::Audio , channels: 1 },
-    Port { name: "ch6", direction: Direction::In, kind: SignalKind::Audio , channels: 1 },
-    Port { name: "ch7", direction: Direction::In, kind: SignalKind::Audio , channels: 1 },
-    Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio , channels: 2 },
+    Port {
+        name: "ch0",
+        direction: Direction::In,
+        kind: SignalKind::Audio,
+        channels: 1,
+    },
+    Port {
+        name: "ch1",
+        direction: Direction::In,
+        kind: SignalKind::Audio,
+        channels: 1,
+    },
+    Port {
+        name: "ch2",
+        direction: Direction::In,
+        kind: SignalKind::Audio,
+        channels: 1,
+    },
+    Port {
+        name: "ch3",
+        direction: Direction::In,
+        kind: SignalKind::Audio,
+        channels: 1,
+    },
+    Port {
+        name: "ch4",
+        direction: Direction::In,
+        kind: SignalKind::Audio,
+        channels: 1,
+    },
+    Port {
+        name: "ch5",
+        direction: Direction::In,
+        kind: SignalKind::Audio,
+        channels: 1,
+    },
+    Port {
+        name: "ch6",
+        direction: Direction::In,
+        kind: SignalKind::Audio,
+        channels: 1,
+    },
+    Port {
+        name: "ch7",
+        direction: Direction::In,
+        kind: SignalKind::Audio,
+        channels: 1,
+    },
+    Port {
+        name: "audio",
+        direction: Direction::Out,
+        kind: SignalKind::Audio,
+        channels: 2,
+    },
 ];
 
 /// The mixer's declared runtime parameter surface — the logged `SetParam`
 /// namespace (`Engine::set_param` refuses anything not listed here).
 pub const MIXER_PARAMS: &[ParamDef] = &[
-    ParamDef { name: "ch0.gain", min: 0.0, max: 2.0 },
-    ParamDef { name: "ch0.mute", min: 0.0, max: 1.0 },
-    ParamDef { name: "ch0.solo", min: 0.0, max: 1.0 },
-    ParamDef { name: "ch0.pan", min: -1.0, max: 1.0 },
-    ParamDef { name: "ch1.gain", min: 0.0, max: 2.0 },
-    ParamDef { name: "ch1.mute", min: 0.0, max: 1.0 },
-    ParamDef { name: "ch1.solo", min: 0.0, max: 1.0 },
-    ParamDef { name: "ch1.pan", min: -1.0, max: 1.0 },
-    ParamDef { name: "ch2.gain", min: 0.0, max: 2.0 },
-    ParamDef { name: "ch2.mute", min: 0.0, max: 1.0 },
-    ParamDef { name: "ch2.solo", min: 0.0, max: 1.0 },
-    ParamDef { name: "ch2.pan", min: -1.0, max: 1.0 },
-    ParamDef { name: "ch3.gain", min: 0.0, max: 2.0 },
-    ParamDef { name: "ch3.mute", min: 0.0, max: 1.0 },
-    ParamDef { name: "ch3.solo", min: 0.0, max: 1.0 },
-    ParamDef { name: "ch3.pan", min: -1.0, max: 1.0 },
-    ParamDef { name: "ch4.gain", min: 0.0, max: 2.0 },
-    ParamDef { name: "ch4.mute", min: 0.0, max: 1.0 },
-    ParamDef { name: "ch4.solo", min: 0.0, max: 1.0 },
-    ParamDef { name: "ch4.pan", min: -1.0, max: 1.0 },
-    ParamDef { name: "ch5.gain", min: 0.0, max: 2.0 },
-    ParamDef { name: "ch5.mute", min: 0.0, max: 1.0 },
-    ParamDef { name: "ch5.solo", min: 0.0, max: 1.0 },
-    ParamDef { name: "ch5.pan", min: -1.0, max: 1.0 },
-    ParamDef { name: "ch6.gain", min: 0.0, max: 2.0 },
-    ParamDef { name: "ch6.mute", min: 0.0, max: 1.0 },
-    ParamDef { name: "ch6.solo", min: 0.0, max: 1.0 },
-    ParamDef { name: "ch6.pan", min: -1.0, max: 1.0 },
-    ParamDef { name: "ch7.gain", min: 0.0, max: 2.0 },
-    ParamDef { name: "ch7.mute", min: 0.0, max: 1.0 },
-    ParamDef { name: "ch7.solo", min: 0.0, max: 1.0 },
-    ParamDef { name: "ch7.pan", min: -1.0, max: 1.0 },
-    ParamDef { name: "master.gain", min: 0.0, max: 2.0 },
+    ParamDef {
+        name: "ch0.gain",
+        min: 0.0,
+        max: 2.0,
+    },
+    ParamDef {
+        name: "ch0.mute",
+        min: 0.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "ch0.solo",
+        min: 0.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "ch0.pan",
+        min: -1.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "ch1.gain",
+        min: 0.0,
+        max: 2.0,
+    },
+    ParamDef {
+        name: "ch1.mute",
+        min: 0.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "ch1.solo",
+        min: 0.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "ch1.pan",
+        min: -1.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "ch2.gain",
+        min: 0.0,
+        max: 2.0,
+    },
+    ParamDef {
+        name: "ch2.mute",
+        min: 0.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "ch2.solo",
+        min: 0.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "ch2.pan",
+        min: -1.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "ch3.gain",
+        min: 0.0,
+        max: 2.0,
+    },
+    ParamDef {
+        name: "ch3.mute",
+        min: 0.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "ch3.solo",
+        min: 0.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "ch3.pan",
+        min: -1.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "ch4.gain",
+        min: 0.0,
+        max: 2.0,
+    },
+    ParamDef {
+        name: "ch4.mute",
+        min: 0.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "ch4.solo",
+        min: 0.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "ch4.pan",
+        min: -1.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "ch5.gain",
+        min: 0.0,
+        max: 2.0,
+    },
+    ParamDef {
+        name: "ch5.mute",
+        min: 0.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "ch5.solo",
+        min: 0.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "ch5.pan",
+        min: -1.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "ch6.gain",
+        min: 0.0,
+        max: 2.0,
+    },
+    ParamDef {
+        name: "ch6.mute",
+        min: 0.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "ch6.solo",
+        min: 0.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "ch6.pan",
+        min: -1.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "ch7.gain",
+        min: 0.0,
+        max: 2.0,
+    },
+    ParamDef {
+        name: "ch7.mute",
+        min: 0.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "ch7.solo",
+        min: 0.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "ch7.pan",
+        min: -1.0,
+        max: 1.0,
+    },
+    ParamDef {
+        name: "master.gain",
+        min: 0.0,
+        max: 2.0,
+    },
 ];
 
 /// Per-block peak meters: one atomic per channel (f32 bits) plus the master.
@@ -124,7 +304,10 @@ impl MixerNode {
     /// plugin uses this so the profile can read the meters through the
     /// `mixer.meters` context key.
     pub fn with_channels(channels: usize, meters: Arc<MeterBank>) -> Self {
-        debug_assert!((1..=MIXER_CHANNELS_MAX).contains(&channels), "mixer channels out of range");
+        debug_assert!(
+            (1..=MIXER_CHANNELS_MAX).contains(&channels),
+            "mixer channels out of range"
+        );
         MixerNode {
             channels: channels.clamp(1, MIXER_CHANNELS_MAX),
             gains: [1.0; MIXER_CHANNELS_MAX],
@@ -263,7 +446,10 @@ impl Plugin for MixerPlugin {
     fn apply(&mut self, api: &mut PluginApi) -> Result<(NodeId, Disposer), String> {
         let meters = Arc::new(MeterBank::default());
         let node = api.graph.add_node(
-            NodeKind::Opaque(Box::new(MixerNode::with_channels(self.channels, meters.clone()))),
+            NodeKind::Opaque(Box::new(MixerNode::with_channels(
+                self.channels,
+                meters.clone(),
+            ))),
             MIXER_PORTS.to_vec(),
         );
         // The mixer owns the master bus: sources route into its channels, and
@@ -294,7 +480,9 @@ pub fn mixer_factory(params: &[(&'static str, f32)]) -> Result<Box<dyn Plugin>, 
         None => MIXER_CHANNELS,
     };
     if !(1..=MIXER_CHANNELS_MAX).contains(&channels) {
-        return Err(format!("mixer channels must be 1..={MIXER_CHANNELS_MAX}, got {channels}"));
+        return Err(format!(
+            "mixer channels must be 1..={MIXER_CHANNELS_MAX}, got {channels}"
+        ));
     }
     Ok(Box::new(MixerPlugin { channels }))
 }
