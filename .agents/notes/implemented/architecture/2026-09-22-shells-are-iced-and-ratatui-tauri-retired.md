@@ -19,7 +19,8 @@ retires a shell and records what decides the rest.
 
 ## Decision
 
-**Tauri + Vue is retired. iced (GUI) and ratatui (TUI) are the shells under evaluation.**
+**Tauri + Vue is retired. The shells are ratatui (primary, TUI) and iced (second, GUI), with one
+modal, key-driven workflow across both.**
 
 1. **Retired means out of the active path, not deleted.** `crates/shell/src-tauri` is removed
    from the root workspace `members` (and listed in `exclude`), so the default `cargo build
@@ -29,22 +30,33 @@ retires a shell and records what decides the rest.
    canvas, the mixer layout, the transport store and the clip-edit gestures are the porting
    reference for the Rust shells. Deleting it is a one-command follow-up whenever the owner
    prefers the tree without it.
-2. **The Host API is the shell seam, and two shells now prove it.** Both spikes drive the
+2. **One workflow, two shells is the rule** (2026-09-22). A capability lands in the *workflow* — an
+   action in the `host v1` vocabulary, a key, a line in the keymap table — before or with the shell
+   that shows it; a shell-only feature (or a key that exists in one shell and not the other) is a bug.
+   The TUI is the reference implementation, and its `KEYMAP` table drives both the handler and the
+   `?` overlay so help cannot drift from behaviour. When iced grows keys, that table is what moves —
+   into a shared crate both shells depend on, rather than two tables that agree by discipline.
+3. **The Host API is the shell seam, and two shells now prove it.** Both spikes drive the
    *same* `host::live::HostHandle` the bridge drove (`spikes/iced-shell`, `spikes/tui-shell`),
    each its own isolated workspace so neither framework leaks into the core's build. The
    [UI-as-plugin note](../2026-08-18-ui-as-plugin-host-api-and-headless-reference.md) argued
    this seam; the retirement is the first real test of it, and the core crates did not change.
-3. **`iced_audio` is the iced shell's widget library.** `iced_audio 0.17` (MIT, 2026-09-09)
+4. **`iced_audio` is the iced shell's widget library.** `iced_audio 0.17` (MIT, 2026-09-09)
    tracks `iced_core`/`iced_graphics` 0.14 exactly — the version the spike already used — and
    supplies what a mixer is made of: `VSlider`/`HSlider`/`Knob`/`Ramp`/`XYPad`/`ModRangeInput`,
    a normalized-parameter contract (`NormalParam`), unit ranges (`DBRange`, `FreqRange`,
    `IntRange` with `snap`), tick/text marks and modulation ranges. The spike uses it for the
    console: one `VSlider` per channel plus the master on `DBRange::new(-60.0, 12.0, …)`, meters
    beside them, values in dB. The widgets are **stock** — no fork, no vendored patch.
-4. **Neither shell is the primary yet.** The criteria are recorded under *Consequences*, and
-   the decision is deferred until the iced spike has the surfaces ratatui already has (or
-   fails to get them) and the TUI has been judged against the workflow, not against a feature
-   list.
+5. **The TUI is primary; iced is the second shell** (decided 2026-09-22, the day after the
+   retirement). The modal, key-driven workflow is what the tool *is*, and the terminal is where it is
+   cheapest to prove and cannot cheat — no mouse to fall back on, and frames that can be asserted.
+   iced follows key for key, and its job is what a terminal cannot do: the same keys and the same
+   `host v1` commands with real text (a `:` prompt with completion, dialogs, multi-window) — the
+   emacs move. The owner's framing: "the same workflow on iced as on ratatui… and eventually lean
+   into the benefits of not running inside a terminal", with iced's churn accepted as the price.
+   See *one workflow, two shells* in the
+   [modal editing note](../../proposed/architecture/2026-09-21-modal-editing-model.md).
 
 ## Evidence
 
@@ -102,8 +114,8 @@ retires a shell and records what decides the rest.
 - **A working editor sits frozen in the tree.** Until one Rust shell reaches parity, features
   the owner wants *today* have nowhere to live; that is the accepted cost of the retirement,
   and `crates/shell/RETIRED.md` says how to resurrect it if a porting question needs it.
-- **The open question — which is primary — has explicit criteria**, and the two shells are
-  measured against all of them rather than argued about:
+- **The primary is the TUI; iced is second** — and the criteria below are why, in the order they
+  counted (not as an open question any more, but as the standard the second shell is still held to):
   - **Surfaces**: timeline (waveform, lanes, playhead), mixer, pool, detail; how much is stock
     widget vs hand-drawn canvas.
   - **Interaction**: modal editing, visual-mode selection, the `:` prompt; whether a terminal's
@@ -113,13 +125,19 @@ retires a shell and records what decides the rest.
   - **Reach**: the TUI runs over SSH, on a container, on a Raspberry-Pi "box mode", with no GPU;
     iced needs a display and a working wgpu stack (it does work here: niri/Wayland + Mesa).
   - **Testability**: ratatui's `TestBackend` + a pty harness (deterministic frames) vs iced's
-    windowed app (no headless render in the spike yet).
+    windowed app (no headless render in the spike yet). This decided it: the workflow can be
+    *asserted* in the TUI, and a workflow is what is being built.
   - **The plugin story**: if we later export instruments as CLAP plugins (see
     [the export note](../../proposed/architecture/2026-09-22-clap-export-via-nice-plug.md)),
     the iced shell's widgets and layouts are reusable as plugin editors via `nice-plug-iced`;
     a TUI cannot be a plugin editor at all.
 - **`RESEARCH.md` §4.5/§4.6 and the §0 app-shell row** now read as "retired / under evaluation"
   rather than "shipped", and the notes that assumed the Tauri shell carry a superseded marker.
+- **iced's churn is an accepted, budgeted cost** (the author explicitly reserves breaking changes;
+  0.14 → 0.15-dev already moves the MSRV). Two things keep it affordable: the shells are thin over
+  the Host API (the hard work lives in `engine`/`media`/`host`, which don't move with iced), and the
+  *workflow* is the durable artifact — it is a note, a keymap table and a text vocabulary, none of
+  which is iced-shaped. A future iced can be re-adopted from the note; a workflow cannot.
 
 ## Attribution
 

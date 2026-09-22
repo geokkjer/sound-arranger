@@ -116,7 +116,8 @@ What it does, and what it honestly cannot:
 | **Zoom ceiling** | the whole arrangement **plus margin** (4× the fitted density), so a piece can be seen with room around it. The state line always shows the current `ms/col`, so the density claim is visible, not asserted. |
 | **Lanes** | rows are shared out: `min(4, rows ÷ tracks)` per track, so 3 tracks in a 26-row terminal get 2 rows each and a tall terminal gives envelopes more amplitude resolution. |
 | **Selection** | `v` anchors a frame span at the playhead, `h`/`l` extend it, the state line shows the span and its duration, `Esc` leaves. Mode and focus are always on screen. |
-| **Not yet** | moving clips (within or across tracks), trimming, fades by key, undo gestures from the shell, the `:` prompt, and auditioning — `play` renders the session while the panel draws the arrangement, so the playhead is the *session* clock against the arrangement grid (they line up when the arrangement is what the session renders). |
+| **Not yet** | fades by key, `set_clip_gain` by key, the `:` prompt, auditioning, and drag-to-move — `play` renders the session while the panel draws the arrangement, so the playhead is the *session* clock against the arrangement grid (they line up when the arrangement is what the session renders). |
+| **Empty tracks are lanes** | every host track draws as a lane, including one with no clips: a track is a place a clip can be moved *to*, and a lane that disappeared when its last clip left made `J`/`K` and the active-track cursor disagree with the host's own track list (found by wiring `J`). |
 
 ### Measured, from the demo above
 
@@ -190,9 +191,13 @@ pointless), so the shell falls back to the wide meter bars under the transport.
 | `M` / `S` | **mixer: mute / solo** the selected channel |
 | `x` | timeline: razor-split the clip under the playhead |
 | `d` | timeline: delete the clip under the playhead |
+| `<` / `>` | timeline: trim the clip's **start / end to the playhead** |
+| `t` | **visual**: trim the clip to the selection (consumes the selection) |
+| `H` / `L` | timeline: move the clip **one beat** earlier / later (clamps at 0) |
+| `J` / `K` | timeline: move the clip to the track **below / above**, keeping its time |
 | `Esc` | leave visual mode / close this overlay — **never quits** |
 | `m` | toggle mouse capture |
-| `?` | the keymap |
+| `?` | the keymap (modal, scrollable with `j`/`k`) |
 | `q` / `Ctrl+c` | quit |
 | mouse | click a panel to focus · a lane = that track + seek · the ruler = seek · **drag a mixer strip = set that fader** · Play/Stop/Rewind · wheel = seek |
 

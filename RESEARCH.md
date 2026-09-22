@@ -12,7 +12,7 @@
 |---|---|---|
 | **Target** | **x86 desktop first** (Linux primary; macOS/Windows via Tauri). ARM/RPi + hardware controls = a separate later phase | Best technical solution trumps; don't pre-optimize for a Pi |
 | **Direction** | **Umbrella-first** — the platform is the goal; profiles are the products; sound-arranger is profile #1 | [umbrella-first note](.agents/notes/proposed/architecture/2026-08-15-umbrella-first-product-direction.md) |
-| **App shell** | **Tauri v2 + Vue 3 retired (2026-09-22)**; the shells are **iced** (§4.5, + `iced_audio` widgets) and **ratatui** (§4.6), both in-process Rust over the Host API. **Which is primary is open** — criteria in the [shells note](.agents/notes/implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md) | One stack; the frozen Tauri shell stays as the porting reference ([`crates/shell/RETIRED.md`](crates/shell/RETIRED.md)) |
+| **App shell** | **Tauri v2 + Vue 3 retired (2026-09-22)**; the shells are **iced** (§4.5, + `iced_audio` widgets) and **ratatui** (§4.6), both in-process Rust over the Host API. **The TUI is primary; iced is second, implementing the same modal, key-driven workflow** (and later leaning into the GUI-only extras) — [shells note](.agents/notes/implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md), [one workflow, two shells](.agents/notes/proposed/architecture/2026-09-21-modal-editing-model.md#one-workflow-two-shells-2026-09-22) | One stack, one workflow; the frozen Tauri shell stays as the porting reference ([`crates/shell/RETIRED.md`](crates/shell/RETIRED.md)) |
 | **Architecture** | **Minimal core (clock · graph interpreter · session log · context plumbing) + everything-else-as-plugin; the product is an assembled profile** | §11, §16.7, [minimal-core note](.agents/notes/proposed/architecture/2026-08-15-minimal-core-clock-graph-session-log.md) |
 | **UI library** | **`reka-ui` + shadcn-vue + Tailwind v4** (the "cdp-front" stack — now a documented decision, not a repo) | Headless primitives fit a bespoke DAW. Do **not** add Naive UI / PrimeVue |
 | **Timeline rendering** | `<canvas>` 2D + precomputed waveform **peak pyramids** + viewport culling + offscreen clip caching | Fast and predictable; DOM-per-clip is a dead end |
@@ -211,7 +211,9 @@ two are evaluated together; the keyboard-native TUI is where the model gets test
 ### 4.6 ratatui — the terminal shell (under evaluation, 2026-09-21; one of two candidates)
 
 > **Movement (2026-09-22):** Tauri is retired, so this is no longer "a second reference alongside a
-> shipped shell" — ratatui and iced are *the* two candidates, and which is primary is open
+> shipped shell" — ratatui and iced are the two shells, and **the TUI is primary**: the modal
+> workflow is where the product's identity is, so it is proved where it cannot cheat (no mouse, frames
+> that can be asserted) and ported to iced afterwards
 > ([shells note](.agents/notes/implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md)).
 
 **Why it is on the table.** `egui` and Slint are out by inspection (immediate mode; a second view

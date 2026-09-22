@@ -102,6 +102,16 @@ const KEYMAP: &[(&str, &str)] = &[
     ("M  S", "mixer: mute / solo the selected channel"),
     ("x", "timeline: split the clip under the playhead"),
     ("d", "timeline: delete the clip under the playhead"),
+    (
+        "<  >",
+        "timeline: trim the clip's start / end to the playhead",
+    ),
+    ("H  L", "timeline: move the clip one beat earlier / later"),
+    ("J  K", "timeline: move the clip to the track below / above"),
+    (
+        "t",
+        "visual: trim the clip to the selection (then leave visual)",
+    ),
     ("n  N", "timeline: jump to the next / previous clip"),
     (
         "u  Ctrl+r",
@@ -159,6 +169,9 @@ struct App {
     /// The selected mixer channel.
     selected: usize,
     help: bool,
+    /// How far the `?` overlay is scrolled (the keymap no longer fits a 24-row
+    /// terminal, and a truncated help is a lying help).
+    help_scroll: usize,
     mouse: bool,
     quit: bool,
     /// The last command's label and how long the UI thread was blocked in it.
@@ -236,6 +249,7 @@ impl App {
             status,
             selected: 0,
             help: false,
+            help_scroll: 0,
             mouse: true,
             quit: false,
             last_command: None,
@@ -511,6 +525,7 @@ impl App {
             status: String::new(),
             selected: 0,
             help: false,
+            help_scroll: 0,
             mouse: true,
             quit: false,
             last_command: None,
@@ -599,6 +614,23 @@ impl App {
     fn on_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
+        // The keymap overlay is **modal**: while it is up, `j`/`k` scroll it and
+        // anything else closes it or does nothing. (It cannot be dismissed by
+        // accident into an edit — the help is where you read before you act.)
+        if self.help {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.help_scroll = (self.help_scroll + 1).min(KEYMAP.len());
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                }
+                KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => self.help = false,
+                _ => {}
+            }
+            return;
+        }
+
         match key.code {
             // Global transport: available in either panel and in any mode.
             KeyCode::Char(' ') => self.toggle(),
@@ -634,11 +666,21 @@ impl App {
             KeyCode::Char('v') => self.timeline_key(|app| app.visual()),
             KeyCode::Char('x') => self.timeline_key(|app| app.split_at_playhead()),
             KeyCode::Char('d') => self.timeline_key(|app| app.delete_at_playhead()),
+            KeyCode::Char('<') => self.timeline_key(|app| app.trim_to_playhead(media::Edge::Start)),
+            KeyCode::Char('>') => self.timeline_key(|app| app.trim_to_playhead(media::Edge::End)),
+            KeyCode::Char('t') => self.timeline_key(|app| app.trim_to_selection()),
+            KeyCode::Char('H') => self.timeline_key(|app| app.nudge_clip(-1)),
+            KeyCode::Char('L') => self.timeline_key(|app| app.nudge_clip(1)),
+            KeyCode::Char('J') => self.timeline_key(|app| app.move_clip_to_track(1)),
+            KeyCode::Char('K') => self.timeline_key(|app| app.move_clip_to_track(-1)),
             // Clip-to-clip motion: the "next word" analogue for an arrangement.
             KeyCode::Char('n') => self.timeline_key(|app| app.seek_clip(true)),
             KeyCode::Char('N') => self.timeline_key(|app| app.seek_clip(false)),
 
-            KeyCode::Char('?') => self.help = !self.help,
+            KeyCode::Char('?') => {
+                self.help_scroll = 0;
+                self.help = !self.help;
+            }
             KeyCode::Char('m') => self.toggle_mouse(),
             KeyCode::Char('q') => self.quit = true,
             // Esc leaves *state* (the help overlay, a visual selection) and never
@@ -909,10 +951,130 @@ impl App {
 
     /// The (track id, clip id) at the playhead on the active track.
     fn clip_under_playhead(&self) -> Option<(String, String)> {
+        self.active_clip_at(self.snap.frame)
+            .map(|(track, clip, _, _)| (track, clip))
+    }
+
+    /// The clip under `frame` on the active track, as an edit needs it: the
+    /// track id, the clip id, and the clip's span on the timeline.
+    fn active_clip_at(&self, frame: u64) -> Option<(String, String, u64, u64)> {
         let arrangement = self.arrangement.as_ref()?;
         let lane = arrangement.lanes.get(self.active_track)?;
-        let clip = arrangement.clip_at(self.active_track, self.snap.frame)?;
-        Some((lane.id.clone(), clip.id.clone()))
+        let clip = arrangement.clip_at(self.active_track, frame)?;
+        Some((
+            lane.id.clone(),
+            clip.id.clone(),
+            clip.at_frame,
+            clip.end_frame(),
+        ))
+    }
+
+    /// The lane id `offset` tracks away from the active one, when it exists.
+    fn lane_id_offset(&self, offset: i32) -> Option<String> {
+        let lanes = &self.arrangement.as_ref()?.lanes;
+        let index = self.active_track as i32 + offset;
+        if index < 0 || index as usize >= lanes.len() {
+            return None;
+        }
+        Some(lanes[index as usize].id.clone())
+    }
+
+    /// `<` / `>`: trim the clip under the playhead so one edge lands on it. The op
+    /// is a **delta** in frames (`trim <track> <clip> start|end <by>`), which is
+    /// exactly what a playhead-relative trim is; a playhead already on the edge is
+    /// a no-op. Trimming the *start* moves `at_frame` and `src_start` together, so
+    /// the audio does not shift under the cut.
+    fn trim_to_playhead(&mut self, edge: media::Edge) {
+        let Some((track, clip, at, end)) = self.active_clip_at(self.snap.frame) else {
+            self.status = "no clip under the playhead on the active track".to_string();
+            return;
+        };
+        let playhead = self.snap.frame as i64;
+        let (name, by) = match edge {
+            media::Edge::Start => ("start", playhead - at as i64),
+            media::Edge::End => ("end", playhead - end as i64),
+        };
+        if by == 0 {
+            self.status = format!("{clip}: the playhead is already its {name}");
+            return;
+        }
+        self.status = format!("trim {clip} {name} by {by:+} frames");
+        self.arrange(&format!("trim {track} {clip} {name} {by}"));
+    }
+
+    /// `t` in visual mode: trim the clip to the **selection** — the modal payoff
+    /// ("select, then act"). The clip is the one the selection *starts* in on the
+    /// active track, and the selection's edges become the clip's, clamped to it:
+    /// a selection can only shrink a clip, never extend it. That is up to two
+    /// logged ops (one per moving edge, so `u` unwinds it in steps), and the
+    /// action consumes the selection — back to normal mode, as Helix does.
+    fn trim_to_selection(&mut self) {
+        let Some((anchor, head)) = self.view.as_ref().and_then(|view| view.selection) else {
+            self.status = "no selection — v anchors one at the playhead".to_string();
+            return;
+        };
+        let (sel_start, sel_end) = (anchor.min(head), anchor.max(head));
+        let Some((track, clip, at, end)) = self.active_clip_at(sel_start) else {
+            self.status = format!("no clip on the active track at frame {sel_start}");
+            return;
+        };
+        let new_start = sel_start.max(at);
+        let new_end = sel_end.min(end);
+        if new_end <= new_start {
+            self.status = format!("the selection does not overlap {clip}");
+            return;
+        }
+
+        let (start_by, end_by) = (new_start as i64 - at as i64, new_end as i64 - end as i64);
+        self.status = format!(
+            "trim {clip} to {new_start}–{new_end} ({} frames)",
+            new_end - new_start
+        );
+        if start_by != 0 {
+            self.arrange(&format!("trim {track} {clip} start {start_by}"));
+        }
+        if end_by != 0 {
+            self.arrange(&format!("trim {track} {clip} end {end_by}"));
+        }
+
+        self.mode = Mode::Normal;
+        if let Some(view) = self.view.as_mut() {
+            view.selection = None;
+        }
+    }
+
+    /// `H` / `L`: move the clip under the playhead one **beat** earlier / later.
+    /// The step comes from the session clock (bpm × sample rate), so a nudge is
+    /// musical rather than a cell width, and moving left clamps at frame 0.
+    fn nudge_clip(&mut self, direction: i32) {
+        let Some((track, clip, at, _)) = self.active_clip_at(self.snap.frame) else {
+            self.status = "no clip under the playhead on the active track".to_string();
+            return;
+        };
+        let sample_rate = self.arrangement.as_ref().map_or(48_000, |a| a.sample_rate) as f64;
+        let beat = (60.0 / self.snap.bpm.max(1e-9) * sample_rate).round() as i64;
+        let target = (at as i64 + direction as i64 * beat).max(0) as u64;
+        let beats = direction as i64;
+        self.status = format!("move {clip} {beats:+} beat ({beat} frames) → {target}",);
+        self.arrange(&format!("move_clip {track} {clip} {target}"));
+    }
+
+    /// `J` / `K`: move the clip under the playhead to the track below / above,
+    /// keeping its position in time, and follow it with the cursor so the panel
+    /// stays on the clip.
+    fn move_clip_to_track(&mut self, offset: i32) {
+        let Some((track, clip, at, _)) = self.active_clip_at(self.snap.frame) else {
+            self.status = "no clip under the playhead on the active track".to_string();
+            return;
+        };
+        let Some(target) = self.lane_id_offset(offset) else {
+            let which = if offset > 0 { "below" } else { "above" };
+            self.status = format!("there is no track {which}");
+            return;
+        };
+        self.status = format!("move {clip} {track} → {target} at {at}");
+        self.arrange(&format!("move_clip_to_track {track} {clip} {target} {at}"));
+        self.active_track = (self.active_track as i32 + offset).max(0) as usize;
     }
 
     /// `n`/`N`: jump the playhead to the next/previous clip boundary on the
@@ -1401,10 +1563,11 @@ impl App {
         frame.render_widget(paragraph, area);
     }
 
+    /// The `?` overlay: the keymap table, rendered (so it cannot drift from the
+    /// behaviour) and **scrollable**, because a terminal that shows 24 rows cannot
+    /// show a 22-entry keymap plus its wrapped meanings. The title says when there
+    /// is more below, so a clipped help never reads as the whole help.
     fn draw_help(&self, frame: &mut Frame, area: Rect) {
-        let popup = centered_rect(64, KEYMAP.len() as u16 + 4, area);
-        frame.render_widget(Clear, popup);
-
         let rows: Vec<ratatui::text::Line> = KEYMAP
             .iter()
             .map(|(keys, meaning)| {
@@ -1420,9 +1583,20 @@ impl App {
             })
             .collect();
 
+        let popup = centered_rect(64, (KEYMAP.len() as u16 + 4).min(area.height), area);
+        frame.render_widget(Clear, popup);
+
+        let more = KEYMAP.len().saturating_sub(self.help_scroll);
+        let title = if more + 4 > popup.height as usize {
+            format!(" keys — ? or Esc closes · j/k scrolls ({more} below) ")
+        } else {
+            " keys — ? or Esc closes ".to_string()
+        };
+
         frame.render_widget(
             Paragraph::new(rows)
-                .block(Block::bordered().title(" keys — ? or Esc closes "))
+                .block(Block::bordered().title(title))
+                .scroll((self.help_scroll as u16, 0))
                 .wrap(Wrap { trim: true }),
             popup,
         );
@@ -1811,16 +1985,40 @@ mod tests {
     fn the_help_overlay_lists_every_key() {
         let mut app = App::demo();
         app.help = true;
-        let screen = rendered(&mut app);
 
-        for (keys, _) in KEYMAP {
-            // The overlay pads the key column, so match on the first token.
+        // The overlay is scrollable (the keymap outgrew a 24-row terminal), so
+        // "every key is listed" means every row is *reachable*: scroll to each
+        // index and look for that entry's key token. The overlay pads the key
+        // column, so matching on the first token is enough.
+        for (index, (keys, _)) in KEYMAP.iter().enumerate() {
+            app.help_scroll = index;
+            let screen = rendered(&mut app);
             let token = keys.split_whitespace().next().expect("a key");
             assert!(
                 screen.contains(token),
-                "key `{token}` missing from the overlay:\n{screen}"
+                "key `{token}` (row {index}) missing from the overlay:\n{screen}"
             );
         }
+
+        // Scrolling is bounded and `j`/`k` move it while the overlay is modal.
+        app.help_scroll = 0;
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()));
+        assert_eq!(app.help_scroll, 1, "j scrolls the overlay");
+        app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()));
+        app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()));
+        assert_eq!(app.help_scroll, 0, "k stops at the top");
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()));
+        assert!(
+            app.help,
+            "keys other than scroll/close do nothing while help is open"
+        );
+        assert!(
+            app.last_command.is_none(),
+            "no command leaked through the overlay"
+        );
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(!app.help, "Esc closes the overlay");
+        assert!(!app.quit, "and still never quits");
     }
 
     #[test]
@@ -2210,6 +2408,143 @@ mod tests {
         app.snap.frame = 1_000_000;
         app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()));
         assert!(app.status.contains("no clip"), "status: {}", app.status);
+
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// The gestures that were missing: move (in time, across tracks) and trim.
+    /// Every one of them goes through the host's `arrange` language, and the
+    /// host's value — not the shell's guess — is what the assertions read.
+    #[test]
+    fn clips_move_and_trim_through_the_arrange_language() {
+        let (pool, script_path) = pool_script("moves", "arrange add_track t1\n");
+        let mut app = App::idle();
+        app.snap = App::demo_snapshot(); // the playhead sits at 2.000 s (96 000)
+        app.open_script(&script_path);
+
+        let clip = |app: &App| {
+            app.arrangement.as_ref().expect("an arrangement").lanes[0]
+                .clips
+                .first()
+                .cloned()
+        };
+
+        // `>` trims the clip's end to the playhead: 3 s of source becomes 2 s.
+        app.on_key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::empty()));
+        assert!(
+            matches!(app.last_command, Some(("arrange", _))),
+            "{}",
+            app.status
+        );
+        assert_eq!(
+            clip(&app).expect("a clip").src_len,
+            96_000,
+            "{}",
+            app.status
+        );
+
+        // …and `u` unwinds it: a trim is a logged edit like any other.
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::empty()));
+        assert_eq!(
+            clip(&app).expect("a clip").src_len,
+            144_000,
+            "{}",
+            app.status
+        );
+
+        // `<` trims the *start* to the playhead, carrying the audio with it.
+        app.on_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::empty()));
+        let c = clip(&app).expect("a clip");
+        assert_eq!(
+            (c.at_frame, c.src_start, c.src_len),
+            (96_000, 96_000, 48_000),
+            "{}",
+            app.status
+        );
+
+        // `t` in visual mode trims to the **selection** — select, then act.
+        app.view.as_mut().expect("a view").selection = Some((100_000, 120_000));
+        app.mode = Mode::Visual;
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::empty()));
+        let c = clip(&app).expect("a clip");
+        assert_eq!(
+            (c.at_frame, c.src_start, c.src_len),
+            (100_000, 100_000, 20_000),
+            "the selection became the clip: {}",
+            app.status
+        );
+        assert_eq!(app.mode, Mode::Normal, "the action consumed the selection");
+        assert!(
+            app.view.as_ref().expect("a view").selection.is_none(),
+            "the selection is dropped"
+        );
+
+        // `H` / `L` nudge by one beat — 24 000 frames at 120 bpm — and clamp at 0.
+        // The playhead follows the clip's start so each hop has a clip under it.
+        let hop = |app: &mut App, key: char| {
+            let at = clip(app).expect("a clip").at_frame;
+            app.snap.frame = at;
+            app.on_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::empty()));
+        };
+        hop(&mut app, 'H');
+        assert_eq!(
+            clip(&app).expect("a clip").at_frame,
+            76_000,
+            "{}",
+            app.status
+        );
+        hop(&mut app, 'L');
+        assert_eq!(
+            clip(&app).expect("a clip").at_frame,
+            100_000,
+            "{}",
+            app.status
+        );
+        for _ in 0..8 {
+            hop(&mut app, 'H');
+        }
+        assert_eq!(
+            clip(&app).expect("a clip").at_frame,
+            0,
+            "a nudge left clamps at frame 0: {}",
+            app.status
+        );
+
+        // Put it back where the J/K assertions expect it, then move it down a
+        // track: `J` keeps the time and the cursor follows the clip; `K` returns.
+        app.snap.frame = 0;
+        app.arrange("move_clip t0 c0 100000");
+        app.snap.frame = 100_000;
+        app.on_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::empty()));
+        {
+            let arrangement = app.arrangement.as_ref().expect("an arrangement");
+            assert_eq!(arrangement.lanes[0].clips.len(), 0, "{}", app.status);
+            assert_eq!(arrangement.lanes[1].clips.len(), 1, "{}", app.status);
+            assert_eq!(
+                arrangement.lanes[1].clips[0].at_frame, 100_000,
+                "a track move keeps the clip's time"
+            );
+        }
+        assert_eq!(app.active_track, 1, "the cursor follows the clip");
+        app.on_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::empty()));
+        assert_eq!(app.active_track, 0);
+        assert_eq!(
+            app.arrangement.as_ref().expect("an arrangement").lanes[1]
+                .clips
+                .len(),
+            0,
+            "{}",
+            app.status
+        );
+
+        // At the top of the stack `K` reports instead of panicking.
+        app.on_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::empty()));
+        assert!(
+            app.status.contains("no track above"),
+            "status: {}",
+            app.status
+        );
+        assert_eq!(app.active_track, 0);
 
         let _ = std::fs::remove_dir_all(&pool);
     }

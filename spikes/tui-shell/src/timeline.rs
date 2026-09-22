@@ -238,12 +238,14 @@ impl Arrangement {
                 });
             }
 
-            if !clips.is_empty() {
-                lanes.push(Lane {
-                    id: track.id.clone(),
-                    clips,
-                });
-            }
+            // **Every** track is a lane, including an empty one: a track is a place
+            // a clip can be moved *to*, and a lane that vanishes when its last clip
+            // leaves makes `J`/`K` and the active-track cursor disagree with the
+            // host's own track list.
+            lanes.push(Lane {
+                id: track.id.clone(),
+                clips,
+            });
         }
 
         Arrangement {

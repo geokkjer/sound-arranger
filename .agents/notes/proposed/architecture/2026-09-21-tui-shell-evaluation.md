@@ -113,7 +113,8 @@ A dedicated study — [Helix's keyboard model, and what a terminal can actually 
 - **ratatui as a second *reference* host only (the UI-as-plugin note's original placement).** The
   cheap, safe framing — a test/dev shell, not a product. Not chosen as the *scope* of this spike:
   if a TUI could be the product for the editing workflow, that deserves a real evaluation, not a
-  smoke test. The reference-host role remains the fallback if it loses.
+  smoke test. **It won the primary role on 2026-09-22** — and the workflow it proves is what iced
+  then implements (see the shells note).
 - **egui / Slint / Vizia / GPUI.** Rejected by inspection for this app (immediate mode; a second
   view DSL; too small a track record; Zed's GPU-first framework not aimed at third-party apps).
   Recorded here so the same ground is not re-covered.
@@ -247,8 +248,8 @@ The spike exists and is verified; the decision is **open**:
   frames on the first transport command — recorded as a
   [proposed bug-fix note](../bug-fix/2026-09-21-live-host-underrun-burst-on-transport-change.md).
 - **Tauri is out of the race (2026-09-22).** The owner retired the Tauri + Vue shell and named
-  **iced and ratatui** as the two shells, with the primary still open
-  ([shells note](../../implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md)).
+  **iced and ratatui** as the two shells, with **the TUI primary** and iced following the same
+  workflow ([shells note](../../implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md)).
   This evaluation no longer runs against a shipped incumbent; it runs against iced. The comparison
   criteria that matter for that contest are listed in the shells note (surfaces, interaction, text,
   reach, testability, and the plugin-editor path if export lands).

@@ -2,9 +2,10 @@
 
 Status: proposed
 
-> **Movement (2026-09-22):** the owner **retired the Tauri + Vue shell** and named iced and ratatui
-> as the two shells, with the primary still open — so this is no longer "an option against the
-> status quo" but one of two candidates ([shells
+> **Movement (2026-09-22):** the owner **retired the Tauri + Vue shell**, named ratatui primary and
+> iced second, and fixed the rule that both implement the *same* modal, key-driven workflow — so this
+> is no longer "an option against the status quo" but the shell that carries the GUI-only surfaces
+> (text, dialogs, windows, plugin editors) over that workflow ([shells
 > note](../../implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md)).
 > `iced_audio` is adopted for the iced shell's mixer widgets (evidence below), and the no-webview
 > comparison in the Problem section is now the shipped state, kept as the reasoning that got here.
@@ -119,7 +120,8 @@ question, and keep the Tauri + Vue shell shipped until those measurements exist.
   alongside iced: a TUI runs headless and over SSH, it is the cheapest shell to build and test, and
   it is the natural home for the keyboard-first workflow. It has its own spike and note
   ([TUI evaluation](2026-09-21-tui-shell-evaluation.md)), deliberately scoped identically so the
-  two can be compared; the reference-host role is its fallback if it loses.
+  two can be compared. **It won the primary role on 2026-09-22** — iced is now the second shell, and
+  its measured job is the surfaces a terminal cannot carry, over the same workflow.
 
 ## Acceptance criteria
 

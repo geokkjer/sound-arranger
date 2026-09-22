@@ -86,9 +86,42 @@ proposal to *finish* a model rather than to start one:
   concrete.
 - **Clip motions exist in miniature**: `n`/`N` jump the playhead to the next/previous clip — the
   arrangement's answer to "next word".
+- **Move and trim are modal gestures** (2026-09-22): `<`/`>` trim a clip's start/end to the
+  playhead, `H`/`L` move it one beat (the step comes from the session clock, so a nudge is musical,
+  not a cell width), `J`/`K` move it to the track below/above keeping its time, and in visual mode
+  **`t` trims the clip to the selection** — select, then act — consuming the selection and leaving
+  visual mode, as Helix does. Every one of them is an `arrange …` line dispatched through the host's
+  parser; the model has no private mutation path.
 
 What is *not* built: the `:` prompt, registers/repeat/macros, the keymap as loadable data, the
 prefix infobox, the palette, and the Emacs-style extensibility surface.
+
+## One workflow, two shells (2026-09-22)
+
+The owner's direction: **the modal, key-driven workflow is the product, and both shells implement
+the same one.** The TUI is the reference implementation (it is where the model is proved, and it is
+the primary shell); iced follows it key for key, and only then leans into what a GUI can do that a
+terminal cannot — the emacs move: same keys and same commands, better rendering, real text
+(completion, selection, dialogs), multiple windows.
+
+Consequences to hold the two together:
+
+- **No shell-only features.** A capability lands in the workflow (an action in the vocabulary, a key
+  for it, a line in the keymap table) before or with the shell that shows it; a shell that cannot
+  express something (a TUI cannot show a plugin editor, a GUI can hide the log) is a *rendering*
+  difference, never a workflow difference.
+- **The `host v1` vocabulary is the floor.** Every action is an `arrange`/`set_param`/`transport`
+  line, so the `:` prompt, a script, and a key are the same thing — and a key that exists in one
+  shell and not the other is a bug in the shell, not a feature.
+- **The keymap is data, and today it is one table.** The TUI's `KEYMAP` const renders the `?`
+  overlay *and* is the table the handler matches against, so help cannot drift from behaviour. When
+  iced grows keys, the table is what moves: the honest next step is a shared definition (a small
+  crate the shells' isolated workspaces both path-depend on, like `host`) rather than two tables that
+  agree by discipline. Until then, the TUI's table is the reference, and a divergence is a bug.
+
+The GUI-only upside is real and deferred, not denied: text entry and completion for the `:` prompt,
+menus/dialogs, tooltips, multi-window layouts, and reusing the same widgets as a CLAP plugin editor
+later ([export note](../architecture/2026-09-22-clap-export-via-nice-plug.md)).
 
 ## Alternatives considered
 
