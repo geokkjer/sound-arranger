@@ -265,13 +265,14 @@ impl App {
     }
 
     /// Load a single audio file as a **one-clip arrangement in the host**
-    /// (`--wave`): the shell synthesises the same kind of script a user would
-    /// write and hands it over, so the file is *audible* and the arrangement the
-    /// panel draws is the engine's own value — not a shell-side picture of a file
-    /// the host has never seen.
+    /// (`--wave`): the shell imports it into the spike's own **session pool** at
+    /// the session rate — the same boundary a product import crosses — then hands
+    /// the host the script a user would write, so the file is *audible* and the
+    /// arrangement the panel draws is the engine's own value. A 44.1 kHz file is
+    /// resampled here, once, instead of being refused by the transport.
     fn open_wave(&mut self, path: &std::path::Path) {
-        let script = match wave_script(path) {
-            Ok(script) => script,
+        let (script, note) = match wave_script(path) {
+            Ok(loaded) => loaded,
             Err(e) => {
                 self.status = format!("cannot open {}: {e}", path.display());
                 return;
@@ -288,9 +289,7 @@ impl App {
                         .map(|t| t.tracks.iter().map(|t| t.clips.len()).sum::<usize>())
                         .unwrap_or(0);
                     self.status = format!(
-                        "loaded {} — {} clip(s), {} log events (press space to hear it)",
-                        path.display(),
-                        clips,
+                        "{note} — {clips} clip(s), {} log events (press space to hear it)",
                         outcome.event_count,
                     );
                     self.take_arrangement(outcome);
@@ -1446,8 +1445,15 @@ fn run(keys: bool, wave: Option<PathBuf>, script: Option<PathBuf>) -> io::Result
         let _ = execute!(io::stdout(), DisableMouseCapture);
     }
     ratatui::restore();
+    drop_pool();
 
     outcome
+}
+
+/// Remove this process's session pool (its imports are copies; the tool that
+/// brought the material in still has the original).
+fn drop_pool() {
+    let _ = std::fs::remove_dir_all(session_pool_dir());
 }
 
 /// The runtime: poll the host, redraw, wait for input (up to one frame). Mouse
@@ -1500,39 +1506,76 @@ fn dump(keys: bool, wave: Option<PathBuf>, script: Option<PathBuf>) -> io::Resul
         .expect("the test backend is infallible");
 
     print!("{}", buffer_text(terminal.backend().buffer()));
+    drop_pool();
     Ok(())
 }
 
-/// The one-clip host script the shell synthesises for `--wave`. The host owns the
-/// result, so a loaded file is **audible**, editable and logged like any other
-/// arrangement — and the panel draws the engine's value, not the shell's picture
-/// of a file the host has never seen.
-fn wave_script(path: &std::path::Path) -> Result<String, String> {
-    let reader = media::wav::WavReader::open(path).map_err(|e| e.to_string())?;
-    let frames = reader.total_frames();
-    if frames == 0 {
-        return Err("the file has no audio frames".to_string());
-    }
+/// The spike's **session pool**: one directory per process under the temp dir.
+/// A pool is session-owned working material (see `media::pool`), so `--wave`
+/// imports a copy here rather than pointing the pool at the user's own directory
+/// — which would make the pool pass rewrite their file.
+fn session_pool_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("tui-shell-pool-{}", std::process::id()))
+}
 
+/// Import `path` into the spike's session pool at the session rate and build the
+/// one-clip host script that places it. Returns `(script, what to tell the user)`.
+fn wave_script(path: &std::path::Path) -> Result<(String, String), String> {
+    let dir = session_pool_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("pool dir {}: {e}", dir.display()))?;
+
+    // The text format is whitespace-separated, so a path with a space cannot be
+    // named in it. Renaming is the honest fix; quoting soup is not.
+    if dir.to_string_lossy().split_whitespace().count() != 1 {
+        return Err(format!(
+            "the temp dir '{}' contains whitespace — set TMPDIR to a simple path",
+            dir.display()
+        ));
+    }
     let stem = path
         .file_stem()
         .and_then(|stem| stem.to_str())
         .ok_or_else(|| "the file name is not valid UTF-8".to_string())?;
-    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-
-    // The text format is whitespace-separated, so a path with a space cannot be
-    // named in it. Renaming is the honest fix; quoting soup is not.
-    for part in [stem, dir.to_str().unwrap_or("")] {
-        if part.split_whitespace().count() != 1 {
-            return Err(format!(
-                "'{part}' contains whitespace — copy the file to a simple path first"
-            ));
-        }
+    if stem.split_whitespace().count() != 1 {
+        return Err(format!(
+            "'{stem}' contains whitespace — copy the file to a simple name first"
+        ));
     }
 
-    Ok(format!(
-        "host v1\nmount mixer channels=2 @0\npool {}\narrange add_track t0\narrange add_clip t0 c0 {stem} 0 {frames} 0 0 0 1.0\n",
-        dir.display()
+    let pool = media::Pool::open(&dir)?;
+    let imported = pool.import(path, SAMPLE_RATE as u32)?;
+    if imported.frames_out == 0 {
+        return Err("the file has no audio frames".to_string());
+    }
+
+    let note = if imported.converted {
+        format!(
+            "imported {} — resampled {} → {} Hz, {} frames at the session rate{}",
+            imported.id,
+            imported.from_rate,
+            imported.to_rate,
+            imported.frames_out,
+            imported
+                .preserved
+                .as_ref()
+                .map(|p| format!(", original kept as {}", p.display()))
+                .unwrap_or_default(),
+        )
+    } else {
+        format!(
+            "imported {} — {} frames at {} Hz",
+            imported.id, imported.frames_out, imported.to_rate
+        )
+    };
+
+    Ok((
+        format!(
+            "host v1\nmount mixer channels=2 @0\npool {}\narrange add_track t0\narrange add_clip t0 c0 {} 0 {} 0 0 0 1.0\n",
+            dir.display(),
+            imported.id,
+            imported.frames_out,
+        ),
+        note,
     ))
 }
 
@@ -1551,7 +1594,7 @@ fn probe(wave: Option<PathBuf>, script: Option<PathBuf>) -> i32 {
             }
         },
         (None, Some(path)) => match wave_script(path) {
-            Ok(text) => (format!("wave {}", path.display()), text),
+            Ok((text, note)) => (format!("wave {} ({note})", path.display()), text),
             Err(e) => {
                 eprintln!("probe: {e}");
                 return 2;
@@ -1607,6 +1650,7 @@ fn probe(wave: Option<PathBuf>, script: Option<PathBuf>) -> i32 {
 
     println!("probe: peak ch0/master = {peak:.4}");
 
+    drop_pool();
     if let Some(e) = &last.last_error {
         eprintln!("probe: pump error: {e}");
         return 1;
@@ -2026,6 +2070,60 @@ mod tests {
         assert_eq!(app.arrangement.as_ref().expect("the panel").clip_count(), 1);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The reported bug: `--wave` on a 44.1 kHz file used to stop the transport
+    /// with a rate-mismatch error. The shell now imports external material into
+    /// its session pool at the session rate, so the clip is a straight read.
+    #[test]
+    fn a_forty_four_one_khz_file_is_imported_at_the_session_rate() {
+        let path = std::env::temp_dir().join(format!(
+            "tui-shell-44100-{}.wav",
+            std::process::id()
+        ));
+        let rate = 44_100u32;
+        let frames = rate as usize;
+        let mut writer =
+            media::wav::WavWriter::create_float(&path, rate, 1).expect("create the fixture");
+        let samples: Vec<f32> = (0..frames).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        writer.write(&samples).expect("write");
+        writer.finalize().expect("finalize");
+
+        let mut app = App::idle();
+        app.open_wave(&path);
+
+        assert!(
+            app.status.contains("44100 → 48000"),
+            "the import is not reported: {}",
+            app.status
+        );
+        assert!(
+            !app.status.contains("rate-mismatched") && !app.status.contains("refused"),
+            "the file was refused instead of converted: {}",
+            app.status
+        );
+
+        // The host holds the imported source at the session rate: one second of
+        // 44.1 kHz material is 48 000 frames of the session's timeline.
+        let timeline = app
+            .host
+            .outcome()
+            .expect("outcome")
+            .arrangement
+            .expect("the host holds an arrangement");
+        assert_eq!(timeline.tracks[0].clips[0].src_len, 48_000);
+        assert_eq!(app.arrangement.as_ref().expect("the panel").frames, 48_000);
+
+        // …and the panel draws the imported source (its waveform, not a hole).
+        let screen = rendered(&mut app);
+        assert!(screen.contains("ms/col"), "no timeline:\n{screen}");
+        assert!(
+            screen.contains('⣿') || screen.contains('⣤') || screen.contains('⠿'),
+            "no envelope for the imported source:\n{screen}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        drop_pool();
     }
 
     #[test]

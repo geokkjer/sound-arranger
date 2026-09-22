@@ -123,7 +123,7 @@ impl ArrangerNode {
                 .sample_rate();
             if src_rate != session_rate {
                 return Err(format!(
-                    "clip '{}' source is {src_rate} Hz but the session is {session_rate} Hz (rate-mismatched; wire DriftCompensator or resample)",
+                    "clip '{}' source is {src_rate} Hz but the session is {session_rate} Hz (a pool source is converted to the session rate when the pool is adopted — import it through `Pool::import`/`Pool::conform`, or re-point the pool)",
                     c.id
                 ));
             }

@@ -1,6 +1,6 @@
 # sound-arranger (working title)
 
-> 🕒 Last verified against commit `b3f0ef5` (2026-09-21). If the code has
+> 🕒 Last verified against commit `22416d5` (2026-09-22). If the code has
 > moved on, trust the code and move this line forward.
 
 An **audio platform where everything is a plugin**: a minimal core — clock · audio graph
@@ -67,7 +67,7 @@ sketched pending selection wiring; record is still chrome). The direction is loc
 | Crate | What it is | Status |
 |---|---|---|
 | `crates/engine` | The minimal core: clock (tempo map + sample-accurate scheduler), patch-bay graph interpreter (typed ports, PDC), session event log, context plumbing — plus plugins: euclidean, scale, tone, **soft mixer** (gain/pan/mute/solo, stereo master fader, meters). Audio ports are **channel-aware** (mono default; the mixer's master is stereo). Std-only. It also carries the **closed-core plugin-message dispatch** (`Event::Arrangement` + `arrange_logged`): profile-level ops are logged as commands the core understands without knowing them. | works, tested |
-| `crates/media` | The media engine (core-privileged, not a plugin): disk streaming, splice-during-playback, recording writer with crash recovery, **device-clock drift compensation wired into the capture**, multi-channel capture → **float-WAV media pool with live peak pyramids**, pool **enumeration + crash recovery** (finalize un-finalized takes, rebuild `.peaks`), the **clip editor's value + ACID ops + `ArrangerNode`** (renders a track from the value), and the **`ArrangeOp ↔ engine-command` codec**. | works, tested |
+| `crates/media` | The media engine (core-privileged, not a plugin): disk streaming, splice-during-playback, recording writer with crash recovery, **device-clock drift compensation wired into the capture**, multi-channel capture → **float-WAV media pool with live peak pyramids**, pool **enumeration + crash recovery** (finalize un-finalized takes, rebuild `.peaks`) **+ rate conformance** (`import`/`conform`: a source of any rate is resampled once to the session rate, original preserved — see the [session-rate note](.agents/notes/implemented/architecture/2026-09-22-session-rate-and-source-conversion.md)), a **band-limited resampler** (128-tap Kaiser polyphase), the **clip editor's value + ACID ops + `ArrangerNode`** (renders a track from the value), and the **`ArrangeOp ↔ engine-command` codec**. | works, tested |
 | `crates/host` | The **Host API contract** (commands = logged events, events, values — including `params`, the session's parameters folded from the log) + the **headless reference host**: `run_script` assembles the profile and bounces byte-identically — now including the **clip-arrangement commands** (`pool`/`arrange`) in the versioned **text format**, so the CLI smoke binary drives the clip editor end-to-end. It is also a **persistent live session** (`execute()` for incremental edits, `arrangement()` for a serializable snapshot a shell reads). The UI-as-plugin seam — the Tauri shell implements the same contract; swapping shells swaps only the transport adapter. | works, tested |
 | `crates/shell` | The Tauri v2 + Vue 3 shell — now a **working timeline editor**, not a stub: the four planned views as components (`Surface`, `TimelineCanvas`, `SourcePool` with Project/Library contexts, `MixerPanel`, `DetailView`), plus `bridge` (the Host API over Tauri), `transport`, `editor` (undo/redo replayed from the host's session log) and the timeline viewport/editing maths with unit tests. The Detail View is present with its three context tabs, but its bodies are placeholders pending selection wiring. | works; UI wiring in progress |
 | `spikes/iced-shell` | The **iced evaluation spike** (its own workspace, excluded from the core build): a minimal second shell — window, transport, channel/master meters following the audio — driving the *same* `host::live::HostHandle` as the Tauri bridge, but in-process: no IPC, no serde wire, no webview. Ships a headless `--probe` mode that asserts live meter signal. iced 0.14. | spike; decision open — delete the directory to drop the option |
@@ -115,7 +115,8 @@ The headless smoke binary speaks the same versioned command script the Tauri she
 printf 'host v1\nmount mixer channels=4 @0\nbounce 512 /tmp/out.wav\n' | cargo run -p host
 
 # a clip arrangement from a pool source (the clip editor):
-#   pool <dir>s1.wav must exist; then arrange clips on tracks and bounce.
+#   pool <dir>: adopting it resamples any foreign-rate source to the session rate
+#   (`s1.wav` must exist); then arrange clips on tracks and bounce.
 printf 'host v1\nmount mixer channels=2 @0\npool /data/takes\narrange add_track t0 @0\narrange add_clip t0 c0 s1 0 48000 0 0 0 1.0 @0\nbounce 48000 /tmp/out.wav\n' | cargo run -p host
 ```
 

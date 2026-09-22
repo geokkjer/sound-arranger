@@ -225,6 +225,18 @@ jumps once by ~2–3 s of device frames on the first transport command — inclu
 stopped — and then stays flat
 ([bug-fix note](.agents/notes/proposed/bug-fix/2026-09-21-live-host-underrun-burst-on-transport-change.md)).
 
+**A rough edge the shell hit, and where it belongs (2026-09-22).** `--wave` on a 44.1 kHz file
+stopped the transport (`clip 'c0' source is 44100 Hz but the session is 48000 Hz`). The refusal is
+right — a rate-mismatched take would play ~8.8% flat with no counter — but there was no **import**
+door at all, so the most common music rate was unusable. The fix is *not* shell-side: the pool owns
+the rate boundary now (`Pool::import`/`Pool::conform` with a band-limited 128-tap Kaiser resampler;
+converted once at the boundary, original preserved, and `set_pool` conforms as it adopts), so any
+shell gets it. The spike's `--wave` therefore imports a copy into its own session pool
+(`$TMPDIR/tui-shell-pool-<pid>`) instead of pointing `pool` at the user's directory — the pool is
+session-owned working material. The 48 kHz-vs-44.1 kHz question and the conversion boundary are
+recorded in the
+[session-rate note](.agents/notes/implemented/architecture/2026-09-22-session-rate-and-source-conversion.md).
+
 **Verifying a TUI is cheap** — which is itself part of the case for it: `TestBackend` makes the view
 testable (a deterministic `--dump` frame, embedded in the spike's README, plus five assertions on
 the rendered buffer), and a pty harness (`script -qec` with `stty rows/cols`) covers the real path

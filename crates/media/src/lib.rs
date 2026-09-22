@@ -11,6 +11,7 @@
 //! - [`stream`] — the long-file player and splice-during-playback;
 //! - [`record`] — the `Recorder` seam and the WAV recorder provider;
 //! - [`drift`] — device-clock drift reconciliation;
+//! - [`resample`] — band-limited sample-rate conversion (the pool boundary);
 //! - [`devices`] — the cpal device path (enumerate, open input + output).
 //!
 //! Invariants (Spike B note):
@@ -37,6 +38,7 @@ pub mod drift;
 pub mod peaks;
 pub mod pool;
 pub mod record;
+pub mod resample;
 pub mod ring;
 pub mod stream;
 pub mod timeline;
@@ -49,8 +51,9 @@ pub use capture::{Capture, CaptureNode};
 pub use clip_editor::{decode_op, encode_op, register_handlers, ClipEditor, Interner};
 pub use drift::DriftCompensator;
 pub use peaks::{PeakBuilder, PeakFile, PEAK_BASE_BIN, PEAK_LEVELS};
-pub use pool::{Pool, PoolIndex, PoolSource, Recovery};
+pub use pool::{Conform, ConformReport, Pool, PoolIndex, PoolSource, Recovery};
 pub use record::{Recorder, RecordNode, WavRecorder};
+pub use resample::Resampler;
 pub use ring::Spsc;
 pub use stream::{mailbox, ClipRef, FilePlayer, Mailbox, PlaybackNode, SpliceCmd, DEFAULT_RING_CAPACITY};
 pub use timeline::{ArrangeOp, Clip, Edge, Frame, Id, Timeline, Track};

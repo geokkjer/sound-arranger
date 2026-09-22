@@ -223,8 +223,11 @@ pub struct HostSession {
     editor: Option<media::ClipEditor>,
     /// resolves a pool source id (stem) to its `.wav` path, set by `set_pool`.
     pool_resolver: Option<media::PoolResolver>,
-    /// the pool directory (set by `set_pool`), used to list sources for the UI.
+    /// The pool directory (set by `set_pool`), used to list sources for the UI.
     pool_dir: Option<PathBuf>,
+    /// The sources the last `set_pool` resampled to the session rate (see
+    /// [`HostSession::pool_conformed`]).
+    pool_conformed: Vec<media::Conform>,
     /// track id → the arranger node mounted for it (avoids re-wiring on a rebuild).
     wired_tracks: std::collections::HashMap<String, engine::NodeId>,
     /// the arrangement value changed since last wiring (re-wire before render).
@@ -277,6 +280,7 @@ impl HostSession {
             editor: None,
             pool_resolver: None,
             pool_dir: None,
+            pool_conformed: Vec::new(),
             wired_tracks: std::collections::HashMap::new(),
             arrange_dirty: false,
             playing: false,
@@ -288,9 +292,20 @@ impl HostSession {
 
     /// Set the media pool for arrangement clips. The pool (float-WAV sources by
     /// stem id) is where the clip editor's clips resolve their source paths.
+    ///
+    /// **Adopting a pool conforms it.** A source whose rate differs from the
+    /// session rate is resampled once, in place (the original kept beside it as
+    /// `{id}.wav.pre{rate}`), because an arrangement clip is a straight read in
+    /// the session's one frame domain — a 44.1 kHz file in a 48 kHz session is
+    /// material to convert, not a reason to refuse the transport. The report is
+    /// kept on the session ([`HostSession::pool_conformed`]) and carried on the
+    /// [`HostOutcome`](crate::live::HostOutcome) so a shell can say what moved.
     pub fn set_pool(&mut self, pool_dir: impl Into<PathBuf>) -> Result<(), String> {
         let dir: PathBuf = pool_dir.into();
-        media::Pool::open(&dir)?; // validate it exists as a directory
+        let pool = media::Pool::open(&dir)?; // validate it exists as a directory
+        // A file that cannot be converted is reported, not fatal: it stays at its
+        // own rate and the arranger names it if a clip reads it.
+        self.pool_conformed = pool.conform(self.engine.clock.sample_rate)?.converted;
         let resolver_dir = dir.clone();
         let resolver: media::PoolResolver = std::sync::Arc::new(move |id| {
             let p = resolver_dir.join(format!("{id}.wav"));
@@ -299,6 +314,13 @@ impl HostSession {
         self.pool_resolver = Some(resolver);
         self.pool_dir = Some(dir);
         Ok(())
+    }
+
+    /// The sources the last [`set_pool`](Self::set_pool) brought to the session
+    /// rate (empty when the pool already fitted). A shell shows this once, as a
+    /// fact about the load — the pool is not converted again afterwards.
+    pub fn pool_conformed(&self) -> &[media::Conform] {
+        &self.pool_conformed
     }
 
     /// The pool source listing (id, frame count, sample rate, peaks), for the
@@ -1018,7 +1040,8 @@ impl HostSession {
 /// transport stop
 /// play /abs/clip.wav ch0 @0
 /// splice 4000 /abs/clip2.wav 512
-/// pool /data/takes                           # the media pool dir
+/// pool /data/takes                           # the media pool dir (adopting it
+///                                             # resamples foreign-rate sources)
 /// arrange add_track t0 @0                    # the clip editor (P1.3.4)
 /// arrange add_clip t0 c0 s1 0 4000 0 0 0 1.0 @0
 /// bounce 6000 /abs/out.wav

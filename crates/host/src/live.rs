@@ -108,6 +108,9 @@ pub struct HostOutcome {
     /// — never a silent empty value.
     pub arrangement: Result<media::Timeline, String>,
     pub pool_sources: Option<Vec<media::PoolSource>>,
+    /// Sources the pool pass resampled to the session rate while adopting the
+    /// pool (`set_pool`); empty when the pool already fitted.
+    pub pool_conformed: Vec<media::Conform>,
     pub mixer_channels: Option<usize>,
     /// The session's current parameter values, folded from the log — what a
     /// shell reads instead of keeping its own copy (see `HostSession::params`).
@@ -435,6 +438,7 @@ fn build_outcome(session: &HostSession) -> HostOutcome {
         media_commands: session.media_command_count(),
         arrangement: session.arrangement(),
         pool_sources: session.pool_sources(),
+        pool_conformed: session.pool_conformed().to_vec(),
         mixer_channels: session.mixer_channels(),
         params: session.params(),
     }

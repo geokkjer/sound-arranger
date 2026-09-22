@@ -510,3 +510,70 @@ fn chop_text_format_splits_a_clip_and_renders() {
     let _ = std::fs::remove_dir_all(&pool);
     let _ = std::fs::remove_dir_all(&out_dir);
 }
+
+/// Write a constant source at an explicit rate (a foreign-rate import fixture).
+fn write_source_at_rate(dir: &Path, stem: &str, sample_rate: u32, frames: u64) {
+    let mut w = WavWriter::create_float(&dir.join(format!("{stem}.wav")), sample_rate, 1).unwrap();
+    w.write(&vec![0.5f32; frames as usize]).unwrap();
+    w.finalize().unwrap();
+}
+
+/// **The reported bug.** A 44.1 kHz source in a 48 kHz session used to stop the
+/// transport at play ("clip 'c0' source is 44100 Hz but the session is 48000 Hz").
+/// Adopting the pool converts it — once, in place, preserving the original — so
+/// the arrangement is playable and the session reports what it moved.
+#[test]
+fn adopting_a_pool_converts_a_foreign_rate() {
+    let pool = tmp_dir("foreignrate");
+    write_source_at_rate(&pool, "s1", 44_100, 44_100); // one second, foreign rate
+    let out_dir = tmp_dir("foreignrateout");
+    let out = out_dir.join("out.wav");
+
+    let mut s = HostSession::new();
+    s.execute(&HostCommand::Mount { plugin: "mixer", params: vec![("channels", 2.0)], at_frame: Some(0) })
+        .unwrap();
+    s.execute(&HostCommand::Pool { dir: pool.clone() }).unwrap();
+
+    // The pool pass converted it, and the session says so (a shell shows this).
+    let conformed = s.pool_conformed();
+    assert_eq!(conformed.len(), 1, "one source was converted");
+    assert_eq!(conformed[0].id, "s1");
+    assert_eq!((conformed[0].from_rate, conformed[0].to_rate), (44_100, 48_000));
+    assert_eq!((conformed[0].frames_in, conformed[0].frames_out), (44_100, 48_000));
+    assert!(conformed[0].converted);
+    assert!(
+        pool.join("s1.wav.pre44100").is_file(),
+        "the pre-conversion original is preserved"
+    );
+
+    // The pool now lists one source at the session rate (the original is not indexed).
+    let sources = s.pool_sources().expect("a pool");
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].sample_rate, SR);
+    assert_eq!(sources[0].frames, SR as u64);
+
+    // Adopting it again is a no-op — the conversion does not run twice.
+    s.execute(&HostCommand::Pool { dir: pool.clone() }).unwrap();
+    assert!(s.pool_conformed().is_empty(), "conform is idempotent");
+
+    // …and the clip that spans it renders audio instead of refusing the transport.
+    s.execute(&HostCommand::Arrange { op: ArrangeOp::AddTrack { track: "t0".into() }, at_frame: Some(0) })
+        .unwrap();
+    let foreign = Clip { src_len: SR as u64, ..clip("c0", 0, SR as u64) };
+    s.execute(&HostCommand::Arrange { op: ArrangeOp::AddClip { track: "t0".into(), clip: foreign }, at_frame: Some(0) })
+        .unwrap();
+    s.execute(&HostCommand::Bounce { frames: 4800, path: out.clone() })
+        .expect("the converted source plays");
+
+    let mut r = media::WavReader::open(&out).unwrap();
+    assert_eq!(r.sample_rate(), SR);
+    let mut audio = vec![0.0f32; r.total_frames() as usize];
+    let n = r.read_into(&mut audio);
+    assert!(
+        audio[..n].iter().any(|s| s.abs() > 1e-3),
+        "the resampled source must be audible through the mixer"
+    );
+
+    let _ = std::fs::remove_dir_all(&pool);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}

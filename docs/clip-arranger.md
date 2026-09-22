@@ -1,6 +1,6 @@
 # The clip arranger — an arrangement is data
 
-> 🕒 Last verified against commit `7c5a2e7` (2026-09-05). If the code has moved on,
+> 🕒 Last verified against commit `22416d5` (2026-09-22). If the code has moved on,
 > trust the code and move this line forward.
 
 **What this is.** The engine ([`architecture-explainer.md`](architecture-explainer.md)) is a
@@ -118,7 +118,10 @@ Per block, the node:
   the steady-state rule from the explainer (§3.4).
 - **Rate-match is enforced, not assumed.** `ArrangerNode::new` opens each source and refuses a
   clip whose sample rate differs from the session. A rate-mismatched take would otherwise play
-  pitch-shifted with no diagnostic — a bug that's invisible until you hear it.
+  pitch-shifted with no diagnostic — a bug that's invisible until you hear it. The refusal is the
+  invariant guard, not the user's door: a **pool** is material at the session rate, and adopting it
+  converts a foreign-rate source once (`Pool::conform`, original preserved) — see the
+  [session-rate note](../.agents/notes/implemented/architecture/2026-09-22-session-rate-and-source-conversion.md).
 - **Mid-transport rebuilds are positioned correctly.** `from_frame` computes `off0`
   (`from_frame - at_frame`, clamped) so a reader rebuilt while the transport is mid-clip
   continues the clip instead of restarting it.

@@ -24,9 +24,11 @@ What this spike adds, because it is what a TUI has to answer for:
 - **an arrangement you can hear** — `--script <host script>` loads the session and
   draws the **clips and tracks the host holds** (the engine's own `Timeline`, not a
   copy): braille min/max envelopes, one lane per track, boundaries, per-track
-  colour. `--wave <file.wav>` synthesises a one-clip script, hands it to the host
-  and draws the result — so a loaded file is **audible**, and the panel is never a
-  picture of something the engine has not got;
+  colour. `--wave <file.wav>` **imports the file into the spike's own session
+  pool** at the session rate (a 44.1 kHz file is resampled once — see
+  `media::Pool::import`), hands the host a one-clip script and draws the result —
+  so a loaded file is **audible**, and the panel is never a picture of something
+  the engine has not got;
 - **edits that go through the host's own language** — `x` splits and `d` deletes
   by building an `arrange …` line and handing it to the host's parser, so a key
   runs exactly what a script writes, and the engine logs it like any command;
@@ -57,13 +59,15 @@ cd spikes/tui-shell
 
 cargo run                            # the TUI (any terminal)
 cargo run -- --wave /tmp/demo.wav     # …with a one-clip timeline for a file
+                                      # (imported into $TMPDIR/tui-shell-pool-<pid> at 48 kHz,
+                                      #  so a 44.1 kHz file plays at the right pitch)
 cargo run -- --script /tmp/arr.script # …with the clips/tracks a host script builds
 cargo run -- --keys                  # (same as pressing ? in the app)
 cargo run -- --probe                 # headless: host thread + transport + live meters, no TTY
 cargo run -- --probe --wave f.wav     # …and assert that the *loaded file* renders (meters move)
 cargo run -- --dump                  # render one deterministic frame and print it as text
 cargo run -- --dump --script f.script # …including the arrangement (deterministic)
-cargo test                           # 16 tests; asserts the rendered frame, no TTY needed
+cargo test                           # 22 tests; asserts the rendered frame, no TTY needed
 ./scripts/pty-check.sh               # the real terminal path, asserted
 ```
 
@@ -120,6 +124,12 @@ What it does, and what it honestly cannot:
 **ch0 = 0.8000** and **master = 0.5657** — the file's own amplitude, and the equal-power centre-pan
 law (0.8 × 1/√2) on the way to the stereo master. That is the headless proof that a loaded file is
 audible: a silent host's meters only move if the arrangement rendered through the mixer.
+
+`--probe --wave /tmp/rate44.wav` (a 1-second 440 Hz file at **44.1 kHz**) reports
+`imported rate44 — resampled 44100 → 48000 Hz, 48000 frames`, then **ch0 = 0.5000** and
+**master = 0.3535** — the same file, at the session rate, played instead of refused (before the
+pool boundary existed this stopped the transport: `pump error: … source is 44100 Hz but the session
+is 48000 Hz`).
 
 A 9-second arrangement, 3 tracks, 5 clips, rendered in a 100×26 terminal:
 **98.917 ms/cell** fitted (≈10 cells per second), playhead and ruler legible, all

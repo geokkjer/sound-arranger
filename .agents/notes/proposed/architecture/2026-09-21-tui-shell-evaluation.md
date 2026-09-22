@@ -227,10 +227,17 @@ The spike exists and is verified; the decision is **open**:
   the host's value — so `space` plays it (verified headlessly: `--probe --wave` reports the file's own
   amplitude on ch0 and the equal-power centre-pan law on the master). The earlier caveat that the
   timeline was not wired to the transport is gone.
+- **A rate-mismatched file plays instead of stopping the transport.** `--wave` on a 44.1 kHz file
+  used to stop at play (`source is 44100 Hz but the session is 48000 Hz`) — the refusal is the
+  clock-honesty guard, but it had no import door. The pool now owns the boundary
+  (`Pool::import`/`Pool::conform`, a band-limited resampler; `set_pool` conforms as it adopts), and
+  `--wave` imports into a **session-owned** pool at the session rate rather than pointing `pool` at
+  the user's directory — see the
+  [session-rate note](../../implemented/architecture/2026-09-22-session-rate-and-source-conversion.md).
 - **Visual mode has a real object.** `v` anchors a selection at the playhead, `h`/`l` extend it, the
   state line shows the span and its duration, and `Esc` leaves — with `Esc` no longer quitting (the
   safety key must not be destructive; `q`/`Ctrl+c` are the way out).
-- **Verification is cheap and CI-able**: thirteen tests assert the rendered buffer (including the
+- **Verification is cheap and CI-able**: twenty-two tests assert the rendered buffer (including the
   timeline panel, the zoom floor and the visual-mode transition) through `TestBackend`, `--dump`
   prints a deterministic frame (the README embeds one), and a pty harness covers the real terminal
   path.
