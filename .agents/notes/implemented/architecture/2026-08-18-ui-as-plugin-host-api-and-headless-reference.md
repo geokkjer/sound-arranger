@@ -2,6 +2,12 @@
 
 Status: implemented
 
+> **Superseded direction (2026-09-22):** the Tauri + Vue shell is **retired** — the shells are
+> iced and ratatui, both in-process Rust over this same Host API. The contract and the seam argued
+> here still stand; what changed is which side of it is shipped. See
+> [the shells note](2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md) (and
+> [`crates/shell/RETIRED.md`](../../../../crates/shell/RETIRED.md)).
+
 ## Problem
 
 The project began as a tightly coupled UI sound-clip arranger; the everything-is-a-plugin discipline (composition-seams note) says UI is a capability too, not the substrate. Ardour's postmortems are the anti-pattern: session model and GUI grew together, and extracting the seams took years. The UI must be **interchangeable** — the Tauri app is a *reference implementation* of the host, not the host. The composition-seams note already demanded the two halves: "the IPC command list is written down" and "a headless smoke binary records and bounces without the frontend." This step ships the seam and its first reference host.

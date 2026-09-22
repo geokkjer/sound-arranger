@@ -2,6 +2,15 @@
 
 Status: implemented
 
+> **Superseded direction (2026-09-22):** the Tauri + Vue shell is **retired** and excluded from
+> the workspace, so `pnpm test` is no longer run by this repository's default verification — the
+> suite still exists and still passes if the shell is ever resurrected
+> ([shells note](../architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md),
+> [`crates/shell/RETIRED.md`](../../../../crates/shell/RETIRED.md)). The *lesson* — extract pure
+> logic (viewport, ruler, edit transforms) into testable modules instead of burying it in the view
+> — carries over to the iced and ratatui shells, where the same extraction is what makes them
+> testable without a display.
+
 ## Problem
 
 The Vue shell had **no tests at all**, while the Rust side is heavily tested. That gap started to

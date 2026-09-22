@@ -1,17 +1,18 @@
 # sound-arranger (working title)
 
-> 🕒 Last verified against commit `22416d5` (2026-09-22). If the code has
+> 🕒 Last verified against commit `1190ec7` (2026-09-22). If the code has
 > moved on, trust the code and move this line forward.
 
 An **audio platform where everything is a plugin**: a minimal core — clock · audio graph
 interpreter · session event log · context plumbing — with every capability as a plugin, and
-the product an **assembled profile**. Rust (engine core + media engine + host), driven by a
-Tauri v2 + Vue 3 shell over the Host API (the same versioned text format the CLI drives) — with
-**iced** and a **ratatui TUI** under evaluation as in-process Rust shells that would remove the
-webview, the IPC wire and TypeScript entirely ([RESEARCH §4.5–4.6](RESEARCH.md)). The interaction
-direction under evaluation with them: **modal editing — visual mode for clips — with the `host v1`
-command language as the `:` prompt**, i.e. for audio what vim/helix/emacs is for text
-([note](.agents/notes/proposed/architecture/2026-09-21-modal-editing-model.md)).
+the product an **assembled profile**. Rust (engine core + media engine + host) and Rust shells over
+the Host API — the same versioned text format the CLI drives. The shells are **iced** (GUI, with
+`iced_audio` widgets) and **ratatui** (TUI), both in-process over the same host actor; the
+**Tauri v2 + Vue 3 shell is retired** ([note](.agents/notes/implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md),
+[`crates/shell/RETIRED.md`](crates/shell/RETIRED.md)) — which shell becomes primary is the open
+question. The interaction direction under evaluation: **modal editing — visual mode for clips —
+with the `host v1` command language as the `:` prompt**, i.e. for audio what vim/helix/emacs is for
+text ([note](.agents/notes/proposed/architecture/2026-09-21-modal-editing-model.md)).
 
 ## Scope (focused core)
 
@@ -31,16 +32,17 @@ the Tidal live-coding tool (`tidal-lsp`) — those are not on the clip-arranger 
 > **Working title.** The repo name names the *first profile*, not the platform; a rename
 > ("audio" / "sound") is an open question — see RESEARCH.md §14.
 
-**Status: pre-alpha.** The audio core works and is tested, and the shell is no longer a stub —
-it is a working timeline editor. What exists today: the minimal core, the media engine (disk
-streaming, recording, splicing, multi-channel capture), the soft mixer (gain/pan/mute/solo +
-stereo master), **the clip editor (P1.3 — value, ACID ops, arranger node, media pool with crash
-recovery, the engine's closed-core message dispatch, the logged-command codec, host wiring, and
-a text-format that drives it from the CLI)**, a **headless reference host** that proves the
-UI-as-plugin contract end-to-end, and a **Tauri v2 + Vue 3 shell** carrying the four planned
-views (source pool · timeline canvas · mixer panel · detail view), transport, playhead
-following, timeline zoom/pan, clip editing (select · move · resize · razor), and undo/redo
-replayed from the host's session log.
+**Status: pre-alpha.** The audio core works and is tested. What exists today: the minimal core,
+the media engine (disk streaming, recording, splicing, multi-channel capture, pool rate
+conformance), the soft mixer (gain/pan/mute/solo + stereo master), **the clip editor (P1.3 — value,
+ACID ops, arranger node, media pool with crash recovery, the engine's closed-core message
+dispatch, the logged-command codec, host wiring, and a text-format that drives it from the CLI)**,
+a **headless reference host** that proves the UI-as-plugin contract end-to-end, and **two shell
+spikes over it** — iced (transport, meters, a real `iced_audio` fader console) and ratatui (a
+timeline with braille envelopes, clip edits through the host's own `arrange` language, modal
+selection, a console whose faders read back from the log). The Tauri + Vue shell that carried the
+four views, zoom/pan, clip editing and undo/redo is **retired and frozen** — it is the porting
+reference, not the app.
 
 What doesn't exist yet: effects (no `fundsp` effect plugins), MIDI/OSC implementations (declared
 seams only), CLAP hosting, live-edit audio re-wiring, stereo *sources/clips* (the master is
@@ -68,16 +70,17 @@ sketched pending selection wiring; record is still chrome). The direction is loc
 |---|---|---|
 | `crates/engine` | The minimal core: clock (tempo map + sample-accurate scheduler), patch-bay graph interpreter (typed ports, PDC), session event log, context plumbing — plus plugins: euclidean, scale, tone, **soft mixer** (gain/pan/mute/solo, stereo master fader, meters). Audio ports are **channel-aware** (mono default; the mixer's master is stereo). Std-only. It also carries the **closed-core plugin-message dispatch** (`Event::Arrangement` + `arrange_logged`): profile-level ops are logged as commands the core understands without knowing them. | works, tested |
 | `crates/media` | The media engine (core-privileged, not a plugin): disk streaming, splice-during-playback, recording writer with crash recovery, **device-clock drift compensation wired into the capture**, multi-channel capture → **float-WAV media pool with live peak pyramids**, pool **enumeration + crash recovery** (finalize un-finalized takes, rebuild `.peaks`) **+ rate conformance** (`import`/`conform`: a source of any rate is resampled once to the session rate, original preserved — see the [session-rate note](.agents/notes/implemented/architecture/2026-09-22-session-rate-and-source-conversion.md)), a **band-limited resampler** (128-tap Kaiser polyphase), the **clip editor's value + ACID ops + `ArrangerNode`** (renders a track from the value), and the **`ArrangeOp ↔ engine-command` codec**. | works, tested |
-| `crates/host` | The **Host API contract** (commands = logged events, events, values — including `params`, the session's parameters folded from the log) + the **headless reference host**: `run_script` assembles the profile and bounces byte-identically — now including the **clip-arrangement commands** (`pool`/`arrange`) in the versioned **text format**, so the CLI smoke binary drives the clip editor end-to-end. It is also a **persistent live session** (`execute()` for incremental edits, `arrangement()` for a serializable snapshot a shell reads). The UI-as-plugin seam — the Tauri shell implements the same contract; swapping shells swaps only the transport adapter. | works, tested |
-| `crates/shell` | The Tauri v2 + Vue 3 shell — now a **working timeline editor**, not a stub: the four planned views as components (`Surface`, `TimelineCanvas`, `SourcePool` with Project/Library contexts, `MixerPanel`, `DetailView`), plus `bridge` (the Host API over Tauri), `transport`, `editor` (undo/redo replayed from the host's session log) and the timeline viewport/editing maths with unit tests. The Detail View is present with its three context tabs, but its bodies are placeholders pending selection wiring. | works; UI wiring in progress |
-| `spikes/iced-shell` | The **iced evaluation spike** (its own workspace, excluded from the core build): a minimal second shell — window, transport, channel/master meters following the audio — driving the *same* `host::live::HostHandle` as the Tauri bridge, but in-process: no IPC, no serde wire, no webview. Ships a headless `--probe` mode that asserts live meter signal. iced 0.14. | spike; decision open — delete the directory to drop the option |
-| `spikes/tui-shell` | The **ratatui evaluation spike** (its own workspace): the terminal counterpart of the iced spike — transport, channel/master meters, position readout — over the same in-process `HostHandle`, plus an **arrangement view** (`--script <host script>` draws the engine's own clips and tracks: braille min/max envelopes per clip, per-track colour, boundaries, fades, ruler, zoom/scroll, playhead, **visual-mode selection**) with **edits dispatched through the host's own `arrange` text format** (`x` split, `d` delete, `n`/`N` clip motion, `u`/`Ctrl+r` undo/redo by log replay), a **right-hand console** whose faders are **read back from the log** (`params`), and **panel focus** (`Tab`). `--wave <file.wav>` synthesises a one-clip script, so a loaded file is **audible**. Mouse, per-command UI latency, `?` keymap, deterministic `--dump`. | spike; decision open — delete the directory to drop the option |
-| `plugins/` | **External-integration home** (placeholder, direction changed 2026-09-21): **no VST/CLAP builds and no CDP sidecar binary** — capabilities that already exist as standalone programs (TidalCycles, VCV Rack, CDP8, sox, ffmpeg) are driven as *processes* and recorded into the pool, and hardware is synced and captured the same way. See [plugins/README.md](plugins/README.md) and the [note](.agents/notes/proposed/architecture/2026-09-21-external-programs-not-sidecars.md). | placeholder |
+| `crates/host` | The **Host API contract** (commands = logged events, events, values — including `params`, the session's parameters folded from the log) + the **headless reference host**: `run_script` assembles the profile and bounces byte-identically — now including the **clip-arrangement commands** (`pool`/`arrange`) in the versioned **text format**, so the CLI smoke binary drives the clip editor end-to-end. It is also a **persistent live session** (`execute()` for incremental edits, `arrangement()` for a serializable snapshot a shell reads). The UI-as-plugin seam — the iced and ratatui shells implement the same contract (the retired Tauri shell did too); swapping shells swaps only the transport adapter. | works, tested |
+| `crates/shell` | **RETIRED (2026-09-22)** — the Tauri v2 + Vue 3 shell: the four views as components (`Surface`, `TimelineCanvas`, `SourcePool`, `MixerPanel`, `DetailView`), `bridge` (the Host API over Tauri), `transport`, `editor` (undo/redo replayed from the log) and the timeline viewport/editing maths with unit tests. Frozen and **excluded from the workspace** (no Tauri/npm in the default build); kept as the porting reference for the Rust shells. See [`crates/shell/RETIRED.md`](crates/shell/RETIRED.md). | retired / frozen |
+| `spikes/iced-shell` | The **iced shell** (its own workspace, excluded from the core build): window, transport, channel/master meters following the audio, and **a real mixer** — `iced_audio 0.17` `VSlider` faders on a dB range, one per channel plus the master, positions read from the host's **parameter fold** (screenshot in its README). Drives the *same* `host::live::HostHandle` in-process: no IPC, no serde wire, no webview. Headless `--probe` asserts live meter signal; 2 tests pin the strip mapping and the dB range. iced 0.14 + `iced_audio` 0.17. | candidate shell — primary open |
+| `spikes/tui-shell` | The **ratatui evaluation spike** (its own workspace): the terminal counterpart of the iced spike — transport, channel/master meters, position readout — over the same in-process `HostHandle`, plus an **arrangement view** (`--script <host script>` draws the engine's own clips and tracks: braille min/max envelopes per clip, per-track colour, boundaries, fades, ruler, zoom/scroll, playhead, **visual-mode selection**) with **edits dispatched through the host's own `arrange` text format** (`x` split, `d` delete, `n`/`N` clip motion, `u`/`Ctrl+r` undo/redo by log replay), a **right-hand console** whose faders are **read back from the log** (`params`), and **panel focus** (`Tab`). `--wave <file.wav>` imports the file into a session pool at the session rate, so a loaded 44.1 kHz file is **audible at the right pitch**. Mouse, per-command UI latency, `?` keymap, deterministic `--dump`. | candidate shell — primary open |
+| `plugins/` | **External-integration home** (placeholder, direction changed 2026-09-21): **no sidecar binaries and no plugin *host*** — capabilities that already exist as standalone programs (TidalCycles, VCV Rack, CDP8, sox, ffmpeg) are driven as *processes* and recorded into the pool, and hardware is synced and captured the same way. *Narrowed 2026-09-22:* exporting **our own instruments** as CLAP plugins is re-opened as a deferred option ([note](.agents/notes/proposed/architecture/2026-09-22-clap-export-via-nice-plug.md)). See [plugins/README.md](plugins/README.md) and the [no-sidecars note](.agents/notes/proposed/architecture/2026-09-21-external-programs-not-sidecars.md). | placeholder |
 
-**191 Rust tests + 38 frontend unit tests**, all passing (the two spike workspaces are outside that
-count — `spikes/tui-shell` carries 5 view/input tests of its own); the core's invariants (byte-identical
-replay, no-allocation render, sample-accurate lifecycle) are tested, and the streaming soak +
-real hardware capture run as `#[ignore]`d tests.
+**The core workspace's Rust suites pass** (engine · media · host — 22 test binaries; the frontend
+tests retired with the shell, and both spike workspaces are outside the count: `spikes/tui-shell`
+carries 22 view/input tests and `spikes/iced-shell` 2). The core's invariants (byte-identical replay,
+no-allocation render, sample-accurate lifecycle) are tested, and the streaming soak + real hardware
+capture run as `#[ignore]`d tests.
 
 **Honest gaps** (deliberate, pre-alpha): the master is **stereo** (the mixer pans mono channels
 into L/R and the bounce is 2-channel) but stereo *sources/clips* are still forthcoming — a
@@ -160,7 +163,7 @@ by the [`~/Projects/music`](../music/README.md) symlink view.
 ## Dev environment
 
 **Native host toolchain** (Arch/CachyOS). Dev builds use the system `node`/`pnpm` and the
-**host** GTK/WebKit/Mesa; the **Rust toolchain is rustup-managed**, declared in
+**host** Mesa (and, only for the retired shell, GTK/WebKit); the **Rust toolchain is rustup-managed**, declared in
 [`rust-toolchain.toml`](rust-toolchain.toml) (`stable` + rustfmt/clippy/rust-analyzer), so the
 compiler is a property of the repo rather than of the distro package. The Nix/devenv setup is
 parked under [`nix/`](nix/): on this non-NixOS host a Nix-built GUI binary cannot open a window (the
@@ -169,23 +172,21 @@ diagnosis and the decisions are in the
 [host toolchain note](.agents/notes/implemented/process/2026-09-10-native-host-dev-toolchain.md)
 and the [rustup note](.agents/notes/implemented/process/2026-09-21-rustup-managed-toolchain.md).
 
-Install (Arch) — `rustup` **replaces** the distro `rust` package (they conflict):
+Install (Arch) — `rustup` **replaces** the distro `rust` package (they conflict); the retired
+shell's GTK/WebKit and `pnpm` are only needed if it is ever resurrected:
 ```sh
-sudo pacman -S --needed base-devel rustup nodejs npm pnpm \
-  webkit2gtk-4.1 gtk3 libsoup3 librsvg libayatana-appindicator \
-  alsa-lib openssl appmenu-gtk-module
+sudo pacman -S --needed base-devel rustup alsa-lib
+# for the retired Tauri shell only:
+#   sudo pacman -S nodejs npm pnpm webkit2gtk-4.1 gtk3 libsoup3 librsvg libayatana-appindicator openssl appmenu-gtk-module
 
 rustup default stable     # the repo's rust-toolchain.toml then supplies the components
 ```
 
-Frontend checks, from `crates/shell`: `pnpm typecheck` · `pnpm test` · `pnpm build`
-(and `pnpm tauri dev` to run the app).
-
-The **spike shells** are their own workspaces, so iced, wgpu and the terminal backend never enter
-the core build. Both drive the same in-process `HostHandle` the Tauri shell reaches over IPC:
+The **shells** are their own workspaces, so iced, wgpu and the terminal backend never enter
+the core build. Both drive the same in-process `HostHandle`:
 
 ```sh
-cd spikes/iced-shell           # iced 0.14 — a native window
+cd spikes/iced-shell           # iced 0.14 + iced_audio 0.17 — a native window
 cargo run                      # the window (needs a display and an audio device)
 cargo run -- --probe           # headless proof: host thread + transport + live meters
 

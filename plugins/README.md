@@ -4,7 +4,8 @@
 artifacts. The decision is
 [integration is external programs and devices, not in-process sidecars](../.agents/notes/proposed/architecture/2026-09-21-external-programs-not-sidecars.md):
 
-- **No VST3/CLAP builds** of our capabilities and **no CDP sidecar binary**. Capabilities that
+- **No sidecar binaries and no plugin *host*** — no CDP sidecar binary, and no in-process hosting of
+  other people's CLAP/VST3 plugins. Capabilities that
   already exist as better standalone programs (TidalCycles, VCV Rack, CDP8, sox, ffmpeg,
   `tui-wave`) are **driven as processes**: we provide the clicks and the timing, we record their
   audio into the media pool as takes, and offline processors run on rendered sources whose output
@@ -18,6 +19,13 @@ artifacts. The decision is
 - **"Everything is a plugin" still describes the engine** (the `Plugin` trait, the graph, the
   session log). This decision is about the *product* boundary, which is now process/device-level
   rather than binary-level.
+
+*Narrowed 2026-09-22:* the blanket "no VST3/CLAP builds" was about **others'** artifacts and about
+this directory being a roadmap promise. **Exporting our own instruments** (the native voices and
+generators — never the arranger, which is a timeline host and has no plugin shape) is reopened as a
+deferred option, with `nice-plug` as the framework the day it happens
+([note](../.agents/notes/proposed/architecture/2026-09-22-clap-export-via-nice-plug.md)). It does not
+change what this directory is: an integration pointer, not a build target.
 
 Nothing is built here yet. When the first integration lands, it lands as a **contract** — how the
 session starts/addressing a partner, what sync it takes, how its audio arrives, how a take is

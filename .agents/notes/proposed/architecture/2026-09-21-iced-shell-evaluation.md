@@ -2,6 +2,13 @@
 
 Status: proposed
 
+> **Movement (2026-09-22):** the owner **retired the Tauri + Vue shell** and named iced and ratatui
+> as the two shells, with the primary still open — so this is no longer "an option against the
+> status quo" but one of two candidates ([shells
+> note](../../implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md)).
+> `iced_audio` is adopted for the iced shell's mixer widgets (evidence below), and the no-webview
+> comparison in the Problem section is now the shipped state, kept as the reasoning that got here.
+
 ## Problem
 
 The shipped shell is **three runtimes for one program**: the Rust engine/media/host crates, a Rust
@@ -59,13 +66,23 @@ question, and keep the Tauri + Vue shell shipped until those measurements exist.
   wgpu — the exact thing the parked Nix shell died on), it opens the real audio device at
   48 kHz / 2 ch, the transport drives it, the channel and master meters and the readout follow the
   audio, and `--probe` observes live meter signal (peak 0.88) headlessly.
+- **The mixer is stock-widget material, and it reads the log** (2026-09-22). The spike's console
+  uses `iced_audio 0.17` `VSlider`s on a dB range (`DBRange`, −60…+12 dB, unity at ~83 % of the
+  travel) — one fader per channel plus the master, a live meter and a dB readout beside each. The
+  positions come from the host's **parameter fold**: the demo script's `master.gain 0.8` boots as
+  **master −1.9 dB** (20·log10(0.8)) while `ch0…ch3` sit at +0.0 dB, and a drag sends a logged
+  `set_param` back (screenshot:
+  [`spikes/iced-shell/mixer-fold.png`](../../../../spikes/iced-shell/mixer-fold.png)). Two tests
+  pin the strip↔parameter mapping and the dB range round trip. The widget crate tracks iced
+  exactly (it depends on `iced_core`/`iced_graphics` 0.14, the version this spike uses), so it
+  cannot drift from the shell.
 - **The human's read of the window is favourable** — "looks good and more native" than the webview
   shell — and **`egui` and Slint were dismissed by inspection** as not what this app wants. The
   appraisal is an input to the decision, not evidence for it: the acceptance criteria below are
   what closes it.
 - **A second candidate is now in flight**: a terminal shell
-  ([TUI evaluation](2026-09-21-tui-shell-evaluation.md)), deliberately scoped identically, so the
-  choice is between three shapes rather than two.
+  ([TUI evaluation](2026-09-21-tui-shell-evaluation.md)), deliberately scoped identically. Since
+  2026-09-22 these two *are* the choice — three shapes became two.
 - **And the interaction model is now a decided direction, separate from the shell**: the UI should be
   *for audio what vim/helix/emacs is for text* — modal, selection-first, with the existing `host v1`
   vocabulary as the `:` command line ([modal editing model](2026-09-21-modal-editing-model.md)).
@@ -78,11 +95,13 @@ question, and keep the Tauri + Vue shell shipped until those measurements exist.
 
 ## Alternatives considered
 
-- **Keep Tauri v2 + Vue 3 (the status quo).** The safe answer, and the shipped one. It is *not*
+- **Keep Tauri v2 + Vue 3 (the status quo).** The safe answer, and what shipped first. It is *not*
   obviously worse: the webview gives text rendering, IME, accessibility, menus, and a component
   ecosystem for free, and the canvas timeline is already the right rendering strategy there.
-  Rejected as an *unexamined* default, not as an option — it stays the shell until the evaluation
-  finishes.
+  **Rejected by the owner on 2026-09-22** — not because it failed, but because it is three runtimes
+  for one program and the direction is one stack
+  ([shells note](../../implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md));
+  the code stays frozen in the tree as the porting reference.
 - **egui (immediate mode).** Smaller dependency tree and a very fast start, but immediate mode
   re-derives the whole UI every frame and offers no architecture (no message loop to reason about,
   no subscription model); it fits tools, not a long-lived instrument with a session value.
@@ -133,8 +152,13 @@ rejected) note replacing this one:
 - **A spike is not a shell.** The proof covers windowing, threading, transport, and live meters. It
   deliberately does not cover the timeline, the detail view, or editing — the parts most likely to
   be worse.
-- **Two shells to maintain during the evaluation.** The spike is excluded from the default build,
-  but its dependencies and its drift are still a (small) ongoing cost.
+- **Two shells to maintain during the evaluation.** The spikes are excluded from the default build,
+  but their dependencies and their drift are still a (small) ongoing cost. Since the retirement
+  there is no third shell to keep in step — the frozen Tauri crate is out of the workspace.
+- **`iced_audio` is a young crate by one author** (0.17, 2026-09-09, MIT, in the iced org but
+  released by BillyDM). Mitigation: it is widgets on top of `iced_core` 0.14, version-locked to the
+  shell's iced; if it stalls, the fader/knob draw code is a canvas widget, not a rewrite of the
+  shell.
 
 ## Attribution
 

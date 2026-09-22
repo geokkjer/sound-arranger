@@ -2,6 +2,12 @@
 
 Status: implemented
 
+> **Superseded direction (2026-09-22):** the Tauri + Vue shell is **retired** — the shells are
+> iced and ratatui, both in-process Rust over this same Host API. The contract and the seam argued
+> here still stand; what changed is which side of it is shipped. See
+> [the shells note](2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md) (and
+> [`crates/shell/RETIRED.md`](../../../../crates/shell/RETIRED.md)).
+
 ## Problem
 
 The shell (`crates/shell/src/App.vue`) was a hardcoded clip-arranger profile: it imported

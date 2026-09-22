@@ -1,8 +1,12 @@
 [package]
 name = "sound-arranger-shell"
 version = "0.1.0"
-description = "Tauri v2 shell — the thin transport adapter over the Host API (docs/design/ui-plan.md)."
+description = "RETIRED (2026-09-22) Tauri v2 shell — kept frozen as a reference; see ../RETIRED.md."
 edition = "2021"
+
+# Retired: excluded from the root workspace (see ../../Cargo.toml), so it needs
+# its own workspace table to stay buildable in place.
+[workspace]
 
 # The lib is the Host-API bridge; `_lib` avoids the bin/lib same-name
 # self-reference so `main.rs` can call `sound_arranger_shell_lib::run()`.

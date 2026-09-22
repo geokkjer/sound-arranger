@@ -12,7 +12,7 @@
 |---|---|---|
 | **Target** | **x86 desktop first** (Linux primary; macOS/Windows via Tauri). ARM/RPi + hardware controls = a separate later phase | Best technical solution trumps; don't pre-optimize for a Pi |
 | **Direction** | **Umbrella-first** — the platform is the goal; profiles are the products; sound-arranger is profile #1 | [umbrella-first note](.agents/notes/proposed/architecture/2026-08-15-umbrella-first-product-direction.md) |
-| **App shell** | Tauri v2 + Vue 3 + TypeScript (shipped) — with **iced** (§4.5) and a **ratatui TUI** (§4.6) evaluated as in-process Rust replacements | Rust audio engine + web UI; the single-stack option is a live question |
+| **App shell** | **Tauri v2 + Vue 3 retired (2026-09-22)**; the shells are **iced** (§4.5, + `iced_audio` widgets) and **ratatui** (§4.6), both in-process Rust over the Host API. **Which is primary is open** — criteria in the [shells note](.agents/notes/implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md) | One stack; the frozen Tauri shell stays as the porting reference ([`crates/shell/RETIRED.md`](crates/shell/RETIRED.md)) |
 | **Architecture** | **Minimal core (clock · graph interpreter · session log · context plumbing) + everything-else-as-plugin; the product is an assembled profile** | §11, §16.7, [minimal-core note](.agents/notes/proposed/architecture/2026-08-15-minimal-core-clock-graph-session-log.md) |
 | **UI library** | **`reka-ui` + shadcn-vue + Tailwind v4** (the "cdp-front" stack — now a documented decision, not a repo) | Headless primitives fit a bespoke DAW. Do **not** add Naive UI / PrimeVue |
 | **Timeline rendering** | `<canvas>` 2D + precomputed waveform **peak pyramids** + viewport culling + offscreen clip caching | Fast and predictable; DOM-per-clip is a dead end |
@@ -57,7 +57,7 @@ The tool is a **clip-based visual arranger**, not a groovebox or MIDI sequencer.
 | Project | Role | How it relates |
 |---|---|---|
 | `pi5-daisy-synth-rig` | **The jam source** (Pi 5 + JUCE mixer + Daisy voices, USB interface, JACK) | In a **later phase** the arranger can record its output. Not part of the x86 prototype. |
-| `plugins/` (CDP sidecar) | **CDP / offline-process sidecar** (CDP8, PaulStretch, Csound offline, phase-vocoder) as `OfflineProcess` plugins | The former `cdp-front` **frontend** scaffold is dropped — no standalone frontend until the Tauri shell. CDP integration is now a **sidecar plugin** in [`plugins/`](plugins/), not a separate repo. Its UI *stack* decision (reka-ui + shadcn-vue + Tailwind v4) is captured in §17 and the [app-shell note](.agents/notes/proposed/architecture/2026-08-13-tauri-vue-rust-app-shell.md). |
+| `plugins/` (CDP sidecar) | **CDP / offline-process sidecar** (CDP8, PaulStretch, Csound offline, phase-vocoder) as `OfflineProcess` plugins | The former `cdp-front` **frontend** scaffold is dropped — no standalone frontend until there was a shell (the Tauri one; now iced/ratatui). CDP integration is now a **sidecar plugin** in [`plugins/`](plugins/), not a separate repo. Its UI *stack* decision (reka-ui + shadcn-vue + Tailwind v4) is captured in §17 and the [app-shell note](.agents/notes/proposed/architecture/2026-08-13-tauri-vue-rust-app-shell.md). |
 
 The gear/hardware **notes** (the USB characterizations and the Eurorack plan) live in the **studio project** — `music-composition-theory/studio/instruments/<name>/research-note.md` — not here. They are linked below for context; sound-arranger is software-only. (VCV Rack is its own project: `~/Projects/music/vcv-rack`.)
 
@@ -87,6 +87,11 @@ Keep the arranger's **engine** as a standalone Rust crate (not Tauri-coupled), s
 ---
 
 ## 4. Frontend
+
+> **Movement (2026-09-22):** §4.1–4.4 describe the **retired** Tauri + Vue shell; the live question is
+> §4.5 (iced) versus §4.6 (ratatui). The React/Vue reasoning below is kept as the record of what the
+> shell was and why the web stack was chosen then — and as the porting reference for the Vue
+> components the Rust shells replace.
 
 ### 4.1 Stack
 
@@ -184,8 +189,17 @@ evaluation note is [`.agents/notes/proposed/architecture/2026-09-21-iced-shell-e
    break its API (0.14 is the released baseline; `master` already requires rustc 1.93). That is a
    real ongoing cost against a frozen Vue/webview baseline.
 
-**Where it stands:** a spike, not a decision. The shipped shell stays Tauri + Vue until the canvas
-slice and the widget inventory above are answered.
+**Where it stands (updated 2026-09-22):** the shells are iced and ratatui — Tauri was retired by the
+owner, so canvas parity and the widget inventory are now the work of *making* the shell, not of
+qualifying an option ([shells note](.agents/notes/implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md)).
+**`iced_audio` (0.17, MIT, 2026-09-09)** answers a slice of the widget gap with stock widgets:
+`VSlider`/`HSlider`/`Knob`/`Ramp`/`XYPad`/`ModRangeInput` on a normalized-parameter contract, with
+unit ranges (`DBRange` logarithmic in dB, `FreqRange`, `IntRange` with `snap`), tick/text marks and
+modulation ranges. It depends on `iced_core`/`iced_graphics` **0.14**, i.e. exactly the shell's iced,
+so it cannot drift from it; iced must be built with `canvas` **and** `image` for it. The spike's
+console is now real faders on the host's parameter fold — the demo's `master.gain 0.8` boots as
+master **−1.9 dB** while `ch0…ch3` sit at +0.0 dB, and a drag sends a logged `set_param`
+([screenshot](spikes/iced-shell/mixer-fold.png), [spike README](spikes/iced-shell/README.md)).
 
 **The shell and the model are one decision (2026-09-21).** The direction is that the UI should be
 *for audio what vim/helix/emacs is for text* — modal, selection-first, with the existing `host v1`
@@ -194,7 +208,11 @@ vocabulary as the `:` command line — written down in the
 iced can host that model, but a GUI-shaped shell hides the log this engine is built around, so the
 two are evaluated together; the keyboard-native TUI is where the model gets tested first.
 
-### 4.6 ratatui — the terminal shell (under evaluation, 2026-09-21)
+### 4.6 ratatui — the terminal shell (under evaluation, 2026-09-21; one of two candidates)
+
+> **Movement (2026-09-22):** Tauri is retired, so this is no longer "a second reference alongside a
+> shipped shell" — ratatui and iced are *the* two candidates, and which is primary is open
+> ([shells note](.agents/notes/implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md)).
 
 **Why it is on the table.** `egui` and Slint are out by inspection (immediate mode; a second view
 DSL) and the human's read of the iced spike is favourable ("looks good and more native"), but a
@@ -487,7 +505,9 @@ Not part of the x86 prototype. Kept here as the target for the eventual ARM phas
 | Crate / framework | What it is | License | Verdict for us |
 |---|---|---|---|
 | **clack** (`clack-host` 0.2.0, `clack-plugin`, `clack-extensions`, `clap-sys`) | **Host CLAP plugins** in Rust; `clack-plugin` builds them | MIT OR Apache-2.0 | The active, permissive path to *load* third-party synths/FX (Cardinal, the clap ecosystem). 0.2.0, updated 2026-09-12. |
-| **nih-plug** (`nih_plug_*`) | Build **VST3/CLAP/standalone** plugins; GUIs via `nih_plug_egui` / `_iced` / `_vizia` | ISC framework; **VST3 bindings (`vst3-sys`) are GPLv3** | In maintenance mode (README points at the Codeberg community fork); the framework is not on crates.io (only sub-crates, 0.1.2/0.1.1, 2026-05). Don't adopt as the export path — prefer `clack`. |
+| **nice-plug** (`nice-plug` 0.4.2, `-core`, `-derive`, `-iced`, `-egui`) | Build **CLAP/VST3/standalone** plugins; declarative params + Serde state; baseview editor API; **standalone with JACK/MIDI/transport** | ISC (framework + examples) | **The live successor to `nih-plug`** (community fork on Codeberg, 19 releases since 2026-06-04, updated 2026-09-14, MSRV **1.88** — stable Rust). CLAP is the base; `vst3` is an opt-in feature that pulls the Steinberg SDK (a C++ build) and GPLv3-encumbers the artifact (fine for this GPL-3.0-or-later repo, worth knowing if ever relicensed). `assert_process_allocs` matches our no-alloc render invariant. **Proposed as the export framework for our own instruments** — see the [CLAP-export note](.agents/notes/proposed/architecture/2026-09-22-clap-export-via-nice-plug.md); `clack` remains the hosting path and the fallback. |
+| **nih-plug** (`nih_plug_*`) | The upstream framework nice-plug forked | ISC framework; **VST3 bindings (`vst3-sys`) are GPLv3** | **Superseded** — in maintenance mode, not on crates.io (only sub-crates), community moved to nice-plug. Historical only. |
+| **iced_audio** (0.17) | Audio widgets for iced (faders, knobs, XY pad, ramps) + unit ranges and modulation display | MIT | **Adopted for the iced shell's mixer** (§4.5): depends on `iced_core`/`iced_graphics` 0.14 — the shell's iced — and has a `nice-plug` feature to bind its widgets to plugin parameters, plus a `nice-plug-iced` editor adapter. |
 | **vst** (0.4.0) | VST2 build/host | — | Legacy/frozen; VST2 SDK is closed — ignore |
 | VST3 *hosting* | — | — | Immature in Rust; don't plan on it |
 | **Faust** (`faust -lang rust`, 2.88.0) | **DSP language** with an official in-tree **Rust backend** (AOT; `-rnt`/`-rnlm`/`-it`/`-noreprc`), Rust architecture files + `faust2cpalrust`/`faust2jackrust`/`faust2portaudiorust` | Compiler **LGPL-2.1-or-later**; generated code explicitly **not** covered (FAQ) | **Adopt as an optional DSP *source*** — build-time only, no crate/FFI/alloc, wrapped behind our `AudioNode`; a peer of fundsp. Caveats: ≈1.3× slower than the C++ backend on delay-heavy DSP; `RwLock` tables unless `-it`; `soundfile`/`-quad`/`-omp` unsupported. [evaluation](research/architecture/2026-09-20-faust-libfaust-and-hise-evaluation.md) · [note](.agents/notes/proposed/architecture/2026-09-20-faust-as-optional-dsp-source.md) |
@@ -502,7 +522,7 @@ Not part of the x86 prototype. Kept here as the target for the eventual ARM phas
 | **rsynth** | Polyphony / voice-allocation utilities (`EventDispatcher`, `SimpleVoiceState`) | MIT | Possible helper for voice stealing later |
 | **rtrb** / **basedrop** / **audio_thread_priority** | RT-safe ring buffer / memory / thread priority | MIT/Apache-2.0 | Audio-thread safety |
 
-**What this means for the effects/instrument plan:** built-in effects = our own `AudioNode` blocks using **fundsp** for the DSP; load third-party synths/FX = **`clack`** (CLAP); export our instruments as plugins = **`clack`** (avoid `nih-plug`'s GPLv3 VST3 binding and its maintenance-mode status). All permissively licensed → compose cleanly with GPL-3.0 (§12).
+**What this means for the effects/instrument plan:** built-in effects = our own `AudioNode` blocks using **fundsp** (or Faust-generated Rust) for the DSP; load third-party synths/FX = **`clack`** (CLAP, hosting); **export our own instruments** = **nice-plug** (CLAP base, VST3 and a JACK standalone behind features) — proposed, deferred, instruments only, never the arranger ([note](.agents/notes/proposed/architecture/2026-09-22-clap-export-via-nice-plug.md)). All permissively licensed → compose cleanly with GPL-3.0 (§12); the nice-plug + `nice-plug-iced` + `iced_audio` trio shares the shell's GUI stack.
 
 **Building our own soft synth in Rust** — the landscape splits into three kinds of material: **(1) building-block DSP libraries** (fundsp, dasp, augmented-audio, glicol), **(2) graph/DSP engines** (fundsp `Net`, glicol's engine, dasp_graph), **(3) plugin build/host frameworks** (clack, nih-plug). For our own voices we use **fundsp/dasp as the block *algorithm* source and keep our own `AudioNode`/patch-bay graph as the abstraction** — our patch is a loggable, diffable value, whereas fundsp's graph is compile-time/acyclic/non-serializable and carries no note/trigger/event type; glicol's engine is an experimental DSL. **Added 2026-09-20: Faust is the second block source, not a second graph** — `.dsp` compiled AOT to Rust behind our `AudioNode`, an optional feature-gated peer of fundsp, with the voice/polyphony layer still ours (measured: zero-alloc render, byte-deterministic codegen, ≈1.3× the C++ backend on a delay-heavy reverb). Evaluation: [research](research/architecture/2026-09-20-faust-libfaust-and-hise-evaluation.md); decision: [note](.agents/notes/proposed/architecture/2026-09-20-faust-as-optional-dsp-source.md). SuperCollider, Csound and every third-party CLAP instrument remain external hosts/embedded targets (the A/B/C routes in the [integration-routes](research/architecture/2026-08-19-softsynth-integration-routes.md) research), never the mechanism for our own voices. Decision: [note](.agents/notes/proposed/architecture/2026-08-30-native-soft-synth-building-blocks.md). **Validated 2026-08-30** by a feature-gated spike in `crates/engine` (`plugins::fundsp_synth`): a monophonic fundsp voice as an opaque `AudioNode`, passing the engine's zero-alloc-render, byte-identical-replay, sample-accurate-onset, `set_param` and PDC invariants; `fundsp` is an **optional** dependency (feature `fundsp`) so the minimal core stays dep-lean by default. Validating the spike in release surfaced a pre-existing, release-only engine bug (scheduled mounts never applied — `debug_assert!` swallowed `apply_mount`), now fixed: see the [bug-fix note](.agents/notes/implemented/bug-fix/2026-08-30-scheduled-mounts-apply-in-release.md) and the [soft-synth note](.agents/notes/proposed/architecture/2026-08-30-native-soft-synth-building-blocks.md).
 

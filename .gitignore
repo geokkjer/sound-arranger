@@ -10,6 +10,10 @@ dist/
 # rust
 target/
 src-tauri/target/
+# the retired Tauri shell's own lockfile: it is frozen and out of the workspace,
+# so cargo regenerates this on the rare occasion it is checked (shells note,
+# 2026-09-22) — the core's Cargo.lock stays tracked.
+crates/shell/src-tauri/Cargo.lock
 
 # local research downloads (cordiverse/paper preprint + reading companions)
 .research/

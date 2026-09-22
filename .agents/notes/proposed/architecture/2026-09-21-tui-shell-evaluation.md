@@ -246,8 +246,12 @@ The spike exists and is verified; the decision is **open**:
   arbitrary terminal sizes), and the live host's underrun counter jumps once by ~2–3 s of device
   frames on the first transport command — recorded as a
   [proposed bug-fix note](../bug-fix/2026-09-21-live-host-underrun-burst-on-transport-change.md).
-- **The shipped shell is unchanged.** Tauri + Vue remains the app; iced and ratatui are spikes
-  until criteria 2–5 above are answered.
+- **Tauri is out of the race (2026-09-22).** The owner retired the Tauri + Vue shell and named
+  **iced and ratatui** as the two shells, with the primary still open
+  ([shells note](../../implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md)).
+  This evaluation no longer runs against a shipped incumbent; it runs against iced. The comparison
+  criteria that matter for that contest are listed in the shells note (surfaces, interaction, text,
+  reach, testability, and the plugin-editor path if export lands).
 
 ## Attribution
 

@@ -26,7 +26,10 @@ item 9). Every hour spent on plugin plumbing is an hour not spent there.
 
 1. **We do not ship in-process sidecars or plugin-format builds as a product goal.** No VST3/CLAP
    builds, no CDP sidecar binary, no plugin host. `plugins/` stops being a promise and becomes a
-   pointer to this note.
+   pointer to this note. *Narrowed 2026-09-22:* this forbids **hosting** other people's plugins and
+   shipping a sidecar/CDP binary as the integration story — it does not forbid **exporting our own
+   instruments** to a DAW, which the [CLAP-export note](2026-09-22-clap-export-via-nice-plug.md)
+   proposes (deferred, instruments only, never the arranger).
 2. **Integration is at the process/device boundary.** A partner is something we can *start or
    address*, *sync*, and *record*: its audio arrives in the media pool as a normal take, and its
    identity is a property of the source, not of our link-edited binary.

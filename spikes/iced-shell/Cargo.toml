@@ -10,5 +10,13 @@ description = "iced spike — the minimal proof that a second, in-process Rust s
 [workspace]
 
 [dependencies]
-iced = "0.14"
+# `canvas` and `image` are off by default in iced; `iced_audio` needs both to
+# draw (canvas for the widget, image for its renderer bounds on the fallback
+# renderer).
+iced = { version = "0.14", features = ["canvas", "image"] }
+# The audio widgets: faders/knobs/sliders whose ranges are dB, frequency and
+# integer-aware, plus tick/text marks and a modulation range. MIT, same iced_core
+# 0.14 this shell uses, maintained in the iced org:
+# https://github.com/iced-rs/iced_audio
+iced_audio = "0.17"
 host = { path = "../../crates/host" }

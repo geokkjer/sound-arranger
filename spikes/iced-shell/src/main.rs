@@ -1,5 +1,5 @@
-//! The iced spike — the minimal proof that **iced can be a second sound-arranger
-//! shell**, replacing the Tauri + Vue transport with an in-process Rust one.
+//! The iced spike — the minimal proof that **iced can be a sound-arranger shell**
+//! (in-process Rust, replacing the retired Tauri + Vue transport).
 //!
 //! The evaluation this serves is written down in
 //! `.agents/notes/proposed/architecture/2026-09-21-iced-shell-evaluation.md`.
@@ -14,9 +14,17 @@
 //! 4. **Meters and the playhead follow the audio** — the published `Snapshot` is
 //!    polled on every window frame.
 //!
+//! 5. **The mixer is real** — channel and master faders are `iced_audio`
+//!    `VSlider`s on a dB range (`DBRange`), and their positions come from the
+//!    host's **parameter fold**, not from the widget's own memory: a script's
+//!    `set_param mixer master.gain 0.8` shows up as a fader at 0.8 (-1.9 dB), and
+//!    dragging a fader sends a logged `set_param` back. That is the mixer path a
+//!    shell needs, with stock widgets.
+//!
 //! It is *not* a UI: there is no timeline canvas, no waveform, no clip editing,
-//! no text-heavy layout. Those are the parts that decide iced vs Tauri+Vue, and
-//! the note records them as the next step if this proof holds.
+//! no text-heavy layout. Those are the parts that decide iced against ratatui
+//! ([the two candidate shells](../../.agents/notes/implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md)),
+//! and the evaluations record them as the next step.
 //!
 //! ```sh
 //! cd spikes/iced-shell
@@ -32,7 +40,8 @@ use host::live::{HostHandle, Snapshot};
 use iced::keyboard;
 use iced::widget::{column, container, progress_bar, row, text};
 use iced::window;
-use iced::{Element, Fill, Length, Subscription, Theme};
+use iced::{Center, Element, Fill, Length, Subscription, Theme};
+use iced_audio::{DBRange, Gesture, Normal, NormalParam, VSlider};
 
 /// The demo profile — the `docs/FIRST_SESSION.md` chain, so the meters have
 /// signal on launch: a euclidean generator → scale → tone → mixer channel 0.
@@ -47,6 +56,39 @@ patch scale.note tone.note
 patch tone.audio mixer.ch0
 set_param mixer master.gain 0.8 @0
 ";
+
+/// The console fader range: -60 dB (silence) to +12 dB, with unity at ~83 % of
+/// the travel — the console convention. `DBRange` is logarithmic and skewed
+/// towards 0 dB, so the useful part of the throw is not squeezed into the top
+/// millimetre, and `unmap_to_db` is the exact inverse of `map_db`.
+const FADER: DBRange = DBRange::new(
+    -60.0,
+    12.0,
+    Normal::new(0.833),
+    DBRange::DEFAULT_SKEW_FACTOR,
+);
+
+/// `set_param` targets as `&'static str` (the command carries static names):
+/// `ch0.gain` … `ch7.gain`, then the master. `MIXER_CHANNELS_MAX` is 8.
+const GAIN_PARAMS: [&str; 8] = [
+    "ch0.gain", "ch1.gain", "ch2.gain", "ch3.gain", "ch4.gain", "ch5.gain", "ch6.gain", "ch7.gain",
+];
+/// The master's fader is the strip *after* the channels.
+const MASTER_GAIN: &str = "master.gain";
+
+/// The strip a `set_param` gain name belongs to (channels first, the master
+/// last) — the one index mapping the fold and the widgets must agree on.
+fn strip_of(param: &str, channels: usize) -> Option<usize> {
+    if param == MASTER_GAIN {
+        return Some(channels);
+    }
+    let channel = param
+        .strip_prefix("ch")?
+        .strip_suffix(".gain")?
+        .parse::<usize>()
+        .ok()?;
+    (channel < channels).then_some(channel)
+}
 
 fn main() -> iced::Result {
     if std::env::args().any(|arg| arg == "--probe") {
@@ -68,6 +110,11 @@ struct Spike {
     host: HostHandle,
     snap: Snapshot,
     status: String,
+    /// One fader per mixer channel plus the master, as `iced_audio` normalized
+    /// parameters. The *values* live in the host's log fold; these are the
+    /// widget's view of it.
+    faders: Vec<NormalParam>,
+    channels: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +126,8 @@ enum Message {
     Rewind,
     /// Spacebar: start or stop, whichever the transport is not.
     Toggle,
+    /// A fader gesture: `strip` is the channel (or the master, last).
+    Fader(usize, Gesture),
 }
 
 impl Spike {
@@ -100,11 +149,100 @@ impl Spike {
             Err(e) => format!("demo script does not parse: {e}"),
         };
 
-        Spike {
+        let mut spike = Spike {
             snap: host.snapshot(),
             host,
             status,
+            faders: vec![FADER.default_param(); 1],
+            channels: 0,
+        };
+        spike.adopt();
+        spike
+    }
+
+    /// Take the mixer's fader positions from the host's **parameter fold** — the
+    /// log is the source of truth, exactly as `HostOutcome::params` reports it,
+    /// never the widget's own memory. Called at boot and when a gesture ends, so
+    /// a fader the log moved (a script, a replay, an undo) is visible here.
+    fn adopt(&mut self) {
+        let outcome = match self.host.outcome() {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                self.status = format!("cannot read the host: {e}");
+                return;
+            }
+        };
+
+        let channels = outcome
+            .params
+            .iter()
+            .find(|(plugin, param, _)| *plugin == "mixer" && *param == "channels")
+            .map(|(_, _, value)| (*value).max(0.0) as usize)
+            .unwrap_or(self.channels)
+            .min(GAIN_PARAMS.len() - 1);
+        if channels + 1 != self.faders.len() {
+            self.channels = channels;
+            self.faders = vec![FADER.default_param(); channels + 1];
         }
+
+        for (plugin, param, value) in &outcome.params {
+            if *plugin != "mixer" {
+                continue;
+            }
+            if let Some(index) = strip_of(param, channels) {
+                self.set_fader(index, *value);
+            }
+        }
+    }
+
+    /// Show `gain` (linear) on fader `index`, through the fader's dB range.
+    fn set_fader(&mut self, index: usize, gain: f32) {
+        if let Some(fader) = self.faders.get_mut(index) {
+            let db = if gain > 0.0 {
+                20.0 * gain.log10()
+            } else {
+                f32::NEG_INFINITY
+            };
+            fader.set(FADER.map_db(db));
+        }
+    }
+
+    /// The `set_param` target for a strip: channels first, the **master last**
+    /// (its fader index is the channel count, so the two index spaces differ).
+    fn gain_param(index: usize, channels: usize) -> &'static str {
+        if index >= channels {
+            MASTER_GAIN
+        } else {
+            GAIN_PARAMS[index.min(GAIN_PARAMS.len() - 1)]
+        }
+    }
+
+    /// A fader gesture: move the widget, then send the host a logged `set_param`
+    /// with the gain that position means. The engine smooths the change, so a
+    /// drag is a stream of parameter events — which is what automation is.
+    fn gesture(&mut self, index: usize, gesture: Gesture) {
+        let Gesture::Gesturing(normal) = gesture else {
+            // Start/end carry no value; re-read the host so a value the log
+            // disagrees with (a clamp, say) wins.
+            if matches!(gesture, Gesture::GestureEnd) {
+                self.adopt();
+            }
+            return;
+        };
+
+        if let Some(fader) = self.faders.get_mut(index) {
+            fader.set(normal);
+        }
+        let param = Spike::gain_param(index, self.channels);
+        let db = FADER.unmap_to_db(normal);
+        let gain = 10f32.powf(db / 20.0);
+        self.status = format!("{param} = {db:+.1} dB ({gain:.4})");
+        self.command(HostCommand::SetParam {
+            plugin: "mixer",
+            param,
+            value: gain,
+            at_frame: None,
+        });
     }
 
     fn title(&self) -> String {
@@ -135,6 +273,7 @@ impl Spike {
                     self.command(HostCommand::TransportPlay);
                 }
             }
+            Message::Fader(index, gesture) => self.gesture(index, gesture),
         }
     }
 
@@ -184,7 +323,7 @@ impl Spike {
             text("a second shell over the same Host API — in-process, no webview").size(13),
             reading,
             controls,
-            self.meters(),
+            self.console(),
             text(audio_label(&self.snap)).size(12),
             text(&self.status).size(12),
         ]
@@ -194,43 +333,48 @@ impl Spike {
         container(body).width(Fill).height(Fill).padding(12).into()
     }
 
-    /// The channel meters plus the master, as vertical gauges. Cheap widgets on
-    /// purpose: a bare `progress_bar` per channel — the spike is testing that
-    /// live values reach the widgets at all, not the final mixer look.
-    fn meters(&self) -> Element<'_, Message> {
-        let count = self.snap.channel_count;
-
-        let mut bars = row![].spacing(10).height(Length::Fixed(150.0));
-
-        if count == 0 {
-            bars = bars.push(text("no mixer mounted").size(12));
+    /// The mixer: per channel and master, a live meter beside a real **fader**
+    /// (`iced_audio::VSlider` on the dB range), with the value read out in dB.
+    /// The meter is a plain `progress_bar` (the value that matters here is the
+    /// fader, and a peak meter with hold is a widget we would style ourselves).
+    fn console(&self) -> Element<'_, Message> {
+        if self.channels == 0 {
+            return text("no mixer mounted").size(12).into();
         }
 
-        for channel in 0..count {
-            bars = bars.push(
+        let mut strips = row![].spacing(14).height(Length::Fixed(210.0));
+        for index in 0..=self.channels {
+            let Some(fader) = self.faders.get(index) else {
+                continue;
+            };
+            let (label, meter) = if index == self.channels {
+                ("master".to_string(), self.snap.master)
+            } else {
+                (format!("ch{index}"), self.snap.channels[index])
+            };
+            let db = FADER.unmap_to_db(fader.normal);
+
+            strips = strips.push(
                 column![
-                    container(progress_bar(0.0..=1.0, self.snap.channels[channel]).vertical())
-                        .width(Length::Fixed(28.0))
-                        .height(Length::Fixed(130.0)),
-                    text(format!("ch{channel}")).size(11),
+                    row![
+                        container(progress_bar(0.0..=1.0, meter).vertical())
+                            .width(Length::Fixed(16.0))
+                            .height(Length::Fixed(150.0)),
+                        VSlider::new(*fader)
+                            .on_gesture(move |gesture| Message::Fader(index, gesture))
+                            .width(Length::Fixed(18.0))
+                            .height(Length::Fixed(150.0)),
+                    ]
+                    .spacing(6),
+                    text(label).size(11),
+                    text(format!("{db:+.1} dB")).size(10),
                 ]
                 .spacing(4)
-                .align_x(iced::Center),
+                .align_x(Center),
             );
         }
 
-        bars = bars.push(
-            column![
-                container(progress_bar(0.0..=1.0, self.snap.master).vertical())
-                    .width(Length::Fixed(28.0))
-                    .height(Length::Fixed(130.0)),
-                text("master").size(11),
-            ]
-            .spacing(4)
-            .align_x(iced::Center),
-        );
-
-        bars.into()
+        strips.into()
     }
 
     fn command(&mut self, command: HostCommand) {
@@ -344,4 +488,50 @@ fn probe() -> i32 {
 
     println!("probe: OK — the host thread, transport, and live meters all work");
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The one mapping the host's fold and the widgets must agree on: channels
+    /// first, the master last — and nothing outside the mounted channels.
+    #[test]
+    fn a_gain_name_maps_to_its_strip() {
+        assert_eq!(strip_of("ch0.gain", 4), Some(0));
+        assert_eq!(strip_of("ch3.gain", 4), Some(3));
+        assert_eq!(
+            strip_of("master.gain", 4),
+            Some(4),
+            "the master is the last strip"
+        );
+        assert_eq!(
+            strip_of("ch4.gain", 4),
+            None,
+            "past the mounted channel count"
+        );
+        assert_eq!(strip_of("ch0.mute", 4), None, "only gains have faders");
+        assert_eq!(strip_of("channels", 4), None);
+
+        assert_eq!(Spike::gain_param(0, 4), "ch0.gain");
+        assert_eq!(Spike::gain_param(3, 4), "ch3.gain");
+        assert_eq!(Spike::gain_param(4, 4), "master.gain");
+    }
+
+    /// The dB fader range is the inverse of itself, unity is 0 dB, and silence
+    /// floors at the range minimum instead of going to -inf/NaN.
+    #[test]
+    fn the_fader_range_round_trips_in_db() {
+        assert!(FADER.unmap_to_db(FADER.map_db(0.0)).abs() < 1e-4);
+
+        for gain in [1.0f32, 0.5, 0.25, 2.0] {
+            let db = 20.0 * gain.log10();
+            let back = 10f32.powf(FADER.unmap_to_db(FADER.map_db(db)) / 20.0);
+            assert!((back - gain).abs() < 0.01 * gain, "{gain} -> {back}");
+        }
+
+        assert_eq!(FADER.unmap_to_db(FADER.map_db(-120.0)), -60.0);
+        assert_eq!(FADER.unmap_to_db(FADER.map_db(f32::NEG_INFINITY)), -60.0);
+        assert_eq!(FADER.unmap_to_db(FADER.map_db(24.0)), 12.0);
+    }
 }

@@ -1,6 +1,12 @@
 # sound-arranger — Desktop UI Plan (the Vue side of the Host API)
 
-> **Status: proposed (design draft) — and now one of three shell options.** The Tauri shell exists (the four views, transport, timeline editing, undo/redo — see the README), so this plan describes the *shipped* Vue host-side plugin runtime: the shell + profile + view layer that turns the Host API contract into a usable instrument. Since 2026-09-21 two spikes evaluate the opposite bet — one Rust binary, no webview, no IPC: **iced** ([evaluation note](../../.agents/notes/proposed/architecture/2026-09-21-iced-shell-evaluation.md)) and a **ratatui TUI** ([evaluation note](../../.agents/notes/proposed/architecture/2026-09-21-tui-shell-evaluation.md)); see [RESEARCH §4.5–4.6](../../RESEARCH.md). Everything below is written for the Vue side and assumes a webview; the parts that would *not* survive either move are §0's renderer constraint list, §1's declarative plugin loader, and §4.3–4.4's canvas/IPC rules.
+> **Status: proposed (design draft) — superseded as the shell direction (2026-09-22).** The Tauri
+> shell this plan was written for is **retired** and frozen ([`crates/shell/RETIRED.md`](../../crates/shell/RETIRED.md),
+> [shells note](../../.agents/notes/implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md));
+> the shells are **iced** and **ratatui**, both in-process Rust over the same Host API. This plan keeps its
+> value as the *design* record — the four views, the interaction model and the canvas/IPC constraints — which the
+> Rust shells inherit, minus the parts that exist only because of a webview (§0's renderer constraint list, §1's
+> declarative loader, §4.3–4.4's canvas/IPC rules).
 
 This document owns the *shape* and the *tradeoffs of the UI*. The visual/token contract lives in [`design-system.md`](design-system.md); the wireframes are in [`mocks/`](mocks/). The reference webview is **WebKitGTK 2.52.6** (`webkit2gtk-4.1`), i.e. Linux and the primary target.
 

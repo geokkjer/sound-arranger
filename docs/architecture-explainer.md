@@ -1,6 +1,6 @@
 # sound-arranger: from architecture up
 
-> 🕒 Last verified against commit `2be3104` (2026-09-12). If the code has moved on,
+> 🕒 Last verified against commit `1190ec7` (2026-09-22). If the code has moved on,
 > trust the code and move this line forward.
 
 > A plain-English (mostly) tour of the Rust code, for a developer with roughly six
@@ -47,17 +47,19 @@ Everything the product *does* is a plugin mounted onto those four. A profile —
 like the clip-arranger — is just a named assembly of plugins plus a thin shell
 (the host).
 
-### 1.2 Four crates, four layers
+### 1.2 Three crates, three layers (and the shells outside them)
 
-The workspace (`Cargo.toml`) has four members, and the layering is strict:
+The workspace (`Cargo.toml`) has **three** members, and the layering is strict.
+The shells are deliberately *not* members: each is its own workspace, so no UI
+framework enters the core's build.
 
 ```
-crates/engine    crates/media     crates/host      crates/shell
- (the core)     (streaming/I-O)   (headless shell)   (Tauri+Vue)
-     ^                ^                 ^                 ^
-     |                | depends on      | depends on      | will depend on
-     | depends on     | engine          | engine + media  | host (same
-     +--- std only ----+                |                 |  contract)
+crates/engine    crates/media     crates/host        spikes/iced-shell   spikes/tui-shell
+ (the core)     (streaming/I-O)   (headless host)     (iced, GUI)        (ratatui, TUI)
+     ^                ^                 ^                   ^                   ^
+     |                | depends on      | depends on        | depends on        | depends on
+     | depends on     | engine          | engine + media    | host (same        | host (same
+     +--- std only ----+                |                   |  contract)        |  contract)
                         std + cpal       |
 ```
 
@@ -70,14 +72,19 @@ crates/engine    crates/media     crates/host      crates/shell
 - **`host`** — a headless reference host. It defines the Host API contract
   (commands / events / values) and a CLI binary that runs a text script to
   assemble the profile, render, and bounce — with **no frontend at all** (the host
-  crate stays headless). The Tauri shell (`shell`) implements the *same*
-  contract; swapping shells swaps one transport adapter.
-- **`shell`** — the Tauri v2 + Vue scaffold for the graphical shell. As of this
-  writing it is a **bridge**: it owns a live `host::HostSession` over the engine
-  and exposes a single Tauri command (`run_host_script`) that runs the versioned
-  text format — the *same* contract the CLI smoke binary drives, so a script that
-  bounces byte-identically on the CLI behaves the same here. The Vue component is
-  still a stub (no product UI yet). It exists so the frontend work has a home and
+  crate stays headless). Every shell implements the *same* contract; swapping
+  shells swaps one transport adapter.
+- **the shells** — `spikes/iced-shell` (iced 0.14 + `iced_audio` widgets) and
+  `spikes/tui-shell` (ratatui), each an isolated workspace that owns a live
+  `host::live::HostHandle`. **The Tauri v2 + Vue shell (`crates/shell`) is
+  retired** (2026-09-22): it is frozen and excluded from the workspace, kept as the
+  porting reference for the Rust shells —
+  [`crates/shell/RETIRED.md`](../crates/shell/RETIRED.md), decision in
+  [the shells note](../.agents/notes/implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md).
+  Historically it was the first rich shell and, as the *bridge*, owned a live
+  `host::HostSession` and exposed a single Tauri command (`run_host_script`) that
+  ran the versioned text format — the *same* contract the CLI smoke binary drives, so a script that
+  bounces byte-identically on the CLI behaves the same here. It exists so the frontend work has a home and
   to prove host↔shell wiring, not because anything in the core depends on it.
 
 The dependency direction is the whole point: `engine` and `media` must never

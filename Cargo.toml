@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/engine", "crates/media", "crates/host", "crates/shell/src-tauri"]
+members = ["crates/engine", "crates/media", "crates/host"]
+# The Tauri + Vue shell is **retired** (2026-09-22) and frozen out of the default
+# build/test path: `crates/shell/RETIRED.md`, and the decision in
+# `.agents/notes/implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md`.
+# The shells are the isolated workspaces `spikes/iced-shell` and `spikes/tui-shell`.
+exclude = ["crates/shell/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
