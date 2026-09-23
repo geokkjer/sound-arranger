@@ -48,9 +48,11 @@ What this spike adds, because it is what a TUI has to answer for:
   the host's `TransportSeek` is O(target) and a shell that binds it to a key owns
   that stall — measured, not feared.
 
-Not in scope yet: dragging, moving clips between tracks, fades by mouse, undo
-gestures from the shell, the `:` prompt, and auditioning (`play` renders the
-session; the panel draws the arrangement).
+Not in scope yet: mouse dragging (clips move by key: `H`/`L` for time, `J`/`K`
+for tracks), fades by mouse, the keymap as loadable data, and auditioning (`play`
+renders the session; the panel draws the arrangement). Move, trim, fade, gain and
+the `:` command line are all in — and every one of them is a line in the host's
+own text format.
 
 ## Run it
 
@@ -116,8 +118,30 @@ What it does, and what it honestly cannot:
 | **Zoom ceiling** | the whole arrangement **plus margin** (4× the fitted density), so a piece can be seen with room around it. The state line always shows the current `ms/col`, so the density claim is visible, not asserted. |
 | **Lanes** | rows are shared out: `min(4, rows ÷ tracks)` per track, so 3 tracks in a 26-row terminal get 2 rows each and a tall terminal gives envelopes more amplitude resolution. |
 | **Selection** | `v` anchors a frame span at the playhead, `h`/`l` extend it, the state line shows the span and its duration, `Esc` leaves. Mode and focus are always on screen. |
-| **Not yet** | fades by key, `set_clip_gain` by key, the `:` prompt, auditioning, and drag-to-move — `play` renders the session while the panel draws the arrangement, so the playhead is the *session* clock against the arrangement grid (they line up when the arrangement is what the session renders). |
+| **Not yet** | registers/repeat/macros, the keymap as loadable data, the prefix infobox, a command palette, auditioning, and drag-to-move — `play` renders the session while the panel draws the arrangement, so the playhead is the *session* clock against the arrangement grid (they line up when the arrangement is what the session renders). |
 | **Empty tracks are lanes** | every host track draws as a lane, including one with no clips: a track is a place a clip can be moved *to*, and a lane that disappeared when its last clip left made `J`/`K` and the active-track cursor disagree with the host's own track list (found by wiring `J`). |
+
+### The `:` command line
+
+Every key in this shell is an `arrange` / `set_param` / `transport` line dispatched through the
+host's own parser — so the command line is not a separate feature, it is the **same vocabulary**
+typed instead of pressed:
+
+```
+: arrange set_clip_gain t0 c0 0.25      # a line with no key of its own
+: transport seek 96000                  # the transport
+: set_param mixer ch0.gain 0.5          # the console reads it back out of the log
+```
+
+One line is one command; the prompt wraps it in the `host v1` header the format requires and hands
+it to `host::parse_script`, so a key, a script line and a typed line are the same command with the
+same logging and the same errors. A refused line is shown and **not logged**. `↑`/`↓` walk the
+history (including the line that failed, which is the one worth fixing). The status line becomes
+the command line while it is open, and the mode badge reads `COMMAND` — a modal UI that hides its
+mode is a trap.
+
+This is what makes the vocabulary *complete* before the keys are: the modal editing note's point
+that the `:` prompt is "a widget away, not a project" — and it is now built.
 
 ### Measured, from the demo above
 
@@ -195,8 +219,11 @@ pointless), so the shell falls back to the wide meter bars under the transport.
 | `t` | **visual**: trim the clip to the selection (consumes the selection) |
 | `H` / `L` | timeline: move the clip **one beat** earlier / later (clamps at 0) |
 | `J` / `K` | timeline: move the clip to the track **below / above**, keeping its time |
+| `g` / `G` | timeline: clip gain **−1 dB / +1 dB** (the range is the console fader's) |
+| `f` / `F` | timeline: fade in / fade out **to the playhead** (absolute, not a nudge) |
 | `Esc` | leave visual mode / close this overlay — **never quits** |
 | `m` | toggle mouse capture |
+| `:` | **the command line**: type any `host v1` line (Enter runs, Esc cancels, `↑`/`↓` history) |
 | `?` | the keymap (modal, scrollable with `j`/`k`) |
 | `q` / `Ctrl+c` | quit |
 | mouse | click a panel to focus · a lane = that track + seek · the ruler = seek · **drag a mixer strip = set that fader** · Play/Stop/Rewind · wheel = seek |

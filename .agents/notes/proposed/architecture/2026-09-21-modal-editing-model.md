@@ -36,7 +36,7 @@ wins**, and validate it in the TUI spike (the cheapest place to test a keyboard 
 concretely:
 
 1. **Four modes.** `Normal` (navigate, select, act), `Visual` (extend/refine a selection, then act),
-   `Insert` (text only: clip names, markers, search), `Command` (`:` prompt). The mode is always
+   `Insert` (text only: clip names, markers, search), `Command` (`:` prompt — **built**, 2026-09-22). The mode is always
    visible in the statusline; `Esc` always returns to `Normal`; nothing destructive happens in a
    mode the user cannot see.
 2. **Selection-first (noun, then verb).** One `Selection` value with kinds — *clip*, *time span on a
@@ -75,8 +75,11 @@ proposal to *finish* a model rather than to start one:
   call engine internals: they build an `arrange …` line and hand it to the host's own parser
   (`host::parse_arrange_line`), which returns a `HostCommand::Arrange` the host logs like any other
   command. A refused op (a split at frame 0) is reported in the state line and never logged. **The
-  `:` prompt is therefore a widget away, not a project**: it types the same vocabulary. *(`:` itself
-  is not built.)*
+  `:` prompt was therefore a widget away, not a project** — and it is built (2026-09-22): it wraps a
+  typed line in the `host v1` header and hands it to the same `host::parse_script`, one line = one
+  command, with the same logging and the same errors, so the whole vocabulary is reachable before a
+  key exists for it. It is modal (`COMMAND` on the mode badge), Esc cancels, `↑`/`↓` walk the
+  history — including the line that failed, which is the one worth fixing.
 - **Modes are visible and non-destructive to leave.** `NORMAL`/`VISUAL` is always on the state line,
   visual mode carries a frame-span selection with its duration, and `Esc` now leaves state and never
   quits — the safety key is not the destructive one.
@@ -86,6 +89,13 @@ proposal to *finish* a model rather than to start one:
   concrete.
 - **Clip motions exist in miniature**: `n`/`N` jump the playhead to the next/previous clip — the
   arrangement's answer to "next word".
+- **The `:` command line exists** (2026-09-22), which is the acceptance criterion that the
+  vocabulary is complete without a full keymap: `arrange set_clip_gain t0 c0 0.25`, `set_param
+  mixer ch0.gain 0.5`, `transport seek 96000` — all typed, all logged, all re-read from the log.
+- **Gain and fades are keys** (2026-09-22): `g`/`G` step a clip's gain ±1 dB (the range matches the
+  console fader), and `f`/`F` put the fade-in/fade-out *at the playhead* — the DAW gesture, and
+  absolute like the trims, with the model's `fade_in + fade_out <= src_len` cap reported rather than
+  refused.
 - **Move and trim are modal gestures** (2026-09-22): `<`/`>` trim a clip's start/end to the
   playhead, `H`/`L` move it one beat (the step comes from the session clock, so a nudge is musical,
   not a cell width), `J`/`K` move it to the track below/above keeping its time, and in visual mode
@@ -93,8 +103,15 @@ proposal to *finish* a model rather than to start one:
   visual mode, as Helix does. Every one of them is an `arrange …` line dispatched through the host's
   parser; the model has no private mutation path.
 
-What is *not* built: the `:` prompt, registers/repeat/macros, the keymap as loadable data, the
-prefix infobox, the palette, and the Emacs-style extensibility surface.
+What is *not* built: registers/repeat/macros, the keymap as loadable data, the prefix infobox, the
+palette, and the Emacs-style extensibility surface.
+
+One gap worth naming: **one gesture is not always one undo step.** `t` (trim to the selection) is
+two `trim` ops when both edges move, because the vocabulary's trim is per-edge — so `u` unwinds it in
+two steps. The test pins the resulting clip, not the op count. The fix is a compound op in the log
+(or shell-side grouping of consecutive ops from one gesture, which the log's `@frame` could carry);
+it is not urgent, but it is the first place where "the gesture is the unit of editing" and "every op
+is a log line" disagree.
 
 ## One workflow, two shells (2026-09-22)
 
@@ -152,7 +169,9 @@ The model is decided (this note becomes implemented, or is rejected) when:
    `host v1` verb set as the command vocabulary, and a test asserting every binding names a real
    command (no binding can drift from the log).
 2. **`:` and the keys dispatch the same commands** in the spike, both visible in the log; a scripted
-   session and a hand-played session produce the same event sequence.
+   session and a hand-played session produce the same event sequence. *Partly satisfied (2026-09-22):
+   the prompt is built and dispatches through the same parser as the keys; the "same event sequence
+   from a script and from hand-played keys" equality is not yet asserted as a test.*
 3. **Everything is reachable and documented from the model**: every command appears in the palette
    with its bound keys, and the in-app help is generated from the keymap (no hand-written second
    copy).
@@ -161,8 +180,10 @@ The model is decided (this note becomes implemented, or is rejected) when:
    gesture** so the claim ("fewer, and composable") is measured rather than asserted.
 5. **One gesture is one undo step**, verified in the log: a drag-equivalent operation appears as a
    single logged command, not one per key repeat.
-6. **The shipped GUI shell still works**, and the model is additive to it (keys + a visible mode over
-   the existing commands), not a replacement of the pointer path.
+6. **The model is additive, not a replacement of the pointer path.** With the Tauri shell retired
+   (2026-09-22) this reads: the shells keep their mouse support (the TUI still focuses, seeks, selects
+   and rides faders by click) and the model is keys **plus** a visible mode over the same commands —
+   the mouse is never the only way to do something.
 
 ## Risks
 

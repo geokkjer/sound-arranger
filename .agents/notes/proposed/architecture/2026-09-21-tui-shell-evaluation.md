@@ -140,9 +140,10 @@ The evaluation is answered — with an implemented or rejected note replacing th
    re-reads the host's value) and in tests. **Measured density:** 98.917 ms/cell fitted for a 9 s,
    3-track, 5-clip arrangement in a 100×26 terminal (≈10 cells/second), floor 5.333 ms/cell set by
    the pyramid's 256-sample bin, ceiling = the arrangement **plus a 4× margin** so a piece can be
-   seen with room around it. **Still open:** move/trim/fades by key, undo gestures issued from the
-   shell, the `:` prompt, and auditioning (the playhead is the *session* clock against the
-   arrangement grid). Going below 5.333 ms/col needs a **raw-sample read path** — and the human's
+   seen with room around it. **Built since (2026-09-22):** move by key (time and track), trim
+   (playhead and selection), gain and fades, the `:` command line, and undo/redo issued from the
+   shell. **Still open:** auditioning (the playhead is the *session* clock against the arrangement
+   grid), the keymap as loadable data, and mouse drag. Going below 5.333 ms/col needs a **raw-sample read path** — and the human's
    read is that the braille resolution is already enough, so it is not urgent.
 3. **A task-level mouse-vs-keys verdict**: the same short task list (select a clip, seek, split,
    nudge, mute a channel) performed both ways, with the friction noted — including the terminal

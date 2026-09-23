@@ -40,7 +40,7 @@ use host::live::{AudioStatus, HostHandle, Snapshot};
 mod mixer;
 mod timeline;
 use mixer::Mixer;
-use timeline::{Arrangement, Mode, Sources, View};
+use timeline::{Arrangement, Mode, Placed, Sources, View};
 
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -122,6 +122,10 @@ const KEYMAP: &[(&str, &str)] = &[
         "leave visual mode / close this overlay (never quits)",
     ),
     ("m", "toggle mouse capture"),
+    (
+        ":",
+        "the command line — type any `host v1` line (Esc cancels, ↑/↓ history)",
+    ),
     ("?", "this keymap"),
     ("q  Ctrl+c", "quit"),
     (
@@ -172,6 +176,14 @@ struct App {
     /// How far the `?` overlay is scrolled (the keymap no longer fits a 24-row
     /// terminal, and a truncated help is a lying help).
     help_scroll: usize,
+    /// The `:` command line, `Some(text)` while it is open. It types the **same
+    /// `host v1` text format** the keys dispatch, so every action is reachable even
+    /// before a key exists for it — the modal note's "a widget away, not a project".
+    prompt: Option<String>,
+    /// Executed command lines, oldest first; `↑`/`↓` walk them.
+    history: Vec<String>,
+    /// Where the history walk currently is (`history.len()` = the live line).
+    history_at: usize,
     mouse: bool,
     quit: bool,
     /// The last command's label and how long the UI thread was blocked in it.
@@ -250,6 +262,9 @@ impl App {
             selected: 0,
             help: false,
             help_scroll: 0,
+            prompt: None,
+            history: Vec::new(),
+            history_at: 0,
             mouse: true,
             quit: false,
             last_command: None,
@@ -526,6 +541,9 @@ impl App {
             selected: 0,
             help: false,
             help_scroll: 0,
+            prompt: None,
+            history: Vec::new(),
+            history_at: 0,
             mouse: true,
             quit: false,
             last_command: None,
@@ -614,7 +632,39 @@ impl App {
     fn on_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-        // The keymap overlay is **modal**: while it is up, `j`/`k` scroll it and
+        // The command line is **modal** (as vim's `:` is): it takes every key while
+        // it is open. Enter runs the line, Esc cancels, `↑`/`↓` walk the history.
+        if self.prompt.is_some() {
+            match key.code {
+                KeyCode::Enter => self.run_prompt(),
+                // Esc and Ctrl+c cancel — plain `c` is a *character*, which is
+                // exactly the bug this arm used to have.
+                KeyCode::Esc => {
+                    self.prompt = None;
+                    self.status = "command line cancelled".to_string();
+                }
+                KeyCode::Char('c') if ctrl => {
+                    self.prompt = None;
+                    self.status = "command line cancelled".to_string();
+                }
+                KeyCode::Backspace => {
+                    if let Some(text) = self.prompt.as_mut() {
+                        text.pop();
+                    }
+                }
+                KeyCode::Up => self.history_step(-1),
+                KeyCode::Down => self.history_step(1),
+                KeyCode::Char(c) if !ctrl => {
+                    if let Some(text) = self.prompt.as_mut() {
+                        text.push(c);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // The keymap overlay is **modal** too: while it is up, `j`/`k` scroll it and
         // anything else closes it or does nothing. (It cannot be dismissed by
         // accident into an edit — the help is where you read before you act.)
         if self.help {
@@ -673,10 +723,20 @@ impl App {
             KeyCode::Char('L') => self.timeline_key(|app| app.nudge_clip(1)),
             KeyCode::Char('J') => self.timeline_key(|app| app.move_clip_to_track(1)),
             KeyCode::Char('K') => self.timeline_key(|app| app.move_clip_to_track(-1)),
+            KeyCode::Char('g') => self.timeline_key(|app| app.step_clip_gain(-1.0)),
+            KeyCode::Char('G') => self.timeline_key(|app| app.step_clip_gain(1.0)),
+            KeyCode::Char('f') => self.timeline_key(|app| app.fade_to_playhead(true)),
+            KeyCode::Char('F') => self.timeline_key(|app| app.fade_to_playhead(false)),
             // Clip-to-clip motion: the "next word" analogue for an arrangement.
             KeyCode::Char('n') => self.timeline_key(|app| app.seek_clip(true)),
             KeyCode::Char('N') => self.timeline_key(|app| app.seek_clip(false)),
 
+            // `:` opens the command line. It is the escape hatch that makes the
+            // vocabulary complete: every key here is a line in this format.
+            KeyCode::Char(':') => {
+                self.prompt = Some(String::new());
+                self.history_at = self.history.len();
+            }
             KeyCode::Char('?') => {
                 self.help_scroll = 0;
                 self.help = !self.help;
@@ -952,21 +1012,17 @@ impl App {
     /// The (track id, clip id) at the playhead on the active track.
     fn clip_under_playhead(&self) -> Option<(String, String)> {
         self.active_clip_at(self.snap.frame)
-            .map(|(track, clip, _, _)| (track, clip))
+            .map(|(track, clip)| (track, clip.id))
     }
 
-    /// The clip under `frame` on the active track, as an edit needs it: the
-    /// track id, the clip id, and the clip's span on the timeline.
-    fn active_clip_at(&self, frame: u64) -> Option<(String, String, u64, u64)> {
+    /// The clip under `frame` on the active track, as an edit needs it: the track
+    /// id and the clip itself (cloned — a copy is one small struct, and the caller
+    /// is about to send the host a command that re-reads everything anyway).
+    fn active_clip_at(&self, frame: u64) -> Option<(String, Placed)> {
         let arrangement = self.arrangement.as_ref()?;
         let lane = arrangement.lanes.get(self.active_track)?;
         let clip = arrangement.clip_at(self.active_track, frame)?;
-        Some((
-            lane.id.clone(),
-            clip.id.clone(),
-            clip.at_frame,
-            clip.end_frame(),
-        ))
+        Some((lane.id.clone(), clip.clone()))
     }
 
     /// The lane id `offset` tracks away from the active one, when it exists.
@@ -985,21 +1041,21 @@ impl App {
     /// a no-op. Trimming the *start* moves `at_frame` and `src_start` together, so
     /// the audio does not shift under the cut.
     fn trim_to_playhead(&mut self, edge: media::Edge) {
-        let Some((track, clip, at, end)) = self.active_clip_at(self.snap.frame) else {
+        let Some((track, clip)) = self.active_clip_at(self.snap.frame) else {
             self.status = "no clip under the playhead on the active track".to_string();
             return;
         };
         let playhead = self.snap.frame as i64;
         let (name, by) = match edge {
-            media::Edge::Start => ("start", playhead - at as i64),
-            media::Edge::End => ("end", playhead - end as i64),
+            media::Edge::Start => ("start", playhead - clip.at_frame as i64),
+            media::Edge::End => ("end", playhead - clip.end_frame() as i64),
         };
         if by == 0 {
-            self.status = format!("{clip}: the playhead is already its {name}");
+            self.status = format!("{}: the playhead is already its {name}", clip.id);
             return;
         }
-        self.status = format!("trim {clip} {name} by {by:+} frames");
-        self.arrange(&format!("trim {track} {clip} {name} {by}"));
+        self.status = format!("trim {} {name} by {by:+} frames", clip.id);
+        self.arrange(&format!("trim {track} {} {name} {by}", clip.id));
     }
 
     /// `t` in visual mode: trim the clip to the **selection** — the modal payoff
@@ -1014,27 +1070,31 @@ impl App {
             return;
         };
         let (sel_start, sel_end) = (anchor.min(head), anchor.max(head));
-        let Some((track, clip, at, end)) = self.active_clip_at(sel_start) else {
+        let Some((track, clip)) = self.active_clip_at(sel_start) else {
             self.status = format!("no clip on the active track at frame {sel_start}");
             return;
         };
-        let new_start = sel_start.max(at);
-        let new_end = sel_end.min(end);
+        let new_start = sel_start.max(clip.at_frame);
+        let new_end = sel_end.min(clip.end_frame());
         if new_end <= new_start {
-            self.status = format!("the selection does not overlap {clip}");
+            self.status = format!("the selection does not overlap {}", clip.id);
             return;
         }
 
-        let (start_by, end_by) = (new_start as i64 - at as i64, new_end as i64 - end as i64);
+        let (start_by, end_by) = (
+            new_start as i64 - clip.at_frame as i64,
+            new_end as i64 - clip.end_frame() as i64,
+        );
         self.status = format!(
-            "trim {clip} to {new_start}–{new_end} ({} frames)",
+            "trim {} to {new_start}–{new_end} ({} frames)",
+            clip.id,
             new_end - new_start
         );
         if start_by != 0 {
-            self.arrange(&format!("trim {track} {clip} start {start_by}"));
+            self.arrange(&format!("trim {track} {} start {start_by}", clip.id));
         }
         if end_by != 0 {
-            self.arrange(&format!("trim {track} {clip} end {end_by}"));
+            self.arrange(&format!("trim {track} {} end {end_by}", clip.id));
         }
 
         self.mode = Mode::Normal;
@@ -1047,23 +1107,23 @@ impl App {
     /// The step comes from the session clock (bpm × sample rate), so a nudge is
     /// musical rather than a cell width, and moving left clamps at frame 0.
     fn nudge_clip(&mut self, direction: i32) {
-        let Some((track, clip, at, _)) = self.active_clip_at(self.snap.frame) else {
+        let Some((track, clip)) = self.active_clip_at(self.snap.frame) else {
             self.status = "no clip under the playhead on the active track".to_string();
             return;
         };
-        let sample_rate = self.arrangement.as_ref().map_or(48_000, |a| a.sample_rate) as f64;
+        let sample_rate = self.sample_rate() as f64;
         let beat = (60.0 / self.snap.bpm.max(1e-9) * sample_rate).round() as i64;
-        let target = (at as i64 + direction as i64 * beat).max(0) as u64;
+        let target = (clip.at_frame as i64 + direction as i64 * beat).max(0) as u64;
         let beats = direction as i64;
-        self.status = format!("move {clip} {beats:+} beat ({beat} frames) → {target}",);
-        self.arrange(&format!("move_clip {track} {clip} {target}"));
+        self.status = format!("move {} {beats:+} beat ({beat} frames) → {target}", clip.id);
+        self.arrange(&format!("move_clip {track} {} {target}", clip.id));
     }
 
     /// `J` / `K`: move the clip under the playhead to the track below / above,
     /// keeping its position in time, and follow it with the cursor so the panel
     /// stays on the clip.
     fn move_clip_to_track(&mut self, offset: i32) {
-        let Some((track, clip, at, _)) = self.active_clip_at(self.snap.frame) else {
+        let Some((track, clip)) = self.active_clip_at(self.snap.frame) else {
             self.status = "no clip under the playhead on the active track".to_string();
             return;
         };
@@ -1072,9 +1132,145 @@ impl App {
             self.status = format!("there is no track {which}");
             return;
         };
-        self.status = format!("move {clip} {track} → {target} at {at}");
-        self.arrange(&format!("move_clip_to_track {track} {clip} {target} {at}"));
+        self.status = format!("move {} {track} → {target} at {}", clip.id, clip.at_frame);
+        self.arrange(&format!(
+            "move_clip_to_track {track} {} {target} {}",
+            clip.id, clip.at_frame
+        ));
         self.active_track = (self.active_track as i32 + offset).max(0) as usize;
+    }
+
+    /// `g` / `G`: step the clip's gain by a dB. The op carries a linear
+    /// multiplier, so the step is taken in dB (where a step means something) and
+    /// converted back; the range is the console fader's (-60…+12 dB).
+    fn step_clip_gain(&mut self, step_db: f32) {
+        let Some((track, clip)) = self.active_clip_at(self.snap.frame) else {
+            self.status = "no clip under the playhead on the active track".to_string();
+            return;
+        };
+        let current_db = if clip.gain > 0.0 {
+            20.0 * clip.gain.log10()
+        } else {
+            f32::NEG_INFINITY
+        };
+        let next_db = (current_db + step_db).clamp(-60.0, 12.0);
+        if !next_db.is_finite() {
+            self.status = format!("{}: gain is silent (-∞ dB)", clip.id);
+            return;
+        }
+        if (next_db - current_db).abs() < 1e-3 {
+            self.status = format!("{} gain is already at {current_db:+.1} dB", clip.id);
+            return;
+        }
+        let gain = 10f32.powf(next_db / 20.0);
+        self.status = format!("{} gain {next_db:+.1} dB ({gain:.4})", clip.id);
+        self.arrange(&format!("set_clip_gain {track} {} {gain:.6}", clip.id));
+    }
+
+    /// `f` / `F`: put the clip's **fade-in / fade-out** at the playhead — the DAW
+    /// gesture ("the fade ends here"), so it is absolute like the trims rather than
+    /// a nudge. The model requires `fade_in + fade_out <= src_len`, so the other
+    /// fade caps this one and a capped gesture says so.
+    fn fade_to_playhead(&mut self, fade_in: bool) {
+        let Some((track, clip)) = self.active_clip_at(self.snap.frame) else {
+            self.status = "no clip under the playhead on the active track".to_string();
+            return;
+        };
+        let playhead = self.snap.frame;
+        let (mut new_in, mut new_out) = (clip.fade_in, clip.fade_out);
+        let (wanted, capped) = if fade_in {
+            let wanted = playhead.saturating_sub(clip.at_frame);
+            (wanted, clip.src_len.saturating_sub(clip.fade_out))
+        } else {
+            let wanted = clip.end_frame().saturating_sub(playhead);
+            (wanted, clip.src_len.saturating_sub(clip.fade_in))
+        };
+        let value = wanted.min(capped);
+        if fade_in {
+            new_in = value;
+        } else {
+            new_out = value;
+        }
+
+        let which = if fade_in { "fade in" } else { "fade out" };
+        let clamped = if value < wanted {
+            format!(" (capped at {value} by the other fade)")
+        } else {
+            String::new()
+        };
+        self.status = format!(
+            "{} {which} = {value} frames ({:.3} s){clamped}",
+            clip.id,
+            value as f64 / self.sample_rate() as f64,
+        );
+        self.arrange(&format!(
+            "set_clip_fade {track} {} {new_in} {new_out}",
+            clip.id
+        ));
+    }
+
+    /// The session's sample rate (the arrangement's, or the fallback).
+    fn sample_rate(&self) -> u32 {
+        self.arrangement
+            .as_ref()
+            .map_or(48_000, |a| a.sample_rate)
+            .max(1)
+    }
+
+    // -- the `:` command line ----------------------------------------------
+
+    /// Run the typed line **through the host's own parser**: the prompt types the
+    /// `host v1` script format, so a line here is the same command a script writes,
+    /// a key dispatches, and the log records. One line is one command; a parse
+    /// error is shown and nothing is logged.
+    fn run_prompt(&mut self) {
+        let Some(raw) = self.prompt.take() else {
+            return;
+        };
+        let line = raw.trim().to_string();
+        if line.is_empty() {
+            self.status.clear();
+            return;
+        }
+        self.history.push(line.clone());
+        self.history_at = self.history.len();
+
+        // The header the format requires; the parser rejects anything else.
+        let script = format!("host v1\n{line}\n");
+        let commands = match host::parse_script(&script) {
+            Ok(commands) => commands,
+            Err(e) => {
+                self.status = format!(": {line} — {e}");
+                return;
+            }
+        };
+
+        let started = Instant::now();
+        for command in commands {
+            if let Err(e) = self.host.execute(command) {
+                self.status = format!(": {line} — {e}");
+                return;
+            }
+        }
+        self.last_command = Some(("prompt", started.elapsed()));
+        self.status = format!(": {line}");
+        // A line may have edited the arrangement, the parameters, or the transport:
+        // re-read what the log now says rather than guessing which.
+        self.refresh_arrangement();
+    }
+
+    /// `↑` / `↓`: walk the command history, ending on the blank live line.
+    fn history_step(&mut self, direction: i32) {
+        if self.history.is_empty() {
+            return;
+        }
+        let next = if direction < 0 {
+            self.history_at.saturating_sub(1)
+        } else {
+            (self.history_at + 1).min(self.history.len())
+        };
+        self.history_at = next;
+        self.prompt = Some(self.history.get(next).cloned().unwrap_or_default());
     }
 
     /// `n`/`N`: jump the playhead to the next/previous clip boundary on the
@@ -1505,8 +1701,13 @@ impl App {
 
         // The mode is always on screen — a modal UI that hides its mode is a trap
         // (the modal editing note's first rule).
-        let mode_label = format!(" {} ", self.mode.label());
-        let mode = if self.mode == Mode::Visual {
+        // The mode is always on screen — and the command line is a mode.
+        let mode_label = if self.prompt.is_some() {
+            " COMMAND ".to_string()
+        } else {
+            format!(" {} ", self.mode.label())
+        };
+        let mode = if self.mode == Mode::Visual || self.prompt.is_some() {
             Span::styled(
                 mode_label,
                 Style::new()
@@ -1549,13 +1750,29 @@ impl App {
             _ => String::new(),
         };
 
+        // The second line is the status — or, while the prompt is open, the command
+        // line itself with a block cursor, where a `:` belongs.
+        let second = match &self.prompt {
+            Some(text) => ratatui::text::Line::from(vec![
+                Span::styled(
+                    ":",
+                    Style::new()
+                        .fg(Color::LightMagenta)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(text.clone()),
+                Span::styled(" ", Style::new().add_modifier(Modifier::REVERSED)),
+            ]),
+            None => self.status.clone().into(),
+        };
+
         let paragraph = Paragraph::new(vec![
             ratatui::text::Line::from(vec![
                 mode,
                 Span::raw(format!("  {focus}mouse {}   {latency}", on_off(self.mouse))),
                 Span::styled(timeline, Style::new().fg(Color::Gray)),
             ]),
-            self.status.clone().into(),
+            second,
         ])
         .block(Block::bordered().title(" state "))
         .wrap(Wrap { trim: true });
@@ -2545,6 +2762,162 @@ mod tests {
             app.status
         );
         assert_eq!(app.active_track, 0);
+
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// `g`/`G` step the clip's gain in dB and `f`/`F` put its fades at the
+    /// playhead — both are `arrange` lines like every other edit, and the model's own
+    /// limits (gain range, `fade_in + fade_out <= src_len`) are respected with the
+    /// clamp reported rather than refused silently.
+    #[test]
+    fn clip_gain_and_fades_are_keys() {
+        let (pool, script_path) = pool_script("gainfade", "");
+        let mut app = App::idle();
+        app.snap = App::demo_snapshot(); // the playhead sits at 2.000 s (96 000)
+        app.open_script(&script_path);
+
+        let clip = |app: &App| {
+            app.arrangement.as_ref().expect("an arrangement").lanes[0]
+                .clips
+                .first()
+                .cloned()
+                .expect("a clip")
+        };
+
+        // Gain: -1 dB then +1 dB is back to unity (within the log's rounding).
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::empty()));
+        let gain = clip(&app).gain;
+        assert!(
+            (gain - 10f32.powf(-1.0 / 20.0)).abs() < 1e-3,
+            "-1 dB: {gain} ({})",
+            app.status
+        );
+        app.on_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::empty()));
+        assert!((clip(&app).gain - 1.0).abs() < 1e-3, "{}", app.status);
+
+        // Fades: `f` puts the fade-in at the playhead, `F` the fade-out, and the
+        // two together exactly fill the clip (96 000 + 48 000 = 144 000).
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::empty()));
+        assert_eq!(clip(&app).fade_in, 96_000, "{}", app.status);
+        app.on_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::empty()));
+        let c = clip(&app);
+        assert_eq!((c.fade_in, c.fade_out), (96_000, 48_000), "{}", app.status);
+
+        // The model's sum rule caps a fade instead of letting the host refuse it:
+        // at 2.5 s the fade-in wants 120 000, but only 96 000 is left.
+        app.snap.frame = 120_000;
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::empty()));
+        assert_eq!(clip(&app).fade_in, 96_000, "{}", app.status);
+        assert!(
+            app.status.contains("capped"),
+            "the cap is reported: {}",
+            app.status
+        );
+
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// The `:` command line types the same `host v1` format the keys dispatch, so
+    /// the whole vocabulary is reachable without a key: Enter runs it, Esc cancels,
+    /// a parse error is shown and changes nothing, and `↑` walks the history.
+    #[test]
+    fn the_command_line_runs_host_lines() {
+        let (pool, script_path) = pool_script("prompt", "");
+        let mut app = App::idle();
+        app.snap = App::demo_snapshot();
+        app.open_script(&script_path);
+
+        fn type_line(app: &mut App, line: &str) {
+            app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::empty()));
+            assert!(app.prompt.is_some(), "the command line opens");
+            for c in line.chars() {
+                app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+            }
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        }
+
+        // A line the keys have no key for: set the clip's gain.
+        type_line(&mut app, "arrange set_clip_gain t0 c0 0.25");
+        assert!(app.prompt.is_none(), "Enter closes the prompt");
+        let gain = app.arrangement.as_ref().expect("an arrangement").lanes[0].clips[0].gain;
+        assert!((gain - 0.25).abs() < 1e-6, "gain {gain} ({})", app.status);
+        assert!(app.status.starts_with(": arrange"), "{}", app.status);
+        assert_eq!(app.last_command.map(|(label, _)| label), Some("prompt"));
+
+        // Every script line works, not just `arrange`: a parameter, and the
+        // transport, through the same parser.
+        type_line(&mut app, "set_param mixer ch0.gain 0.5");
+        assert!(
+            (app.mixer.value(0) - 0.5).abs() < 1e-6,
+            "the console reads the log back: {}",
+            app.status
+        );
+        type_line(&mut app, "transport seek 0");
+        assert_eq!(
+            app.host.snapshot().frame,
+            0,
+            "the host seeks (the shell's own copy of the snapshot is the event loop's job)"
+        );
+
+        // A bad line reports and changes nothing.
+        let before = app.arrangement.as_ref().expect("an arrangement").lanes[0].clips[0].gain;
+        type_line(&mut app, "arrange nonsense");
+        assert!(
+            app.status.contains(':'),
+            "the error is shown: {}",
+            app.status
+        );
+        assert_eq!(
+            app.arrangement.as_ref().expect("an arrangement").lanes[0].clips[0].gain,
+            before,
+            "a refused line is not logged"
+        );
+
+        // Esc cancels without running, and backspace edits.
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::empty()));
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()));
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()));
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()));
+        assert_eq!(app.prompt.as_deref(), Some("x"), "backspace edits the line");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(app.prompt.is_none(), "Esc closes the prompt");
+        assert!(app.status.contains("cancelled"), "{}", app.status);
+        assert_eq!(
+            app.arrangement.as_ref().expect("an arrangement").lanes[0]
+                .clips
+                .len(),
+            1,
+            "a cancelled line runs nothing"
+        );
+
+        // The mode is on screen while the line is open — a modal UI that hides its
+        // mode is a trap — and the line replaces the status where a `:` belongs.
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::empty()));
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()));
+        let screen = rendered(&mut app);
+        assert!(
+            screen.contains("COMMAND"),
+            "the command line's mode is shown:\n{screen}"
+        );
+        assert!(screen.contains(":x"), "the typed line is shown:\n{screen}");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+
+        // `↑` recalls the last line; `↓` returns to the live (empty) line.
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::empty()));
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(
+            app.prompt.as_deref(),
+            Some("arrange nonsense"),
+            "history recalls the last line attempted — including one worth fixing"
+        );
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        assert_eq!(
+            app.prompt.as_deref(),
+            Some(""),
+            "down returns to the live line"
+        );
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
 
         let _ = std::fs::remove_dir_all(&pool);
     }
