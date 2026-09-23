@@ -33,9 +33,10 @@ modal, key-driven workflow across both.**
 2. **One workflow, two shells is the rule** (2026-09-22). A capability lands in the *workflow* — an
    action in the `host v1` vocabulary, a key, a line in the keymap table — before or with the shell
    that shows it; a shell-only feature (or a key that exists in one shell and not the other) is a bug.
-   The TUI is the reference implementation, and its `KEYMAP` table drives both the handler and the
-   `?` overlay so help cannot drift from behaviour. When iced grows keys, that table is what moves —
-   into a shared crate both shells depend on, rather than two tables that agree by discipline.
+   **Built 2026-09-22:** the model is the **`workflow` crate** (`crates/workflow`, a core-workspace
+   member with no UI toolkit) — modes, a neutral `Key`, the `Action` vocabulary, and the keymap table
+   that generates the `?` help. The TUI translates crossterm into it and dispatches; the iced shell
+   will translate iced's keys into the same table.
 3. **The Host API is the shell seam, and two shells now prove it.** Both spikes drive the
    *same* `host::live::HostHandle` the bridge drove (`spikes/iced-shell`, `spikes/tui-shell`),
    each its own isolated workspace so neither framework leaks into the core's build. The

@@ -1,0 +1,11 @@
+[package]
+name = "workflow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "sound-arranger's shell workflow — the modal, key-driven editing model the shells share (keys → actions, and the host v1 vocabulary behind them)"
+
+[dependencies]
+# The vocabulary the actions dispatch (`host::parse_arrange_line` in a test, and the
+# op names in `Action::command_name`). No UI toolkit, ever: the shells translate.
+host = { path = "../host" }

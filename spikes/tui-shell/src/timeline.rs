@@ -294,23 +294,9 @@ impl Arrangement {
     }
 }
 
-/// Which of the interaction model's modes the panel is in. Only the two that the
-/// timeline needs so far — the full model (Normal / Visual / Insert / Command) is
-/// the [modal editing note](../../../.agents/notes/proposed/architecture/2026-09-21-modal-editing-model.md).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    Normal,
-    Visual,
-}
-
-impl Mode {
-    pub fn label(self) -> &'static str {
-        match self {
-            Mode::Normal => "NORMAL",
-            Mode::Visual => "VISUAL",
-        }
-    }
-}
+/// The interaction model's modes come from the **shared workflow** (`workflow::Mode`),
+/// not from this view: the model is the product, the panel is a rendering of it.
+pub use workflow::Mode;
 
 /// The viewport: which frames are visible, how wide a column is, and the
 /// selection (in frames) when there is one.

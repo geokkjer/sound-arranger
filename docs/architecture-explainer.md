@@ -47,21 +47,26 @@ Everything the product *does* is a plugin mounted onto those four. A profile —
 like the clip-arranger — is just a named assembly of plugins plus a thin shell
 (the host).
 
-### 1.2 Three crates, three layers (and the shells outside them)
+### 1.2 Four crates, and the shells outside them
 
-The workspace (`Cargo.toml`) has **three** members, and the layering is strict.
+The workspace (`Cargo.toml`) has **four** members, and the layering is strict.
 The shells are deliberately *not* members: each is its own workspace, so no UI
 framework enters the core's build.
 
 ```
-crates/engine    crates/media     crates/host        spikes/iced-shell   spikes/tui-shell
- (the core)     (streaming/I-O)   (headless host)     (iced, GUI)        (ratatui, TUI)
-     ^                ^                 ^                   ^                   ^
-     |                | depends on      | depends on        | depends on        | depends on
-     | depends on     | engine          | engine + media    | host (same        | host (same
-     +--- std only ----+                |                   |  contract)        |  contract)
-                        std + cpal       |
+crates/engine  crates/media   crates/host      crates/workflow    spikes/iced-shell  spikes/tui-shell
+ (the core)   (streaming)     (headless host)  (the shell model)   (iced, GUI)       (ratatui, TUI)
+     ^              ^               ^                 ^                  ^                  ^
+     |              | depends on    | depends on      | depends on       | depends on       | depends on
+     | depends on   | engine        | engine + media  | host             | host + workflow  | host + workflow
+     +-- std only ---+              |                 |                  |                  |
+                    std + cpal      |                 | no UI toolkit    |                  |
 ```
+
+`workflow` is the odd one out on purpose: it is **not** a UI — it is the modal,
+key-driven *model* both shells render (modes, the neutral `Key`, the `Action`
+vocabulary, the keymap that generates the `?` help). Putting it in the core
+workspace is what keeps two shells from growing two workflows.
 
 - **`engine`** — the minimal core. **Std-only.** No `cpal`, no Tauri, no I/O of
   any kind. This is a deliberate, guarded property: the core is the one thing that

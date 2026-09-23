@@ -77,62 +77,10 @@ const FRAME: Duration = Duration::from_millis(16);
 /// work headless too.
 const SAMPLE_RATE: u64 = 48_000;
 
-/// The keymap — rendered verbatim by the `?` overlay, so the help and the
-/// behaviour cannot drift apart.
-const KEYMAP: &[(&str, &str)] = &[
-    ("space", "play / stop"),
-    ("s", "stop"),
-    ("r  Home", "rewind to 0"),
-    (",  .", "seek -1 s / +1 s (stops first)"),
-    ("Tab  Shift-Tab", "move between panels (mixer ⇄ timeline)"),
-    (
-        "j  k  ↑  ↓",
-        "the focused panel: mixer channel / active track",
-    ),
-    ("v", "visual mode: select from the playhead"),
-    (
-        "h  l",
-        "timeline: scroll (visual mode: extend the selection)",
-    ),
-    (
-        "+  -",
-        "timeline: zoom in / out · mixer: ride the selected fader",
-    ),
-    ("0", "timeline: fit · mixer: fader to unity"),
-    ("M  S", "mixer: mute / solo the selected channel"),
-    ("x", "timeline: split the clip under the playhead"),
-    ("d", "timeline: delete the clip under the playhead"),
-    (
-        "<  >",
-        "timeline: trim the clip's start / end to the playhead",
-    ),
-    ("H  L", "timeline: move the clip one beat earlier / later"),
-    ("J  K", "timeline: move the clip to the track below / above"),
-    (
-        "t",
-        "visual: trim the clip to the selection (then leave visual)",
-    ),
-    ("n  N", "timeline: jump to the next / previous clip"),
-    (
-        "u  Ctrl+r",
-        "undo / redo the last arrangement edit (a log replay)",
-    ),
-    (
-        "Esc",
-        "leave visual mode / close this overlay (never quits)",
-    ),
-    ("m", "toggle mouse capture"),
-    (
-        ":",
-        "the command line — type any `host v1` line (Esc cancels, ↑/↓ history)",
-    ),
-    ("?", "this keymap"),
-    ("q  Ctrl+c", "quit"),
-    (
-        "mouse",
-        "click a panel to focus · click a lane = that track + seek · click the ruler = seek · wheel = seek",
-    ),
-];
+/// The keymap now lives in the **shared workflow** (`workflow::KEYMAP`): the
+/// handler matches on its [`workflow::Action`]s and the `?` overlay renders its rows,
+/// so both shells read one table and the help cannot drift from the behaviour.
+use workflow::Action;
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -190,7 +138,7 @@ struct App {
     last_command: Option<(&'static str, Duration)>,
     /// Rects recorded by the last draw, for mouse hit-testing: the terminal has
     /// no widget tree to query, so the view publishes what is clickable.
-    buttons: Vec<(Rect, Action)>,
+    buttons: Vec<(Rect, Button)>,
     meter_rows: Vec<(usize, Rect)>,
     mixer_rect: Rect,
     /// The console: fader positions, mutes and solos the shell has asked the
@@ -230,8 +178,11 @@ impl Panel {
     }
 }
 
+/// A mouse target: the transport buttons. Distinct from a workflow
+/// [`workflow::Action`] on purpose — one is a rectangle to click, the other is what the
+/// workflow says a key means (and both can reach the same method).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Action {
+enum Button {
     Play,
     Stop,
     Rewind,
@@ -621,24 +572,46 @@ impl App {
         self.selected = (self.selected as i64 + delta).rem_euclid(count) as usize;
     }
 
-    fn apply(&mut self, action: Action) {
+    fn apply(&mut self, action: Button) {
         match action {
-            Action::Play => self.play(),
-            Action::Stop => self.stop(),
-            Action::Rewind => self.rewind(),
+            Button::Play => self.play(),
+            Button::Stop => self.stop(),
+            Button::Rewind => self.rewind(),
         }
+    }
+
+    /// Translate a toolkit key into the shared workflow's neutral key. Everything
+    /// toolkit-specific stops here: the workflow crate knows nothing about crossterm.
+    fn workflow_key(key: &KeyEvent) -> Option<workflow::Key> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        Some(match key.code {
+            KeyCode::Char(c) if ctrl => workflow::Key::Ctrl(c.to_ascii_lowercase()),
+            KeyCode::Char(' ') => workflow::Key::Space,
+            KeyCode::Char(c) => workflow::Key::Char(c),
+            KeyCode::Enter => workflow::Key::Enter,
+            KeyCode::Esc => workflow::Key::Esc,
+            KeyCode::Backspace => workflow::Key::Backspace,
+            KeyCode::Tab => workflow::Key::Tab,
+            KeyCode::BackTab => workflow::Key::BackTab,
+            KeyCode::Up => workflow::Key::Up,
+            KeyCode::Down => workflow::Key::Down,
+            KeyCode::Left => workflow::Key::Left,
+            KeyCode::Right => workflow::Key::Right,
+            KeyCode::Home => workflow::Key::Home,
+            _ => return None,
+        })
     }
 
     fn on_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
         // The command line is **modal** (as vim's `:` is): it takes every key while
-        // it is open. Enter runs the line, Esc cancels, `↑`/`↓` walk the history.
+        // it is open. Enter runs the line, Esc/Ctrl+c cancels, `↑`/`↓` walk the
+        // history. This is the one place the shell handles *text*, so it stays here.
         if self.prompt.is_some() {
             match key.code {
                 KeyCode::Enter => self.run_prompt(),
-                // Esc and Ctrl+c cancel — plain `c` is a *character*, which is
-                // exactly the bug this arm used to have.
                 KeyCode::Esc => {
                     self.prompt = None;
                     self.status = "command line cancelled".to_string();
@@ -664,13 +637,13 @@ impl App {
             return;
         }
 
-        // The keymap overlay is **modal** too: while it is up, `j`/`k` scroll it and
-        // anything else closes it or does nothing. (It cannot be dismissed by
-        // accident into an edit — the help is where you read before you act.)
+        // The keymap overlay is modal too: while it is up, `j`/`k` scroll it and
+        // anything else closes it or does nothing. (It cannot be dismissed by accident
+        // into an edit — the help is where you read before you act.)
         if self.help {
             match key.code {
                 KeyCode::Char('j') | KeyCode::Down => {
-                    self.help_scroll = (self.help_scroll + 1).min(KEYMAP.len());
+                    self.help_scroll = (self.help_scroll + 1).min(workflow::help_len());
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
                     self.help_scroll = self.help_scroll.saturating_sub(1);
@@ -681,83 +654,72 @@ impl App {
             return;
         }
 
-        match key.code {
-            // Global transport: available in either panel and in any mode.
-            KeyCode::Char(' ') => self.toggle(),
-            KeyCode::Char('s') => self.stop(),
-            KeyCode::Char('r') if ctrl => self.redo(),
-            KeyCode::Char('r') | KeyCode::Home => self.rewind(),
-            KeyCode::Char(',') => self.nudge(-1),
-            KeyCode::Char('.') => self.nudge(1),
-            // Undo/redo are *log replays*: the host drops the last arrangement
-            // edit and rebuilds by replaying the log, and the shell re-reads the
-            // arrangement **and** the parameters — which is why a fader ride
-            // survives undoing a clip edit.
-            KeyCode::Char('u') => self.undo(),
+        // Everything else is the **shared workflow**: one table, mapped to this
+        // shell's methods. There is no second keymap here to drift from it.
+        let Some(pressed) = Self::workflow_key(&key) else {
+            return;
+        };
+        let Some(action) = workflow::action(pressed) else {
+            return;
+        };
+        self.dispatch(action);
+    }
 
-            // Panel navigation. Shift-Tab arrives as BackTab on most terminals.
-            KeyCode::Tab => self.cycle_focus(1),
-            KeyCode::BackTab => self.cycle_focus(-1),
-
-            // Panel-scoped vertical movement: the mixer's channel, or the
-            // timeline's active track.
-            KeyCode::Char('j') | KeyCode::Down => self.vertical(1),
-            KeyCode::Char('k') | KeyCode::Up => self.vertical(-1),
-
-            // Timeline only (the viewport is free to move; only seeking and
-            // editing talk to the host).
-            KeyCode::Char('h') | KeyCode::Left => self.timeline_key(|app| app.timeline_move(-1)),
-            KeyCode::Char('l') | KeyCode::Right => self.timeline_key(|app| app.timeline_move(1)),
-            KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char('Z') => self.plus(),
-            KeyCode::Char('-') | KeyCode::Char('z') => self.minus(),
-            KeyCode::Char('0') => self.zero(),
-            KeyCode::Char('M') => self.mixer_key(|app| app.mute()),
-            KeyCode::Char('S') => self.mixer_key(|app| app.solo()),
-            KeyCode::Char('v') => self.timeline_key(|app| app.visual()),
-            KeyCode::Char('x') => self.timeline_key(|app| app.split_at_playhead()),
-            KeyCode::Char('d') => self.timeline_key(|app| app.delete_at_playhead()),
-            KeyCode::Char('<') => self.timeline_key(|app| app.trim_to_playhead(media::Edge::Start)),
-            KeyCode::Char('>') => self.timeline_key(|app| app.trim_to_playhead(media::Edge::End)),
-            KeyCode::Char('t') => self.timeline_key(|app| app.trim_to_selection()),
-            KeyCode::Char('H') => self.timeline_key(|app| app.nudge_clip(-1)),
-            KeyCode::Char('L') => self.timeline_key(|app| app.nudge_clip(1)),
-            KeyCode::Char('J') => self.timeline_key(|app| app.move_clip_to_track(1)),
-            KeyCode::Char('K') => self.timeline_key(|app| app.move_clip_to_track(-1)),
-            KeyCode::Char('g') => self.timeline_key(|app| app.step_clip_gain(-1.0)),
-            KeyCode::Char('G') => self.timeline_key(|app| app.step_clip_gain(1.0)),
-            KeyCode::Char('f') => self.timeline_key(|app| app.fade_to_playhead(true)),
-            KeyCode::Char('F') => self.timeline_key(|app| app.fade_to_playhead(false)),
-            // Clip-to-clip motion: the "next word" analogue for an arrangement.
-            KeyCode::Char('n') => self.timeline_key(|app| app.seek_clip(true)),
-            KeyCode::Char('N') => self.timeline_key(|app| app.seek_clip(false)),
-
-            // `:` opens the command line. It is the escape hatch that makes the
-            // vocabulary complete: every key here is a line in this format.
-            KeyCode::Char(':') => {
+    /// Run one workflow action. This is the shell's whole key surface: the workflow
+    /// says what a key means, and every arm below is one method (and one `host v1`
+    /// line) the iced shell will call the same way.
+    fn dispatch(&mut self, action: Action) {
+        match action {
+            Action::PlayToggle => self.toggle(),
+            Action::Stop => self.stop(),
+            Action::Rewind => self.rewind(),
+            Action::SeekSeconds(seconds) => self.nudge(seconds),
+            Action::SeekClip(forward) => self.timeline_key(|app| app.seek_clip(forward)),
+            Action::CycleFocus(direction) => self.cycle_focus(direction),
+            Action::Vertical(direction) => self.vertical(direction),
+            Action::Timeline(direction) => self.timeline_key(|app| app.timeline_move(direction)),
+            Action::Zoom(direction) => self.zoom_or_ride(direction),
+            Action::Fit => self.zero(),
+            Action::MixerMute => self.mixer_key(|app| app.mute()),
+            Action::MixerSolo => self.mixer_key(|app| app.solo()),
+            Action::Visual => self.timeline_key(|app| app.visual()),
+            Action::Split => self.timeline_key(|app| app.split_at_playhead()),
+            Action::Delete => self.timeline_key(|app| app.delete_at_playhead()),
+            Action::TrimStart => self.timeline_key(|app| app.trim_to_playhead(media::Edge::Start)),
+            Action::TrimEnd => self.timeline_key(|app| app.trim_to_playhead(media::Edge::End)),
+            Action::TrimToSelection => self.timeline_key(|app| app.trim_to_selection()),
+            Action::Nudge(direction) => self.timeline_key(|app| app.nudge_clip(direction)),
+            Action::MoveTrack(offset) => self.timeline_key(|app| app.move_clip_to_track(offset)),
+            Action::Gain(direction) => {
+                self.timeline_key(|app| app.step_clip_gain(direction as f32))
+            }
+            Action::Fade(fade_in) => self.timeline_key(|app| app.fade_to_playhead(fade_in)),
+            Action::Undo => self.undo(),
+            Action::Redo => self.redo(),
+            Action::Prompt => {
                 self.prompt = Some(String::new());
                 self.history_at = self.history.len();
             }
-            KeyCode::Char('?') => {
+            Action::Help => {
                 self.help_scroll = 0;
                 self.help = !self.help;
             }
-            KeyCode::Char('m') => self.toggle_mouse(),
-            KeyCode::Char('q') => self.quit = true,
-            // Esc leaves *state* (the help overlay, a visual selection) and never
-            // quits: `q` and Ctrl+c are the only ways out. A double-Esc quit was a
-            // design mistake — it makes the safety key destructive.
-            KeyCode::Esc => {
-                if self.help {
-                    self.help = false;
-                } else if self.mode == Mode::Visual {
-                    self.mode = Mode::Normal;
-                    if let Some(view) = self.view.as_mut() {
-                        view.selection = None;
-                    }
-                }
+            Action::ToggleMouseCapture => self.toggle_mouse(),
+            Action::Quit => self.quit = true,
+            Action::Cancel => self.cancel(),
+        }
+    }
+
+    /// Esc: leave whatever state is on top — and never quit (the safety key must not
+    /// be the destructive one).
+    fn cancel(&mut self) {
+        if self.help {
+            self.help = false;
+        } else if self.mode == Mode::Visual {
+            self.mode = Mode::Normal;
+            if let Some(view) = self.view.as_mut() {
+                view.selection = None;
             }
-            KeyCode::Char('c') if ctrl => self.quit = true,
-            _ => {}
         }
     }
 
@@ -777,17 +739,12 @@ impl App {
 
     /// `+` / `-` / `0` mean different things per panel — the payoff of the focus
     /// ring: zoom the timeline, or ride the selected fader.
-    fn plus(&mut self) {
+    /// `+`/`-`: the *focused* panel's more/less — zoom the timeline, or ride the
+    /// fader. One workflow action, two meanings, chosen by focus (never by the key).
+    fn zoom_or_ride(&mut self, direction: i32) {
         match self.focus {
-            Panel::Timeline => self.timeline_zoom(true),
-            Panel::Mixer => self.ride(0.05),
-        }
-    }
-
-    fn minus(&mut self) {
-        match self.focus {
-            Panel::Timeline => self.timeline_zoom(false),
-            Panel::Mixer => self.ride(-0.05),
+            Panel::Timeline => self.timeline_zoom(direction > 0),
+            Panel::Mixer => self.ride(0.05 * direction as f32),
         }
     }
 
@@ -853,30 +810,34 @@ impl App {
 
     /// `j`/`k`: the focused panel's vertical movement — mixer channel, or the
     /// timeline's active track.
-    fn vertical(&mut self, direction: i64) {
+    fn vertical(&mut self, direction: i32) {
         match self.focus {
-            Panel::Mixer => self.select(direction),
+            Panel::Mixer => self.select(direction as i64),
             Panel::Timeline => {
                 let lanes = self.arrangement.as_ref().map_or(0, |a| a.lanes.len());
                 if lanes == 0 {
                     return;
                 }
-                self.active_track =
-                    (self.active_track as i64 + direction).clamp(0, lanes as i64 - 1) as usize;
+                self.active_track = (self.active_track as i64 + direction as i64)
+                    .clamp(0, lanes as i64 - 1) as usize;
             }
         }
     }
 
     /// `Tab`/`Shift-Tab`: move the focus ring.
-    fn cycle_focus(&mut self, _direction: i64) {
+    fn cycle_focus(&mut self, direction: i32) {
         if self.arrangement.is_none() {
             self.focus = Panel::Mixer; // only one panel to focus
             return;
         }
-        self.focus = match self.focus {
-            Panel::Mixer => Panel::Timeline,
-            Panel::Timeline => Panel::Mixer,
-        };
+        // Two panels today, so this is a toggle — but the *direction* comes from the
+        // workflow (Tab vs Shift-Tab), so a third panel will not need a new key.
+        let panels = [Panel::Mixer, Panel::Timeline];
+        let index = panels
+            .iter()
+            .position(|panel| *panel == self.focus)
+            .unwrap_or(0) as i32;
+        self.focus = panels[(index + direction).rem_euclid(panels.len() as i32) as usize];
     }
 
     // -- the timeline's update side ----------------------------------------
@@ -1332,7 +1293,7 @@ impl App {
 
     /// The mouse's whole role: hit-test the rects the last draw published. No
     /// widget tree, no focus, no hit regions — just the areas the view recorded.
-    fn action_at(&self, position: Position) -> Option<Action> {
+    fn action_at(&self, position: Position) -> Option<Button> {
         self.buttons
             .iter()
             .find(|(rect, _)| rect.contains(position))
@@ -1531,9 +1492,9 @@ impl App {
 
         let playing = self.snap.playing;
         let buttons = [
-            ("Play", Action::Play, playing),
-            ("Stop", Action::Stop, !playing),
-            ("Rewind", Action::Rewind, false),
+            ("Play", Button::Play, playing),
+            ("Stop", Button::Stop, !playing),
+            ("Rewind", Button::Rewind, false),
         ];
 
         let mut spans = Vec::new();
@@ -1785,8 +1746,7 @@ impl App {
     /// show a 22-entry keymap plus its wrapped meanings. The title says when there
     /// is more below, so a clipped help never reads as the whole help.
     fn draw_help(&self, frame: &mut Frame, area: Rect) {
-        let rows: Vec<ratatui::text::Line> = KEYMAP
-            .iter()
+        let rows: Vec<ratatui::text::Line> = workflow::help()
             .map(|(keys, meaning)| {
                 ratatui::text::Line::from(vec![
                     Span::styled(
@@ -1795,15 +1755,15 @@ impl App {
                             .fg(Color::LightBlue)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::raw(*meaning),
+                    Span::raw(meaning),
                 ])
             })
             .collect();
 
-        let popup = centered_rect(64, (KEYMAP.len() as u16 + 4).min(area.height), area);
+        let popup = centered_rect(64, (workflow::help_len() as u16 + 4).min(area.height), area);
         frame.render_widget(Clear, popup);
 
-        let more = KEYMAP.len().saturating_sub(self.help_scroll);
+        let more = workflow::help_len().saturating_sub(self.help_scroll);
         let title = if more + 4 > popup.height as usize {
             format!(" keys — ? or Esc closes · j/k scrolls ({more} below) ")
         } else {
@@ -2207,7 +2167,8 @@ mod tests {
         // "every key is listed" means every row is *reachable*: scroll to each
         // index and look for that entry's key token. The overlay pads the key
         // column, so matching on the first token is enough.
-        for (index, (keys, _)) in KEYMAP.iter().enumerate() {
+        let help: Vec<(&str, &str)> = workflow::help().collect();
+        for (index, (keys, _)) in help.iter().enumerate() {
             app.help_scroll = index;
             let screen = rendered(&mut app);
             let token = keys.split_whitespace().next().expect("a key");
@@ -2246,11 +2207,11 @@ mod tests {
         let (play, _) = app
             .buttons
             .iter()
-            .find(|(_, action)| *action == Action::Play)
+            .find(|(_, action)| *action == Button::Play)
             .expect("the play button was laid out");
 
         let centre = Position::new(play.x + play.width / 2, play.y);
-        assert_eq!(app.action_at(centre), Some(Action::Play));
+        assert_eq!(app.action_at(centre), Some(Button::Play));
 
         // Outside every button nothing happens — no accidental transport hits.
         assert_eq!(app.action_at(Position::new(0, 25)), None);
@@ -2920,5 +2881,53 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
 
         let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// The one place drift can now enter: the shell's translation of a toolkit event
+    /// into the workflow's neutral key. (Which key means *what* is the workflow's
+    /// business; that crossterm's `BackTab` is the workflow's `BackTab` is ours.)
+    #[test]
+    fn toolkit_keys_translate_into_the_workflow() {
+        let press = |code: KeyCode, modifiers: KeyModifiers| {
+            workflow::action(App::workflow_key(&KeyEvent::new(code, modifiers)).expect("a key"))
+        };
+
+        assert_eq!(
+            press(KeyCode::Char(' '), KeyModifiers::empty()),
+            Some(Action::PlayToggle)
+        );
+        assert_eq!(
+            press(KeyCode::Char('j'), KeyModifiers::empty()),
+            Some(Action::Vertical(1))
+        );
+        assert_eq!(
+            press(KeyCode::Char('k'), KeyModifiers::empty()),
+            Some(Action::Vertical(-1))
+        );
+        assert_eq!(
+            press(KeyCode::Char('K'), KeyModifiers::SHIFT),
+            Some(Action::MoveTrack(-1))
+        );
+        assert_eq!(
+            press(KeyCode::BackTab, KeyModifiers::SHIFT),
+            Some(Action::CycleFocus(-1))
+        );
+        assert_eq!(
+            press(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            Some(Action::Redo)
+        );
+        assert_eq!(
+            press(KeyCode::Char(':'), KeyModifiers::empty()),
+            Some(Action::Prompt)
+        );
+        assert_eq!(
+            press(KeyCode::Esc, KeyModifiers::empty()),
+            Some(Action::Cancel)
+        );
+        // A key the workflow does not use is not an action (and not a panic).
+        assert_eq!(
+            App::workflow_key(&KeyEvent::new(KeyCode::F(5), KeyModifiers::empty())),
+            None
+        );
     }
 }

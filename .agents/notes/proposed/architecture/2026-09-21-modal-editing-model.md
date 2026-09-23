@@ -130,11 +130,13 @@ Consequences to hold the two together:
 - **The `host v1` vocabulary is the floor.** Every action is an `arrange`/`set_param`/`transport`
   line, so the `:` prompt, a script, and a key are the same thing — and a key that exists in one
   shell and not the other is a bug in the shell, not a feature.
-- **The keymap is data, and today it is one table.** The TUI's `KEYMAP` const renders the `?`
-  overlay *and* is the table the handler matches against, so help cannot drift from behaviour. When
-  iced grows keys, the table is what moves: the honest next step is a shared definition (a small
-  crate the shells' isolated workspaces both path-depend on, like `host`) rather than two tables that
-  agree by discipline. Until then, the TUI's table is the reference, and a divergence is a bug.
+- **The keymap is data, and it is shared** (built 2026-09-22): it lives in the
+  **`workflow` crate** — a core-workspace member with no UI toolkit — as `KEYMAP: &[Binding]`
+  (`Key → Action`, plus the help line) with `Mode`, the neutral `Key`, and the `Action` vocabulary.
+  The TUI translates crossterm events into it and dispatches actions; the `?` overlay renders
+  `workflow::help()`, so the help is generated from the same table the handler matches. Two tests
+  guard the drift the rule exists to stop: no key is bound twice, and every action that claims to be
+  a log op is an op the host's parser accepts (`Action::command_name` → `host::parse_arrange_line`).
 
 The GUI-only upside is real and deferred, not denied: text entry and completion for the `:` prompt,
 menus/dialogs, tooltips, multi-window layouts, and reusing the same widgets as a CLAP plugin editor
@@ -167,7 +169,9 @@ The model is decided (this note becomes implemented, or is rejected) when:
 
 1. **A keymap spec exists as data** — modes × bindings × commands — loadable by the shell, with the
    `host v1` verb set as the command vocabulary, and a test asserting every binding names a real
-   command (no binding can drift from the log).
+   command (no binding can drift from the log). *Partly satisfied (2026-09-22): the spec is data in
+   the `workflow` crate and the vocabulary test exists; **loadable** (TOML/JSON overrides, the Helix
+   "user wins" property) is not built — it is compiled in.*
 2. **`:` and the keys dispatch the same commands** in the spike, both visible in the log; a scripted
    session and a hand-played session produce the same event sequence. *Partly satisfied (2026-09-22):
    the prompt is built and dispatches through the same parser as the keys; the "same event sequence

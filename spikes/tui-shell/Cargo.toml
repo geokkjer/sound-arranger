@@ -15,5 +15,8 @@ description = "ratatui spike — the terminal counterpart of the iced spike, dri
 # drift from the widget crate's.
 ratatui = "0.30"
 host = { path = "../../crates/host" }
+# The shell workflow — modes, keys, actions — defined once, shared with the iced
+# shell. The crate is UI-toolkit-free; this spike translates crossterm events into it.
+workflow = { path = "../../crates/workflow" }
 # For the timeline: the peak pyramid (`media::peaks`) and the WAV reader.
 media = { path = "../../crates/media" }
