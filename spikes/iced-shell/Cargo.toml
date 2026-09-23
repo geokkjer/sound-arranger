@@ -20,3 +20,6 @@ iced = { version = "0.14", features = ["canvas", "image"] }
 # https://github.com/iced-rs/iced_audio
 iced_audio = "0.17"
 host = { path = "../../crates/host" }
+# The shared shell workflow: modes, keys, actions. This shell is the *second* one to
+# speak it, which is the whole point — one table, two shells.
+workflow = { path = "../../crates/workflow" }

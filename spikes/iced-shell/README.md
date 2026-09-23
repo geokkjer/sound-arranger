@@ -19,6 +19,13 @@ In scope:
   used — and never touches the render path: no IPC, no webview, no serde wire;
 - play / stop / rewind (space, `r`) drive the transport;
 - channel + master meters and the position readout follow the audio at 60 Hz;
+- **it speaks the shared workflow**: modes, keys, the `:` command line and the
+  keymap overlay all come from the `workflow` crate — *the same table the ratatui
+  shell reads* — so the two shells cannot grow two workflows. iced translates its
+  key events into the workflow's neutral `Key`; what a key means is not this shell's
+  business. Actions iced cannot express *yet* (split/trim/move a clip — it has no
+  timeline) **report themselves** in the status line instead of doing nothing: the
+  parity debt is visible on purpose, because the rule is "no shell-only features";
 - **the mixer is real stock-widget material**: `iced_audio 0.17` `VSlider`s on a
   dB range (`DBRange`, −60…+12 dB, unity at ~83 % of the travel), one fader per
   channel plus the master, each with a live meter and a dB readout. Dragging a
@@ -27,6 +34,12 @@ In scope:
 
 ![the iced spike's mixer: four channel faders and a master, the master at -1.9 dB
 because the demo script sets `master.gain 0.8`](mixer-fold.png)
+
+The same shell with the shared keymap open (`cargo run -- --keys`) — the rows are
+`workflow::help()`, the identical table the TUI renders:
+
+![the iced spike's keymap overlay, rendered from the shared workflow
+table](workflow-keys.png)
 
 The screenshot is the boot state of the demo profile: `ch0…ch3` at +0.0 dB and
 **master at −1.9 dB**, which is `20·log10(0.8)` — the value the *script* set, read
@@ -43,9 +56,20 @@ decide iced against ratatui, and the note records them as the follow-up.
 cd spikes/iced-shell
 
 cargo run              # the window (needs a display and an audio device)
+cargo run -- --keys    # …with the shared keymap overlay open
 cargo run -- --probe   # headless: host thread + transport + meters, no window
-cargo test             # the strip mapping + the dB range round trip
+cargo test             # key translation, the command line, the console keys
 ```
+
+## Keys, and what is not wired yet
+
+`space` `s` `r` `,` `.` drive the transport; `j`/`k` select a console strip and
+`+`/`-`/`0` ride it (or return it to unity); `u`/`Ctrl+r` undo/redo through the
+log; `:` opens the command line (any `host v1` line, Enter runs, Esc cancels, ↑/↓
+history); `?` shows the keymap; `Esc` cancels. The rest of the workflow's table —
+`x` `d` `<` `>` `t` `H` `L` `J` `K` `g` `G` `f` `F` `v` `n` `N` — needs the timeline
+canvas, and each one says so in the status line when pressed. That is deliberate:
+the workflow is shared, so the gap is a *rendering* gap and it is visible.
 
 `--probe` is the CI-able half: it boots a silent host (wall-clock pump, no audio
 device), loads the demo profile, plays, polls the published snapshot for 600 ms,

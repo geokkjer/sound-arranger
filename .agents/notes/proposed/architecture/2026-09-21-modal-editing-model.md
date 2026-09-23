@@ -130,6 +130,11 @@ Consequences to hold the two together:
 - **The `host v1` vocabulary is the floor.** Every action is an `arrange`/`set_param`/`transport`
   line, so the `:` prompt, a script, and a key are the same thing — and a key that exists in one
   shell and not the other is a bug in the shell, not a feature.
+- **Both shells speak the table** (2026-09-22): the TUI (crossterm) and the iced spike (iced's
+  `keyboard::Key`) each translate their own events into `workflow::Key` and dispatch `workflow::Action`
+  — one keymap, one `:` command line, one help overlay rendered from `workflow::help()`. The iced
+  shell's actions for surfaces it does not have yet (the timeline) report the gap in its status line,
+  which is what "no shell-only features" looks like before the second shell catches up.
 - **The keymap is data, and it is shared** (built 2026-09-22): it lives in the
   **`workflow` crate** — a core-workspace member with no UI toolkit — as `KEYMAP: &[Binding]`
   (`Key → Action`, plus the help line) with `Mode`, the neutral `Key`, and the `Action` vocabulary.

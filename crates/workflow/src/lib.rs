@@ -122,6 +122,40 @@ pub enum Action {
 }
 
 impl Action {
+    /// A short human name, for status lines and (later) the command palette.
+    pub fn name(self) -> &'static str {
+        match self {
+            Action::PlayToggle => "play / stop",
+            Action::Stop => "stop",
+            Action::Rewind => "rewind",
+            Action::SeekSeconds(_) => "seek by seconds",
+            Action::SeekClip(_) => "next / previous clip",
+            Action::CycleFocus(_) => "move the focus",
+            Action::Vertical(_) => "move the selection",
+            Action::Timeline(_) => "scroll / extend the selection",
+            Action::Zoom(_) => "zoom or ride the fader",
+            Action::Fit => "fit or unity",
+            Action::MixerMute => "mute",
+            Action::MixerSolo => "solo",
+            Action::Visual => "visual mode",
+            Action::Split => "split the clip",
+            Action::Delete => "delete the clip",
+            Action::TrimStart | Action::TrimEnd => "trim the clip",
+            Action::TrimToSelection => "trim to the selection",
+            Action::Nudge(_) => "move the clip a beat",
+            Action::MoveTrack(_) => "move the clip to another track",
+            Action::Gain(_) => "clip gain",
+            Action::Fade(_) => "fade",
+            Action::Undo => "undo",
+            Action::Redo => "redo",
+            Action::Prompt => "the command line",
+            Action::Help => "the keymap",
+            Action::ToggleMouseCapture => "toggle mouse capture",
+            Action::Quit => "quit",
+            Action::Cancel => "cancel",
+        }
+    }
+
     /// The `host v1` operation this action dispatches, when it is a log op. The
     /// strings are the parser's own op names (`arrange <name> …`), so a shell builds a
     /// line and the test below proves the vocabulary still has it.
@@ -323,7 +357,7 @@ pub static KEYMAP: &[Binding] = &[
             (Key::Char('f'), Action::Fade(true)),
             (Key::Char('F'), Action::Fade(false)),
         ],
-        "timeline: fade in / fade out **to the playhead**",
+        "timeline: fade in / fade out to the playhead",
     ),
     bind(
         "u  Ctrl+r",
@@ -336,7 +370,7 @@ pub static KEYMAP: &[Binding] = &[
     bind(
         ":",
         &[(Key::Char(':'), Action::Prompt)],
-        "the command line — type any `host v1` line (Esc cancels, ↑/↓ history)",
+        "the command line — type any host v1 line (Esc cancels, ↑/↓ history)",
     ),
     bind(
         "Esc",
@@ -505,6 +539,17 @@ mod tests {
                 claimed.contains(name),
                 "the workflow has no action for the op `{name}`"
             );
+        }
+    }
+
+    #[test]
+    fn every_action_has_a_name() {
+        // The match in `name` is exhaustive by the compiler; this checks the strings
+        // are real (a status line printing "" is a bug you only see at runtime).
+        for row in KEYMAP {
+            for (_, action) in all_keys(row) {
+                assert!(!action.name().trim().is_empty(), "{action:?} has no name");
+            }
         }
     }
 
