@@ -153,7 +153,12 @@ from the shared workflow (a key or a `: ` line — never a shell-only feature).
    validation is the one gap left (a live command can name a track with a space).
 9. **Pool panel**: browse sources (name, length, rate, peaks), place at the playhead or on a track, and
    **audition** first. Also where the pool-before-arrange requirement becomes an affordance instead of an
-   error string.
+   error string. *Half done (2026-09-24):* the panel exists (`Tab` reaches it, `j`/`k` walk it, `Enter`
+   places the selected source on the active track at the playhead — and makes the first track when there
+   is none, in one gesture), with crashed takes and missing peaks marked
+   ([note](../../implemented/feature/2026-09-24-pool-panel-and-placement.md)). **Audition is next**
+   (slice D3b): the existing `play` command is logged *state* (replayed on seek), so an audition needs an
+   unlogged action path — a host change with its own decision, not a flag on the panel.
 
 **C — shape and length**
 10. **Utility gestures, mostly over ops that already exist**: **reverse** is the one new clip property

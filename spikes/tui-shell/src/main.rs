@@ -50,7 +50,7 @@ use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Flex, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
-use ratatui::widgets::{Block, Clear, Gauge, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Gauge, List, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
 /// The demo profile — identical to the iced spike's, so the two shells are
@@ -181,16 +181,24 @@ struct App {
     /// clip's start), so a paste keeps the copied clips' relative spacing.
     clipboard_origin: u64,
     /// The next minted paste id (`paste.{n}`), seeded above anything the session
-    /// already has so a paste can never collide with an earlier one.
+    /// already has and **never decreasing**, so a paste after an undo cannot mint an
+    /// id the journal still holds (a replay would refuse the second `add_clip` and the
+    /// clip would vanish on recovery).
     next_paste: u64,
-    /// The session pool's source ids as of the last adoption. The clipboard is a
-    /// value and survives a load, but the pool a source id names may not — so a
-    /// paste checks it here and says so, instead of logging a clip the panel drops.
-    pool_ids: Vec<String>,
+    /// The same counter for the pool panel's placements (`pool.{n}`).
+    next_pool: u64,
+    /// The session pool's **listing** as of the last adoption: the pool panel's
+    /// rows, and what a paste checks its sources against (the clipboard is a value
+    /// and survives a load, but the pool a source id names may not).
+    pool: Vec<media::PoolSource>,
+    /// The selected row in the pool panel.
+    pool_selected: usize,
     /// What a *prefilled* prompt was opened with (`R`'s rename line): walking the
     /// history and coming back to the live line must return this, not blank.
     prompt_prefill: Option<String>,
     panel: timeline::PanelRects,
+    /// The pool panel's rectangle, for mouse hit-testing.
+    pool_rect: Rect,
 }
 
 /// Which panel the keys act on. `Tab`/`Shift-Tab` cycle; a click focuses.
@@ -198,6 +206,10 @@ struct App {
 enum Panel {
     Mixer,
     Timeline,
+    /// The session pool: the material the arrangement is made *from*. It appears
+    /// only when a pool is loaded, and it is where "load clips from the pool" stops
+    /// being an error string.
+    Pool,
 }
 
 impl Panel {
@@ -205,6 +217,7 @@ impl Panel {
         match self {
             Panel::Mixer => "mixer",
             Panel::Timeline => "timeline",
+            Panel::Pool => "pool",
         }
     }
 }
@@ -270,9 +283,12 @@ impl App {
             clipboard: Vec::new(),
             clipboard_origin: 0,
             next_paste: 1,
-            pool_ids: Vec::new(),
+            next_pool: 1,
+            pool: Vec::new(),
+            pool_selected: 0,
             prompt_prefill: None,
             panel: timeline::PanelRects::default(),
+            pool_rect: Rect::default(),
         };
 
         if let Some(path) = script {
@@ -401,6 +417,13 @@ impl App {
                 take.sources.join(", "),
             );
         }
+        // The pool listing is adopted **first**: it is the pool panel's rows *and*
+        // what a paste checks its sources against, so an arrangement error below must
+        // not leave both pointing at the previous session's material.
+        self.pool = outcome.pool_sources.clone().unwrap_or_default();
+        self.pool_selected = self.pool_selected.min(self.pool.len().saturating_sub(1));
+        self.focus = self.focus_that_exists();
+
         let timeline = match outcome.arrangement {
             Ok(timeline) => timeline,
             Err(e) => {
@@ -421,14 +444,6 @@ impl App {
         // folded it for us, so a reload (or a replay) restores exactly what was
         // last asked for.
         self.apply_params(&outcome.params);
-
-        // The pool listing is also what a paste checks the clipboard against; keep
-        // the ids, since `from_host` only borrows the listing.
-        self.pool_ids = outcome
-            .pool_sources
-            .as_ref()
-            .map(|sources| sources.iter().map(|source| source.id.clone()).collect())
-            .unwrap_or_default();
 
         let arrangement = Arrangement::from_host(
             &timeline,
@@ -595,9 +610,12 @@ impl App {
             clipboard: Vec::new(),
             clipboard_origin: 0,
             next_paste: 1,
-            pool_ids: Vec::new(),
+            next_pool: 1,
+            pool: Vec::new(),
+            pool_selected: 0,
             prompt_prefill: None,
             panel: timeline::PanelRects::default(),
+            pool_rect: Rect::default(),
         }
     }
 
@@ -811,6 +829,7 @@ impl App {
             Action::TrackRename => self.timeline_key(|app| app.rename_track_prompt()),
             Action::TrackDelete => self.timeline_key(|app| app.delete_track()),
             Action::ReorderTrack(direction) => self.timeline_key(|app| app.move_track(direction)),
+            Action::PoolPlace => self.pool_key(|app| app.place_pool_source()),
             Action::MoveTrack(offset) => self.timeline_key(|app| app.move_clip_to_track(offset)),
             Action::Gain(direction) => {
                 self.timeline_key(|app| app.step_clip_gain(direction as f32))
@@ -853,6 +872,18 @@ impl App {
         }
     }
 
+    /// Run `action` only when the **pool panel** is the focused panel. A key pressed
+    /// at the wrong panel explains itself rather than vanishing.
+    fn pool_key(&mut self, action: impl FnOnce(&mut App)) {
+        if self.focus == Panel::Pool {
+            action(self);
+        } else if self.pool.is_empty() {
+            self.status = "no pool to browse — open one with `: pool <dir>`".to_string();
+        } else {
+            self.status = "`Tab` to the pool panel first (it owns the source list)".to_string();
+        }
+    }
+
     /// Run `action` only when the mixer is the focused panel.
     fn mixer_key(&mut self, action: impl FnOnce(&mut App)) {
         if self.focus == Panel::Mixer {
@@ -868,6 +899,8 @@ impl App {
         match self.focus {
             Panel::Timeline => self.timeline_zoom(direction > 0),
             Panel::Mixer => self.ride(0.05 * direction as f32),
+            // The pool has no "more/less"; walking it is `j`/`k`.
+            Panel::Pool => {}
         }
     }
 
@@ -875,6 +908,7 @@ impl App {
         match self.focus {
             Panel::Timeline => self.timeline_fit(),
             Panel::Mixer => self.set_fader(self.selected, 1.0),
+            Panel::Pool => {}
         }
     }
 
@@ -946,18 +980,50 @@ impl App {
                 self.active_track = (self.active_track as i64 + direction as i64)
                     .clamp(0, lanes as i64 - 1) as usize;
             }
+            Panel::Pool => {
+                if self.pool.is_empty() {
+                    return;
+                }
+                self.pool_selected = (self.pool_selected as i64 + direction as i64)
+                    .clamp(0, self.pool.len() as i64 - 1)
+                    as usize;
+            }
+        }
+    }
+
+    /// The focused panel if it still exists, else the nearest one that does — a focus
+    /// on a panel that is no longer drawn would leave every key dead-but-explained
+    /// until the user pressed `Tab`.
+    fn focus_that_exists(&self) -> Panel {
+        let exists = match self.focus {
+            Panel::Mixer => true,
+            Panel::Timeline => self.arrangement.is_some(),
+            Panel::Pool => !self.pool.is_empty(),
+        };
+        if exists {
+            return self.focus;
+        }
+        if self.arrangement.is_some() {
+            Panel::Timeline
+        } else if !self.pool.is_empty() {
+            Panel::Pool
+        } else {
+            Panel::Mixer
         }
     }
 
     /// `Tab`/`Shift-Tab`: move the focus ring.
     fn cycle_focus(&mut self, direction: i32) {
-        if self.arrangement.is_none() {
-            self.focus = Panel::Mixer; // only one panel to focus
-            return;
+        // The panels that *exist*: the mixer is always there, the timeline needs an
+        // arrangement, and the pool needs a pool. The direction comes from the
+        // workflow (Tab vs Shift-Tab), so a fourth panel will not need a new key.
+        let mut panels = vec![Panel::Mixer];
+        if self.arrangement.is_some() {
+            panels.push(Panel::Timeline);
         }
-        // Two panels today, so this is a toggle — but the *direction* comes from the
-        // workflow (Tab vs Shift-Tab), so a third panel will not need a new key.
-        let panels = [Panel::Mixer, Panel::Timeline];
+        if !self.pool.is_empty() {
+            panels.push(Panel::Pool);
+        }
         let index = panels
             .iter()
             .position(|panel| *panel == self.focus)
@@ -1070,6 +1136,101 @@ impl App {
                 false
             }
         }
+    }
+
+    // -- the pool panel (alpha slice D3) --------------------------------------
+
+    /// `Enter` in the pool panel: place the selected source on the active track at
+    /// the playhead — a logged `add_clip` with the source's full length and the click
+    /// guard on both new boundaries. With **no arrangement yet** it makes a track
+    /// first (the plan's "pool before arrange" as an affordance, not an error string:
+    /// the pool is where material comes from, so placing it is how a piece starts).
+    fn place_pool_source(&mut self) {
+        let Some(source) = self.pool.get(self.pool_selected).cloned() else {
+            self.status = "no pool source selected".to_string();
+            return;
+        };
+        if !Self::placeable_source(&source.id) {
+            self.status = format!(
+                "'{}' cannot be named in a `host v1` line (a space or a `#`) — rename the file in the pool",
+                source.id
+            );
+            return;
+        }
+        if source.frames == 0 {
+            self.status = format!("'{}' has no audio frames", source.id);
+            return;
+        }
+        let frames = source.frames;
+        let micro = MICRO_FADE.min(frames / 2);
+        let id = self.mint_clip_id("pool");
+
+        let Some(track) = self.active_lane_id() else {
+            // Nothing to place into: mint a track in the same gesture.
+            let track = self.free_track_id();
+            let lines = vec![
+                format!("add_track {track}"),
+                format!(
+                    "add_clip {track} {id} {} 0 {frames} 0 {micro} {micro} 1.0",
+                    source.id
+                ),
+            ];
+            if self.arrange_group(&lines) {
+                self.active_track = 0;
+                self.focus = Panel::Timeline;
+                self.status = format!(
+                    "placed {} on a new track {track} — {frames} frames at {} Hz",
+                    source.id, source.sample_rate
+                );
+            }
+            return;
+        };
+
+        let at = self.snap_frame(self.snap.frame);
+        let line = format!(
+            "add_clip {track} {id} {} 0 {frames} {at} {micro} {micro} 1.0",
+            source.id
+        );
+        if self.arrange(&line) {
+            self.status = format!(
+                "placed {} on {track} at {at}{} — {frames} frames at {} Hz",
+                source.id,
+                snapped_note(self.snap.frame, at, self.grid.label()),
+                source.sample_rate,
+            );
+        }
+    }
+
+    /// Mint a clip id for a gesture that adds clips (`pool.{n}`): the shell names the
+    /// clips because the ids are logged. The counter is seeded above anything the
+    /// session has **and only ever moves forward** — an undone `pool.1` is gone from
+    /// the arrangement but still in the journal, and re-minting it would make journal
+    /// recovery drop the second `add_clip` (the clip silently vanishes on a crash).
+    fn mint_clip_id(&mut self, prefix: &str) -> String {
+        let mut highest = 0;
+        if let Some(arrangement) = self.arrangement.as_ref() {
+            for lane in &arrangement.lanes {
+                for clip in &lane.clips {
+                    if let Some(n) = clip.id.strip_prefix(&format!("{prefix}."))
+                        && let Ok(n) = n.parse::<u64>()
+                    {
+                        highest = highest.max(n);
+                    }
+                }
+            }
+        }
+        let next = self.next_pool.max(highest + 1);
+        self.next_pool = next + 1;
+        format!("{prefix}.{next}")
+    }
+
+    /// Whether a pool source id can be **written into a `host v1` line**: the id is a
+    /// file stem (`Pool::import` only rejects path separators), so a hand-filled pool
+    /// can hold `my jam.wav` or `a#b.wav`, and a line naming either would be split (or
+    /// truncated at the `#`) by the parser. The panel marks such a row instead of
+    /// offering a key that cannot work.
+    fn placeable_source(id: &str) -> bool {
+        !id.is_empty() && id.split_whitespace().count() == 1 && !id.contains('#')
     }
 
     // -- tracks (alpha slice D2) ---------------------------------------------
@@ -1409,8 +1570,17 @@ impl App {
         // A paste names pool sources: one this session does not have would be
         // logged by the media layer and then dropped by the panel (and refuse to
         // wire), so say it *here*, before minting anything.
+        if let Some(unnameable) = self.clipboard.iter().find_map(|(_, clip)| {
+            (!Self::placeable_source(&clip.source_id)).then(|| clip.source_id.clone())
+        }) {
+            self.status = format!(
+                "paste: the source id '{unnameable}' cannot be written into a `host v1` line"
+            );
+            return;
+        }
         if let Some(missing) = self.clipboard.iter().find_map(|(_, clip)| {
-            (!self.pool_ids.contains(&clip.source_id)).then(|| clip.source_id.clone())
+            (!self.pool.iter().any(|source| source.id == clip.source_id))
+                .then(|| clip.source_id.clone())
         }) {
             self.status = format!(
                 "paste: this session's pool has no source '{missing}' — the clipboard came from another session (import it, or copy from a clip here)"
@@ -2006,6 +2176,14 @@ impl App {
 
         // The timeline panel appears when an arrangement is loaded; the meters
         // take its space otherwise.
+        let pool_rows = if self.pool.is_empty() {
+            0
+        } else {
+            // Six rows: a border, the column header, three sources, and a "…" line.
+            // The pool is a *list*, not a browser: the alpha browses by scrolling.
+            (self.pool.len() + 2).clamp(4, 8) as u16
+        };
+
         if self.arrangement.is_some() {
             let [head, controls, body, foot] = Layout::vertical([
                 Constraint::Length(5),
@@ -2026,7 +2204,17 @@ impl App {
 
             self.draw_head(frame, head);
             self.draw_controls(frame, controls);
-            self.draw_timeline(frame, timeline_area);
+            if pool_rows > 0 {
+                // The pool under the timeline: material *from which* the arrangement
+                // is made, so it belongs beside it, not in a separate screen.
+                let [timeline_area, pool_area] =
+                    Layout::vertical([Constraint::Min(6), Constraint::Length(pool_rows)])
+                        .areas(timeline_area);
+                self.draw_timeline(frame, timeline_area);
+                self.draw_pool(frame, pool_area);
+            } else {
+                self.draw_timeline(frame, timeline_area);
+            }
             self.draw_mixer(frame, mixer_area);
             self.draw_foot(frame, foot);
         } else {
@@ -2040,7 +2228,15 @@ impl App {
 
             self.draw_head(frame, head);
             self.draw_controls(frame, controls);
-            self.draw_meters(frame, meters);
+            if pool_rows > 0 {
+                let [meters, pool_area] =
+                    Layout::vertical([Constraint::Min(3), Constraint::Length(pool_rows)])
+                        .areas(meters);
+                self.draw_meters(frame, meters);
+                self.draw_pool(frame, pool_area);
+            } else {
+                self.draw_meters(frame, meters);
+            }
             self.draw_foot(frame, foot);
         }
 
@@ -2182,6 +2378,80 @@ impl App {
             Paragraph::new(ratatui::text::Line::from(spans)).wrap(Wrap { trim: true }),
             inner,
         );
+    }
+
+    /// The pool panel: one row per source — id, length (frames and seconds), rate,
+    /// channels — with the selected row marked. A source that could not be read is
+    /// not here at all (the pool's `list` reports it and the state line says so).
+    fn draw_pool(&mut self, frame: &mut Frame, area: Rect) {
+        let border = if self.focus == Panel::Pool {
+            Color::LightBlue
+        } else {
+            Color::DarkGray
+        };
+        // The list is handed **whole** to ratatui, so the widget scrolls the selected
+        // row into view; the title carries the hint when there are more rows than fit
+        // (truncating the items here would defeat that scrolling).
+        let block = Block::bordered()
+            .title(format!(
+                " pool — {} source{}{} ",
+                self.pool.len(),
+                if self.pool.len() == 1 { "" } else { "s" },
+                if self.pool.len() > area.height.saturating_sub(3) as usize {
+                    " · j/k scrolls"
+                } else {
+                    ""
+                }
+            ))
+            .border_style(Style::new().fg(border));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        self.pool_rect = area;
+
+        if inner.height == 0 {
+            return;
+        }
+        let header = vec![ratatui::text::Line::from(Span::styled(
+            "  id                     length        rate   ch",
+            Style::new().fg(Color::DarkGray),
+        ))];
+        let items: Vec<ratatui::text::Line> = self
+            .pool
+            .iter()
+            .map(|source| {
+                let seconds = source.frames as f64 / source.sample_rate.max(1) as f64;
+                let mut flags = String::new();
+                if !source.finalized {
+                    flags.push_str(" (crashed take)");
+                } else if source.peaks_missing {
+                    flags.push_str(" (no peaks)");
+                }
+                if !Self::placeable_source(&source.id) {
+                    flags.push_str(" (unplaceable: space or # in the name)");
+                }
+                if source.frames == 0 {
+                    flags.push_str(" (no frames)");
+                }
+                ratatui::text::Line::from(format!(
+                    "▸{:<22} {:>7} {:>7.3}s  {:>5}  {:>2}{flags}",
+                    source.id, source.frames, seconds, source.sample_rate, source.channels,
+                ))
+            })
+            .collect();
+        let list = List::new(items)
+            .highlight_style(
+                Style::new()
+                    .fg(Color::Black)
+                    .bg(Color::LightBlue)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("");
+        let mut state = ratatui::widgets::ListState::default()
+            .with_selected((!self.pool.is_empty()).then_some(self.pool_selected));
+        let [header_area, list_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+        frame.render_widget(Paragraph::new(header), header_area);
+        frame.render_stateful_widget(list, list_area, &mut state);
     }
 
     fn draw_meters(&mut self, frame: &mut Frame, area: Rect) {
@@ -3097,9 +3367,15 @@ mod tests {
         let _ = rendered(&mut app);
         assert_eq!(app.focus, Panel::Timeline, "loading adopts the timeline");
 
-        // With the mixer focused, timeline keys are inert.
+        // The ring is every panel that *exists*: mixer → timeline → pool → mixer,
+        // because a loaded `--wave` session has both an arrangement and a pool.
+        assert!(!app.pool.is_empty(), "the wave import filled the pool");
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+        assert_eq!(app.focus, Panel::Pool, "the pool is in the ring");
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
         assert_eq!(app.focus, Panel::Mixer);
+
+        // With the mixer focused, timeline keys are inert.
         let before = app.view.as_ref().expect("a view").start;
         app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::empty()));
         assert_eq!(
@@ -3108,7 +3384,9 @@ mod tests {
             "the timeline does not scroll while the mixer has the keys"
         );
 
-        // Shift-Tab (BackTab) goes back, and then the keys act again.
+        // Shift-Tab (BackTab) goes back through the pool, and then the keys act.
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()));
+        assert_eq!(app.focus, Panel::Pool);
         app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()));
         assert_eq!(app.focus, Panel::Timeline);
         let before = app.view.as_ref().expect("a view").frames_per_cell;
@@ -4073,7 +4351,7 @@ mod tests {
             0,
             app.arrangement.as_ref().expect("arrangement").lanes[0].clips[0].clone(),
         )];
-        app.pool_ids.clear();
+        app.pool.clear();
         let before = app.arrangement.as_ref().expect("arrangement").lanes[1]
             .clips
             .len();
@@ -4273,6 +4551,223 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// **The pool panel is where "load clips from the pool" happens.** `Tab` reaches
+    /// it, `j`/`k` walk it, and `Enter` places the selected source on the active track
+    /// at the playhead — a logged `add_clip` with the click guard, one undo away.
+    #[test]
+    fn the_pool_panel_places_a_source_on_the_timeline() {
+        let _pool = pool_guard();
+        let path = wav_fixture("poolplace");
+        let stem = path.file_stem().unwrap().to_str().unwrap().to_string();
+        let mut app = App::idle();
+        // The synthetic snapshot is the tests' transport/meter state; `undo` gates on
+        // its `can_undo`, which the live pump would keep fresh between frames.
+        app.snap = App::demo_snapshot();
+        app.open_wave(&path);
+        assert_eq!(app.focus, Panel::Timeline, "loading adopts the timeline");
+
+        // The session pool is one directory per process, so other tests may have left
+        // sources in it: select *this* one rather than assuming it is alone.
+        let index = app
+            .pool
+            .iter()
+            .position(|source| source.id == stem)
+            .expect("the import listed the source");
+        assert_eq!(app.pool[index].channels, 1);
+
+        // Reach the pool and place the source at the playhead on the active track.
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+        assert_eq!(app.focus, Panel::Pool);
+        app.pool_selected = index;
+        app.snap.frame = 96_000;
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+
+        let arrangement = app.arrangement.as_ref().expect("an arrangement");
+        let placed = arrangement.lanes[0]
+            .clips
+            .iter()
+            .find(|clip| clip.at_frame == 96_000)
+            .expect("the source landed at the playhead");
+        assert_eq!(placed.id, "pool.1");
+        assert_eq!(placed.source_id, stem);
+        assert_eq!(
+            placed.fade_in, MICRO_FADE,
+            "new boundaries get the click guard"
+        );
+        assert!(app.status.contains("placed"), "{}", app.status);
+
+        // One undo removes it, and the panel's row survives (it is pool material).
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::empty()));
+        assert!(
+            !app.arrangement.as_ref().expect("arrangement").lanes[0]
+                .clips
+                .iter()
+                .any(|clip| clip.id == "pool.1"),
+            "{}",
+            app.status
+        );
+        assert!(app.pool.iter().any(|source| source.id == stem));
+
+        // The panel draws the source it lists.
+        let screen = rendered(&mut app);
+        assert!(screen.contains("pool"), "no pool panel:\n{screen}");
+        assert!(screen.contains(&stem), "the source is listed:\n{screen}");
+
+        let _ = std::fs::remove_file(&path);
+        drop_pool();
+    }
+
+    /// Placing into a session with **no tracks** makes the track first: the pool is
+    /// usable before there is an arrangement, which is the order a piece is built in.
+    #[test]
+    fn placing_from_the_pool_creates_the_first_track() {
+        // A pool-only session: a pool with one source and no arrangement at all.
+        let dir = std::env::temp_dir().join(format!("tui-shell-poolonly-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("pool dir");
+        let source = dir.join("jam.wav");
+        let mut writer =
+            media::wav::WavWriter::create_float(&source, 48_000, 1).expect("fixture source");
+        writer.write(&vec![0.5f32; 4_800]).expect("write");
+        writer.finalize().expect("finalize");
+        let script_path = dir.join("pool-only.script");
+        std::fs::write(
+            &script_path,
+            format!(
+                "host v1\nmount mixer channels=2 @0\npool {}\n",
+                dir.display()
+            ),
+        )
+        .expect("write the script");
+
+        let mut app = App::idle();
+        app.open_script(&script_path);
+        let arrangement = app.arrangement.as_ref().expect("an empty arrangement");
+        assert!(arrangement.lanes.is_empty(), "no tracks yet");
+        assert_eq!(app.pool.len(), 1, "{}", app.status);
+
+        app.focus = Panel::Pool;
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        let arrangement = app.arrangement.as_ref().expect("an arrangement now exists");
+        assert_eq!(
+            arrangement.lanes.len(),
+            1,
+            "a track was made: {}",
+            app.status
+        );
+        assert_eq!(arrangement.lanes[0].clips.len(), 1);
+        assert_eq!(arrangement.lanes[0].clips[0].id, "pool.1");
+        assert_eq!(arrangement.lanes[0].clips[0].source_id, "jam");
+        assert!(app.status.contains("new track"), "{}", app.status);
+        assert_eq!(app.focus, Panel::Timeline, "and the keys follow it");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A minted id never repeats**, even after an undo: the id is out of the
+    /// arrangement but still in the journal, and re-minting it would make journal
+    /// recovery drop the second `add_clip` (the clip silently vanishing on a crash).
+    /// A source the text format cannot name is refused *by name* instead of producing
+    /// a parse error, and a source with no frames is refused too.
+    #[test]
+    fn pool_placement_mints_forward_and_refuses_unusable_rows() {
+        // A pool with a normal source, one whose name has a space, and one with no
+        // frames at all.
+        let dir = std::env::temp_dir().join(format!("tui-shell-poolrows-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("pool dir");
+        for (name, frames) in [
+            ("jam.wav", 4_800usize),
+            ("my jam.wav", 4_800),
+            ("empty.wav", 0),
+        ] {
+            let mut w = media::wav::WavWriter::create_float(&dir.join(name), 48_000, 1)
+                .expect("fixture source");
+            w.write(&vec![0.5f32; frames]).expect("write");
+            w.finalize().expect("finalize");
+        }
+        let script_path = dir.join("pool.script");
+        std::fs::write(
+            &script_path,
+            format!(
+                "host v1\nmount mixer channels=2 @0\npool {}\n",
+                dir.display()
+            ),
+        )
+        .expect("script");
+
+        let mut app = App::idle();
+        app.snap = App::demo_snapshot();
+        app.open_script(&script_path);
+        assert_eq!(app.pool.len(), 3, "{}", app.status);
+        app.focus = Panel::Pool;
+        let index = |app: &App, id: &str| {
+            app.pool
+                .iter()
+                .position(|source| source.id == id)
+                .expect("a row")
+        };
+
+        // A normal source places, and an undo does not let the next one reuse the id.
+        app.pool_selected = index(&app, "jam");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(app.status.contains("placed jam"), "{}", app.status);
+        let first = app.arrangement.as_ref().expect("arrangement").lanes[0].clips[0]
+            .id
+            .clone();
+        assert_eq!(first, "pool.1");
+
+        // The first placement made a track; undo it (both the id and the clip leave
+        // the arrangement) and place again.
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::empty()));
+        app.focus = Panel::Pool;
+        app.pool_selected = index(&app, "jam");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        let ids: Vec<String> = app
+            .arrangement
+            .as_ref()
+            .expect("arrangement")
+            .lanes
+            .iter()
+            .flat_map(|lane| lane.clips.iter().map(|clip| clip.id.clone()))
+            .collect();
+        assert!(
+            ids.contains(&"pool.2".to_string()),
+            "the minted id moved forward past the journal's: {ids:?} ({})",
+            app.status
+        );
+        assert!(!ids.contains(&"pool.1".to_string()), "and never repeated");
+
+        // A row the `host v1` format cannot name is refused with the reason. (A
+        // placement that made a track moved the focus to the timeline, so come back.)
+        app.focus = Panel::Pool;
+        app.pool_selected = index(&app, "my jam");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(
+            app.status.contains("cannot be named"),
+            "the unnameable row explains itself: {}",
+            app.status
+        );
+        let screen = rendered(&mut app);
+        assert!(
+            screen.contains("unplaceable"),
+            "and the panel marks it:\n{screen}"
+        );
+
+        // A source with no frames is refused too (it could never be a clip).
+        app.focus = Panel::Pool;
+        app.pool_selected = index(&app, "empty");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(app.status.contains("no audio frames"), "{}", app.status);
+
+        // A focus whose panel vanished falls back rather than leaving the keys dead.
+        app.focus = Panel::Pool;
+        app.pool.clear();
+        assert_ne!(app.focus_that_exists(), Panel::Pool);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The `:` command line types the same `host v1` format the keys dispatch, so

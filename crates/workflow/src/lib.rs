@@ -192,6 +192,10 @@ pub enum Action {
     /// Reorder the active track down (+1) / up (-1), keeping it active. (Not
     /// `MoveTrack` — that one moves a *clip* between tracks.)
     ReorderTrack(i32),
+    /// Place the **selected pool source** on the active track at the playhead — the
+    /// pool panel's "load this clip" (the clipboard's `p` is the same idea with the
+    /// clipboard as its source).
+    PoolPlace,
     /// Move the clip to the track below (+1) / above (-1).
     MoveTrack(i32),
     /// Step the clip's gain in dB.
@@ -244,6 +248,7 @@ impl Action {
             Action::TrackRename => "rename the track",
             Action::TrackDelete => "delete the track",
             Action::ReorderTrack(_) => "reorder the track",
+            Action::PoolPlace => "place the pool source",
             Action::MoveTrack(_) => "move the clip to another track",
             Action::Gain(_) => "clip gain",
             Action::Fade(_) => "fade",
@@ -277,6 +282,7 @@ impl Action {
             Action::TrackRename => Some("rename_track"),
             Action::TrackDelete => Some("remove_track"),
             Action::ReorderTrack(_) => Some("move_track"),
+            Action::PoolPlace => Some("add_clip"),
             _ => None,
         }
     }
@@ -497,6 +503,12 @@ pub static KEYMAP: &[Binding] = &[
             (Key::Char('}'), Action::ReorderTrack(1)),
         ],
         "timeline: move the active track up / down (the mixer channel follows)",
+    ),
+    bind(
+        "Enter",
+        &[(Key::Enter, Action::PoolPlace)],
+        "pool: place the selected source on the active track at the playhead \
+         (creates the track when the pool is all there is)",
     ),
     bind(
         "g  G",

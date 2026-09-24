@@ -21,6 +21,13 @@ In scope (identical to the iced spike):
 
 What this spike adds, because it is what a TUI has to answer for:
 
+- **the pool panel** — the sources the arrangement is made *from*, listed under the
+  timeline (id, length, rate, channels; a crashed take or a missing `.peaks` is
+  marked). `Tab` reaches it, `j`/`k` walk it, and `Enter` **places** the selected
+  source on the active track at the playhead as a logged `add_clip` with the click
+  guard — so "load clips from the pool" is a key, and in a session with no tracks yet
+  it makes the first one. (Auditioning a source is the next sub-step; the panel is
+  where it will live.)
 - **an arrangement you can hear** — `--script <host script>` loads the session and
   draws the **clips and tracks the host holds** (the engine's own `Timeline`, not a
   copy): braille min/max envelopes, one lane per track, boundaries, per-track
@@ -258,6 +265,8 @@ pointless), so the shell falls back to the wide meter bars under the transport.
 | `b` | cycle the **snap grid**: off → bar → beat → 1/2 → 1/4 (never logged — see the note) |
 | `y` / `c` | copy / cut the selection (or the clip under the playhead) — a shell value, not a log entry |
 | `p` / `P` | paste at the playhead / **appended** after the track's last clip (one `group`, one undo step) |
+| `Tab` / `Shift-Tab` | cycle the focus ring: mixer → timeline → pool (the panels a session *has*) |
+| `Enter` | pool: place the selected source on the active track at the playhead (makes the track when there is none) |
 | `a` | add a track (the first free `t{n}`), and make it active |
 | `R` | rename the active track — opens the command line prefilled with `arrange rename_track …` |
 | `D` | delete the active track **and its clips** as one gesture (one undo brings both back) |
