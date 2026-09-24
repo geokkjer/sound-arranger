@@ -1,6 +1,6 @@
 # sound-arranger (working title)
 
-> 🕒 Last verified against commit `31fef35` (2026-09-23). If the code has
+> 🕒 Last verified against commit `4434756` (2026-09-24). If the code has
 > moved on, trust the code and move this line forward.
 
 An **audio platform where everything is a plugin**: a minimal core — clock · audio graph
@@ -39,7 +39,7 @@ Its most important finding: the substrate is further along than the capability l
 **recording is not wired into the host** (`HostCommand::Record` is a stub), so the record → arrange loop
 has no first half yet, and the session has no save/open.
 
-The audio core works and is tested. **Recording works** and the pool reads 16/24-bit PCM and float WAVs: `record <take_id>` captures the input device
+The audio core works and is tested. **Recording works** and the pool reads 16/24-bit PCM and float WAVs, splitting a multi-channel import into one source per channel: `record <take_id>` captures the input device
 into the pool at the session rate and `record stop` finalizes it ([note](.agents/notes/implemented/feature/2026-09-23-recording-into-the-host.md)).
 What exists today: the minimal core,
 the media engine (disk streaming, recording, splicing, multi-channel capture, pool rate
@@ -54,9 +54,9 @@ four views, zoom/pan, clip editing and undo/redo is **retired and frozen** — i
 reference, not the app.
 
 What doesn't exist yet: effects (no `fundsp` effect plugins), MIDI/OSC implementations (declared
-seams only), CLAP hosting, live-edit audio re-wiring, stereo *sources/clips* (the master is
-stereo and mono channels pan into it, but a genuine stereo take/clip is still forthcoming),
-and **full UI wiring** — several surfaces are real
+seams only), CLAP hosting, live-edit audio re-wiring, a genuine stereo *clip* (the master is
+stereo, stereo **material** is split into one mono pool source per channel and panned, but one
+clip is still one mono source), and **full UI wiring** — several surfaces are real
 components with placeholder bodies (the Detail View's three contexts are tabs whose bodies are
 sketched pending selection wiring; record is still chrome). The direction is locked
 ([umbrella-first note](.agents/notes/proposed/architecture/2026-08-15-umbrella-first-product-direction.md)):
@@ -86,15 +86,16 @@ sketched pending selection wiring; record is still chrome). The direction is loc
 | `spikes/tui-shell` | The **ratatui evaluation spike** (its own workspace): the terminal counterpart of the iced spike — transport, channel/master meters, position readout — over the same in-process `HostHandle`, plus an **arrangement view** (`--script <host script>` draws the engine's own clips and tracks: braille min/max envelopes per clip, per-track colour, boundaries, fades, ruler, zoom/scroll, playhead, **visual-mode selection**) with **edits dispatched through the host's own `arrange` text format** (`x` split, `d` delete, `n`/`N` clip motion, `u`/`Ctrl+r` undo/redo by log replay), a **right-hand console** whose faders are **read back from the log** (`params`), and **panel focus** (`Tab`). `--wave <file.wav>` imports the file into a session pool at the session rate, so a loaded 44.1 kHz file is **audible at the right pitch**. Mouse, per-command UI latency, a **scrollable `?` keymap**, deterministic `--dump`. **Move/trim by key**: `<`/`>` trim to the playhead, `t` trims to the selection, `H`/`L` nudge a beat, `J`/`K` change track. | **primary shell** (the workflow reference) |
 | `plugins/` | **External-integration home** (placeholder, direction changed 2026-09-21): **no sidecar binaries and no plugin *host*** — capabilities that already exist as standalone programs (TidalCycles, VCV Rack, CDP8, sox, ffmpeg) are driven as *processes* and recorded into the pool, and hardware is synced and captured the same way. *Narrowed 2026-09-22:* exporting **our own instruments** as CLAP plugins is re-opened as a deferred option ([note](.agents/notes/proposed/architecture/2026-09-22-clap-export-via-nice-plug.md)). See [plugins/README.md](plugins/README.md) and the [no-sidecars note](.agents/notes/proposed/architecture/2026-09-21-external-programs-not-sidecars.md). | placeholder |
 
-**The core workspace's Rust suites pass** (engine · media · host — 22 test binaries; the frontend
-tests retired with the shell, and both spike workspaces are outside the count: `spikes/tui-shell`
-carries 22 view/input tests and `spikes/iced-shell` 2). The core's invariants (byte-identical replay,
-no-allocation render, sample-accurate lifecycle) are tested, and the streaming soak + real hardware
+**The core workspace's Rust suites pass** (engine · media · host · workflow — 25 test binaries, 235
+tests; the frontend tests retired with the shell, and both spike workspaces are outside the count:
+`spikes/tui-shell` carries 29 view/input tests and `spikes/iced-shell` 5). The core's invariants
+(byte-identical replay, no-allocation render, sample-accurate lifecycle) are tested, and the streaming soak + real hardware
 capture run as `#[ignore]`d tests.
 
 **Honest gaps** (deliberate, pre-alpha): the master is **stereo** (the mixer pans mono channels
-into L/R and the bounce is 2-channel) but stereo *sources/clips* are still forthcoming — a
-genuine stereo take/clip is the next sub-step, using the per-port channel-count seam;
+into L/R and the bounce is 2-channel) and stereo *material* is kept whole — a multi-channel file is
+split at import into `{id}.ch0`/`{id}.ch1` and placed on panned tracks — but a genuine stereo
+*source/clip* (one source, two channels, the per-port channel-count seam) is still forthcoming;
 control-side mutations apply on the render call stack (the real control→render handoff is
 seeded by `flush_scheduled`, not finished); the recorder's `play`/`splice` media commands are
 now **logged events** (the [media-commands note](.agents/notes/implemented/architecture/2026-09-12-media-commands-logged.md));

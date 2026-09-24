@@ -46,11 +46,12 @@ foundational, not polish:**
 - **Recording into the host** (above). Verified: the wiring does not exist.
 - **Session save/open.** The log lives in memory; there is no `save`. Arranging for a day and quitting
   loses the piece. The pool has crash recovery; the log has nothing.
-- **Stereo material.** `WavReader` yields **channel 0 only** for a stereo file, and the one-clip model is
-  mono per track — so a stereo jam imported as a clip silently plays the left channel. That gates "load
-  clips from the pool" for every real take.
-- **Import breadth.** The pool reader accepts 16-bit PCM and 32-bit float only — **24-bit WAV is refused
-  outright** (`crates/media/src/wav.rs:100`). Material from other tools is routinely 24-bit.
+- **Stereo material.** *Closed (2026-09-24).* A multi-channel file is now split at the import boundary into
+  one mono source per channel, so a stereo jam imports as `{id}.ch0` + `{id}.ch1` and both are placed and
+  panned (slice A4, [note](../../implemented/feature/2026-09-24-stereo-material-per-channel-pool.md)). The
+  one-clip model stays mono per track; a genuine stereo *clip* is deferred.
+- **Import breadth.** *Closed (2026-09-23/24).* The reader accepts 16-bit, **24-bit** and 32-bit float
+  PCM/WAV, and any channel count up to the reader's chunk ceiling (256).
 - **Seek cost on long material.** `TransportSeek` is `replay_to`: rebuild a fresh session, replay the
   history, render from zero to the target. Measured ~92 ms for a 6 s seek → **~28 s into a 30-minute
   jam**, and 30-minute jams are the workflow. The one gap that gets worse with use.
@@ -107,11 +108,16 @@ from the shared workflow (a key or a `: ` line — never a shell-only feature).
    recovery and per-channel writers) behind the existing `record <take_id>` line: the host opens the input
    device, mounts `CaptureNode`s into the pool, and the take lands as pool sources (`{take_id}.ch{N}`)
    that the pool panel can then place. This is the loop's missing first half.
-4. **Material that is actually usable: stereo and bit depths.** *Half done (2026-09-23):* the reader
-   accepts **24-bit PCM** (decoded to f32 on the control side; a 32-bit PCM tag is refused, only float is
-   read). **Still open:** keeping both channels of a stereo file — today a stereo source is reduced to
-   channel 0, so the capture convention (`{take}.ch{k}` per channel) has to become the *import*
-   convention too. Both are prerequisites for the owner's own takes.
+4. **Material that is actually usable: stereo and bit depths.** *Done (2026-09-24):* the reader accepts
+   **16/24-bit PCM and 32-bit float** (24-bit decoded to f32 on the control side; a 32-bit PCM tag is
+   refused — only float is a format the pool writes, and guessing int-vs-float would be silent
+   corruption). A **multi-channel file is split at the import boundary** into one mono pool source per
+   channel (`{id}.ch0`, `{id}.ch1`, … — the capture convention, now the import convention too), so both
+   channels of a stereo file survive and are placed independently; `conform` expands a legacy
+   multi-channel source in place, keeping `{id}` as channel 0 so no existing clip breaks
+   ([note](../../implemented/feature/2026-09-24-stereo-material-per-channel-pool.md)). A stereo *clip*
+   (one source, two channels) stays deferred — the split makes each channel editable, which is what the
+   alpha needs.
 
 **B — the grid and the edit vocabulary (the owner's core ask)**
 5. **Grid snap, in the language and in the shell.** The log keeps absolute frames: a snapped edit is an

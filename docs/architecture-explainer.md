@@ -1,6 +1,6 @@
 # sound-arranger: from architecture up
 
-> 🕒 Last verified against commit `1190ec7` (2026-09-22). If the code has moved on,
+> 🕒 Last verified against commit `4434756` (2026-09-24). If the code has moved on,
 > trust the code and move this line forward.
 
 > A plain-English (mostly) tour of the Rust code, for a developer with roughly six
@@ -825,7 +825,14 @@ out:
 This is the "the pool keeps 32-bit float, export is 16-bit" decision made
 concrete: `WavWriter::create` (16-bit, clamping and quantizing) vs
 `create_float` (32-bit float, lossless), and the reader transparently reads both
-and downmixes stereo to channel 0 (clips are mono today).
+(it also reads 24-bit PCM, the depth other tools write).
+
+A **multi-channel** file is not downmixed: `Pool::import` splits it into one mono
+source per channel (`{id}.ch0`, `{id}.ch1`, … — the naming capture already uses),
+and `WavReader::with_channel(k)` selects which channel a reader yields, so both
+channels of a stereo take survive and are placed, panned and edited
+independently. A *clip* is still one mono source on one mixer channel; a genuine
+stereo clip (one source, two channels) is not implemented.
 
 > **Rustism — `Drop` for best-effort cleanup:**
 > ```rust
@@ -1134,8 +1141,9 @@ considered, and the code is candid about its edges.
   (WAV I/O) as the crates you'd adopt rather than hand-roll, and the WAV code's
   own docs say "`hound` stays the Phase-1 upgrade if format edge cases
   (WAVEFORMATEXTENSIBLE, 24-bit, …) bite." So the current implementations are
-  explicitly *placeholders with known limits* — 16-bit PCM and 32-bit float,
-  mono/stereo only — not production codecs.
+  explicitly *placeholders with known limits* — 16/24-bit PCM and 32-bit float,
+  a channel-count ceiling instead of WAVEFORMATEXTENSIBLE, no RF64 — not
+  production codecs.
 - Hand-rolled `unsafe` (the ring) is a maintenance liability versus a vetted
   crate, no matter how well-commented.
 

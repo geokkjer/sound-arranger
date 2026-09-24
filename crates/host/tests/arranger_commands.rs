@@ -828,3 +828,157 @@ fn adopting_a_pool_converts_a_foreign_rate() {
     let _ = std::fs::remove_dir_all(&pool);
     let _ = std::fs::remove_dir_all(&out_dir);
 }
+
+/// Write a stereo float source: channel 0 is a `left_hz` tone, channel 1 a
+/// `right_hz` tone, so a dropped channel or a swapped one is visible in the
+/// samples (a constant source would hide both).
+fn write_stereo_tones(dir: &Path, stem: &str, frames: u64, left_hz: f64, right_hz: f64) {
+    let path = dir.join(format!("{stem}.wav"));
+    let mut w = WavWriter::create_float(&path, SR, 2).unwrap();
+    let mut interleaved = Vec::with_capacity(frames as usize * 2);
+    for i in 0..frames {
+        let t = i as f64 / SR as f64;
+        interleaved.push((std::f64::consts::TAU * left_hz * t).sin() as f32 * 0.5);
+        interleaved.push((std::f64::consts::TAU * right_hz * t).sin() as f32 * 0.5);
+    }
+    w.write(&interleaved).unwrap();
+    w.finalize().unwrap();
+}
+
+/// Zero crossings in `audio` (a monotone property of a pure tone's frequency).
+fn crossings(audio: &[f32]) -> usize {
+    audio
+        .windows(2)
+        .filter(|w| (w[0] > 0.0) != (w[1] > 0.0))
+        .count()
+}
+
+/// Read one channel of a (possibly stereo) WAV in full.
+fn read_channel(path: &Path, channel: u16) -> Vec<f32> {
+    let mut r = media::WavReader::open(path)
+        .unwrap()
+        .with_channel(channel)
+        .unwrap();
+    let mut audio = vec![0.0f32; r.total_frames() as usize];
+    let n = r.read_into(&mut audio);
+    audio.truncate(n);
+    audio
+}
+
+/// **Stereo material survives the trip.** A stereo file adopted into the pool is
+/// split into one mono source per channel (the same `{id}.ch{k}` naming capture
+/// writes), and arranging them on two tracks with the mixer's pan puts the left
+/// tone on the left and the right tone on the right — so neither channel is
+/// dropped, and neither is swapped.
+#[test]
+fn a_stereo_pool_source_plays_both_channels_on_the_right_sides() {
+    let pool = tmp_dir("stereosplit");
+    let out_dir = tmp_dir("stereosplitout");
+    let out = out_dir.join("out.wav");
+    write_stereo_tones(&pool, "jam", SR as u64, 440.0, 880.0);
+
+    let mut s = HostSession::new();
+    s.execute(&HostCommand::Mount {
+        plugin: "mixer",
+        params: vec![("channels", 2.0)],
+        at_frame: Some(0),
+    })
+    .unwrap();
+    // Adopting the pool conforms it: the stereo file is split in place.
+    s.execute(&HostCommand::Pool { dir: pool.clone() }).unwrap();
+
+    // One entry per pool source the split produced, the file's own `jam` first.
+    let conformed = s.pool_conformed();
+    assert_eq!(
+        conformed.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+        vec!["jam", "jam.ch1"]
+    );
+    assert_eq!(conformed[0].channels, 2);
+    assert_eq!(conformed[0].extracted, vec!["jam.ch1"]);
+    assert!(!conformed[0].converted, "the rate was already right");
+
+    // The pool is mono now: channel 0 stays `jam` (a clip that referenced it
+    // still plays what it always played), channel 1 is `jam.ch1`.
+    let sources = s.pool_sources().expect("a pool");
+    let mut ids: Vec<&str> = sources.iter().map(|s| s.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["jam", "jam.ch1"]);
+    assert!(sources.iter().all(|s| s.channels == 1));
+    assert!(sources.iter().all(|s| s.sample_rate == SR));
+
+    // One track per channel, panned hard to its own side.
+    for (i, (track, channel)) in [("t0", "jam"), ("t1", "jam.ch1")].into_iter().enumerate() {
+        s.execute(&HostCommand::Arrange {
+            op: ArrangeOp::AddTrack {
+                track: track.into(),
+            },
+            at_frame: Some(0),
+        })
+        .unwrap();
+        s.execute(&HostCommand::Arrange {
+            op: ArrangeOp::AddClip {
+                track: track.into(),
+                clip: Clip {
+                    source: channel.into(),
+                    ..clip(&format!("c{i}"), 0, SR as u64)
+                },
+            },
+            at_frame: Some(0),
+        })
+        .unwrap();
+    }
+    s.execute(&HostCommand::SetParam {
+        plugin: "mixer",
+        param: "ch0.pan",
+        value: -1.0,
+        at_frame: Some(0),
+    })
+    .unwrap();
+    s.execute(&HostCommand::SetParam {
+        plugin: "mixer",
+        param: "ch1.pan",
+        value: 1.0,
+        at_frame: Some(0),
+    })
+    .unwrap();
+    s.execute(&HostCommand::Bounce {
+        frames: 4800,
+        path: out.clone(),
+    })
+    .expect("both channels play");
+
+    // The bounce is the stereo master: hard-left is channel 0 only.
+    let r = media::WavReader::open(&out).unwrap();
+    assert_eq!(r.channels(), 2, "the mixer renders a stereo master");
+    drop(r);
+    let left = read_channel(&out, 0);
+    let right = read_channel(&out, 1);
+    let left_rms = (left.iter().map(|s| s * s).sum::<f32>() / left.len() as f32).sqrt();
+    let right_rms = (right.iter().map(|s| s * s).sum::<f32>() / right.len() as f32).sqrt();
+    assert!(
+        left_rms > 0.2,
+        "the left tone is audible: rms {left_rms:.3}"
+    );
+    assert!(
+        right_rms > 0.2,
+        "the right tone is audible: rms {right_rms:.3}"
+    );
+
+    // …and the right tone is *the right tone*: 440 Hz crosses zero ~44 times per
+    // 100 ms at 48 kHz, 880 Hz twice that, so a swap cannot pass.
+    let (lc, rc) = (crossings(&left), crossings(&right));
+    let expect = |hz: f64| (2.0 * hz * left.len() as f64 / SR as f64).round() as i64;
+    assert!(
+        (lc as i64 - expect(440.0)).abs() <= 2,
+        "left channel should be 440 Hz: {lc} crossings, expected ~{}",
+        expect(440.0)
+    );
+    assert!(
+        (rc as i64 - expect(880.0)).abs() <= 2,
+        "right channel should be 880 Hz: {rc} crossings, expected ~{}",
+        expect(880.0)
+    );
+
+    let _ = std::fs::remove_dir_all(&pool);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}

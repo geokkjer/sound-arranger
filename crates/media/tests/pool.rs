@@ -128,14 +128,386 @@ fn write_tone(dir: &std::path::Path, stem: &str, frames: u64, sample_rate: u32, 
     w.finalize().unwrap();
 }
 
-/// Read a mono WAV back in full, with its header facts.
-fn read_all(path: &std::path::Path) -> (Vec<f32>, u32, u64) {
-    let mut r = WavReader::open(path).unwrap();
+/// Read one channel of a WAV back in full, with its header facts.
+fn read_all_ch(path: &std::path::Path, channel: u16) -> (Vec<f32>, u32, u64) {
+    let mut r = WavReader::open(path)
+        .unwrap()
+        .with_channel(channel)
+        .unwrap();
     let rate = r.sample_rate();
     let frames = r.total_frames();
     let mut buf = vec![0.0f32; frames as usize];
     assert_eq!(r.read_into(&mut buf), frames as usize);
     (buf, rate, frames)
+}
+
+/// Read channel 0 (the pool's own convention for a source).
+fn read_all(path: &std::path::Path) -> (Vec<f32>, u32, u64) {
+    read_all_ch(path, 0)
+}
+
+/// A stereo float file the *writer* can produce: distinct per-channel levels, so
+/// a channel swap or a dropped channel is visible in the samples.
+fn write_stereo(dir: &std::path::Path, stem: &str, frames: u64, sample_rate: u32, l: f32, r: f32) {
+    let path = dir.join(format!("{stem}.wav"));
+    let mut w = WavWriter::create_float(&path, sample_rate, 2).unwrap();
+    let mut interleaved = Vec::with_capacity(frames as usize * 2);
+    for _ in 0..frames {
+        interleaved.push(l);
+        interleaved.push(r);
+    }
+    w.write(&interleaved).unwrap();
+    w.finalize().unwrap();
+}
+
+/// A float WAV with an arbitrary channel count, each channel a distinct constant
+/// (`ch + i/1000`), so a mis-routed or stale channel is visible in the samples.
+/// The writer is mono/stereo on purpose, so this hand-builds the header.
+fn write_channels(dir: &std::path::Path, stem: &str, frames: u64, sample_rate: u32, channels: u16) {
+    let path = dir.join(format!("{stem}.wav"));
+    let ba = channels * 4;
+    let data_bytes = (frames as usize * ba as usize * 4 / 4) as u32;
+    let mut v = Vec::with_capacity(44 + data_bytes as usize);
+    v.extend_from_slice(b"RIFF");
+    v.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+    v.extend_from_slice(b"WAVEfmt ");
+    v.extend_from_slice(&16u32.to_le_bytes());
+    v.extend_from_slice(&3u16.to_le_bytes()); // IEEE float
+    v.extend_from_slice(&channels.to_le_bytes());
+    v.extend_from_slice(&sample_rate.to_le_bytes());
+    v.extend_from_slice(&(sample_rate * ba as u32).to_le_bytes());
+    v.extend_from_slice(&ba.to_le_bytes());
+    v.extend_from_slice(&32u16.to_le_bytes());
+    v.extend_from_slice(b"data");
+    v.extend_from_slice(&data_bytes.to_le_bytes());
+    for i in 0..frames {
+        for ch in 0..channels {
+            let value = ch as f32 + (i % 10) as f32 / 10.0;
+            v.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    std::fs::write(&path, v).unwrap();
+}
+
+/// Importing a stereo file splits it **at the boundary**: two mono pool sources
+/// named the way capture names them, each holding one channel, so a clip is a
+/// straight mono read and the mixer decides where the channel goes.
+#[test]
+fn a_stereo_file_imports_as_two_mono_sources() {
+    let src_dir = tmp_dir("stereo-src");
+    let pool_dir = tmp_dir("stereo-pool");
+    write_stereo(&src_dir, "jam", 4800, 48_000, 0.25, -0.5);
+
+    let pool = Pool::open(&pool_dir).unwrap();
+    let done = pool.import(&src_dir.join("jam.wav"), 48_000).unwrap();
+
+    assert_eq!(done.channels, 2);
+    assert_eq!(done.ids(), vec!["jam.ch0", "jam.ch1"]);
+    assert!(!done.converted(), "already at the session rate");
+    assert_eq!(done.frames_out(), 4800);
+    assert!(
+        !pool_dir.join("jam.wav").exists(),
+        "a split file must not also land as a whole-file source"
+    );
+
+    for (id, want) in [("jam.ch0", 0.25f32), ("jam.ch1", -0.5f32)] {
+        let path = pool_dir.join(format!("{id}.wav"));
+        let (audio, rate, frames) = read_all(&path);
+        assert_eq!((rate, frames), (48_000, 4800), "{id}");
+        assert!(
+            audio.iter().all(|s| (s - want).abs() < 1e-6),
+            "{id} must hold its own channel"
+        );
+        assert!(
+            path.with_extension("peaks").is_file(),
+            "{id} needs its peaks"
+        );
+    }
+
+    // The index agrees: two mono sources at the session rate.
+    let index = pool.list().unwrap();
+    assert_eq!(index.errors, Vec::new());
+    assert_eq!(index.sources.len(), 2);
+    assert!(index.sources.iter().all(|s| s.channels == 1));
+
+    let _ = std::fs::remove_dir_all(&src_dir);
+    let _ = std::fs::remove_dir_all(&pool_dir);
+}
+
+/// A stereo file that is *already* in the pool (hand-filled, or written by an
+/// older build) is split by `conform`: `{id}` keeps meaning channel 0 — clips
+/// that referenced it still play what they played — and channel 1 becomes
+/// addressable instead of silently dropped.
+/// Importing over an existing id **replaces** it: a stereo file whose stem is
+/// already a mono pool source leaves the split channels and no stale source
+/// behind (otherwise a clip on that id keeps playing the old material).
+#[test]
+fn a_stereo_import_replaces_the_mono_source_holding_that_id() {
+    let src_dir = tmp_dir("replace-src");
+    let pool_dir = tmp_dir("replace-pool");
+    write_finalized(&pool_dir, "jam", 4800, 48_000, 0.25); // the existing, mono source
+    write_stereo(&src_dir, "jam", 4800, 48_000, 0.5, -0.5);
+
+    let pool = Pool::open(&pool_dir).unwrap();
+    let done = pool.import(&src_dir.join("jam.wav"), 48_000).unwrap();
+    assert_eq!(done.ids(), vec!["jam.ch0", "jam.ch1"]);
+
+    let index = pool.list().unwrap();
+    assert_eq!(index.sources.len(), 2, "the old mono source is gone");
+    assert!(
+        !pool_dir.join("jam.wav").exists(),
+        "a replaced id leaves no stale source"
+    );
+    let (left, _, _) = read_all(&pool_dir.join("jam.ch0.wav"));
+    assert!(left.iter().all(|s| (s - 0.5).abs() < 1e-6));
+    let (right, _, _) = read_all(&pool_dir.join("jam.ch1.wav"));
+    assert!(right.iter().all(|s| (s + 0.5).abs() < 1e-6));
+
+    let _ = std::fs::remove_dir_all(&src_dir);
+    let _ = std::fs::remove_dir_all(&pool_dir);
+}
+
+/// Importing **replaces the id**: a narrower file imported under a stem that
+/// held a wider one leaves no channel of the old material behind. (The first
+/// draft removed only `{id}.wav`, so `jam.ch2`… of a former 4-channel take
+/// stayed addressable and a clip on them played audio the user had replaced.)
+#[test]
+fn a_narrower_import_removes_the_older_channels() {
+    let src_dir = tmp_dir("narrow-src");
+    let pool_dir = tmp_dir("narrow-pool");
+    write_channels(&pool_dir, "jam", 4800, 48_000, 4); // the existing 4-channel take
+    write_stereo(&src_dir, "jam", 4800, 48_000, 0.25, -0.5);
+
+    let pool = Pool::open(&pool_dir).unwrap();
+    let done = pool.import(&src_dir.join("jam.wav"), 48_000).unwrap();
+    assert_eq!(done.ids(), vec!["jam.ch0", "jam.ch1"]);
+
+    let mut left: Vec<String> = pool
+        .list()
+        .unwrap()
+        .sources
+        .iter()
+        .map(|s| s.id.clone())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        vec!["jam.ch0", "jam.ch1"],
+        "the replaced take's extra channels must not survive"
+    );
+    for stale in [
+        "jam.wav",
+        "jam.ch2.wav",
+        "jam.ch3.wav",
+        "jam.ch2.peaks",
+        "jam.ch3.peaks",
+    ] {
+        assert!(
+            !pool_dir.join(stale).exists(),
+            "{stale} outlived the import that replaced it"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&src_dir);
+    let _ = std::fs::remove_dir_all(&pool_dir);
+}
+
+/// A **torn sibling** (an interrupted split, or a hand-placed truncated file) is
+/// re-derived by the next pass instead of being trusted: `{id}.ch{k}` means
+/// "channel k of `{id}`", so the pass overwrites it through a temporary name.
+#[test]
+fn a_torn_sibling_is_re_derived_not_trusted() {
+    let dir = tmp_dir("torn-sibling");
+    write_stereo(&dir, "jam", 4800, 48_000, 0.25, -0.5);
+
+    // A sibling that died mid-write: placeholder header, never finalized, and it
+    // holds the wrong channel's audio (0.75), so trusting it is visible.
+    {
+        let mut w = WavWriter::create_float(&dir.join("jam.ch1.wav"), 48_000, 1).unwrap();
+        w.write(&vec![0.75f32; 100]).unwrap();
+        w.flush().unwrap();
+        // No finalize, and Drop suppressed: the "crash" (Drop would patch the
+        // header best-effort, which is exactly what must not have happened).
+        mem::forget(w);
+    }
+    assert!(
+        !WavWriter::is_finalized(&dir.join("jam.ch1.wav")).unwrap(),
+        "the fixture must look like a crashed take"
+    );
+
+    let pool = Pool::open(&dir).unwrap();
+    let report = pool.conform(48_000).unwrap();
+    assert_eq!(report.errors, Vec::new());
+    assert_eq!(
+        report
+            .converted
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["jam", "jam.ch1"]
+    );
+
+    let sibling = dir.join("jam.ch1.wav");
+    assert!(
+        WavWriter::is_finalized(&sibling).unwrap(),
+        "the re-derived sibling is a complete take"
+    );
+    let (right, _, frames) = read_all(&sibling);
+    assert_eq!(frames, 4800, "the full channel, not the torn 100 frames");
+    assert!(
+        right.iter().all(|s| (s + 0.5).abs() < 1e-6),
+        "channel 1's own audio, not the torn file's"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Preserving an original never overwrites an earlier preservation: the backup
+/// name is numbered when it is taken. (The first draft's `hard_link` failed on an
+/// existing name and the `fs::copy` fallback silently truncated it.)
+#[test]
+fn preserving_an_original_does_not_clobber_an_earlier_backup() {
+    let dir = tmp_dir("backup-clash");
+    write_stereo(&dir, "jam", 4800, 48_000, 0.25, -0.5);
+    // An older preservation of the same file already sits beside it.
+    let older = dir.join("jam.wav.pre2ch");
+    std::fs::write(&older, b"an older preservation").unwrap();
+
+    let pool = Pool::open(&dir).unwrap();
+    let report = pool.conform(48_000).unwrap();
+    let done = &report.converted[0];
+    let backup = done.preserved.clone().expect("the original is kept");
+    assert_ne!(backup, older, "the older backup keeps its name");
+    assert_eq!(std::fs::read(&older).unwrap(), b"an older preservation");
+    let (audio, _, _) = read_all(&backup);
+    assert!(audio.iter().all(|s| (s - 0.25).abs() < 1e-6));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Importing a file that **is already the pool's source** must report what it
+/// found, not an empty result: the shell's `--wave` uses `import` for every
+/// path, including one inside the session pool.
+#[test]
+fn importing_a_pool_source_over_itself_reports_it() {
+    let dir = tmp_dir("self-import");
+    write_finalized(&dir, "jam", 4800, 48_000, 0.25);
+    write_stereo(&dir, "two", 4800, 48_000, 0.25, -0.5);
+
+    let pool = Pool::open(&dir).unwrap();
+
+    // A mono source at the session rate: nothing to do, and no backup appears.
+    let mono = pool.import(&dir.join("jam.wav"), 48_000).unwrap();
+    assert_eq!(mono.ids(), vec!["jam"]);
+    assert_eq!(mono.frames_out(), 4800, "the source's length is reported");
+    assert!(!mono.converted());
+    assert!(
+        !dir.join("jam.wav.pre48000").exists(),
+        "a no-op leaves no backup"
+    );
+
+    // A stereo source in the pool: importing it over itself splits it in place,
+    // and the result lists **every** source the material now has — a shell
+    // places tracks from this list, so `two` alone would drop the right channel.
+    let stereo = pool.import(&dir.join("two.wav"), 48_000).unwrap();
+    assert_eq!(stereo.channels, 2);
+    assert_eq!(stereo.ids(), vec!["two", "two.ch1"]);
+    assert_eq!(stereo.sources[0].extracted, vec!["two.ch1"]);
+    assert_eq!(stereo.frames_out(), 4800);
+    assert!(dir.join("two.ch1.wav").is_file());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn conform_splits_a_stereo_source_already_in_the_pool() {
+    let dir = tmp_dir("conform-stereo");
+    write_stereo(&dir, "jam", 4800, 48_000, 0.25, -0.5);
+
+    let pool = Pool::open(&dir).unwrap();
+    let report = pool.conform(48_000).unwrap();
+    assert_eq!(report.errors, Vec::new());
+    // One entry per pool source the pass wrote: the file's own `{id}` first
+    // (listing the siblings it produced), then each sibling.
+    assert_eq!(report.converted.len(), 2);
+    assert_eq!(
+        report
+            .converted
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["jam", "jam.ch1"]
+    );
+    let done = &report.converted[0];
+    assert_eq!(done.id, "jam");
+    assert_eq!(done.channels, 2);
+    assert_eq!(done.extracted, vec!["jam.ch1"]);
+    assert_eq!(report.converted[1].frames_out, 4800);
+    assert!(!done.converted, "the rate was already right");
+    let preserved = done.preserved.clone().expect("the original is kept");
+    assert_eq!(preserved, dir.join("jam.wav.pre2ch"));
+
+    // The original survives intact — both channels — under a name the pool does
+    // not index.
+    let (audio, rate, frames) = read_all(&preserved);
+    assert_eq!((rate, frames), (48_000, 4800));
+    assert!(audio.iter().all(|s| (s - 0.25).abs() < 1e-6));
+    let (right, _, _) = read_all_ch(&preserved, 1);
+    assert!(right.iter().all(|s| (s + 0.5).abs() < 1e-6));
+
+    // `jam` is now channel 0, mono and at the session rate.
+    let (audio, rate, frames) = read_all(&dir.join("jam.wav"));
+    assert_eq!((rate, frames), (48_000, 4800));
+    assert!(audio.iter().all(|s| (s - 0.25).abs() < 1e-6));
+    let (right, _, _) = read_all(&dir.join("jam.ch1.wav"));
+    assert!(right.iter().all(|s| (s + 0.5).abs() < 1e-6));
+
+    let index = pool.list().unwrap();
+    assert_eq!(index.sources.len(), 2, "the backup is not a source");
+    assert!(
+        index.sources.iter().all(|s| s.channels == 1),
+        "the pool is mono after a split: {:?}",
+        index.sources.iter().map(|s| &s.id).collect::<Vec<_>>()
+    );
+
+    // Idempotent: a second pass finds nothing to do and extracts nothing twice.
+    let again = pool.conform(48_000).unwrap();
+    assert!(again.converted.is_empty());
+    assert!(again.errors.is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The two halves compose: a foreign-rate stereo file is resampled *and* split,
+/// both channels landing at the session rate with the original preserved.
+#[test]
+fn conform_resamples_and_splits_a_stereo_source() {
+    let dir = tmp_dir("conform-stereo-rate");
+    write_stereo(&dir, "jam", 44_100, 44_100, 0.25, -0.5);
+
+    let pool = Pool::open(&dir).unwrap();
+    let report = pool.conform(48_000).unwrap();
+    assert_eq!(report.errors, Vec::new());
+    let done = &report.converted[0];
+    assert!(done.converted, "44.1 kHz was resampled");
+    assert_eq!(done.channels, 2);
+    assert_eq!(done.extracted, vec!["jam.ch1"]);
+    assert_eq!(done.preserved, Some(dir.join("jam.wav.pre44100")));
+
+    let index = pool.list().unwrap();
+    assert_eq!(index.sources.len(), 2);
+    assert!(index.sources.iter().all(|s| s.sample_rate == 48_000));
+    for (id, want) in [("jam", 0.25f32), ("jam.ch1", -0.5f32)] {
+        let (audio, rate, frames) = read_all(&dir.join(format!("{id}.wav")));
+        assert_eq!((rate, frames), (48_000, 48_000), "{id}");
+        let middle = &audio[256..audio.len() - 256];
+        assert!(
+            middle.iter().all(|s| (s - want).abs() < 0.01),
+            "{id} holds its own channel at the right level"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -147,6 +519,9 @@ fn import_converts_a_foreign_rate_once() {
 
     let pool = Pool::open(&pool_dir).unwrap();
     let done = pool.import(&src_dir.join("jam.wav"), 48_000).unwrap();
+    assert_eq!(done.channels, 1, "a mono file is one source");
+    assert_eq!(done.ids(), vec!["jam"]);
+    let done = &done.sources[0];
 
     assert!(done.converted, "44.1 kHz must be resampled");
     assert_eq!((done.from_rate, done.to_rate), (44_100, 48_000));
@@ -199,6 +574,8 @@ fn import_copies_a_matching_rate_bit_for_bit() {
 
     let pool = Pool::open(&pool_dir).unwrap();
     let done = pool.import(&src_dir.join("take.wav"), 48_000).unwrap();
+    assert!(!done.converted(), "a matching rate must not be resampled");
+    let done = &done.sources[0];
     assert!(!done.converted, "a matching rate must not be resampled");
     assert_eq!((done.frames_in, done.frames_out), (4800, 4800));
     assert_eq!(

@@ -102,3 +102,25 @@ disposition. The designated gate stays owed for both slices when Kimi returns.
    pair, (c) the A2 text round-trip completeness.
 3. If Kimi is still unavailable, the GLM stand-in review is the recorded substitute; it is cross-vendor
    to the author, but it is *not* the designated gate, and both slices stay owed.
+
+## Slice A4 (stereo material) — refused again, 2026-09-24
+
+The A4 brief (the same adversarial brief as the GLM stand-in gate for that slice) was sent to
+`opencode-go/kimi-k3` on 2026-09-24. The run **failed before it finished and left no closing message**
+— the same failure shape as A1/A2 (the route accepts the request and never returns a result). No
+review output was produced, so nothing is archived here.
+
+This keeps the designated gate **owed** for A1, A2, A3 and now A4. (The owner's status read at
+2026-09-24 13:03 local: 5-hour window 100 % used, resetting 14:09; 7-day window 20.94 %.) The GLM-5.3 stand-in for A4 is
+archived in
+[`2026-09-24-alpha-slice-gate-a4-glm-standin.md`](2026-09-24-alpha-slice-gate-a4-glm-standin.md)
+with a disposition; the substitution is recorded there, not here (this file stays the record of the
+Kimi route's state).
+
+**What the owner can unblock it with (2026-09-24):** the API route is the one to try, and the account
+now reports the **5-hour usage window at 100 %** (reset 2026-09-24 14:09 local) with the 7-day window
+at ~21 % — so the failure is the short window, not the key. The owner also relays that the provider
+wants the **256 k-context** variant, i.e. the model id `k3-256k` (the DSH catalog advertises
+`opencode-go/kimi-k3`; an unlisted id is worth trying since adapter membership is advisory). Retry
+after 14:09 with that id, for the A4 brief first and then the owed A1–A3 retro-gate. The CLI's device
+login still answers `403 Forbidden`, and `kimi -p` conflicts with `--auto`.

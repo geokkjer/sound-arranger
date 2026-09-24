@@ -26,9 +26,12 @@ What this spike adds, because it is what a TUI has to answer for:
   copy): braille min/max envelopes, one lane per track, boundaries, per-track
   colour. `--wave <file.wav>` **imports the file into the spike's own session
   pool** at the session rate (a 44.1 kHz file is resampled once — see
-  `media::Pool::import`), hands the host a one-clip script and draws the result —
-  so a loaded file is **audible**, and the panel is never a picture of something
-  the engine has not got;
+  `media::Pool::import`), hands the host a script that places what landed and draws
+  the result — so a loaded file is **audible**, and the panel is never a picture of
+  something the engine has not got. A **stereo** (or wider) file is split at import
+  into one mono source per channel (`{id}.ch0`, `{id}.ch1`, …) and placed on one
+  track each, panned hard left/right, so both channels play instead of only the
+  left;
 - **edits that go through the host's own language** — `x` splits and `d` deletes
   by building an `arrange …` line and handing it to the host's parser, so a key
   runs exactly what a script writes, and the engine logs it like any command;
@@ -165,6 +168,12 @@ that the `:` prompt is "a widget away, not a project" — and it is now built.
 **ch0 = 0.8000** and **master = 0.5657** — the file's own amplitude, and the equal-power centre-pan
 law (0.8 × 1/√2) on the way to the stereo master. That is the headless proof that a loaded file is
 audible: a silent host's meters only move if the arrangement rendered through the mixer.
+
+`--probe --wave /tmp/stereo-demo.wav` (a 16-bit **stereo** file: 440 Hz left, 660 Hz right)
+reports `imported stereo-demo — 2 channels split into stereo-demo.ch0, stereo-demo.ch1, 48000 frames
+each at 48000 Hz`, then **ch0 = 0.5000** *and* **ch1 = 0.5000** — both channels of the file reach
+the mixer, which is what the per-channel split buys (`--probe` prints every mounted channel, not just
+the first).
 
 `--probe --wave /tmp/rate44.wav` (a 1-second 440 Hz file at **44.1 kHz**) reports
 `imported rate44 — resampled 44100 → 48000 Hz, 48000 frames`, then **ch0 = 0.5000** and

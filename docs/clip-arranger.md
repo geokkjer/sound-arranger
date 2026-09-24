@@ -1,6 +1,6 @@
 # The clip arranger — an arrangement is data
 
-> 🕒 Last verified against commit `22416d5` (2026-09-22). If the code has moved on,
+> 🕒 Last verified against commit `4434756` (2026-09-24). If the code has moved on,
 > trust the code and move this line forward.
 
 **What this is.** The engine ([`architecture-explainer.md`](architecture-explainer.md)) is a
@@ -215,8 +215,10 @@ clip editor end-to-end with no GUI.
   from the transport frame; the shared-state `ArrangerNode` reuse (reusing a reader across
   rebuilds without re-warming) is still deferred — see the README's honest gaps.
 - **Mono inputs, stereo master, no effects** — the mixer pans mono channels into a stereo
-  master, but a genuine stereo *source* (a two-channel take/clip) is still forthcoming, and
-  there are no effects (the "sound sculptor" offline profile is separate and deferred).
+  master. Stereo *material* now arrives as one mono pool source per channel (import splits a
+  multi-channel file as `{id}.ch0`/`{id}.ch1`, placed on two panned tracks), but a genuine
+  stereo *clip* (one source, two channels) is still forthcoming, and there are no effects
+  (the "sound sculptor" offline profile is separate and deferred).
 - **Underrun surfacing is a hard requirement.** A bounce with `underruns != 0` must be treated
   as an error, not a quiet glitch.
 

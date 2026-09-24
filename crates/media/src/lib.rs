@@ -51,7 +51,7 @@ pub use capture::{Capture, CaptureNode};
 pub use clip_editor::{ClipEditor, Interner, decode_op, encode_op, register_handlers};
 pub use drift::DriftCompensator;
 pub use peaks::{PEAK_BASE_BIN, PEAK_LEVELS, PeakBuilder, PeakFile};
-pub use pool::{Conform, ConformReport, Pool, PoolIndex, PoolSource, Recovery};
+pub use pool::{Conform, ConformReport, Import, Pool, PoolIndex, PoolSource, Recovery};
 pub use record::{RecordNode, Recorder, WavRecorder};
 pub use resample::Resampler;
 pub use ring::Spsc;

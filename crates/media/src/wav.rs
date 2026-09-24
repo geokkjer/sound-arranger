@@ -19,6 +19,15 @@ const DATA_TAG: &[u8; 4] = b"data";
 
 const FMT_PCM: u16 = 1;
 const FMT_FLOAT: u16 = 3;
+
+/// Frames read per interleaved chunk (and the size of the reader's stack buffer).
+const MAX_CHUNK_FRAMES: usize = 256;
+/// The reader's interleaved chunk, in bytes: [`MAX_CHUNK_FRAMES`] frames of the
+/// widest sample it decodes (4 bytes). A frame must fit, so a file is refused
+/// past the channel count this allows rather than read without progress.
+const MAX_CHUNK_BYTES: usize = MAX_CHUNK_FRAMES * 4;
+/// The channel ceiling: how many 4-byte samples fit one chunk. 5.1 is 6.
+const MAX_CHANNELS: u16 = (MAX_CHUNK_BYTES / 4) as u16;
 /// Header layout positions: RIFF size at 4, data size at 40 (12-byte RIFF +
 /// 8-byte fmt header + 16-byte fmt body + 4-byte "data" tag).
 const RIFF_SIZE_POS: u64 = 4;
@@ -90,9 +99,17 @@ fn parse_header(reader: &mut (impl Read + Seek)) -> Result<Header, String> {
                     "unsupported WAV audio format {format} (PCM or float only)"
                 ));
             }
-            if channels != 1 && channels != 2 {
+            // Any channel count a recorder wrote is readable — `read_into` yields
+            // one channel and `with_channel` picks which, so a 5.1 file imports
+            // as six mono pool sources. The ceiling is what one interleaved chunk
+            // can hold ([`MAX_CHANNELS`] 4-byte samples in [`MAX_CHUNK_BYTES`]): a
+            // file whose *frame* does not fit could never make progress, so it is
+            // refused here rather than spun on. Real material is far below it, and
+            // the declared block-align field is ignored either way — the reader
+            // re-derives frames from the channel count and bit depth.
+            if channels == 0 || channels > MAX_CHANNELS {
                 return Err(format!(
-                    "unsupported channel count {channels} (mono/stereo only)"
+                    "unsupported channel count {channels} (max {MAX_CHANNELS})"
                 ));
             }
             // 24-bit PCM is what most other tools write; it decodes to f32 on the
@@ -141,6 +158,8 @@ pub struct WavReader {
     data_offset: u64,
     total_frames: u64,
     frames_left: u64,
+    /// Which channel `read_into` yields (0 by default; see [`Self::with_channel`]).
+    pick: u16,
 }
 
 impl WavReader {
@@ -165,7 +184,26 @@ impl WavReader {
             data_offset: h.data_offset,
             total_frames,
             frames_left: total_frames,
+            pick: 0,
         })
+    }
+
+    /// Read channel `k` instead of channel 0 — how a multi-channel file is split
+    /// into the pool's mono sources. Errors past the file's channel count.
+    pub fn with_channel(mut self, k: u16) -> Result<Self, String> {
+        if k >= self.channels {
+            return Err(format!(
+                "channel {k} does not exist in a {}-channel file",
+                self.channels
+            ));
+        }
+        self.pick = k;
+        Ok(self)
+    }
+
+    /// Which channel `read_into` yields.
+    pub fn channel(&self) -> u16 {
+        self.pick
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -196,50 +234,51 @@ impl WavReader {
         self.channels as u64 * (self.bits / 8) as u64
     }
 
-    /// Read up to `out.len()` mono frames (stereo files contribute channel 0).
-    /// Returns the number of frames written (fewer at EOF). Never blocks on
-    /// the audio path — called from reader threads, not from render.
+    /// Read up to `out.len()` mono frames of the selected channel (channel 0
+    /// unless [`Self::with_channel`] said otherwise). Returns the number of
+    /// frames written (fewer at EOF). Never blocks on the audio path — called
+    /// from reader threads, not from render.
     pub fn read_into(&mut self, out: &mut [f32]) -> usize {
-        const MAX_FRAMES: usize = 256;
+        // One interleaved chunk at a time, always on the stack: cap the frame
+        // count by the buffer so a wide file (5.1, 7.1) cannot overrun it. The
+        // channel guard in `parse_header` makes a zero-width chunk unreachable;
+        // returning 0 rather than looping keeps that a guarantee, not a hope.
+        let mut raw = [0u8; MAX_CHUNK_BYTES];
+        let ba = self.block_align() as usize;
+        let chunk_frames = MAX_CHUNK_FRAMES.min(raw.len() / ba.max(1));
+        if chunk_frames == 0 {
+            return 0;
+        }
         let mut written = 0usize;
         while written < out.len() && self.frames_left > 0 {
             let want = (out.len() - written)
-                .min(MAX_FRAMES)
+                .min(chunk_frames)
                 .min(self.frames_left as usize);
-            let bytes = want * self.block_align() as usize;
-            let mut raw = [0u8; MAX_FRAMES * 8]; // 256 frames × 2 ch × 4 bytes
-            let Ok(got) = self.reader.read(&mut raw[..bytes]) else {
-                break;
-            };
-            if got == 0 {
+            // Whole frames only: a short read would leave the stream pointing
+            // mid-frame, so every later sample would come from the wrong channel.
+            if self.reader.read_exact(&mut raw[..want * ba]).is_err() {
                 break;
             }
-            let frames = got / self.block_align() as usize;
-            let ba = self.block_align() as usize;
+            let frames = want;
+            let pick = self.pick as usize * (self.bits / 8) as usize;
             for f in 0..frames {
-                let base = f * ba;
+                let at = f * ba + pick;
                 let s = match self.bits {
                     16 => {
-                        let v = i16::from_le_bytes([raw[base], raw[base + 1]]);
+                        let v = i16::from_le_bytes([raw[at], raw[at + 1]]);
                         v as f32 / 32768.0
                     }
                     // Sign-extend three little-endian bytes and scale by 2^23.
                     24 => {
                         let v = i32::from_le_bytes([
-                            raw[base],
-                            raw[base + 1],
-                            raw[base + 2],
-                            if raw[base + 2] & 0x80 != 0 {
-                                0xff
-                            } else {
-                                0x00
-                            },
+                            raw[at],
+                            raw[at + 1],
+                            raw[at + 2],
+                            if raw[at + 2] & 0x80 != 0 { 0xff } else { 0x00 },
                         ]);
                         v as f32 / 8_388_608.0
                     }
-                    _ => {
-                        f32::from_le_bytes([raw[base], raw[base + 1], raw[base + 2], raw[base + 3]])
-                    }
+                    _ => f32::from_le_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]]),
                 };
                 out[written] = s;
                 written += 1;
@@ -532,6 +571,112 @@ mod tests {
         for (a, b) in frames.iter().zip(&back) {
             assert!((a - b).abs() < 1e-3, "{a} vs {b}");
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Channel 1 of a stereo file, read directly — how the pool splits material.
+    #[test]
+    fn with_channel_reads_that_channel() {
+        let path = tmp("pick");
+        let left: Vec<f32> = (0..100).map(|i| i as f32 / 100.0).collect();
+        let mut interleaved = Vec::with_capacity(left.len() * 2);
+        for f in &left {
+            interleaved.push(*f);
+            interleaved.push(-*f);
+        }
+        {
+            let mut w = WavWriter::create(&path, 44_100, 2).unwrap();
+            w.write(&interleaved).unwrap();
+            w.finalize().unwrap();
+        }
+        let mut r = WavReader::open(&path).unwrap().with_channel(1).unwrap();
+        assert_eq!(r.channel(), 1);
+        let mut back = vec![0.0f32; 100];
+        assert_eq!(r.read_into(&mut back), 100);
+        for (a, b) in left.iter().zip(&back) {
+            assert!((a + b).abs() < 1e-3, "{a} vs {b}");
+        }
+        assert!(WavReader::open(&path).unwrap().with_channel(2).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Hand-write a float WAV with more than two channels — the *writer* is
+    /// mono/stereo on purpose, but a reader must survive anything a recorder or
+    /// another tool produced.
+    fn write_wide_float_wav(path: &Path, rate: u32, channels: u16, interleaved: &[f32]) {
+        let ba = channels * 4;
+        let data_bytes = (interleaved.len() * 4) as u32;
+        let mut v = Vec::with_capacity(44 + data_bytes as usize);
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        v.extend_from_slice(b"WAVEfmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&3u16.to_le_bytes()); // IEEE float
+        v.extend_from_slice(&channels.to_le_bytes());
+        v.extend_from_slice(&rate.to_le_bytes());
+        v.extend_from_slice(&(rate * ba as u32).to_le_bytes());
+        v.extend_from_slice(&ba.to_le_bytes());
+        v.extend_from_slice(&32u16.to_le_bytes());
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&data_bytes.to_le_bytes());
+        for s in interleaved {
+            v.extend_from_slice(&s.to_le_bytes());
+        }
+        std::fs::write(path, v).unwrap();
+    }
+
+    /// A wide file (more than two channels) reads channel *k* without overrunning
+    /// the reader's stack chunk — the interleaved frame is 4 bytes per channel.
+    #[test]
+    fn a_six_channel_file_reads_every_channel() {
+        let path = tmp("six");
+        let want = 700usize; // more than one 256-frame chunk
+        let mut interleaved = Vec::with_capacity(want * 6);
+        for i in 0..want {
+            for ch in 0..6 {
+                interleaved.push((i as f32 + ch as f32) / 1000.0);
+            }
+        }
+        write_wide_float_wav(&path, 48_000, 6, &interleaved);
+        for ch in 0..6u16 {
+            let mut r = WavReader::open(&path).unwrap().with_channel(ch).unwrap();
+            let mut back = vec![0.0f32; want];
+            assert_eq!(r.read_into(&mut back), want);
+            for (i, s) in back.iter().enumerate() {
+                let expect = (i as f32 + ch as f32) / 1000.0;
+                assert!(
+                    (s - expect).abs() < 1e-6,
+                    "ch{ch} frame {i}: {s} vs {expect}"
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A file too wide for one chunk is refused at open, never read without
+    /// progress (a frame wider than the chunk buffer used to mean `want == 0` and
+    /// an infinite loop). The widest the reader accepts still progresses.
+    #[test]
+    fn a_frame_wider_than_the_chunk_is_refused() {
+        let path = tmp("toowide");
+        write_wide_float_wav(&path, 48_000, MAX_CHANNELS + 1, &[]);
+        assert!(
+            WavReader::open(&path).is_err(),
+            "a frame the reader cannot chunk must be refused"
+        );
+
+        // At the ceiling a one-frame file still reads (progress, no spin).
+        write_wide_float_wav(
+            &path,
+            48_000,
+            MAX_CHANNELS,
+            &vec![0.5f32; MAX_CHANNELS as usize],
+        );
+        let mut r = WavReader::open(&path).unwrap().with_channel(3).unwrap();
+        let mut back = [0.0f32; 4];
+        assert_eq!(r.read_into(&mut back), 1, "the single frame is read");
+        assert_eq!(back[0], 0.5);
+        assert_eq!(r.read_into(&mut back), 0, "and then EOF");
         let _ = std::fs::remove_file(&path);
     }
 

@@ -1953,39 +1953,69 @@ fn wave_script(path: &std::path::Path) -> Result<(String, String), String> {
 
     let pool = media::Pool::open(&dir)?;
     let imported = pool.import(path, SAMPLE_RATE as u32)?;
-    if imported.frames_out == 0 {
+    if imported.frames_out() == 0 {
         return Err("the file has no audio frames".to_string());
     }
 
-    let note = if imported.converted {
+    // A multi-channel file arrives as one mono source per channel (import splits
+    // it). Place each on its own track — and for a stereo file pan the pair hard
+    // left/right, so it plays as stereo instead of losing its right channel. A
+    // wider file gets one centred track per channel; more channels than the mixer
+    // has (`MIXER_CHANNELS_MAX`) is refused by the host's own mount check, with
+    // every channel still split and in the pool.
+    let sources = &imported.sources;
+    let mut script = String::from("host v1\n");
+    script.push_str(&format!(
+        "mount mixer channels={} @0\n",
+        sources.len().max(2)
+    ));
+    script.push_str(&format!("pool {}\n", dir.display()));
+    if sources.len() == 2 {
+        script.push_str("set_param mixer ch0.pan -1 @0\n");
+        script.push_str("set_param mixer ch1.pan 1 @0\n");
+    }
+    for (i, source) in sources.iter().enumerate() {
+        script.push_str(&format!("arrange add_track t{i}\n"));
+        script.push_str(&format!(
+            "arrange add_clip t{i} c{i} {} 0 {} 0 0 0 1.0\n",
+            source.id, source.frames_out
+        ));
+    }
+
+    let note = if imported.converted() {
+        let first = &sources[0];
         format!(
-            "imported {} — resampled {} → {} Hz, {} frames at the session rate{}",
+            "imported {} — {} channel(s) resampled {} → {} Hz, {} frames at the session rate{}",
             imported.id,
-            imported.from_rate,
-            imported.to_rate,
-            imported.frames_out,
-            imported
+            imported.channels,
+            first.from_rate,
+            first.to_rate,
+            imported.frames_out(),
+            first
                 .preserved
                 .as_ref()
                 .map(|p| format!(", original kept as {}", p.display()))
                 .unwrap_or_default(),
         )
+    } else if sources.len() > 1 {
+        format!(
+            "imported {} — {} channels split into {}, {} frames each at {} Hz",
+            imported.id,
+            imported.channels,
+            imported.ids().join(", "),
+            imported.frames_out(),
+            SAMPLE_RATE,
+        )
     } else {
         format!(
             "imported {} — {} frames at {} Hz",
-            imported.id, imported.frames_out, imported.to_rate
+            imported.id,
+            imported.frames_out(),
+            SAMPLE_RATE,
         )
     };
 
-    Ok((
-        format!(
-            "host v1\nmount mixer channels=2 @0\npool {}\narrange add_track t0\narrange add_clip t0 c0 {} 0 {} 0 0 0 1.0\n",
-            dir.display(),
-            imported.id,
-            imported.frames_out,
-        ),
-        note,
-    ))
+    Ok((script, note))
 }
 
 /// `--probe`: the non-TUI half of the proof — host thread, transport, and live
@@ -2046,10 +2076,25 @@ fn probe(wave: Option<PathBuf>, script: Option<PathBuf>) -> i32 {
     for _ in 0..24 {
         std::thread::sleep(Duration::from_millis(25));
         let snap = host.snapshot();
-        peak = peak.max(snap.channels[0]).max(snap.master);
+        // Every mounted channel, not just the first: a stereo import routes one
+        // channel per track, so `ch1` moving is the proof the right channel is
+        // wired (a silent one would look identical if only `ch0` were printed).
+        let channels = &snap.channels[..snap.channel_count.min(snap.channels.len())];
+        peak = peak.max(channels.iter().copied().fold(0.0, f32::max));
+        peak = peak.max(snap.master);
+        let meters: Vec<String> = channels
+            .iter()
+            .enumerate()
+            .map(|(i, v)| format!("ch{i}={v:.4}"))
+            .collect();
         println!(
-            "probe: frame={:>7} t={:>6.3}s beat={:>6.2} playing={:<5} ch0={:.4} master={:.4}",
-            snap.frame, snap.seconds, snap.beat, snap.playing, snap.channels[0], snap.master,
+            "probe: frame={:>7} t={:>6.3}s beat={:>6.2} playing={:<5} {} master={:.4}",
+            snap.frame,
+            snap.seconds,
+            snap.beat,
+            snap.playing,
+            meters.join(" "),
+            snap.master,
         );
     }
 
@@ -2057,7 +2102,7 @@ fn probe(wave: Option<PathBuf>, script: Option<PathBuf>) -> i32 {
     let _ = host.execute(HostCommand::TransportStop);
     host.shutdown();
 
-    println!("probe: peak ch0/master = {peak:.4}");
+    println!("probe: peak channels/master = {peak:.4}");
 
     drop_pool();
     if let Some(e) = &last.last_error {
@@ -2165,6 +2210,15 @@ mod tests {
             .expect("draw does not fail on a test backend");
 
         buffer_text(terminal.backend().buffer())
+    }
+
+    /// The session pool is **one directory per process** (`session_pool_dir`), so
+    /// tests that import into it — or drop it — must not run concurrently: they
+    /// share the pool the running shell uses, by design.
+    static POOL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn pool_guard() -> std::sync::MutexGuard<'static, ()> {
+        POOL_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// A three-second WAV on disk (a loud second and a half, then silence), so
@@ -2317,6 +2371,7 @@ mod tests {
 
     #[test]
     fn the_timeline_panel_draws_a_real_file() {
+        let _pool = pool_guard();
         let path = wav_fixture("panel");
         let mut app = App::demo();
         app.open_wave(&path);
@@ -2346,6 +2401,7 @@ mod tests {
 
     #[test]
     fn visual_mode_selects_from_the_playhead_and_escape_leaves_it() {
+        let _pool = pool_guard();
         let path = wav_fixture("visual");
         let mut app = App::demo();
         app.open_wave(&path);
@@ -2396,6 +2452,7 @@ mod tests {
 
     #[test]
     fn zoom_keys_change_the_density_without_touching_the_host() {
+        let _pool = pool_guard();
         let path = wav_fixture("zoom-keys");
         let mut app = App::demo();
         app.open_wave(&path);
@@ -2424,6 +2481,7 @@ mod tests {
 
     #[test]
     fn tab_cycles_the_focus_and_scopes_the_timeline_keys() {
+        let _pool = pool_guard();
         let path = wav_fixture("focus");
         let mut app = App::demo();
         assert_eq!(app.focus, Panel::Mixer, "no arrangement → the mixer");
@@ -2484,6 +2542,7 @@ mod tests {
 
     #[test]
     fn a_loaded_file_is_held_by_the_host_so_it_can_play() {
+        let _pool = pool_guard();
         let path = wav_fixture("audible");
         let mut app = App::idle();
         app.open_wave(&path);
@@ -2511,6 +2570,7 @@ mod tests {
     /// its session pool at the session rate, so the clip is a straight read.
     #[test]
     fn a_forty_four_one_khz_file_is_imported_at_the_session_rate() {
+        let _pool = pool_guard();
         let path = std::env::temp_dir().join(format!("tui-shell-44100-{}.wav", std::process::id()));
         let rate = 44_100u32;
         let frames = rate as usize;
@@ -2554,6 +2614,80 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+        drop_pool();
+    }
+
+    /// A **stereo** file keeps both of its channels: `--wave` splits it into one
+    /// pool source per channel, places each on its own track, and pans them hard
+    /// left/right through the host's own script — so the right channel is played
+    /// instead of silently dropped.
+    #[test]
+    fn a_stereo_file_is_split_across_two_panned_tracks() {
+        let _pool = pool_guard();
+        let stem = format!("tui-shell-stereo-{}", std::process::id());
+        let path = std::env::temp_dir().join(format!("{stem}.wav"));
+        let rate = 48_000u32;
+        let frames = rate as usize;
+        let mut writer =
+            media::wav::WavWriter::create_float(&path, rate, 2).expect("create the fixture");
+        let mut interleaved = Vec::with_capacity(frames * 2);
+        for i in 0..frames {
+            let s = (i as f32 * 0.05).sin() * 0.5;
+            interleaved.push(s); // left
+            interleaved.push(-s); // right: the same tone, inverted
+        }
+        writer.write(&interleaved).expect("write");
+        writer.finalize().expect("finalize");
+
+        let mut app = App::idle();
+        app.open_wave(&path);
+
+        let outcome = app.host.outcome().expect("outcome");
+        let timeline = outcome.arrangement.expect("the host holds an arrangement");
+        assert_eq!(
+            timeline.tracks.len(),
+            2,
+            "one track per channel: {}",
+            app.status
+        );
+        assert_eq!(timeline.tracks[0].clips[0].source, format!("{stem}.ch0"));
+        assert_eq!(timeline.tracks[1].clips[0].source, format!("{stem}.ch1"));
+        assert_eq!(timeline.tracks[0].clips[0].src_len, rate as u64);
+        assert!(
+            app.status.contains("2 channels split into"),
+            "the split is reported: {}",
+            app.status
+        );
+
+        // The pan is a **logged** parameter, not a shell-side guess.
+        let pan = |param: &str| {
+            outcome
+                .params
+                .iter()
+                .find(|(plugin, name, _)| *plugin == "mixer" && *name == param)
+                .map(|(_, _, value)| *value)
+        };
+        assert_eq!(pan("ch0.pan"), Some(-1.0), "left channel hard left");
+        assert_eq!(pan("ch1.pan"), Some(1.0), "right channel hard right");
+
+        // The panel resolves both sources from the pool listing (no read errors).
+        let arrangement = app.arrangement.as_ref().expect("the panel");
+        assert_eq!(arrangement.lanes.len(), 2);
+        assert_eq!(arrangement.frames, rate as u64);
+
+        // A mono file still lands on one track — the split is channel-count driven.
+        let mono = wav_fixture("still-mono");
+        app.open_wave(&mono);
+        let outcome = app.host.outcome().expect("outcome");
+        assert_eq!(
+            outcome.arrangement.expect("arrangement").tracks.len(),
+            1,
+            "a mono file is one track: {}",
+            app.status
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&mono);
         drop_pool();
     }
 
@@ -3044,7 +3178,7 @@ mod tests {
             dir.join("pool/s1.wav").is_file(),
             "the pool travelled with it"
         );
-        assert_eq!(dir.join("journal.txt").exists(), true, "the journal exists");
+        assert!(dir.join("journal.txt").exists(), "the journal exists");
 
         // A later edit is autosaved into the journal …
         app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()));
@@ -3121,7 +3255,7 @@ mod tests {
         );
 
         // …and the command line still works afterwards.
-        let line = format!("arrange set_clip_gain t0 c0 0.4");
+        let line = "arrange set_clip_gain t0 c0 0.4".to_string();
         app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::empty()));
         for c in line.chars() {
             app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));

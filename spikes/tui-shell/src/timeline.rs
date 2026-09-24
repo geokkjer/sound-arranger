@@ -807,6 +807,7 @@ mod tests {
             peaks: path.with_extension("peaks"),
             frames: frames as u64,
             sample_rate: 48_000,
+            channels: 1,
             peaks_missing: true,
             finalized: true,
         }];

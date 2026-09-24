@@ -52,15 +52,22 @@ the pool boundary.**
   fed; `flush` emits the tail against zero padding, so **the output does not depend on the block
   size** — the property that makes a converted take byte-reproducible. Equal rates are a bit-exact
   passthrough.
-- **`Pool::import(src, session_rate)`** — bring a WAV of any rate in under its file stem: a byte copy
-  when it already fits (a 16-bit source is not re-quantized), a single resample otherwise, and always
-  a derived `.peaks` sidecar. This is the path `--wave` now takes: the spike imports into its own
-  session pool (`$TMPDIR/tui-shell-pool-<pid>`) instead of pointing `pool` at the user's directory.
+- **`Pool::import(src, session_rate) -> Import`** — bring a WAV of any rate in under its file stem: a
+  byte copy when it already fits (a 16-bit source is not re-quantized), a single resample otherwise, and
+  always a derived `.peaks` sidecar. A **multi-channel** file is split at this boundary into one mono
+  source per channel (`{id}.ch0`, `{id}.ch1`, …), so the rate rule and the channel rule are both
+  enforced once, where material enters ([stereo-material
+  note](.agents/notes/implemented/feature/2026-09-24-stereo-material-per-channel-pool.md)). This is the
+  path `--wave` now takes: the spike imports into its own session pool
+  (`$TMPDIR/tui-shell-pool-<pid>`) instead of pointing `pool` at the user's directory.
 - **`Pool::conform(session_rate)`** — the maintenance pass (sibling of `Pool::recover`) that makes a
-  pool which predates the rule, or was filled by hand, playable. Each mismatched source is converted
+  pool which predates the rules, or was filled by hand, playable. Each mismatched source is converted
   in place: the original is preserved as `{id}.wav.pre{rate}` (not a `.wav`, so the pool never indexes
   it as a source), the converted audio is written to a side file and **renamed over** the source, so a
-  crash never leaves the pool without it. Per-source failures are reported, not fatal.
+  crash never leaves the pool without it. Per-source failures are reported, not fatal. A
+  **multi-channel** source is expanded the same way — extra channels written beside it as `{id}.ch{k}`,
+  `{id}` rewritten as channel 0 (backup `.pre{channels}ch` when only the split rewrote it), idempotent
+  because the split leaves a mono source that no longer matches the filter.
 - **`HostSession::set_pool` conforms as it adopts**, so every shell gets this without new vocabulary:
   the Tauri bridge, the CLI, and the spikes. The report is kept on the session
   (`HostSession::pool_conformed`) and rides `HostOutcome::pool_conformed`, so a shell can say what
@@ -132,8 +139,8 @@ the pool boundary.**
 - `Pool::recover` (the crash pass) still has no production caller while `conform` now has one;
   folding both into a single "pool maintenance on adoption" call is the next cleanup.
 - Deferred: an explicit import command; conform progress/cancellation; time-stretch/pitch (a different
-  algorithm); importing a stereo file as separate `.ch{N}` sources (today `WavReader` yields channel 0,
-  unchanged).
+  algorithm); a stereo *clip* (one source, two channels — material is per-channel now, the signal path
+  is still mono per clip).
 
 ## Attribution
 
