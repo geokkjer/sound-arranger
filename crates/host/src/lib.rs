@@ -4202,9 +4202,29 @@ mod tests {
         assert_eq!(status.take_id, "jam");
         assert_eq!(status.channels, 2);
 
-        // Push a second of interleaved tone, then stop.
+        // Push a second of interleaved tone, then stop once the demux has drained
+        // what the ring accepted. A fixed sleep here is a **race** — a loaded
+        // parallel run failed it (found as a flake by slice D1's gate) — and the
+        // ring drops what it cannot hold, so "wait for N frames" cannot work: poll
+        // the live count instead and wait for it to stop moving (three equal,
+        // non-zero readings), with a bound so a stuck demux still fails loudly in
+        // the assertion below rather than hanging.
         feed_tone(&ring, rate as usize, 2, rate);
-        std::thread::sleep(std::time::Duration::from_millis(120)); // let the demux drain
+        let mut last = 0u64;
+        let mut steady = 0;
+        for _ in 0..400 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let now = s.recording().map(|status| status.frames).unwrap_or(0);
+            if now > 0 && now == last {
+                steady += 1;
+                if steady >= 3 {
+                    break;
+                }
+            } else {
+                steady = 0;
+            }
+            last = now;
+        }
         let take = s.stop_recording().expect("record stops");
         assert_eq!(take.take_id, "jam");
         assert_eq!(take.channels, 2);

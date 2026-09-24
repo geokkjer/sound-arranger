@@ -59,7 +59,10 @@ finalizes the take.**
 - `a_take_records_into_the_pool_and_plays` — the whole loop with the device replaced by the seam: start →
   feed a second of stereo tone → stop → the pool has `jam.ch0`/`jam.ch1` at the session rate with peaks →
   place `jam.ch0` on a track → **bounce, and it is audible**. Also asserts the take report (channels,
-  sources, frames).
+  sources, frames). The wait between feeding and stopping **polls** the live capture count for a steady
+  reading rather than sleeping a fixed 120 ms: the fixed sleep was a race on a loaded parallel test run
+  (found as a flake by slice D1's gate), and the ring drops what it cannot hold, so only "the count
+  stopped moving" is a real drain signal.
 - `recording_refuses_what_it_cannot_do` — no pool ("the refusal names the fix"), one take at a time,
   stopping nothing, an invalid take id (the media layer's filename rule), and the grammar
   (`record jam1` / `record stop`).
