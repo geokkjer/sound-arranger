@@ -122,6 +122,17 @@ reports the **5-hour usage window at 100 %** (reset 2026-09-24 14:09 local) with
 ~21 % — so the failure is the short window, not the key. The owner relays that the provider wants the
 **256 k-context** variant, i.e. the model id `k3-256k`.
 
+**Tried again after the 5-hour window reset (2026-09-24 14:10, with the window reported reset at
+14:09) — same failure shape:** the brief was accepted, the run died with **no closing message and no
+output**, exactly as for A4, C, D1 and D2 (four attempts across 13:00–14:10). The owner's note that
+the CLI's `403` is a *fetch-security* block on the login URL (the provider refuses to fetch
+internal/login URLs) explains the **CLI** route, but not this: the API route accepts the request and
+never returns a result. **Conclusion (for now): `opencode-go/kimi-k3` is unusable for gating**, so
+every slice continues to be gated by the GLM-5.3 stand-in (cross-vendor, recorded per slice), and the
+designated gate stays **owed for every slice: A1, A2, A3, A4, C, D1, D2, D3a**. When the route works
+(or a working key/route is provided), the briefs to run are the per-slice ones archived under
+`research/architecture/2026-09-24-alpha-slice-gate-*-glm-standin.md`.
+
 **Tried `k3-256k`, 2026-09-24 13:25 — refused before it ran:** the harness answers
 `child LLM route "opencode-go/k3-256k" is not allowed for this Session` (the session's route
 allowlist carries the advertised catalog, which has `opencode-go/kimi-k3`, not the 256k id). So the

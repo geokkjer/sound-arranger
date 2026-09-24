@@ -90,11 +90,16 @@ arrangement is made of had no home on screen.
   in the shell would have defeated that scrolling — the gate caught the first draft doing exactly
   that while its own comment claimed otherwise). A focus whose panel disappears (a load with no
   pool) falls back to one that exists instead of leaving the keys dead.
-- **Still open**: **audition** (the plan's other half of this item — D3b); importing from the panel
+- **Audition is cut from the alpha, with the reason recorded** (the plan's item 9): the mixer's channel
+  inputs are single-connection, so a preview needs a monitor path of its own (a mixing decision), and
+  the existing `play` command is logged *state*, so an audition needs an unlogged action (a second
+  decision) — neither is in the owner's ask list, where "load clips from the pool" is.
+- **Still open**: importing from the panel
   (a picker, or the `--wave` path surfaced as a command); a filter/search for a large pool; mouse
   selection in the pool (the panel records its rect but only the keys act on it); `Pool::import`
   still accepts a whitespace-bearing stem, so an unplaceable row can exist — the panel marks it and
-  the key refuses it, but the pool's own id rule is the place to fix it.
+  the key refuses it, but the pool's own id rule is the place to fix it; a preview/audition (see
+  above).
 
 ## The gate's findings
 

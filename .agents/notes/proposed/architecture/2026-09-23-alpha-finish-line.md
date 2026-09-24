@@ -156,9 +156,13 @@ from the shared workflow (a key or a `: ` line — never a shell-only feature).
    error string. *Half done (2026-09-24):* the panel exists (`Tab` reaches it, `j`/`k` walk it, `Enter`
    places the selected source on the active track at the playhead — and makes the first track when there
    is none, in one gesture), with crashed takes and missing peaks marked
-   ([note](../../implemented/feature/2026-09-24-pool-panel-and-placement.md)). **Audition is next**
-   (slice D3b): the existing `play` command is logged *state* (replayed on seek), so an audition needs an
-   unlogged action path — a host change with its own decision, not a flag on the panel.
+   ([note](../../implemented/feature/2026-09-24-pool-panel-and-placement.md)). **Audition is cut from the alpha** (slice D3b), deliberately, for reasons this slice surfaced: (a) the
+   mixer's channel inputs are **single-connection**, so a preview needs a monitor path of its own — a
+   dedicated channel, a monitor bus, or ducking — which is a mixing *decision* the alpha has not made;
+   (b) the existing `play` command is logged **state** (it is replayed on a seek), so an audition needs
+   an unlogged action path, a second decision; and (c) audition is not in the owner's alpha ask list,
+   where "load clips from the pool" is. The panel's rows and its `Enter` cover the ask; a preview is a
+   beta item ([note](../../implemented/feature/2026-09-24-pool-panel-and-placement.md)).
 
 **C — shape and length**
 10. **Utility gestures, mostly over ops that already exist**: **reverse** is the one new clip property
