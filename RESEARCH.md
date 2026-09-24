@@ -18,10 +18,21 @@
 | **Timeline rendering** | `<canvas>` 2D + precomputed waveform **peak pyramids** + viewport culling + offscreen clip caching | Fast and predictable; DOM-per-clip is a dead end |
 | **Audio I/O** | `cpal` (in **and** out) — ALSA/JACK on Linux, CoreAudio on macOS, WASAPI on Windows | Lowest latency; owns the device directly |
 | **Decode / encode** | `symphonia` (decode) · `hound` (WAV in/out) | Pure Rust |
-| **Time-stretch** | `rubato` (real-time) · CDP8 pvoc / own `rustfft` stretch (offline) | Real-time vs "lush spectral" are different jobs |
+| **Time-stretch** | `rubato` (real-time) · CDP8 pvoc / own `rustfft` stretch (offline). **Alpha decision:** an offline **WSOLA-class** render materialised into the pool (rational ratio in the log) — see the [alpha finish-line note](.agents/notes/proposed/architecture/2026-09-23-alpha-finish-line.md); `rubato` stays the buy-it option if quality demands it | Real-time vs "lush spectral" are different jobs |
 | **Effects** | `fundsp` (real-time) · CDP8 as **offline sidecar** (later phase) | Dub sends in-engine; spectral rendered to disk |
 | **License** | App **GPL-3.0-or-later**; CDP8 (LGPL-2.1) as a sidecar binary | Compliant + lets you embed/port anything GPL/LGPL (§12) |
 | **Phase 1 (first profile)** | **Core + the sound-arranger profile: record → cut/splice → clip/loop arrange → soft mixer** | See §11 |
+| **Alpha finish line** | **Record in the tool → cut/copy/paste/append with grid snap → tracks → time-stretch → mastering chain → export → session save/open**, in the TUI, with the iced shell on the same workflow ([plan](.agents/notes/proposed/architecture/2026-09-23-alpha-finish-line.md)) | The co-work passes (GLM-5.3-Flash, GLM-5.3, Kimi K3) found the gaps the owner's list assumed away — [reviews verbatim](research/architecture/2026-09-23-alpha-scope-co-work-reviews.md) |
+
+**Where the project is going (2026-09-23).** The three co-work passes over the owner's alpha ask changed
+the order and the scope: the substrate is further along than the owner's list implies (the whole ACID op
+set, the `host v1` language, undo-by-replay, the shared workflow), but **recording is not wired into the
+host at all** (`HostCommand::Record` is a stub), the session has **no save/open**, stereo material is
+reduced to channel 0, 24-bit WAV is refused, and `TransportSeek` is O(target) (~28 s into a 30-minute
+jam). The plan orders the work foundations-first (compound gestures → session save/open → recording →
+stereo/bit depths → grid snap → clipboard/append → tracks → pool panel → utilities → stretch → mastering
+→ export → markers → seek → docs) and records what is deliberately cut from alpha. The goal is live;
+the slices land as commits with tests and notes, and the architectural ones pass the reviewer gate.
 
 ---
 

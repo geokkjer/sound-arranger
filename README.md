@@ -1,6 +1,6 @@
 # sound-arranger (working title)
 
-> 🕒 Last verified against commit `1190ec7` (2026-09-22). If the code has
+> 🕒 Last verified against commit `31fef35` (2026-09-23). If the code has
 > moved on, trust the code and move this line forward.
 
 An **audio platform where everything is a plugin**: a minimal core — clock · audio graph
@@ -32,7 +32,14 @@ the Tidal live-coding tool (`tidal-lsp`) — those are not on the clip-arranger 
 > **Working title.** The repo name names the *first profile*, not the platform; a rename
 > ("audio" / "sound") is an open question — see RESEARCH.md §14.
 
-**Status: pre-alpha.** The audio core works and is tested. What exists today: the minimal core,
+**Status: pre-alpha, with a finish line.** The alpha scope, its order and what is deliberately cut are
+in the [alpha finish-line note](.agents/notes/proposed/architecture/2026-09-23-alpha-finish-line.md),
+reviewed by the co-work passes ([verbatim](research/architecture/2026-09-23-alpha-scope-co-work-reviews.md)).
+Its most important finding: the substrate is further along than the capability list implies — but
+**recording is not wired into the host** (`HostCommand::Record` is a stub), so the record → arrange loop
+has no first half yet, and the session has no save/open.
+
+The audio core works and is tested. What exists today: the minimal core,
 the media engine (disk streaming, recording, splicing, multi-channel capture, pool rate
 conformance), the soft mixer (gain/pan/mute/solo + stereo master), **the clip editor (P1.3 — value,
 ACID ops, arranger node, media pool with crash recovery, the engine's closed-core message
