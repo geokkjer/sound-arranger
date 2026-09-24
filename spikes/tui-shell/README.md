@@ -27,6 +27,11 @@ What this spike adds, because it is what a TUI has to answer for:
   and material stay), and `T` trims it to the audible content from the peak pyramid.
   Every one is an `arrange …` line through the host's parser, so each is one `u`
   away from undone;
+- **markers and names** — `'` names a marker at the playhead, `;`/`"` jump between
+  markers exactly (the ruler draws a `▼` and the name, and the readout names the section
+  you are in), and `C` names the clip under the playhead — its label is drawn on the
+  lane. Markers and names are logged `arrange` lines like everything else: one undo
+  each, saved, replayed, and invisible to the audio;
 - **export the mix** — `X` opens the command line prefilled with
   `export <dir>/mix.wav f32`: the whole arrangement rendered from frame 0, f32 by
   default or `s16` through a fixed-seed TPDF dither, with the peak/RMS reported and a
@@ -294,6 +299,9 @@ pointless), so the shell falls back to the wide meter bars under the transport.
 | `T` | trim the clip to its audible content (a compound `trim`, mirror-aware for a reversed clip) |
 | `W` | **warp**: stretch the clip to the session tempo from its `source_tempo` (an offline render into the pool, then one logged `arrange stretch`) |
 | `X` | **export the whole arrangement**: opens the command line prefilled with `export <dir>/mix.wav f32` (add `s16` for a dithered 16-bit file); the status reports peak/RMS, or the refusal if it would clip |
+| `'` | **name a marker** at the playhead (a prefilled `arrange set_marker <frame> ` line — one word, then Enter) |
+| `;` / `"` | jump to the **next / previous marker**, landing exactly on it (the readout names the section) |
+| `C` | **name the clip under the playhead** (a prefilled `arrange rename_clip …` line) |
 | `J` / `K` | timeline: move the clip to the track **below / above**, keeping its time |
 | `g` / `G` | timeline: clip gain **−1 dB / +1 dB** (the range is the console fader's) |
 | `f` / `F` | timeline: fade in / fade out **to the playhead** (absolute, not a nudge) |

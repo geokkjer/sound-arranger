@@ -2443,6 +2443,17 @@ pub fn format_arrange(op: &media::ArrangeOp) -> String {
         Op::RenameTrack { track, to } => format!("rename_track {track} {to}"),
         Op::MoveTrack { track, index } => format!("move_track {track} {index}"),
         Op::Reverse { track, clip } => format!("reverse {track} {clip}"),
+        // A 3-word line **clears** the label (an empty operand cannot be spelled), so a
+        // cleared name round-trips instead of printing a line the parser rejects.
+        Op::RenameClip { track, clip, name } => {
+            if name.is_empty() {
+                format!("rename_clip {track} {clip}")
+            } else {
+                format!("rename_clip {track} {clip} {name}")
+            }
+        }
+        Op::SetMarker { at_frame, name } => format!("set_marker {at_frame} {name}"),
+        Op::RemoveMarker { at_frame } => format!("remove_marker {at_frame}"),
         Op::Stretch {
             track,
             clip,
@@ -2463,8 +2474,15 @@ pub fn format_arrange(op: &media::ArrangeOp) -> String {
                 clip.fade_out,
                 fmt_f32(clip.gain)
             );
-            if let Some(loop_len) = clip.loop_len {
-                line.push_str(&format!(" {loop_len}"));
+            // The name is the *last* optional operand, so a named clip with no loop
+            // still prints the loop slot (`0` reads as "no loop", exactly as the codec's
+            // `loop` field means). A name is one token (`valid_name`), so the line
+            // reparses as the same clip.
+            if clip.loop_len.is_some() || clip.name.is_some() {
+                line.push_str(&format!(" {}", clip.loop_len.unwrap_or(0)));
+            }
+            if let Some(name) = &clip.name {
+                line.push_str(&format!(" {name}"));
             }
             line
         }
@@ -3125,6 +3143,37 @@ fn parse_arrange(words: &[&str], at: usize, snap: Option<u64>) -> Result<media::
                 clip: s(2)?,
             })
         }
+        "rename_clip" => {
+            // `rename_clip <track> <clip> <name>` sets the label; the 3-word form
+            // (`rename_clip <track> <clip>`) **clears** it, which is the only way the
+            // empty name can be spelled in a whitespace-separated format.
+            if words.len() != 3 && words.len() != 4 {
+                return Err(format!(
+                    "line {at}: arrange rename_clip takes 2 or 3 operand(s) (a name to set, or                      none to clear), got {}",
+                    words.len() - 1
+                ));
+            }
+            Ok(media::ArrangeOp::RenameClip {
+                track: s(1)?,
+                clip: s(2)?,
+                name: if words.len() == 4 {
+                    s(3)?
+                } else {
+                    String::new()
+                },
+            })
+        }
+        "set_marker" => {
+            arity(3)?;
+            Ok(media::ArrangeOp::SetMarker {
+                at_frame: u(1)?,
+                name: s(2)?,
+            })
+        }
+        "remove_marker" => {
+            arity(2)?;
+            Ok(media::ArrangeOp::RemoveMarker { at_frame: u(1)? })
+        }
         "stretch" => {
             // The **logged** form: it names the materialised source and its length, so
             // a replay reproduces the clip's reference without re-rendering. A script
@@ -3143,14 +3192,20 @@ fn parse_arrange(words: &[&str], at: usize, snap: Option<u64>) -> Result<media::
             })
         }
         "add_clip" => {
-            // add_clip track c0 source src_start src_len at_frame fade_in fade_out gain [loop_len]
+            // add_clip track c0 source src_start src_len at_frame fade_in fade_out gain
+            //           [loop_len] [name]
             // operands (words[0]=op): track(1) id(2) source(3) src_start(4) src_len(5)
             //                       at_frame(6) fade_in(7) fade_out(8) gain(9) loop_len(10)
-            if !(10..=11).contains(&words.len()) {
+            //                       name(11)
+            if !(10..=12).contains(&words.len()) {
                 return Err(format!(
-                    "line {at}: arrange add_clip expects 10 or 11 words (op + 9 operands + optional loop_len), got {}",
+                    "line {at}: arrange add_clip expects 10 to 12 words (op + 9 operands + optional loop_len and name), got {}",
                     words.len()
                 ));
+            }
+            let name = words.get(11).copied().unwrap_or("");
+            if !name.is_empty() && !media::valid_name(name) {
+                return Err(format!("line {at}: '{name}' is not usable as a clip name"));
             }
             let clip = media::Clip {
                 reversed: false,
@@ -3168,6 +3223,7 @@ fn parse_arrange(words: &[&str], at: usize, snap: Option<u64>) -> Result<media::
                     .transpose()
                     .map_err(|_| format!("line {at}: arrange add_clip loop_len must be a count"))?
                     .filter(|v| *v != 0),
+                name: (!name.is_empty()).then(|| name.to_string()),
             };
             Ok(media::ArrangeOp::AddClip { track: s(1)?, clip })
         }
@@ -3418,6 +3474,7 @@ mod tests {
                     clip: media::Clip {
                         reversed: false,
                         id: "c0".into(),
+                        name: None,
                         source: "s1".into(),
                         src_start: 0,
                         src_len: 4000,
@@ -3578,6 +3635,7 @@ mod tests {
             clip: media::Clip {
                 reversed: false,
                 id: id.into(),
+                name: None,
                 source: "s1".into(),
                 src_start: 0,
                 src_len: 4_800,
@@ -3740,6 +3798,24 @@ mod tests {
             parse_script("host v1\nexport /tmp/a.wav flac\n").is_err(),
             "an unknown format is refused"
         );
+        // Clearing a clip name: the 3-word `rename_clip` parses to an empty name, and
+        // the formatter emits exactly that line (the gate's must-fix: an empty operand
+        // cannot be spelled, so "clear" needed its own shape).
+        let cleared = parse_script("host v1\narrange rename_clip t0 c0\n").expect("3 words parse");
+        match &cleared[0] {
+            HostCommand::Arrange { op, .. } => {
+                assert!(
+                    matches!(op, media::ArrangeOp::RenameClip { name, .. } if name.is_empty()),
+                    "3 words clear the label: {op:?}"
+                );
+                assert_eq!(
+                    format_arrange(op),
+                    "rename_clip t0 c0",
+                    "and the formatter emits the line the parser accepts"
+                );
+            }
+            other => panic!("expected an arrange command, got {other:?}"),
+        }
         assert!(
             format_command(
                 &HostCommand::Export {
@@ -4053,6 +4129,8 @@ mod tests {
         let clip = media::Clip {
             reversed: false,
             id: "c0".into(),
+            // A name travels through the text form like any other clip field.
+            name: Some("take-2".into()),
             source: "s1".into(),
             src_start: 100,
             src_len: 4_800,
@@ -4136,6 +4214,23 @@ mod tests {
                 track: "t0".into(),
                 clip: "c0".into(),
             },
+            media::ArrangeOp::RenameClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                name: "chorus".into(),
+            },
+            // Clearing a label is the 3-word form: the empty name cannot be spelled as
+            // an operand, and the formatter must emit the line the parser accepts.
+            media::ArrangeOp::RenameClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                name: String::new(),
+            },
+            media::ArrangeOp::SetMarker {
+                at_frame: 4_800,
+                name: "verse".into(),
+            },
+            media::ArrangeOp::RemoveMarker { at_frame: 4_800 },
         ];
 
         let mut commands: Vec<HostCommand> = vec![
@@ -4613,6 +4708,7 @@ mod tests {
                     clip: media::Clip {
                         reversed: false,
                         id: id.into(),
+                        name: None,
                         source: "s2".into(),
                         src_start,
                         src_len: 4_800,
@@ -5690,6 +5786,7 @@ mod tests {
                 clip: media::Clip {
                     reversed: false,
                     id: "c 0".into(),
+                    name: None,
                     source: "s1".into(),
                     src_start: 0,
                     src_len: 2_400,
@@ -5882,6 +5979,7 @@ mod tests {
                 clip: media::Clip {
                     reversed: false,
                     id: "c0".into(),
+                    name: None,
                     source: "jam.ch0".into(),
                     src_start: 0,
                     src_len: take.frames.min(rate as u64),

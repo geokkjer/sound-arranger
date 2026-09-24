@@ -136,6 +136,9 @@ impl Sources {
 #[derive(Clone)]
 pub struct Placed {
     pub id: String,
+    /// The clip's **human name** (`None` = unnamed) — the label the timeline draws
+    /// beside the id, so a long arrangement is recognisable at a glance.
+    pub name: Option<String>,
     /// The **pool source id** the clip reads (`media::Clip::source`) — what an
     /// `add_clip` line names, so a copied clip can be pasted as a new clip.
     pub source_id: String,
@@ -206,10 +209,14 @@ pub struct Lane {
     pub clips: Vec<Placed>,
 }
 
-/// The arrangement: lanes of clips, and how long it is.
+/// The arrangement: lanes of clips, how long it is, and its markers.
 #[derive(Default)]
 pub struct Arrangement {
     pub lanes: Vec<Lane>,
+    /// The named points on the timeline, sorted by frame (one per frame) — the host
+    /// value's own list, so the ruler and the jump keys read the document rather than a
+    /// shell-side copy.
+    pub markers: Vec<media::Marker>,
     /// The end of the last clip — the arrangement's length in frames.
     pub frames: u64,
     pub sample_rate: u32,
@@ -218,6 +225,24 @@ pub struct Arrangement {
 }
 
 impl Arrangement {
+    /// The marker at `frame`, if any.
+    pub fn marker_at(&self, frame: u64) -> Option<&media::Marker> {
+        self.markers
+            .binary_search_by_key(&frame, |m| m.at_frame)
+            .ok()
+            .map(|i| &self.markers[i])
+    }
+
+    /// The first marker strictly after `frame`.
+    pub fn marker_after(&self, frame: u64) -> Option<&media::Marker> {
+        self.markers.iter().find(|m| m.at_frame > frame)
+    }
+
+    /// The last marker strictly before `frame`.
+    pub fn marker_before(&self, frame: u64) -> Option<&media::Marker> {
+        self.markers.iter().rev().find(|m| m.at_frame < frame)
+    }
+
     /// The host's arrangement, with each clip's source loaded from the pool.
     ///
     /// `pool` is the pool's own listing (`HostOutcome::pool_sources`), which is
@@ -265,6 +290,7 @@ impl Arrangement {
                 frames = frames.max(clip.at_frame + clip.src_len);
                 clips.push(Placed {
                     id: clip.id.clone(),
+                    name: clip.name.clone(),
                     source_id: clip.source.clone(),
                     source,
                     src_start: clip.src_start,
@@ -290,6 +316,7 @@ impl Arrangement {
 
         Arrangement {
             lanes,
+            markers: timeline.markers.clone(),
             frames,
             sample_rate,
             origin,
@@ -711,6 +738,7 @@ fn draw_musical_ruler(
         grid,
         tempo,
         bar_beats,
+        &arrangement.markers,
     );
     frame.render_widget(
         Paragraph::new(String::from_iter(row)).style(Style::new().fg(Color::Gray)),
@@ -718,10 +746,38 @@ fn draw_musical_ruler(
     );
 }
 
+/// The ruler's row for a test: markers at `at`'s cell and a one-screen view, so a
+/// marker test can assert the glyph and the name without a terminal.
+#[cfg(test)]
+pub fn ruler_row_for_test(markers: &[media::Marker], at: u64) -> String {
+    // Start at the marker window's own left edge, so a marker at `at` plus one further
+    // in are both on the row.
+    let mut view = View::new(at + 100_000);
+    view.start = at;
+    view.frames_per_cell = 512;
+    let tempo = host::TempoMap::new(48_000, 120.0, 4);
+    // The row's own right edge: `width * frames_per_cell` past the start.
+    let end_frame = view.start + 200 * 512;
+    String::from_iter(ruler_marks(
+        200,
+        &view,
+        512.0,
+        end_frame,
+        media::Grid::new(media::Division::Beat, 4),
+        &tempo,
+        4.0,
+        markers,
+    ))
+}
+
 /// The ruler's row, in characters — the draw above is only a render of this, which
 /// keeps the geometry testable without a terminal.
 ///
 /// `numbered` is decided by the caller's cell budget (a bar number needs ~4 cells).
+// A pure geometry function: the width, the view, the density, the end, the musical
+// context and the markers. Bundling them into a struct would only move the argument
+// list; the caller is one place and the test calls it directly.
+#[allow(clippy::too_many_arguments)]
 fn ruler_marks(
     width: usize,
     view: &View,
@@ -730,6 +786,7 @@ fn ruler_marks(
     grid: media::Grid,
     tempo: &host::TempoMap,
     bar_beats: f64,
+    markers: &[media::Marker],
 ) -> Vec<char> {
     let step = grid.step_beats();
     let cells_per_beat = (tempo.frame_at(tempo.beat_at(view.start).ceil() + 1.0)
@@ -770,6 +827,33 @@ fn ruler_marks(
             if cell_of(line) == Some(cell) {
                 row[cell] = '·';
             }
+        }
+    }
+
+    // **Markers last, but they never win a digit.** A bar number is what makes the
+    // ruler readable, so a glyph aimed at a cell a number occupies (or a name already
+    // written by an earlier marker) slides to the nearest free cell to its right — at
+    // most `MARKER_SLIDE` cells, after which the marker is simply not drawn at this
+    // zoom (an absent glyph is honest; a clobbered `1▼4` is not). The name follows the
+    // glyph and only ever writes into empty cells.
+    const MARKER_SLIDE: usize = 3;
+    for marker in markers {
+        let Some(cell) = cell_of(marker.at_frame) else {
+            continue;
+        };
+        let free =
+            |row: &[char], at: usize| at < row.len() && !row[at].is_ascii_digit() && row[at] != '▼';
+        let Some(glyph_cell) =
+            (cell..=(cell + MARKER_SLIDE).min(width.saturating_sub(1))).find(|at| free(&row, *at))
+        else {
+            continue;
+        };
+        row[glyph_cell] = '▼';
+        for (at, ch) in (glyph_cell + 1..).zip(marker.name.chars()) {
+            if at >= width || !free(&row, at) || row[at] != ' ' {
+                break;
+            }
+            row[at] = ch;
         }
     }
     row
@@ -909,6 +993,38 @@ fn draw_lanes(
             }
         }
 
+        // **The clip's label**, on the clip's own row: the name when it has one, else
+        // the id. Drawn after the envelope, only where the clip is wide enough for the
+        // whole word (a truncated label is noise), and on the row *above* the bottom
+        // when the lane has two — so the envelope's bottom row (the shape's floor) still
+        // reads. This is what makes a long arrangement recognisable instead of a wall
+        // of ids.
+        for clip in &lane.clips {
+            let label = clip.name.as_deref().unwrap_or(&clip.id);
+            let start = clip.at_frame.max(view.start);
+            if start >= clip.end_frame() || clip.end_frame() <= view.start {
+                continue;
+            }
+            let column = (start - view.start) / view.frames_per_cell;
+            let room = (width_cells.saturating_sub(column)) as usize;
+            if column as u16 >= lane_area.width || room < label.chars().count() + 1 {
+                continue;
+            }
+            // The row above the bottom when there is one (the envelope keeps its floor),
+            // else the only row there is.
+            let label_row = lane_area.height.saturating_sub(2);
+            let y = lane_area.y + label_row;
+            for (k, ch) in label.chars().enumerate() {
+                let x = lane_area.x + column as u16 + 1 + k as u16;
+                if x >= lane_area.x + lane_area.width {
+                    break;
+                }
+                let cell = &mut frame.buffer_mut()[(x, y)];
+                cell.set_char(ch);
+                cell.set_style(Style::new().fg(color).add_modifier(Modifier::BOLD));
+            }
+        }
+
         // Clip boundaries: the first and last column of each visible clip, drawn
         // over the envelope (a cell is the finest boundary this resolution has).
         for clip in &lane.clips {
@@ -995,6 +1111,7 @@ mod tests {
                 clips: vec![media::Clip {
                     reversed: false,
                     id: "c0".to_string(),
+                    name: None,
                     source: "s1".to_string(),
                     src_start: 0,
                     src_len: frames as u64,
@@ -1005,6 +1122,7 @@ mod tests {
                     loop_len: None,
                 }],
             }],
+            markers: Vec::new(),
         };
 
         let mut sources = Sources::default();
@@ -1152,7 +1270,7 @@ mod tests {
             view.fit(frames, width as u64);
             let frames_per_cell = view.visible(width as u64) as f64 / width as f64;
             let end = view.start + view.visible(width as u64);
-            let row = ruler_marks(width, &view, frames_per_cell, end, grid, &tempo, 4.0);
+            let row = ruler_marks(width, &view, frames_per_cell, end, grid, &tempo, 4.0, &[]);
 
             assert_eq!(row.len(), width);
             assert_eq!(row[0], '|', "{label}: the first bar is marked");

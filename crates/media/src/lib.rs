@@ -65,6 +65,7 @@ pub use stream::{
 };
 pub use stretch::Stretch;
 pub use timeline::{ArrangeOp, Clip, Edge, Frame, Id, Timeline, Track};
+pub use timeline::{Marker, valid_name};
 pub use wav::{WavReader, WavWriter};
 
 /// Bounce: render `frames` of the engine's master out and write it to a

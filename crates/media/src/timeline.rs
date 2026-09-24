@@ -64,6 +64,18 @@ pub struct Clip {
     /// When `Some(r > 0)`, the source read wraps every `r` frames (a baked loop);
     /// `src_len` is then `r * times`. `None` = contiguous read.
     pub loop_len: Option<Frame>,
+    /// A **human name** for the clip (`None` = unnamed) — what a shell shows beside the
+    /// id, so a 30-minute arrangement is recognisable ("bridge-take-2") rather than a
+    /// wall of `c17`s. It carries no semantics: navigation, ops and the render path all
+    /// key on `id`, and nothing binds a name to a uniqueness rule (two clips may share
+    /// one — a name is a label, not an address).
+    ///
+    /// It must still be a token the `host v1` format can spell ([`valid_name`]): the
+    /// format is whitespace-separated with no quoting, so a name with a space in it
+    /// would save a session that could not be reopened. Names are therefore one word
+    /// (use `-` or `_`), and the refusal says so.
+    #[serde(default)]
+    pub name: Option<String>,
     /// Play the region **backwards** (a clip property, not a rewritten pool copy:
     /// the source stays immutable and the reader reads the other way). A reversed
     /// clip cannot be looped or re-looped — see [`ArrangeOp::Reverse`].
@@ -107,10 +119,42 @@ pub struct Track {
     pub clips: Vec<Clip>,
 }
 
-/// The arrangement value: the whole timeline of tracks.
+/// Normalise a deserialized marker list: sorted by frame, at most one per frame (the
+/// last one wins, which is what "set" means).
+fn markers_from_json<'de, D>(deserializer: D) -> Result<Vec<Marker>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut markers = Vec::<Marker>::deserialize(deserializer)?;
+    markers.sort_by_key(|m| m.at_frame);
+    markers.dedup_by_key(|m| m.at_frame);
+    Ok(markers)
+}
+
+/// A **marker**: a named point on the timeline (a section boundary, a take start, a
+/// note to self). Markers are part of the arrangement *value* — they are logged like
+/// any other edit, replay and save rebuild them, and the render path ignores them
+/// entirely. One marker per frame; the name is the label a shell draws and jumps to.
+///
+/// The name must be a token the `host v1` format can spell (`valid_marker_name`): a
+/// name the parser would split or strip is not a name, it is an unopenable session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Marker {
+    pub at_frame: Frame,
+    pub name: String,
+}
+
+/// The arrangement value: the whole timeline of tracks, plus its markers (sorted by
+/// frame, one per frame).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Timeline {
     pub tracks: Vec<Track>,
+    /// Navigation labels, sorted by `at_frame` with at most one per frame. The
+    /// deserializer **normalises** what it reads (sorted, deduplicated), so the
+    /// invariant holds for a value that was never built by an op — a hand-written
+    /// snapshot cannot break [`Timeline::marker_at`]'s binary search.
+    #[serde(default, deserialize_with = "markers_from_json")]
+    pub markers: Vec<Marker>,
 }
 
 /// An ACID operation on the timeline (the logged command list). Every entity-creating
@@ -142,6 +186,25 @@ pub enum ArrangeOp {
     Reverse {
         track: Id,
         clip: Id,
+    },
+    /// **Name a clip** (or clear its name with an empty one). A label, not an address:
+    /// the id is what every other op keys on, so a rename can never move audio.
+    RenameClip {
+        track: Id,
+        clip: Id,
+        name: String,
+    },
+    /// **Set the marker at `at_frame`** to `name` — one op for "add" and "rename"
+    /// (there is at most one marker per frame, so "set" is both, and it cannot fail on
+    /// a duplicate). The name must be a token the log can spell.
+    SetMarker {
+        at_frame: Frame,
+        name: String,
+    },
+    /// Remove the marker at `at_frame` (refused when there is none: a deletion that
+    /// deleted nothing is not an edit).
+    RemoveMarker {
+        at_frame: Frame,
     },
     AddClip {
         track: Id,
@@ -242,11 +305,19 @@ fn add_signed(base: u64, delta: i64) -> Option<u64> {
 /// (`@frame`), a leading `snap=`, or a `#` (which starts a comment). A name the
 /// parser would strip is not an id; it is a session that cannot be reopened.
 pub fn valid_track_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.split_whitespace().count() == 1
-        && !id.starts_with('@')
-        && !id.starts_with("snap=")
-        && !id.contains('#')
+    valid_name(id)
+}
+
+/// Whether `name` is a token the `host v1` text format can carry **back**: one
+/// whitespace-free word that is not one of the parser's own tokens (a leading `@` for a
+/// frame, a leading `snap=`, a `#` comment). The same rule serves track ids, clip names
+/// and marker names — anything the log has to spell as an operand.
+pub fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.split_whitespace().count() == 1
+        && !name.starts_with('@')
+        && !name.starts_with("snap=")
+        && !name.contains('#')
 }
 
 /// Validates a clip's invariant fields; `Err` names the first violation.
@@ -266,6 +337,15 @@ pub fn validate_clip(c: &Clip) -> Result<(), String> {
     if c.at_frame.checked_add(c.src_len).is_none() {
         return Err(format!("clip '{}' span overflows the timeline", c.id));
     }
+    if let Some(name) = &c.name
+        && !valid_name(name)
+    {
+        // A label is written as a token in the log (`add_clip … <name>`), so an
+        // `AddClip` that bypasses `RenameClip`'s check is refused here too — and
+        // `Some("")` is unreachable, which is what lets the codec spell "no name" as
+        // the empty string without ambiguity.
+        return Err(format!("clip '{}' has an unusable name '{name}'", c.id));
+    }
     if c.fade_in + c.fade_out > c.src_len {
         return Err(format!("clip '{}' fades exceed the clip length", c.id));
     }
@@ -284,6 +364,33 @@ impl Timeline {
             .map(|c| c.end())
             .max()
             .unwrap_or(0)
+    }
+
+    /// The marker at `frame`, if any.
+    pub fn marker_at(&self, frame: Frame) -> Option<&Marker> {
+        self.markers
+            .binary_search_by_key(&frame, |m| m.at_frame)
+            .ok()
+            .map(|i| &self.markers[i])
+    }
+
+    /// The first marker **strictly after** `frame` — the "next section" a shell jumps
+    /// to. Strictly, so pressing next at a marker moves on rather than standing still.
+    pub fn marker_after(&self, frame: Frame) -> Option<&Marker> {
+        self.markers.iter().find(|m| m.at_frame > frame)
+    }
+
+    /// The last marker **strictly before** `frame` — the "previous section".
+    pub fn marker_before(&self, frame: Frame) -> Option<&Marker> {
+        self.markers.iter().rev().find(|m| m.at_frame < frame)
+    }
+
+    /// The clip with `id` anywhere in the arrangement (the shell's "the clip under the
+    /// playhead", resolved by the value rather than by a panel's copy).
+    pub fn clip(&self, id: &str) -> Option<(&Track, &Clip)> {
+        self.tracks
+            .iter()
+            .find_map(|t| t.clips.iter().find(|c| c.id == id).map(|c| (t, c)))
     }
 
     pub fn new() -> Self {
@@ -375,6 +482,43 @@ impl Timeline {
                 }
                 self.tracks[ti].clips[ci].reversed = !c.reversed;
                 Ok(())
+            }
+            ArrangeOp::RenameClip { track, clip, name } => {
+                if !name.is_empty() && !valid_name(name) {
+                    return Err(format!("'{name}' is not usable as a clip name"));
+                }
+                let (ti, ci) = self
+                    .locate(track, clip)
+                    .ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
+                // An empty name *clears* the label (a rename that only ever added names
+                // would make "the clip is unnamed again" unexpressible).
+                self.tracks[ti].clips[ci].name = (!name.is_empty()).then(|| name.clone());
+                Ok(())
+            }
+            ArrangeOp::SetMarker { at_frame, name } => {
+                if !valid_name(name) {
+                    return Err(format!("'{name}' is not usable as a marker name"));
+                }
+                match self.markers.binary_search_by_key(at_frame, |m| m.at_frame) {
+                    Ok(i) => self.markers[i].name = name.clone(),
+                    Err(i) => self.markers.insert(
+                        i,
+                        Marker {
+                            at_frame: *at_frame,
+                            name: name.clone(),
+                        },
+                    ),
+                }
+                Ok(())
+            }
+            ArrangeOp::RemoveMarker { at_frame } => {
+                match self.markers.binary_search_by_key(at_frame, |m| m.at_frame) {
+                    Ok(i) => {
+                        self.markers.remove(i);
+                        Ok(())
+                    }
+                    Err(_) => Err(format!("no marker at frame {at_frame}")),
+                }
             }
             ArrangeOp::MoveTrack { track, index } => {
                 let ti = self
@@ -696,6 +840,9 @@ impl Timeline {
                     }
                     pieces.push(Clip {
                         id: pid,
+                        // A chop names its pieces from the source's name, so a labelled
+                        // take stays recognisable instead of becoming `c17`/`c18`.
+                        name: c.name.clone(),
                         source: c.source.clone(),
                         src_start: src_at,
                         src_len: slen,
@@ -765,6 +912,7 @@ mod tests {
         Clip {
             reversed: false,
             id: id.into(),
+            name: None,
             source: "pool-1".into(),
             src_start: 0,
             src_len: len,
@@ -1067,6 +1215,172 @@ mod tests {
                 .is_err(),
             "a looped clip cannot be stretched"
         );
+    }
+
+    /// **Markers are named points, and the vocabulary says exactly that.** Adding,
+    /// renaming and removing are logged ops on the arrangement value: they replay, they
+    /// save, and `undo` means what it says. A marker never changes the audio — the
+    /// render path does not read them — and `end_frame` stays clip-based, so a marker
+    /// past the last clip does not make an export render silence.
+    #[test]
+    fn markers_are_set_renamed_sorted_and_removed() {
+        let t = two_tracks();
+        assert!(t.markers.is_empty());
+
+        // Set at 4 800, then at 0 (out of order) and at 96 000: the list stays sorted.
+        let mut t2 = t.clone();
+        for (frame, name) in [(4_800u64, "verse"), (0, "intro"), (96_000, "outro")] {
+            t2 = t2
+                .apply(&ArrangeOp::SetMarker {
+                    at_frame: frame,
+                    name: name.into(),
+                })
+                .unwrap();
+        }
+        let names: Vec<(u64, String)> = t2
+            .markers
+            .iter()
+            .map(|m| (m.at_frame, m.name.clone()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                (0, "intro".to_string()),
+                (4_800, "verse".to_string()),
+                (96_000, "outro".to_string())
+            ],
+            "sorted by frame"
+        );
+
+        // Setting the same frame again **renames** it — at most one marker per frame is
+        // what makes `set_marker` unable to fail on a duplicate.
+        let t3 = t2
+            .apply(&ArrangeOp::SetMarker {
+                at_frame: 4_800,
+                name: "chorus".into(),
+            })
+            .unwrap();
+        assert_eq!(t3.markers.len(), 3);
+        assert_eq!(t3.marker_at(4_800).map(|m| m.name.as_str()), Some("chorus"));
+
+        // Navigation is strict on both sides, so repeated `next`/`prev` walk the list.
+        assert_eq!(t3.marker_after(0).map(|m| m.name.as_str()), Some("chorus"));
+        assert_eq!(
+            t3.marker_after(4_800).map(|m| m.name.as_str()),
+            Some("outro")
+        );
+        assert_eq!(t3.marker_after(96_000), None);
+        assert_eq!(
+            t3.marker_before(4_800).map(|m| m.name.as_str()),
+            Some("intro")
+        );
+        assert_eq!(t3.marker_before(0), None);
+
+        // Removing takes it out; removing something that is not there is refused (a
+        // deletion that deletes nothing is not an edit).
+        let t4 = t3
+            .apply(&ArrangeOp::RemoveMarker { at_frame: 4_800 })
+            .unwrap();
+        assert_eq!(t4.markers.len(), 2);
+        assert!(t4.marker_at(4_800).is_none());
+        assert!(
+            t4.apply(&ArrangeOp::RemoveMarker { at_frame: 4_800 })
+                .is_err()
+        );
+
+        // A marker must be a name the log can spell.
+        for bad in ["", "two words", "@5", "snap=3", "#nope"] {
+            assert!(
+                t3.apply(&ArrangeOp::SetMarker {
+                    at_frame: 1_000,
+                    name: bad.into(),
+                })
+                .is_err(),
+                "'{bad}' must be refused"
+            );
+        }
+        // And markers do not extend the arrangement.
+        assert_eq!(
+            t3.end_frame(),
+            t.end_frame(),
+            "a marker past the last clip is not rendered silence"
+        );
+    }
+
+    /// **A clip name is a label, not an address**: it can be set and cleared, it is
+    /// carried by a chop, and every op keeps keying on the id.
+    #[test]
+    fn a_clip_can_be_named_and_unnamed() {
+        let mut t = two_tracks();
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 0, 4_000),
+            })
+            .unwrap();
+
+        t = t
+            .apply(&ArrangeOp::RenameClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                name: "bridge-take-2".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            t.clip("c0").map(|(_, c)| c.name.as_deref()),
+            Some(Some("bridge-take-2")),
+            "the name is the label a shell shows"
+        );
+
+        // A name the log could not spell is refused (the format is space-separated):
+        // a session that saves a name it cannot reopen is worse than one that says no.
+        for bad in ["two words", "@take", "snap=2", "#take", ""] {
+            let r = t.apply(&ArrangeOp::RenameClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                name: bad.into(),
+            });
+            // An empty name *clears* the label; the rest are refused.
+            if bad.is_empty() {
+                assert!(r.is_ok(), "an empty name clears the label");
+            } else {
+                assert!(r.is_err(), "'{bad}' must be refused");
+            }
+        }
+
+        // An empty name clears it.
+        let cleared = t
+            .apply(&ArrangeOp::RenameClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                name: String::new(),
+            })
+            .unwrap();
+        assert_eq!(cleared.tracks[0].clips[0].name, None);
+
+        // A chop carries the label onto its pieces (a named take stays recognisable).
+        let chopped = t
+            .apply(&ArrangeOp::ChopClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 2,
+                prefix: "c0".into(),
+            })
+            .unwrap();
+        assert!(
+            chopped.tracks[0].clips.iter().all(|c| c.name.is_some()),
+            "both pieces keep the name"
+        );
+
+        // Naming a clip that is not there says which one.
+        let e = t
+            .apply(&ArrangeOp::RenameClip {
+                track: "t0".into(),
+                clip: "nope".into(),
+                name: "x".into(),
+            })
+            .unwrap_err();
+        assert!(e.contains("nope"), "{e}");
     }
 
     /// Renaming keeps a track's **position** (so the mixer channel it feeds does

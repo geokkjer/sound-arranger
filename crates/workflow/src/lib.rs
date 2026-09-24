@@ -217,6 +217,15 @@ pub enum Action {
     /// `export <path> f32` line, so the path and format are visible and editable
     /// before anything is written (the render-out gesture, not a hidden write).
     ExportMix,
+    /// **Name a point on the timeline** (`set_marker`), through the command line so the
+    /// name is typed rather than guessed. Markers are what make a 30-minute piece
+    /// navigable.
+    MarkerSet,
+    /// Jump the playhead to the next (+1) / previous (-1) marker.
+    MarkerSeek(i32),
+    /// **Name the clip under the playhead** (`rename_clip`), through the command line:
+    /// a label a shell shows beside the id, so a long arrangement is recognisable.
+    ClipRename,
     /// Move the clip to the track below (+1) / above (-1).
     MoveTrack(i32),
     /// Step the clip's gain in dB.
@@ -277,6 +286,9 @@ impl Action {
             Action::TrimToContent => "trim the clip to its content",
             Action::StretchToTempo => "stretch the clip to the session tempo",
             Action::ExportMix => "export the whole arrangement",
+            Action::MarkerSet => "name a marker at the playhead",
+            Action::MarkerSeek(_) => "jump to the next / previous marker",
+            Action::ClipRename => "name the clip under the playhead",
             Action::MoveTrack(_) => "move the clip to another track",
             Action::Gain(_) => "clip gain",
             Action::Fade(_) => "fade",
@@ -550,6 +562,24 @@ pub static KEYMAP: &[Binding] = &[
         "W",
         &[(Key::Char('W'), Action::StretchToTempo)],
         "timeline: warp — stretch the clip to the session tempo (needs `: source_tempo <id> <bpm>`)",
+    ),
+    bind(
+        "'",
+        &[(Key::Char('\''), Action::MarkerSet)],
+        "timeline: name a marker at the playhead (`set_marker`) — the section list of a long piece",
+    ),
+    bind(
+        "; / \"",
+        &[
+            (Key::Char(';'), Action::MarkerSeek(1)),
+            (Key::Char('"'), Action::MarkerSeek(-1)),
+        ],
+        "timeline: jump to the next / previous marker (`;` forward, `\"` back)",
+    ),
+    bind(
+        "C",
+        &[(Key::Char('C'), Action::ClipRename)],
+        "timeline: name the clip under the playhead (`rename_clip`) — a label beside the id",
     ),
     bind(
         "X",

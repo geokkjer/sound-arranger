@@ -319,6 +319,7 @@ mod tests {
         crate::timeline::Clip {
             reversed: false,
             id: id.into(),
+            name: None,
             source: source.into(),
             src_start: 0,
             src_len: len,

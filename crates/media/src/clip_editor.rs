@@ -133,8 +133,32 @@ pub fn encode_op(i: &mut Interner, op: &ArrangeOp) -> (&'static str, Vec<(&'stat
                     // it, an `AddClip` with `reversed: true` would encode fine and
                     // decode forward — a silent value change (the gate caught it).
                     ("reversed", Value::U64(u64::from(clip.reversed))),
+                    // The clip's human name is a value field like the others: without it
+                    // an `AddClip` of a named clip would replay unnamed.
+                    (
+                        "name",
+                        Value::Str(i.intern(clip.name.as_deref().unwrap_or(""))),
+                    ),
                 ],
             )
+        }
+        ArrangeOp::RenameClip { track, clip, name } => (
+            "RenameClip",
+            vec![
+                ("track", Value::Str(i.intern(track))),
+                ("clip", Value::Str(i.intern(clip))),
+                ("name", Value::Str(i.intern(name))),
+            ],
+        ),
+        ArrangeOp::SetMarker { at_frame, name } => (
+            "SetMarker",
+            vec![
+                ("at_frame", Value::U64(*at_frame)),
+                ("name", Value::Str(i.intern(name))),
+            ],
+        ),
+        ArrangeOp::RemoveMarker { at_frame } => {
+            ("RemoveMarker", vec![("at_frame", Value::U64(*at_frame))])
         }
         ArrangeOp::RazorSplit {
             track,
@@ -345,12 +369,28 @@ pub fn decode_op(op: &str, fields: &[(&'static str, Value)]) -> Result<ArrangeOp
                 fade_out: u64_field(fields, "fade_out")?,
                 gain: f32_field(fields, "gain")?,
                 loop_len: (loop_len != 0).then_some(loop_len),
+                name: {
+                    let name = str_field(fields, "name")?;
+                    (!name.is_empty()).then_some(name)
+                },
             };
             Ok(ArrangeOp::AddClip {
                 track: str_field(fields, "track")?,
                 clip,
             })
         }
+        "RenameClip" => Ok(ArrangeOp::RenameClip {
+            track: str_field(fields, "track")?,
+            clip: str_field(fields, "clip")?,
+            name: str_field(fields, "name")?,
+        }),
+        "SetMarker" => Ok(ArrangeOp::SetMarker {
+            at_frame: u64_field(fields, "at_frame")?,
+            name: str_field(fields, "name")?,
+        }),
+        "RemoveMarker" => Ok(ArrangeOp::RemoveMarker {
+            at_frame: u64_field(fields, "at_frame")?,
+        }),
         "RazorSplit" => Ok(ArrangeOp::RazorSplit {
             track: str_field(fields, "track")?,
             clip: str_field(fields, "clip")?,
@@ -452,6 +492,9 @@ pub const ALL_OPS: &[&str] = &[
     "MoveTrack",
     "Reverse",
     "Stretch",
+    "RenameClip",
+    "SetMarker",
+    "RemoveMarker",
     "AddClip",
     "RazorSplit",
     "Trim",
@@ -530,6 +573,7 @@ mod tests {
         Clip {
             reversed: false,
             id: id.into(),
+            name: None,
             source: "pool-1".into(),
             src_start: 0,
             src_len: len,
@@ -563,6 +607,15 @@ mod tests {
         roundtrip(&ArrangeOp::AddClip {
             track: "t0".into(),
             clip: clip("c0", 100, 400),
+        });
+        // A **named** clip round-trips (`Some(name)`), while an unnamed one stays `None`:
+        // the codec's `""` means "no name", the same convention `loop_len`'s `0` uses.
+        roundtrip(&ArrangeOp::AddClip {
+            track: "t0".into(),
+            clip: Clip {
+                name: Some("take-2".into()),
+                ..clip("c0", 100, 400)
+            },
         });
         // The direction is part of the clip value, so the op carries it: a reversed
         // clip must survive encode→decode exactly (the gate found it decoding forward).
@@ -632,6 +685,16 @@ mod tests {
             track: "t0".into(),
             clip: "c0".into(),
         });
+        roundtrip(&ArrangeOp::RenameClip {
+            track: "t0".into(),
+            clip: "c0".into(),
+            name: "bridge".into(),
+        });
+        roundtrip(&ArrangeOp::SetMarker {
+            at_frame: 4_800,
+            name: "verse".into(),
+        });
+        roundtrip(&ArrangeOp::RemoveMarker { at_frame: 4_800 });
         roundtrip(&ArrangeOp::Stretch {
             track: "t0".into(),
             clip: "c0".into(),

@@ -213,7 +213,11 @@ from the shared workflow (a key or a `: ` line — never a shell-only feature).
     (2026-09-24)*, with the TUI's `X` gesture (a prefilled, editable export line) and a shell-visible
     report ([note](../../implemented/feature/2026-09-24-export-f32-s16-dither.md)).
 14. **Markers/sections and clip naming** (logged lines + shell list + keys) so a 30-minute piece is
-    navigable and recognisable.
+    navigable and recognisable. *Done (2026-09-24)*: markers are a value field with an `arrange
+    set_marker`/`remove_marker` vocabulary (one marker per frame, so "set" is also "rename"), clip
+    names are labels that travel with the clip, and the shells get `'` (name one), `;`/`"` (jump),
+    `C` (name the clip), ruler glyphs + names, lane labels and a section readout
+    ([note](../../implemented/feature/2026-09-24-markers-and-clip-names.md)).
 
 **E — alpha → beta**
 15. **Seek at scale**: checkpoints (a rebuilt session held at intervals, provably equal to a replay) so a

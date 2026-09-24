@@ -9,6 +9,7 @@ fn clip(id: &str, at: u64, len: u64) -> Clip {
     Clip {
         reversed: false,
         id: id.into(),
+        name: None,
         source: "s1".into(),
         src_start: 0,
         src_len: len,

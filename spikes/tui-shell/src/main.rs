@@ -883,6 +883,9 @@ impl App {
             Action::TrimToContent => self.timeline_key(|app| app.trim_to_content()),
             Action::StretchToTempo => self.timeline_key(|app| app.stretch_to_tempo()),
             Action::ExportMix => self.export_prompt(),
+            Action::MarkerSet => self.marker_prompt(),
+            Action::MarkerSeek(direction) => self.seek_marker(direction),
+            Action::ClipRename => self.rename_clip_prompt(),
             Action::MoveTrack(offset) => self.timeline_key(|app| app.move_clip_to_track(offset)),
             Action::Gain(direction) => {
                 self.timeline_key(|app| app.step_clip_gain(direction as f32))
@@ -1371,6 +1374,74 @@ impl App {
         self.prompt_prefill = Some(prefill);
         self.history_at = self.history.len();
         self.status = "export the whole arrangement: edit the path/format, then Enter".to_string();
+    }
+
+    /// `'`: **name a point on the timeline** — opens the command line prefilled with
+    /// `arrange set_marker <playhead> ` (the name is the missing word), so a section
+    /// list is built from the keyboard without memorising frame numbers.
+    fn marker_prompt(&mut self) {
+        let prefill = format!("arrange set_marker {} ", self.snap_frame(self.snap.frame));
+        self.prompt = Some(prefill.clone());
+        self.prompt_prefill = Some(prefill);
+        self.history_at = self.history.len();
+        self.status = "name this marker: one word (dashes are fine), then Enter".to_string();
+    }
+
+    /// `;` / `"`: jump the playhead to the **next / previous marker** — the section
+    /// navigation a long piece needs. Reports the marker's name, and says so when there
+    /// is none (a silent no-op reads as a broken key).
+    fn seek_marker(&mut self, direction: i32) {
+        let Some(arrangement) = self.arrangement.as_ref() else {
+            self.status = "no arrangement to navigate".to_string();
+            return;
+        };
+        let here = self.snap.frame;
+        let marker = match direction {
+            d if d > 0 => arrangement.marker_after(here),
+            _ => arrangement.marker_before(here),
+        };
+        match marker {
+            Some(m) => {
+                let (frame, name) = (m.at_frame, m.name.clone());
+                // The playhead lands **exactly** on the marker (snapping it to the grid
+                // would move the very point the key is for).
+                self.snap.frame = frame;
+                let seconds = frame as f64 / self.sample_rate() as f64;
+                self.status = format!(
+                    "marker {name} @ {:02}:{:05.2} (frame {frame})",
+                    (seconds / 60.0) as u64,
+                    seconds % 60.0
+                );
+            }
+            None => {
+                self.status = if self
+                    .arrangement
+                    .as_ref()
+                    .map(|a| a.markers.is_empty())
+                    .unwrap_or(true)
+                {
+                    "no markers yet — `'` names one at the playhead".to_string()
+                } else if direction > 0 {
+                    "no marker after the playhead".to_string()
+                } else {
+                    "no marker before the playhead".to_string()
+                };
+            }
+        }
+    }
+
+    /// `C`: **name the clip under the playhead** — the same prefilled-prompt shape as a
+    /// marker, so a label never has to be typed blind.
+    fn rename_clip_prompt(&mut self) {
+        let Some((track, clip)) = self.active_clip_at(self.snap.frame) else {
+            self.status = "no clip under the playhead on the active track".to_string();
+            return;
+        };
+        let prefill = format!("arrange rename_clip {track} {} ", clip.id);
+        self.prompt = Some(prefill.clone());
+        self.prompt_prefill = Some(prefill);
+        self.history_at = self.history.len();
+        self.status = format!("name {}: one word, then Enter", clip.id);
     }
 
     /// `D`: delete the active track **and its clips**, as one gesture — the op drops
@@ -2643,8 +2714,16 @@ impl App {
             "stopped"
         };
 
+        // The marker the playhead is standing on, if any: the readout names the section
+        // you are in, which is what a marker is for.
+        let section = self
+            .arrangement
+            .as_ref()
+            .and_then(|a| a.marker_at(self.snap.frame))
+            .map(|m| format!("   ▼ {}", m.name))
+            .unwrap_or_default();
         let line = format!(
-            "position {:.3} s   beat {:.2}   tempo {:.1} bpm   frame {}   {}",
+            "position {:.3} s   beat {:.2}   tempo {:.1} bpm   frame {}   {}{section}",
             self.snap.seconds, self.snap.beat, self.snap.bpm, self.snap.frame, transport,
         );
 
@@ -3637,6 +3716,24 @@ mod tests {
         assert!(
             screen.contains('┃'),
             "no playhead (the synthetic transport sits at 2.000 s):\n{screen}"
+        );
+
+        // A **named** clip and a marker are drawn on the panel: the label on the clip and
+        // the marker's glyph + name on the ruler. (The demo arrangement's clip is
+        // `wave`, drawn from its id until it is named.)
+        let playhead = app.snap.frame;
+        app.prompt = Some("arrange rename_clip t0 c0 take-1".to_string());
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        app.prompt = Some(format!("arrange set_marker {} intro", playhead));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        let screen = rendered(&mut app);
+        assert!(
+            screen.contains("take-1"),
+            "the clip's name is drawn on its lane:\n{screen}"
+        );
+        assert!(
+            screen.contains('▼') && screen.contains("intro"),
+            "the marker's glyph and name are drawn on the ruler:\n{screen}"
         );
 
         let _ = std::fs::remove_file(&path);
@@ -5560,6 +5657,119 @@ mod tests {
             "and a 16-bit export is one word away"
         );
         assert!(app.status.contains("s16"), "{}", app.status);
+
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// **Markers are a keyboard vocabulary**: `'` names one at the playhead through a
+    /// prefilled prompt, `;` / `"` walk them (landing *exactly* on the marker, not on a
+    /// snapped frame), the ruler draws the glyph and the name, and `C` names the clip
+    /// under the playhead. All of it goes through `arrange` lines, so every gesture is
+    /// one log line and one undo.
+    #[test]
+    fn markers_and_clip_names_are_keyboard_gestures() {
+        let (pool, script_path) = pool_script("markers", "");
+        let mut app = App::idle();
+        app.snap = App::demo_snapshot();
+        app.open_script(&script_path);
+        app.grid = workflow::Grid::new(media::Division::Beat); // so a snap would move a frame
+
+        let press = |app: &mut App, c: char| {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()))
+        };
+        let type_line = |app: &mut App, line: &str| {
+            for c in line.chars() {
+                app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+            }
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        };
+
+        // `'` prefills the marker line with the playhead's frame and no name yet.
+        press(&mut app, '\'');
+        let prefill = app.prompt.clone().expect("the command line opens");
+        assert!(prefill.starts_with("arrange set_marker "), "{prefill}");
+        assert!(
+            prefill.ends_with(' '),
+            "the name is the missing word: {prefill}"
+        );
+        // Answering the prefill unchanged gets the hint (the trailing-space rule).
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(app.status.contains("needs the new value"), "{}", app.status);
+
+        // Name two markers (typed through the same prompt) at frames the playhead is at.
+        // Both markers mid-bar, so the ruler's name has cells to occupy (a bar number
+        // always wins the cells it numbers — the drawing rule).
+        let playhead = app.snap.frame;
+        let intro = playhead + 12_000;
+        press(&mut app, ':');
+        type_line(&mut app, &format!("arrange set_marker {intro} intro"));
+        assert!(
+            app.arrangement
+                .as_ref()
+                .expect("arrangement")
+                .marker_at(intro)
+                .is_some(),
+            "the marker landed: {}",
+            app.status
+        );
+        let later = playhead + 36_000;
+        press(&mut app, ':');
+        type_line(&mut app, &format!("arrange set_marker {later} chorus"));
+        assert_eq!(
+            app.arrangement.as_ref().expect("arrangement").markers.len(),
+            2
+        );
+
+        // Jump: land exactly on the marker, and report its name.
+        app.snap.frame = playhead;
+        press(&mut app, ';');
+        assert_eq!(app.snap.frame, intro, "`;` lands on the marker exactly");
+        assert!(app.status.contains("intro"), "{}", app.status);
+        press(&mut app, ';');
+        assert_eq!(app.snap.frame, later, "and again for the next");
+        press(&mut app, '"');
+        assert_eq!(app.snap.frame, intro, "the previous-marker key goes back");
+        assert!(app.status.contains("intro"), "{}", app.status);
+
+        // The ruler draws the glyph and the name at the marker's cell.
+        let markers = app
+            .arrangement
+            .as_ref()
+            .expect("arrangement")
+            .markers
+            .clone();
+        let row = timeline::ruler_row_for_test(&markers, playhead);
+        assert!(
+            row.contains('▼') && row.contains("intro"),
+            "the ruler shows the marker: {row:?}"
+        );
+
+        // `C` names the clip under the playhead (the demo clip starts at frame 0).
+        app.snap.frame = 0;
+        press(&mut app, 'C');
+        let prefill = app.prompt.clone().expect("the command line opens");
+        assert!(prefill.starts_with("arrange rename_clip t0 "), "{prefill}");
+        // The prompt is already open with the prefill: type the missing word and Enter.
+        for c in "take-1".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(
+            app.arrangement.as_ref().expect("arrangement").lanes[0].clips[0]
+                .name
+                .as_deref(),
+            Some("take-1"),
+            "the clip carries the label: {}",
+            app.status
+        );
+
+        // Removing a marker is one op, and it is refused when there is nothing there.
+        press(&mut app, ':');
+        type_line(&mut app, &format!("arrange remove_marker {later}"));
+        assert_eq!(
+            app.arrangement.as_ref().expect("arrangement").markers.len(),
+            1
+        );
 
         let _ = std::fs::remove_dir_all(&pool);
     }
