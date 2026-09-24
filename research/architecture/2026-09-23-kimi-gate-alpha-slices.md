@@ -1,10 +1,14 @@
-# Reviewer gate — slice A1 (compound gestures): attempted, did not return
+# Reviewer gate — the alpha plan's architectural slices (A1, A2): attempted, did not return
 
 > Research input, 2026-09-23. Co-worker: **Kimi K3** (the designated reviewer gate in the
 > [co-work note](../../.agents/notes/implemented/process/2026-08-27-model-co-work-routing.md)), read-only,
-> over slice A1 of the [alpha plan](../../.agents/notes/proposed/architecture/2026-09-23-alpha-finish-line.md):
-> `HostCommand::Group` + the host history as entries (`Vec<Vec<HostCommand>>`) + `group begin`/`group end`
-> in the text form + the TUI's first gesture (trim-to-selection).
+> over the [alpha plan](../../.agents/notes/proposed/architecture/2026-09-23-alpha-finish-line.md)'s
+> architectural slices:
+>
+> - **A1 — compound gestures**: `HostCommand::Group` + the host history as entries
+>   (`Vec<Vec<HostCommand>>`) + `group begin`/`group end` + the TUI's first gesture (trim-to-selection).
+> - **A2 — session save/open**: a session directory (`session.txt` = the log, `pool/`, a journal),
+>   the text formatter that inverts the parser, `SessionRate`/`Save`/`Load`, journal recovery.
 >
 > **Outcome: no review returned.** Three routes, all failed or stalled:
 >
@@ -69,3 +73,32 @@ Claims to check, one by one (say whether each holds, and why or why not):
 Name the single most likely bug the tests above would NOT catch, and one thing you would refuse to merge
 without. End with `VERDICT: merge` / `VERDICT: merge with changes: …` / `VERDICT: do not merge: …`.
 ```
+
+## Slice A2 — session save/open: also stalled
+
+The same three routes were tried for A2 (the brief is in the transcript; `opencode-go` refused to
+finish, `kimi -p` parked on an approval, and `kimi --auto` inside a pty received the brief and then
+stalled at 2 % context / 15 KB of output with no growth). Kimi was killed after several minutes.
+
+**Root cause, from the owner (2026-09-23):** the CLI's device login is now answered with
+`403 Forbidden` (`kimi-code-cli/2.0.2`, Login Device) — a server-side rejection of the client, not a
+quota error — and the API side has **hit its 5-hour limit** (reset ~1 h 42 min later). The environment
+also has the owner's API key, so the API route is the one to retry once the window resets; the CLI
+route needs the 403 resolved (a client update, or the key route instead).
+
+**Stand-in:** because two architectural slices had now gone ungated, the gate was handed to
+**GLM-5.3** (cross-vendor to this repo's DeepSeek author, and the model that stood in for the plan
+review). Its answer is archived in
+[`2026-09-23-alpha-slice-gate-glm-standin.md`](2026-09-23-alpha-slice-gate-glm-standin.md) with a
+disposition. The designated gate stays owed for both slices when Kimi returns.
+
+## Addendum — what to do when Kimi returns
+
+1. Run this file's A1 brief and the A2 brief (both in the transcript) against **Kimi K3 via the API**
+   (`opencode-go/kimi-k3`) once the 5-hour window resets — the CLI's device login is 403ing, so the API
+   is the route. Archive the answers here, verbatim, with a disposition.
+2. Prioritise in this order: (a) the A2 journal-recovery rule (the mid-gesture cut — a self-review found
+   and fixed it, so an independent check of that fix matters most), (b) A1's all-or-nothing probe/apply
+   pair, (c) the A2 text round-trip completeness.
+3. If Kimi is still unavailable, the GLM stand-in review is the recorded substitute; it is cross-vendor
+   to the author, but it is *not* the designated gate, and both slices stay owed.

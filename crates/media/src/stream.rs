@@ -27,7 +27,9 @@ pub const DEFAULT_RING_CAPACITY: usize = 1 << 16;
 
 /// A named region of a WAV file — the clip seed (an ACID clip is path +
 /// region; the visual clip model is the substrate, musical-event note).
-#[derive(Debug, Clone)]
+/// `PartialEq` so a `host v1` command that carries one can round-trip through the
+/// text form in a test.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ClipRef {
     pub path: PathBuf,
     /// first frame of the region within the file's data chunk

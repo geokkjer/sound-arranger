@@ -112,6 +112,11 @@ pub struct HostOutcome {
     /// pool (`set_pool`); empty when the pool already fitted.
     pub pool_conformed: Vec<media::Conform>,
     pub mixer_channels: Option<usize>,
+    /// Where the session is saved (`None` until a `save`), and the last journal
+    /// (autosave) failure — so a shell can say what happened to the session file
+    /// instead of leaving autosave silent.
+    pub session_dir: Option<std::path::PathBuf>,
+    pub journal_error: Option<String>,
     /// The session's current parameter values, folded from the log — what a
     /// shell reads instead of keeping its own copy (see `HostSession::params`).
     /// A live fader change is just the next `SetParam` in the log.
@@ -322,14 +327,16 @@ fn run(
                 publish(&session, &shared, &audio);
             }
             Ok(Request::Load(commands, reply)) => {
-                let mut fresh = HostSession::new();
+                // `from_script` honours a `session_rate` line, so a loaded session
+                // runs at the rate it was saved at.
                 let mut applied = Ok(());
-                for cmd in &commands {
-                    if let Err(e) = fresh.execute(cmd) {
+                let fresh = match HostSession::from_script(&commands) {
+                    Ok(fresh) => fresh,
+                    Err(e) => {
                         applied = Err(e);
-                        break;
+                        HostSession::new()
                     }
-                }
+                };
                 let outcome = applied.map(|()| build_outcome(&fresh));
                 session = fresh;
                 anchor = None;
@@ -448,6 +455,8 @@ fn build_outcome(session: &HostSession) -> HostOutcome {
         pool_sources: session.pool_sources(),
         pool_conformed: session.pool_conformed().to_vec(),
         mixer_channels: session.mixer_channels(),
+        session_dir: session.session_dir().map(std::path::Path::to_path_buf),
+        journal_error: session.journal_error().map(str::to_string),
         params: session.params(),
     }
 }

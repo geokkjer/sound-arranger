@@ -131,7 +131,15 @@ typed instead of pressed:
 : arrange set_clip_gain t0 c0 0.25      # a line with no key of its own
 : transport seek 96000                  # the transport
 : set_param mixer ch0.gain 0.5          # the console reads it back out of the log
+: save /tmp/mysong.d                    # write the session (the log + its pool)
+: load /tmp/mysong.d                    # read it back (+ everything since the save)
 ```
+
+**Sessions are directories.** `: save <dir>` writes `session.txt` (this session's log, in the same
+`host v1` form the prompt speaks) and copies the pool in beside it, so the directory can be moved or
+handed over; every edit after that is appended to `journal.txt` — the autosave — and `: load <dir>`
+replays the script and then the journal (a half-written last line from a crash is dropped and
+reported).
 
 One line is one command; the prompt wraps it in the `host v1` header the format requires and hands
 it to `host::parse_script`, so a key, a script line and a typed line are the same command with the

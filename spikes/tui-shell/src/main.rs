@@ -334,6 +334,11 @@ impl App {
 
     /// Adopt a host outcome's arrangement into the panel, keeping the viewport.
     fn take_arrangement(&mut self, outcome: host::live::HostOutcome) {
+        // Autosave must never fail silently: the host records the last journal
+        // failure, and the shell says so (an edit is not failed by it).
+        if let Some(err) = &outcome.journal_error {
+            self.status = format!("autosave failed: {err}");
+        }
         let timeline = match outcome.arrangement {
             Ok(timeline) => timeline,
             Err(e) => {
@@ -2977,5 +2982,76 @@ mod tests {
             App::workflow_key(&KeyEvent::new(KeyCode::F(5), KeyModifiers::empty())),
             None
         );
+    }
+
+    /// The command line is how a session is saved and opened in this shell today:
+    /// `: save <dir>` writes the session directory (the log plus its pool) and
+    /// `: load <dir>` reads it back — the whole round trip through the same parser
+    /// the keys use, with no shell-side session format.
+    #[test]
+    fn the_command_line_saves_and_loads_a_session() {
+        let (pool, script_path) = pool_script("session", "");
+        let mut app = App::idle();
+        app.snap = App::demo_snapshot();
+        app.open_script(&script_path);
+        assert_eq!(
+            app.arrangement.as_ref().expect("an arrangement").frames,
+            144_000,
+            "{}",
+            app.status
+        );
+
+        // A first edit, then save: the directory holds the script and the pool.
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()));
+        let dir = std::env::temp_dir().join(format!("tui-session-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let line = format!("save {}", dir.display());
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::empty()));
+        for c in line.chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+
+        assert!(dir.join("session.txt").is_file(), "saved: {}", app.status);
+        assert!(
+            dir.join("pool/s1.wav").is_file(),
+            "the pool travelled with it"
+        );
+        assert_eq!(dir.join("journal.txt").exists(), true, "the journal exists");
+
+        // A later edit is autosaved into the journal …
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()));
+        assert_eq!(
+            app.arrangement
+                .as_ref()
+                .expect("an arrangement")
+                .clip_count(),
+            1,
+            "{}",
+            app.status
+        );
+        let journal = std::fs::read_to_string(dir.join("journal.txt")).expect("journal");
+        assert!(journal.contains("arrange delete"), "autosaved: {journal}");
+
+        // … and `: load` brings the session back (both edits: the split, then the
+        // delete left one clip).
+        let line = format!("load {}", dir.display());
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::empty()));
+        for c in line.chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(
+            app.arrangement
+                .as_ref()
+                .expect("an arrangement")
+                .clip_count(),
+            1,
+            "the journal's edits came back: {}",
+            app.status
+        );
+
+        let _ = std::fs::remove_dir_all(&pool);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

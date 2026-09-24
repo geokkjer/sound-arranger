@@ -88,7 +88,10 @@ from the shared workflow (a key or a `: ` line — never a shell-only feature).
    carries the structure as `group begin` / `group end` lines the parser accepts. *First because
    persistence journals per group and stretch logs as a compound op.* Fixes the standing
    one-gesture-two-undos bug (`t`) and the paste/append/utility gestures below.
-2. **Session save/open — a session is a directory.** `mysong.d/session.txt` (the state-command history
+2. ~~**Session save/open — a session is a directory.**~~ **DONE** (2026-09-23): `session.txt` (the log,
+   loaded by the existing parser) + `pool/` + a journal for autosave, all three `host v1` lines
+   (`session_rate`/`save`/`load`) — [note](../2026-09-23-session-directory-save-and-journal.md). The
+   design below is preserved as the record. `mysong.d/session.txt` (the state-command history
    verbatim, with `set_tempo` and a **session-relative** `pool`) + `mysong.d/pool/` (content-addressed
    WAVs, including conformed and stretched material). Load is the *existing* `parse_script` — no second
    format, no second versioning. `Save`/`Load` are actions (like `Bounce`), written atomically (temp +

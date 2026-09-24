@@ -41,6 +41,14 @@ The unit itself is a **command**: `HostCommand::Group { commands: Vec<HostComman
 
 ## Evidence
 
+- **Review (GLM-5.3 stand-in, 2026-09-23)**: A1 itself came back clean — the fold-then-apply
+  pair is closed (the only fallible step of `arrange_logged` is a validation the timeline has already
+  performed), the engine log is untouched (asserted by test), the per-entry replay skip is correct for
+  one-element and `None`-frame entries, and undo/redo have no single-command regression. One
+  documentation fix: the comment claiming the two applies "cannot diverge" now names the invariant it
+  rests on. The review's A2 findings are in
+  [the session note](2026-09-23-session-directory-save-and-journal.md).
+
 - `crates/host/src/lib.rs` tests: `a_group_is_one_undo_step` (two trims → one undo restores the clip
   whole, one redo re-applies it), `a_refused_group_changes_nothing` (the second trim would empty the
   clip: nothing applied, `event_count` and the media-command counter unchanged), `a_group_is_one_frame_of_arrangement_ops`
@@ -61,7 +69,7 @@ and the pty route (`script -qec "kimi --auto"`, the documented fix) received the
 on the model side at 30 % context. `kimi doctor` reports the CLI config valid, so it is a
 runtime/backend problem, not a local one. **The gate is therefore owed, not skipped**: the brief and the
 diagnosis are archived in
-[`research/architecture/2026-09-23-kimi-gate-compound-gestures.md`](../../../../research/architecture/2026-09-23-kimi-gate-compound-gestures.md),
+[`research/architecture/2026-09-23-kimi-gate-alpha-slices.md`](../../../../research/architecture/2026-09-23-kimi-gate-alpha-slices.md),
 A1 is the first commit that review should read when Kimi returns, and the driver's own pre-merge checks
 (24 workspace binaries, host 17, TUI 26, clippy and fmt clean, plus the failure-mode self-review the
 gate was asked about) are what stood in for it.

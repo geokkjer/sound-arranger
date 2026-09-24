@@ -103,7 +103,7 @@ fn in_list(list: &'static [&str], s: &str, what: &str) -> Result<&'static str, S
 /// A command in the Host API contract. Engine commands carry an optional
 /// `at_frame` — `None` applies at the current position, `Some(f)` renders up
 /// to `f` first, so the log records the command's real frame.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum HostCommand {
     Mount {
         plugin: &'static str,
@@ -190,6 +190,17 @@ pub enum HostCommand {
     /// Point the host at the media pool (where arrangement clip source paths
     /// resolve). Part of the script so it is self-describing.
     Pool { dir: PathBuf },
+    /// The session's sample rate. **Context, not an edit**: a session's rate is
+    /// fixed when it is created (`HostSession::new_at`), so this line belongs at the
+    /// top of a saved session and a live session refuses a *different* rate rather
+    /// than pretending to change. It is state, so a load and a replay honour it.
+    SessionRate { hz: u32 },
+    /// Write the session as a directory: `session.txt` (this log, in the `host v1`
+    /// text form) + `pool/`. An **action** (like `Bounce`), not state.
+    Save { dir: PathBuf },
+    /// Load a session directory written by [`HostCommand::Save`]: the script, then
+    /// its journal (a torn trailing line dropped, and reported). An action.
+    Load { dir: PathBuf },
     /// Render `frames` from the current position and write the master to a
     /// 16-bit WAV.
     Bounce { frames: usize, path: PathBuf },
@@ -230,6 +241,7 @@ impl HostCommand {
                 | HostCommand::Play { .. }
                 | HostCommand::Splice { .. }
                 | HostCommand::Group { .. }
+                | HostCommand::SessionRate { .. }
         )
     }
 }
@@ -297,6 +309,14 @@ pub struct HostSession {
     /// The gestures undone since the last edit, each with the history position it
     /// came from, so a redo reconstructs the same session. Cleared by a new edit.
     redo: Vec<(usize, Vec<HostCommand>)>,
+    /// The session directory, when the session has one (`Save`/`Load`): the journal
+    /// — the autosave — is appended here.
+    session_dir: Option<PathBuf>,
+    /// The last journal write failure. A failed *append* never fails the edit (the
+    /// edit is already applied and logged), but it must not be silent.
+    journal_error: Option<String>,
+    /// What the last `Load` recovered from the journal.
+    last_recovery: Option<JournalRecovery>,
     /// The media intent value (pool dir, player, splices, bounce records). The
     /// media-op handlers rebuild it on replay, so a replayed log reproduces the
     /// media session — media determinism is in the one log, not a parallel seam.
@@ -311,7 +331,15 @@ impl HostSession {
     /// [`run_script`]; this is the persistent form a UI holds and edits
     /// incrementally via [`execute`](Self::execute).
     pub fn new() -> Self {
-        let mut engine = Engine::new(48_000, 120.0, 4);
+        Self::new_at(DEFAULT_SAMPLE_RATE)
+    }
+
+    /// Create a session at `rate` — the constructor a saved session's
+    /// `session_rate` line selects (see [`HostSession::from_script`]). The rate is
+    /// **context**: it is fixed here, because the clock, every frame in the log and
+    /// the device negotiation all derive from it.
+    pub fn new_at(rate: u32) -> Self {
+        let mut engine = Engine::new(rate, 120.0, 4);
         engine.register_factory(
             "euclidean",
             plugins::euclidean_factory,
@@ -360,6 +388,9 @@ impl HostSession {
             last_drain: DrainOutcome::default(),
             history: Vec::new(),
             redo: Vec::new(),
+            session_dir: None,
+            journal_error: None,
+            last_recovery: None,
         }
     }
 
@@ -453,8 +484,12 @@ impl HostSession {
             }
         }
 
-        // Fold over a snapshot first: the value is a pure transform, so validating
-        // on a clone and then applying for real cannot diverge.
+        // Fold over a snapshot first: the value is a pure transform, so the fold and
+        // the real apply agree **as long as the real apply cannot fail after the fold**.
+        // That holds today because the only fallible step of `arrange_logged` is a
+        // validation the timeline has already performed (the op's gains must be
+        // finite). A future op with a field the timeline does *not* validate would
+        // reopen this window — recorded in the note, not just here.
         let mut probe = self
             .editor
             .as_ref()
@@ -481,8 +516,219 @@ impl HostSession {
         Ok(())
     }
 
+    // -- persistence: a session is a directory -------------------------------
+
+    /// The session directory, when this session has one (`Save`/`Load` wrote or
+    /// read it). The journal — the autosave — lives here.
+    pub fn session_dir(&self) -> Option<&std::path::Path> {
+        self.session_dir.as_deref()
+    }
+
+    /// The last journal write failure, if any. An edit is never *failed* by a
+    /// journal error (it is already applied and logged), but autosave must not fail
+    /// silently either.
+    pub fn journal_error(&self) -> Option<&str> {
+        self.journal_error.as_deref()
+    }
+
+    /// What the last [`HostSession::load_session`] recovered from the journal.
+    pub fn last_recovery(&self) -> Option<&JournalRecovery> {
+        self.last_recovery.as_ref()
+    }
+
+    /// Write the session as a **directory**: `session.txt` — the replayable log in
+    /// the `host v1` text form — plus `pool/`, the material the log refers to. The
+    /// pool is copied when the session's pool lives elsewhere, so the directory is
+    /// self-contained and can be moved.
+    ///
+    /// The script is written atomically (temp + rename) and the journal is reset to
+    /// that baseline only after it landed, so a crash mid-save leaves the *previous*
+    /// session intact.
+    pub fn save(&mut self, dir: &std::path::Path) -> Result<(), String> {
+        std::fs::create_dir_all(dir).map_err(|e| format!("save {}: {e}", dir.display()))?;
+        let target_pool = dir.join(POOL_DIR);
+
+        if let Some(src) = self.pool_dir.clone()
+            && src != target_pool
+        {
+            copy_pool(&src, &target_pool)?;
+            // Point the live session at the copy **and re-base the log**: the pool is
+            // context, and a replay (undo, seek) rebuilds from the history — if the
+            // history kept the old path, an undo after a save would re-adopt it (and
+            // fail outright if the original was moved or deleted).
+            self.set_pool(target_pool.clone())?;
+            rebase_pool(&mut self.history, &target_pool);
+        }
+
+        let text = self.script_text(dir)?;
+        // **The file must be able to reproduce this session**, so parse our own output
+        // and compare it to the history before writing anything. A command the text
+        // form cannot express (a path with whitespace, a region play, a future op)
+        // refuses the save instead of writing a file that opens as a *different*
+        // session.
+        let mut check = parse_script(&text).map_err(|e| {
+            format!(
+                "save: the session text does not parse ({e}) — refusing to write a lossy session"
+            )
+        })?;
+        resolve_session_paths(&mut check, dir);
+        let expected: Vec<HostCommand> = self
+            .history
+            .iter()
+            .map(|entry| {
+                if entry.len() == 1 {
+                    entry[0].clone()
+                } else {
+                    HostCommand::Group {
+                        commands: entry.clone(),
+                    }
+                }
+            })
+            .collect();
+        // The first parsed command is the `session_rate` header.
+        if check.get(1..).unwrap_or(&[]) != expected.as_slice() {
+            return Err(
+                "save: the session text does not round-trip — refusing to write a lossy session"
+                    .into(),
+            );
+        }
+
+        let tmp = dir.join("session.txt.tmp");
+        std::fs::write(&tmp, text.as_bytes())
+            .map_err(|e| format!("save {}: {e}", tmp.display()))?;
+        // Push it to disk before the rename, so the rename cannot publish a file whose
+        // contents are still only in the page cache.
+        std::fs::File::open(&tmp)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| format!("sync {}: {e}", tmp.display()))?;
+        let script = dir.join(SESSION_FILE);
+        std::fs::rename(&tmp, &script).map_err(|e| format!("save {}: {e}", script.display()))?;
+
+        // The script is the baseline; the journal restarts from it. A crash between
+        // the rename and this truncation leaves a *stale* journal, which replays on top
+        // of the new script — tolerated, because its commands are already in the script
+        // and are therefore refused and reported, not fatal (see `apply_journal`).
+        std::fs::write(dir.join(JOURNAL_FILE), b"")
+            .map_err(|e| format!("save journal in {}: {e}", dir.display()))?;
+        self.session_dir = Some(dir.to_path_buf());
+        self.journal_error = None;
+        self.last_recovery = None;
+        Ok(())
+    }
+
+    /// The whole session as a `host v1` script: the state commands that rebuild it,
+    /// gestures bracketed, and a pool path **relative to `dir`** when the pool lives
+    /// inside it — which is what lets a saved session be moved.
+    fn script_text(&self, dir: &std::path::Path) -> Result<String, String> {
+        let mut out = String::from("host v1\n");
+        out.push_str(&format!("session_rate {}\n", self.engine.clock.sample_rate));
+        for entry in &self.history {
+            write_entry(&mut out, entry, Some(dir))?;
+        }
+        Ok(out)
+    }
+
+    /// Load a session directory: `session.txt`, then its journal (the autosave since
+    /// the last save). A torn trailing journal line — a crash mid-write — is dropped
+    /// and **reported**, never a parse error that costs the session.
+    pub fn load_session(&mut self, dir: &std::path::Path) -> Result<(), String> {
+        let script_path = dir.join(SESSION_FILE);
+        let script = std::fs::read_to_string(&script_path)
+            .map_err(|e| format!("load {}: {e}", script_path.display()))?;
+        let mut commands = parse_script(&script)?;
+        resolve_session_paths(&mut commands, dir);
+
+        let mut loaded = HostSession::from_script(&commands)?;
+        // Apply the journal with no session dir set, so replaying it does not append
+        // to itself; the history still grows (a later save keeps the edits).
+        let recovery = loaded.apply_journal(dir)?;
+        loaded.session_dir = Some(dir.to_path_buf());
+        loaded.last_recovery = Some(recovery);
+        loaded.playing = false; // a load is a fresh, stopped session
+        *self = loaded;
+        Ok(())
+    }
+
+    /// Apply the journal on top of the loaded script, tolerating a torn final line.
+    fn apply_journal(&mut self, dir: &std::path::Path) -> Result<JournalRecovery, String> {
+        let mut report = JournalRecovery::default();
+        let path = dir.join(JOURNAL_FILE);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Ok(report); // no journal yet: the script is the whole session
+        };
+
+        // A crash can cut the append anywhere: mid-line, or at a line boundary
+        // *inside* a gesture. The journal is a sequence of complete entries, so the
+        // recovery rule is "replay the complete ones" — never "refuse to open the
+        // session because the last one is incomplete".
+        let mut lines: Vec<&str> = text.lines().collect();
+        // A final line with no newline is a partial write: drop it.
+        if !text.ends_with('\n') && !lines.is_empty() {
+            lines.pop();
+            report.torn_lines += 1;
+        }
+        // …and an entry whose `group begin` has no `group end` was cut mid-gesture:
+        // drop it (and anything after it, which cannot exist).
+        if let Some(open) = lines.iter().rposition(|l| l.trim() == "group begin")
+            && !lines[open + 1..].iter().any(|l| l.trim() == "group end")
+        {
+            report.torn_lines += lines.len() - open;
+            lines.truncate(open);
+        }
+        if lines.iter().all(|l| l.trim().is_empty()) {
+            return Ok(report);
+        }
+
+        let commands = parse_script(&format!("host v1\n{}\n", lines.join("\n")))?;
+        for cmd in &commands {
+            // A journal entry the session refuses (a stale journal from a crash in the
+            // save's window, or a pool that moved) is **dropped and reported**, never
+            // fatal.
+            match self.execute(cmd) {
+                Ok(()) => report.applied += 1,
+                Err(e) => {
+                    report.refused += 1;
+                    if report.refused_reason.is_none() {
+                        report.refused_reason = Some(e);
+                    }
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Append a committed gesture to the journal — the autosave. Best effort: the
+    /// edit is already applied, so a failure is recorded ([`Self::journal_error`]),
+    /// not raised.
+    fn journal_append(&mut self, entry: &[HostCommand]) {
+        let Some(dir) = self.session_dir.clone() else {
+            return;
+        };
+        let mut text = String::new();
+        // The journal records *edits*, with the paths the session actually used. A
+        // command with no text form cannot be in the history (a save would have
+        // refused it), so a failure here means nothing to write.
+        if write_entry(&mut text, entry, None).is_err() || text.is_empty() {
+            return;
+        }
+        let path = dir.join(JOURNAL_FILE);
+        let result = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| {
+                use std::io::Write;
+                file.write_all(text.as_bytes())?;
+                file.flush()
+            });
+        match result {
+            Ok(()) => self.journal_error = None,
+            Err(e) => self.journal_error = Some(format!("journal {}: {e}", path.display())),
+        }
+    }
+
     /// Resolve a parsed clip (len 0 = "open the file at apply") to its real
-    /// length.
+    /// length."""
     fn resolve_clip(clip: &ClipRef) -> Result<ClipRef, String> {
         if clip.len == 0 {
             ClipRef::whole(&clip.path)
@@ -619,6 +865,22 @@ impl HostSession {
             HostCommand::Record { .. } => {
                 Err("recording requires a device — the device input path exists in media::devices (open_input) but is not wired into the host; the reference host renders offline via Bounce".into())
             }
+            // Context, validated: a session's rate is set at construction.
+            HostCommand::SessionRate { hz } => {
+                if *hz == 0 {
+                    Err("session_rate must be non-zero".into())
+                } else if *hz == self.engine.clock.sample_rate {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "this session runs at {} Hz — a rate is fixed when the session is created \
+                         (`new_at`/`from_script`), so {} Hz needs a new session",
+                        self.engine.clock.sample_rate, hz
+                    ))
+                }
+            }
+            HostCommand::Save { dir } => self.save(dir),
+            HostCommand::Load { dir } => self.load_session(dir),
             HostCommand::Group { commands } => self.execute_group(commands),
             HostCommand::Arrange { op, .. } => {
                 self.ensure_editor()?;
@@ -1022,14 +1284,42 @@ impl std::fmt::Debug for HostSession {
 /// the final `Bounce` writes the master. The same script on fresh sessions
 /// bounces byte-identically.
 pub fn run_script(script: &[HostCommand]) -> Result<HostSession, String> {
-    let mut session = HostSession::new();
-    for cmd in script {
-        session.process(cmd)?;
-    }
-    Ok(session)
+    HostSession::from_script(script)
 }
 
+/// The session sample rate when a script does not declare one.
+pub const DEFAULT_SAMPLE_RATE: u32 = 48_000;
+
 impl HostSession {
+    /// Build a session from a parsed script, honouring a `session_rate` line.
+    ///
+    /// The rate has to be known *before* the engine exists (the clock, the frames in
+    /// the log and the device negotiation all derive from it), so it is read here
+    /// rather than applied as an edit — `apply` refuses a *different* rate on a live
+    /// session for exactly that reason.
+    pub fn from_script(commands: &[HostCommand]) -> Result<Self, String> {
+        let rate = commands
+            .iter()
+            .find_map(|cmd| match cmd {
+                HostCommand::SessionRate { hz } => Some(*hz),
+                _ => None,
+            })
+            .unwrap_or(DEFAULT_SAMPLE_RATE);
+        if rate == 0 {
+            return Err("session_rate must be non-zero".into());
+        }
+        let mut session = HostSession::new_at(rate);
+        for cmd in commands {
+            // `execute`, not `process`: a script built by `process` alone would have
+            // the *state* but an empty history — so a session opened from a file could
+            // not be undone, and saving it again would write only what happened after
+            // the load. (`execute` appends to the journal only when a session
+            // directory is set, and a session being built or loaded has none.)
+            session.execute(cmd)?;
+        }
+        Ok(session)
+    }
+
     /// Apply a single command onto this persistent session — the incremental
     /// form of [`run_script`], for a live UI that edits one op at a time. A
     /// refused op returns `Err` and changes nothing; the session stays usable.
@@ -1065,7 +1355,7 @@ impl HostSession {
         let history = self.history.clone();
         let redo = std::mem::take(&mut self.redo);
         let playing = self.playing;
-        let mut rebuilt = HostSession::new();
+        let mut rebuilt = HostSession::new_at(self.engine.clock.sample_rate);
         for entry in &history {
             // State that takes effect *after* the target is not yet in force at
             // `frame`. Applying it would render the clock past the target — which
@@ -1087,6 +1377,13 @@ impl HostSession {
         rebuilt.render_to(frame)?;
         rebuilt.playing = playing;
         rebuilt.redo = redo;
+        // **Persistence survives a rebuild.** A replay replaces the session, so the
+        // session directory (and the autosave state) has to come across or the
+        // journal would silently stop after the first undo/seek — the session would
+        // look saved while nothing was written any more.
+        rebuilt.session_dir = self.session_dir.clone();
+        rebuilt.journal_error = self.journal_error.take();
+        rebuilt.last_recovery = self.last_recovery.take();
         *self = rebuilt;
         Ok(())
     }
@@ -1200,12 +1497,329 @@ impl HostSession {
                     HostCommand::Group { commands } => commands.clone(),
                     other => vec![other.clone()],
                 };
+                // Autosave: the journal is appended per committed gesture, so a crash
+                // costs at most the gesture in flight.
+                self.journal_append(&entry);
                 self.history.push(entry);
                 self.redo.clear();
             }
         }
         r
     }
+}
+
+// ------------------------------------------------------------ persistence
+
+/// The session script's file name inside a session directory.
+const SESSION_FILE: &str = "session.txt";
+/// The autosave journal inside a session directory.
+const JOURNAL_FILE: &str = "journal.txt";
+/// The pool's subdirectory inside a session directory.
+const POOL_DIR: &str = "pool";
+
+/// What a load recovered from the journal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JournalRecovery {
+    /// Journal commands replayed on top of the script.
+    pub applied: usize,
+    /// Lines dropped because their **entry was incomplete** — a partial final line,
+    /// or a gesture whose `group end` never made it to disk. Dropped, and reported,
+    /// rather than refusing to open the session.
+    pub torn_lines: usize,
+    /// Journal commands the session **refused** (a stale journal from a crash inside the
+    /// save's window, or a path that moved). Dropped and reported, not fatal: refusing
+    /// to open a session because of an autosave line is the worse failure.
+    pub refused: usize,
+    /// The first refusal, for a shell to show.
+    pub refused_reason: Option<String>,
+}
+
+/// Write one history **entry** (one gesture) as script lines. A multi-command entry
+/// is bracketed with `group begin`/`group end`, so the gesture structure survives a
+/// save (and replays as one undo step).
+fn write_entry(
+    out: &mut String,
+    entry: &[HostCommand],
+    session_dir: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let grouped = entry.len() > 1;
+    if grouped {
+        out.push_str("group begin\n");
+    }
+    for cmd in entry {
+        let Some(line) = format_command(cmd, session_dir) else {
+            return Err(format!(
+                "the host v1 text form cannot express {cmd:?} — refusing to write a session that \
+                 would lose it"
+            ));
+        };
+        out.push_str(&line);
+        out.push('\n');
+    }
+    if grouped {
+        out.push_str("group end\n");
+    }
+    Ok(())
+}
+
+/// Re-point every `pool` command in the history at `pool` (recursing into gestures).
+/// The pool is **context**, not an edit: after a save copies the pool into the session
+/// directory, the log must name the copy, or a later replay would rebuild against the
+/// original path.
+fn rebase_pool(history: &mut [Vec<HostCommand>], pool: &std::path::Path) {
+    fn one(cmd: &mut HostCommand, pool: &std::path::Path) {
+        match cmd {
+            HostCommand::Pool { dir } => *dir = pool.to_path_buf(),
+            HostCommand::Group { commands } => {
+                for member in commands {
+                    one(member, pool);
+                }
+            }
+            _ => {}
+        }
+    }
+    for entry in history {
+        for cmd in entry {
+            one(cmd, pool);
+        }
+    }
+}
+
+/// Format one command in the `host v1` text form, or `None` when it has none (a
+/// pure action, which a log never records). `session_dir` makes a `pool` path
+/// relative to the session directory when the pool lives inside it.
+pub fn format_command(cmd: &HostCommand, session_dir: Option<&std::path::Path>) -> Option<String> {
+    let frame = |at: &Option<u64>| at.map(|f| format!(" @{f}")).unwrap_or_default();
+    Some(match cmd {
+        HostCommand::Mount {
+            plugin,
+            params,
+            at_frame,
+        } => {
+            let mut line = format!("mount {plugin}");
+            for (key, value) in params {
+                line.push_str(&format!(" {key}={}", fmt_f32(*value)));
+            }
+            line.push_str(&frame(at_frame));
+            line
+        }
+        HostCommand::Patch { from, to, at_frame } => format!(
+            "patch {}.{} {}.{}{}",
+            from.0,
+            from.1,
+            to.0,
+            to.1,
+            frame(at_frame)
+        ),
+        HostCommand::SetParam {
+            plugin,
+            param,
+            value,
+            at_frame,
+        } => format!(
+            "set_param {plugin} {param} {}{}",
+            fmt_f32(*value),
+            frame(at_frame)
+        ),
+        HostCommand::SetTempo {
+            bpm,
+            beats_per_bar,
+            at_frame,
+        } => format!("set_tempo {bpm} {beats_per_bar}{}", frame(at_frame)),
+        HostCommand::Unmount { plugin, at_frame } => format!("unmount {plugin}{}", frame(at_frame)),
+        HostCommand::Pool { dir } => format!("pool {}", pool_text(dir, session_dir)),
+        HostCommand::SessionRate { hz } => format!("session_rate {hz}"),
+        HostCommand::Arrange { op, at_frame } => {
+            format!("arrange {}{}", format_arrange(op), frame(at_frame))
+        }
+        // The `v1` text form plays a **whole file** (`play <path> ch<N>`), so a region
+        // play has no representation at all: return `None`, and `save` refuses loudly
+        // rather than write a session that would open as a different one.
+        HostCommand::Play {
+            clip,
+            channel,
+            at_frame,
+        } => {
+            if clip.start != 0 || clip.len != 0 {
+                return None;
+            }
+            format!(
+                "play {} ch{channel}{}",
+                clip.path.display(),
+                frame(at_frame)
+            )
+        }
+        HostCommand::Splice {
+            at_frame,
+            clip,
+            crossfade,
+        } => {
+            if clip.start != 0 || clip.len != 0 {
+                return None;
+            }
+            format!("splice {at_frame} {} {crossfade}", clip.path.display())
+        }
+        HostCommand::Group { commands } => {
+            let mut out = String::from("group begin");
+            for member in commands {
+                out.push('\n');
+                out.push_str(&format_command(member, session_dir)?);
+            }
+            out.push_str("\ngroup end");
+            out
+        }
+        // Actions (and the live transport) are not part of a log.
+        HostCommand::TransportPlay
+        | HostCommand::TransportStop
+        | HostCommand::TransportSeek { .. }
+        | HostCommand::Undo
+        | HostCommand::Redo
+        | HostCommand::Record { .. }
+        | HostCommand::Bounce { .. }
+        | HostCommand::Save { .. }
+        | HostCommand::Load { .. } => return None,
+    })
+}
+
+/// Format an arrangement op as the `arrange …` operands (the inverse of
+/// `parse_arrange`).
+pub fn format_arrange(op: &media::ArrangeOp) -> String {
+    use media::ArrangeOp as Op;
+    match op {
+        Op::AddTrack { track } => format!("add_track {track}"),
+        Op::RemoveTrack { track } => format!("remove_track {track}"),
+        Op::AddClip { track, clip } => {
+            let mut line = format!(
+                "add_clip {track} {} {} {} {} {} {} {} {}",
+                clip.id,
+                clip.source,
+                clip.src_start,
+                clip.src_len,
+                clip.at_frame,
+                clip.fade_in,
+                clip.fade_out,
+                fmt_f32(clip.gain)
+            );
+            if let Some(loop_len) = clip.loop_len {
+                line.push_str(&format!(" {loop_len}"));
+            }
+            line
+        }
+        Op::RazorSplit {
+            track,
+            clip,
+            new_left,
+            new_right,
+            at_frame,
+        } => format!("razor_split {track} {clip} {new_left} {new_right} {at_frame}"),
+        Op::Trim {
+            track,
+            clip,
+            edge,
+            by_frames,
+        } => {
+            let edge = match edge {
+                media::Edge::Start => "start",
+                media::Edge::End => "end",
+            };
+            format!("trim {track} {clip} {edge} {by_frames}")
+        }
+        Op::MoveClip {
+            track,
+            clip,
+            at_frame,
+        } => format!("move_clip {track} {clip} {at_frame}"),
+        Op::MoveClipToTrack {
+            from,
+            clip,
+            to,
+            at_frame,
+        } => format!("move_clip_to_track {from} {clip} {to} {at_frame}"),
+        Op::Duplicate {
+            track,
+            clip,
+            new_id,
+        } => format!("duplicate {track} {clip} {new_id}"),
+        Op::Delete { track, clip } => format!("delete {track} {clip}"),
+        Op::SetClipGain { track, clip, gain } => {
+            format!("set_clip_gain {track} {clip} {}", fmt_f32(*gain))
+        }
+        Op::SetClipFade {
+            track,
+            clip,
+            fade_in,
+            fade_out,
+        } => format!("set_clip_fade {track} {clip} {fade_in} {fade_out}"),
+        Op::LoopRegion { track, clip, times } => format!("loop_region {track} {clip} {times}"),
+        Op::ChopClip {
+            track,
+            clip,
+            times,
+            prefix,
+        } => format!("chop {track} {clip} {times} {prefix}"),
+    }
+}
+
+/// `f32` in the shortest form that parses back to the same bits — the log's values
+/// must survive a save/load round trip exactly.
+fn fmt_f32(value: f32) -> String {
+    format!("{value:?}")
+}
+
+/// The `pool` operand: relative to the session directory when the pool lives inside
+/// it, absolute otherwise.
+fn pool_text(dir: &std::path::Path, session_dir: Option<&std::path::Path>) -> String {
+    if let Some(root) = session_dir
+        && let Ok(rel) = dir.strip_prefix(root)
+    {
+        return rel.to_string_lossy().into_owned();
+    }
+    dir.to_string_lossy().into_owned()
+}
+
+/// A session script's relative `pool` path resolves against the session directory.
+fn resolve_session_paths(commands: &mut [HostCommand], dir: &std::path::Path) {
+    for cmd in commands {
+        match cmd {
+            HostCommand::Pool { dir: pool } if pool.is_relative() => {
+                *pool = dir.join(&*pool);
+            }
+            HostCommand::Group { commands } => resolve_session_paths(commands, dir),
+            _ => {}
+        }
+    }
+}
+
+/// Copy a pool's material (WAVs and their peak sidecars) into `dst`, skipping files
+/// that are already there at the same size.
+fn copy_pool(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("save pool {}: {e}", dst.display()))?;
+    let entries = std::fs::read_dir(src).map_err(|e| format!("pool {}: {e}", src.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let keep = matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("wav") | Some("peaks")
+        );
+        if !keep || !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let target = dst.join(name);
+        // Skip only when size *and* modification time match: a file edited in place
+        // at the same length must still be copied.
+        let same = std::fs::metadata(&target)
+            .ok()
+            .zip(std::fs::metadata(&path).ok())
+            .is_some_and(|(a, b)| a.len() == b.len() && a.modified().ok() == b.modified().ok());
+        if !same {
+            std::fs::copy(&path, &target)
+                .map_err(|e| format!("save pool {}: {e}", target.display()))?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- text form
@@ -1230,6 +1844,9 @@ impl HostSession {
 /// arrange trim t0 c0 start 4800
 /// arrange trim t0 c0 end -4800
 /// group end
+/// session_rate 48000                          # the session's rate (context)
+/// save /data/mysong.d                         # write the session directory
+/// load /data/mysong.d                         # read it back (+ its journal)
 /// pool /data/takes                           # the media pool dir (adopting it
 ///                                             # resamples foreign-rate sources)
 /// arrange add_track t0 @0                    # the clip editor (P1.3.4)
@@ -1425,6 +2042,20 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
             "pool" => {
                 let dir = PathBuf::from(word(&words, 1, at)?);
                 commands.push(HostCommand::Pool { dir });
+            }
+            "session_rate" => {
+                let hz = word(&words, 1, at)?
+                    .parse::<u32>()
+                    .map_err(|_| format!("line {at}: bad session_rate (want Hz)"))?;
+                commands.push(HostCommand::SessionRate { hz });
+            }
+            "save" => {
+                let dir = PathBuf::from(word(&words, 1, at)?);
+                commands.push(HostCommand::Save { dir });
+            }
+            "load" => {
+                let dir = PathBuf::from(word(&words, 1, at)?);
+                commands.push(HostCommand::Load { dir });
             }
             "arrange" => {
                 let op = parse_arrange(&words[1..], at)?;
@@ -2128,6 +2759,32 @@ mod tests {
         (s, pool)
     }
 
+    /// A session with a mixer, a pool, one track and one clip at frame 0.
+    fn session_with_pool(_name: &str, pool: &std::path::Path) -> HostSession {
+        let mut s = HostSession::new();
+        s.execute(&HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 2.0)],
+            at_frame: Some(0),
+        })
+        .expect("mount mixer");
+        s.execute(&HostCommand::Pool {
+            dir: pool.to_path_buf(),
+        })
+        .expect("pool");
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::AddTrack { track: "t0".into() },
+            at_frame: None,
+        })
+        .expect("add track");
+        s.execute(&HostCommand::Arrange {
+            op: add_clip("c0", 0),
+            at_frame: None,
+        })
+        .expect("add clip");
+        s
+    }
+
     fn clip_of(s: &HostSession) -> media::Clip {
         s.arrangement().expect("tl").tracks[0].clips[0].clone()
     }
@@ -2317,5 +2974,817 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    // ---- persistence: a session is a directory ----
+
+    /// A tone take (not silence) so a bounce can be asserted *audible*.
+    fn write_tone(dir: &std::path::Path, id: &str, frames: usize, rate: u32) {
+        let path = dir.join(format!("{id}.wav"));
+        let mut w = media::WavWriter::create(&path, rate, 1).expect("wav writer");
+        let samples: Vec<f32> = (0..frames).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        w.write(&samples).expect("write tone");
+        w.finalize().expect("finalize tone");
+    }
+
+    fn bounce(session: &mut HostSession, frames: usize, path: &std::path::Path) -> Vec<f32> {
+        session
+            .execute(&HostCommand::Bounce {
+                frames,
+                path: path.to_path_buf(),
+            })
+            .expect("bounce");
+        let mut r = media::WavReader::open(path).expect("bounce file");
+        let mut audio = vec![0.0f32; r.total_frames() as usize];
+        let n = r.read_into(&mut audio);
+        audio.truncate(n);
+        audio
+    }
+
+    /// The text form round-trips **every** state command — the property a saved
+    /// session rests on. A new op or a changed operand must be taught to the
+    /// formatter, and this is where it fails.
+    #[test]
+    fn the_text_form_round_trips_every_state_command() {
+        let clip = media::Clip {
+            id: "c0".into(),
+            source: "s1".into(),
+            src_start: 100,
+            src_len: 4_800,
+            at_frame: 200,
+            fade_in: 10,
+            fade_out: 20,
+            gain: 0.75,
+            loop_len: Some(2_400),
+        };
+        let ops = vec![
+            media::ArrangeOp::AddTrack { track: "t0".into() },
+            media::ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip.clone(),
+            },
+            media::ArrangeOp::RazorSplit {
+                track: "t0".into(),
+                clip: "c0".into(),
+                new_left: "L".into(),
+                new_right: "R".into(),
+                at_frame: 2_400,
+            },
+            media::ArrangeOp::Trim {
+                track: "t0".into(),
+                clip: "c0".into(),
+                edge: media::Edge::Start,
+                by_frames: -120,
+            },
+            media::ArrangeOp::MoveClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                at_frame: 9_600,
+            },
+            media::ArrangeOp::MoveClipToTrack {
+                from: "t0".into(),
+                clip: "c0".into(),
+                to: "t1".into(),
+                at_frame: 9_600,
+            },
+            media::ArrangeOp::Duplicate {
+                track: "t0".into(),
+                clip: "c0".into(),
+                new_id: "c1".into(),
+            },
+            media::ArrangeOp::Delete {
+                track: "t0".into(),
+                clip: "c1".into(),
+            },
+            media::ArrangeOp::SetClipGain {
+                track: "t0".into(),
+                clip: "c0".into(),
+                gain: 0.5,
+            },
+            media::ArrangeOp::SetClipFade {
+                track: "t0".into(),
+                clip: "c0".into(),
+                fade_in: 64,
+                fade_out: 128,
+            },
+            media::ArrangeOp::LoopRegion {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 3,
+            },
+            media::ArrangeOp::ChopClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 4,
+                prefix: "pre".into(),
+            },
+            media::ArrangeOp::RemoveTrack { track: "t1".into() },
+        ];
+
+        let mut commands: Vec<HostCommand> = vec![
+            HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(0),
+            },
+            HostCommand::Mount {
+                plugin: "tone",
+                params: vec![("gain", 0.25), ("blip_len", 1_800.0)],
+                at_frame: None,
+            },
+            HostCommand::Patch {
+                from: ("euclidean", "triggers"),
+                to: ("scale", "trigger"),
+                at_frame: Some(0),
+            },
+            HostCommand::SetParam {
+                plugin: "mixer",
+                param: "ch0.gain",
+                value: 0.7,
+                at_frame: None,
+            },
+            HostCommand::SetTempo {
+                bpm: 137.5,
+                beats_per_bar: 3,
+                at_frame: Some(0),
+            },
+            HostCommand::Unmount {
+                plugin: "tone",
+                at_frame: Some(4_800),
+            },
+            HostCommand::Pool {
+                dir: PathBuf::from("/tmp/pool"),
+            },
+            HostCommand::SessionRate { hz: 48_000 },
+            HostCommand::Play {
+                clip: media::ClipRef {
+                    path: PathBuf::from("/tmp/a.wav"),
+                    start: 0,
+                    len: 0,
+                },
+                channel: 1,
+                at_frame: Some(0),
+            },
+            HostCommand::Splice {
+                at_frame: 4_000,
+                clip: media::ClipRef {
+                    path: PathBuf::from("/tmp/b.wav"),
+                    start: 0,
+                    len: 0,
+                },
+                crossfade: 512,
+            },
+        ];
+        commands.extend(
+            ops.into_iter()
+                .map(|op| HostCommand::Arrange { op, at_frame: None }),
+        );
+        commands.push(HostCommand::Group {
+            commands: vec![
+                HostCommand::Arrange {
+                    op: media::ArrangeOp::Trim {
+                        track: "t0".into(),
+                        clip: "c0".into(),
+                        edge: media::Edge::Start,
+                        by_frames: 100,
+                    },
+                    at_frame: None,
+                },
+                HostCommand::Arrange {
+                    op: media::ArrangeOp::Trim {
+                        track: "t0".into(),
+                        clip: "c0".into(),
+                        edge: media::Edge::End,
+                        by_frames: -100,
+                    },
+                    at_frame: None,
+                },
+            ],
+        });
+
+        let mut text = String::from("host v1\n");
+        for cmd in &commands {
+            let line = format_command(cmd, None).expect("a state command has a text form");
+            text.push_str(&line);
+            text.push('\n');
+        }
+        let back = parse_script(&text).expect("the formatted script parses");
+        assert_eq!(
+            back, commands,
+            "the text form round-trips every state command"
+        );
+
+        // A pure action has no text form, so it can never leak into a log.
+        for action in [
+            HostCommand::TransportPlay,
+            HostCommand::TransportStop,
+            HostCommand::Undo,
+            HostCommand::Redo,
+            HostCommand::Record {
+                take_id: "t".into(),
+            },
+            HostCommand::Bounce {
+                frames: 1,
+                path: PathBuf::from("/tmp/x.wav"),
+            },
+            HostCommand::Save {
+                dir: PathBuf::from("/tmp/x"),
+            },
+            HostCommand::Load {
+                dir: PathBuf::from("/tmp/x"),
+            },
+        ] {
+            assert!(
+                format_command(&action, None).is_none(),
+                "{action:?} must not be serializable"
+            );
+        }
+    }
+
+    /// Save → load reproduces the session: the same value, the same folded
+    /// parameters, the same tempo, and a **byte-identical bounce**.
+    #[test]
+    fn save_and_load_round_trips_a_session() {
+        let root = std::env::temp_dir().join(format!("host-session-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("work");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = HostSession::new();
+        s.execute(&HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 2.0)],
+            at_frame: Some(0),
+        })
+        .expect("mixer");
+        s.execute(&HostCommand::Pool { dir: pool.clone() })
+            .expect("pool");
+        s.execute(&HostCommand::SetTempo {
+            bpm: 96.0,
+            beats_per_bar: 4,
+            at_frame: Some(0),
+        })
+        .expect("tempo");
+        s.execute(&HostCommand::SetParam {
+            plugin: "mixer",
+            param: "ch0.gain",
+            value: 0.6,
+            at_frame: None,
+        })
+        .expect("gain");
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::AddTrack { track: "t0".into() },
+            at_frame: None,
+        })
+        .expect("track");
+        s.execute(&HostCommand::Arrange {
+            op: add_clip("c0", 0),
+            at_frame: None,
+        })
+        .expect("clip");
+        // A gesture, so the save has to carry group structure too.
+        s.execute(&gesture(vec![
+            media::ArrangeOp::Trim {
+                track: "t0".into(),
+                clip: "c0".into(),
+                edge: media::Edge::Start,
+                by_frames: 1_200,
+            },
+            media::ArrangeOp::Trim {
+                track: "t0".into(),
+                clip: "c0".into(),
+                edge: media::Edge::End,
+                by_frames: -600,
+            },
+        ]))
+        .expect("gesture");
+
+        let dir = root.join("mysong.d");
+        s.save(&dir).expect("save");
+        assert!(dir.join("session.txt").is_file(), "the script is written");
+        assert!(
+            dir.join("pool/s1.wav").is_file(),
+            "the pool travels with it"
+        );
+        assert_eq!(s.session_dir(), Some(dir.as_path()));
+
+        let mut loaded = HostSession::new();
+        loaded.load_session(&dir).expect("load");
+        assert_eq!(
+            loaded.arrangement().expect("tl"),
+            s.arrangement().expect("tl"),
+            "the arrangement round-trips"
+        );
+        // A `set_tempo` is *scheduled* at its frame, so it takes effect when the clock
+        // renders — the bounce below is what applies it.
+        assert_eq!(loaded.position().bpm, 120.0, "nothing rendered yet");
+        let gain = loaded
+            .params()
+            .iter()
+            .find(|(p, k, _)| *p == "mixer" && *k == "ch0.gain")
+            .map(|(_, _, v)| *v);
+        assert_eq!(
+            gain,
+            Some(0.6),
+            "the parameters round-trip (folded from the log)"
+        );
+
+        // …and the audio is identical, which is the property that matters.
+        let a = bounce(&mut s, 4_800, &root.join("a.wav"));
+        let b = bounce(&mut loaded, 4_800, &root.join("b.wav"));
+        assert!(a.iter().any(|x| x.abs() > 1e-3), "the take is audible");
+        assert_eq!(a, b, "save → load bounces the same audio");
+        assert_eq!(s.position().bpm, 96.0, "the tempo applied on render");
+        assert_eq!(
+            loaded.position().bpm,
+            96.0,
+            "and the loaded session's tempo matches"
+        );
+
+        // A reloaded session is a *session*, not just a value: it can be saved again,
+        // and the new script still holds the baseline (the load built the history).
+        let again = root.join("again.d");
+        loaded.save(&again).expect("save again");
+        let text = std::fs::read_to_string(again.join("session.txt")).expect("second script");
+        assert!(
+            text.contains("arrange add_clip t0 c0 s1"),
+            "the baseline is in the reloaded history:\n{text}"
+        );
+        assert!(text.contains("set_tempo 96"), "{text}");
+
+        // A gesture is still one undo step after a reload.
+        let before = clip_of(&loaded);
+        loaded
+            .execute(&gesture(vec![media::ArrangeOp::MoveClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                at_frame: 24_000,
+            }]))
+            .expect("move");
+        assert!(loaded.undo().expect("undo"));
+        assert_eq!(clip_of(&loaded), before);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The session directory is **movable**: the script's pool path is relative, so
+    /// renaming the directory keeps the session playable (the plan's path trap).
+    #[test]
+    fn a_saved_session_can_be_moved() {
+        let root = std::env::temp_dir().join(format!("host-move-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("elsewhere");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let (mut s, _) = {
+            let mut s = HostSession::new();
+            s.execute(&HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(0),
+            })
+            .expect("mixer");
+            s.execute(&HostCommand::Pool { dir: pool.clone() })
+                .expect("pool");
+            s.execute(&HostCommand::Arrange {
+                op: media::ArrangeOp::AddTrack { track: "t0".into() },
+                at_frame: None,
+            })
+            .expect("track");
+            s.execute(&HostCommand::Arrange {
+                op: add_clip("c0", 0),
+                at_frame: None,
+            })
+            .expect("clip");
+            (s, ())
+        };
+
+        let dir = root.join("take1.d");
+        s.save(&dir).expect("save");
+        let script = std::fs::read_to_string(dir.join("session.txt")).expect("script");
+        assert!(
+            script.contains("pool pool"),
+            "the pool path is relative to the session:\n{script}"
+        );
+        let reference = bounce(&mut s, 4_800, &root.join("ref.wav"));
+
+        // Move the whole session elsewhere and load it there.
+        let moved = root.join("moved.d");
+        std::fs::rename(&dir, &moved).expect("rename the session dir");
+        let _ = std::fs::remove_dir_all(&pool); // the original pool is gone
+
+        let mut loaded = HostSession::new();
+        loaded.load_session(&moved).expect("load from the new path");
+        let audio = bounce(&mut loaded, 4_800, &root.join("moved.wav"));
+        assert!(
+            audio.iter().any(|x| x.abs() > 1e-3),
+            "still audible after a move"
+        );
+        assert_eq!(audio, reference, "and identical");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The journal is the autosave: every committed gesture is appended (with its
+    /// group markers), and a torn trailing line — a crash mid-write — is dropped on
+    /// load and reported, never a parse error that costs the session.
+    #[test]
+    fn the_journal_autosaves_and_a_torn_line_is_dropped() {
+        let root = std::env::temp_dir().join(format!("host-journal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = HostSession::new();
+        s.execute(&HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 2.0)],
+            at_frame: Some(0),
+        })
+        .expect("mixer");
+        s.execute(&HostCommand::Pool { dir: pool.clone() })
+            .expect("pool");
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::AddTrack { track: "t0".into() },
+            at_frame: None,
+        })
+        .expect("track");
+        s.execute(&HostCommand::Arrange {
+            op: add_clip("c0", 0),
+            at_frame: None,
+        })
+        .expect("clip");
+
+        let dir = root.join("song.d");
+        s.save(&dir).expect("save");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("journal.txt")).expect("journal"),
+            "",
+            "a save resets the journal to its baseline"
+        );
+
+        // An edit after the save is autosaved, gestures included.
+        s.execute(&gesture(vec![
+            media::ArrangeOp::Trim {
+                track: "t0".into(),
+                clip: "c0".into(),
+                edge: media::Edge::Start,
+                by_frames: 1_200,
+            },
+            media::ArrangeOp::Trim {
+                track: "t0".into(),
+                clip: "c0".into(),
+                edge: media::Edge::End,
+                by_frames: -600,
+            },
+        ]))
+        .expect("gesture");
+        let journal = std::fs::read_to_string(dir.join("journal.txt")).expect("journal");
+        assert!(
+            journal.contains("group begin"),
+            "the gesture is bracketed:\n{journal}"
+        );
+        assert!(
+            journal.contains("arrange trim t0 c0 start 1200"),
+            "{journal}"
+        );
+        assert!(journal.contains("group end"), "{journal}");
+        assert!(s.journal_error().is_none(), "no journal error");
+
+        // Simulate a crash mid-append: a half-written line with no newline.
+        let mut torn = std::fs::read_to_string(dir.join("journal.txt")).expect("journal");
+        torn.push_str("arrange trim t0 c0 start 99");
+        std::fs::write(dir.join("journal.txt"), torn).expect("torn journal");
+
+        let mut loaded = HostSession::new();
+        loaded.load_session(&dir).expect("load with a torn journal");
+        let recovery = loaded.last_recovery().cloned().expect("a recovery report");
+        assert_eq!(recovery.torn_lines, 1, "the torn line is reported");
+        assert_eq!(
+            recovery.applied, 1,
+            "the intact journal held one gesture (one command)"
+        );
+        assert_eq!(
+            clip_of(&loaded).src_len,
+            3_000,
+            "the journal's gesture survived"
+        );
+
+        // The harder crash: cut *inside* a gesture — one member on disk, no `group
+        // end`. The incomplete gesture is dropped (never half-applied) and the
+        // session still opens.
+        std::fs::write(
+            dir.join("journal.txt"),
+            "group begin\narrange trim t0 c0 start 1200\n",
+        )
+        .expect("mid-gesture journal");
+        let mut loaded = HostSession::new();
+        loaded
+            .load_session(&dir)
+            .expect("a gesture cut mid-write must not make the session unopenable");
+        let recovery = loaded.last_recovery().cloned().expect("a recovery report");
+        assert_eq!(recovery.applied, 0, "the incomplete gesture was dropped");
+        assert_eq!(recovery.torn_lines, 2, "both of its lines are reported");
+        assert_eq!(
+            clip_of(&loaded).src_len,
+            4_800,
+            "and the clip is untouched — not half-trimmed"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A session's rate is context: `session_rate` round-trips, the loaded session
+    /// runs at that rate, and a live session refuses to *change* rate.
+    #[test]
+    fn a_session_at_another_rate_round_trips() {
+        let root = std::env::temp_dir().join(format!("host-rate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 44_100, 44_100);
+
+        let script = format!(
+            "host v1\nsession_rate 44100\nmount mixer channels=2 @0\npool {}\narrange add_track t0\narrange add_clip t0 c0 s1 0 44100 0 0 0 1.0\n",
+            pool.display()
+        );
+        let mut s = run_script(&parse_script(&script).expect("parse")).expect("run");
+        assert_eq!(s.sample_rate(), 44_100);
+
+        let dir = root.join("cd.d");
+        s.save(&dir).expect("save");
+        let mut loaded = HostSession::new();
+        loaded.load_session(&dir).expect("load");
+        assert_eq!(loaded.sample_rate(), 44_100, "the rate round-trips");
+
+        let audio = bounce(&mut loaded, 4_800, &root.join("cd.wav"));
+        assert!(audio.iter().any(|x| x.abs() > 1e-3), "and it plays");
+        let r = media::WavReader::open(&root.join("cd.wav")).expect("bounce");
+        assert_eq!(r.sample_rate(), 44_100, "the bounce is at the session rate");
+
+        // A live session cannot change rate — the clock and every frame derive from it.
+        assert!(s.execute(&HostCommand::SessionRate { hz: 48_000 }).is_err());
+        assert!(s.execute(&HostCommand::SessionRate { hz: 44_100 }).is_ok());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The gate's finding #1**: a rebuild (undo, redo, seek) used to drop the
+    /// session directory, so autosave silently stopped after the first undo. The
+    /// journal must keep growing through both.
+    #[test]
+    fn autosave_survives_an_undo_and_a_seek() {
+        let root = std::env::temp_dir().join(format!("host-autosave-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = session_with_pool("autosave", &pool);
+        let dir = root.join("song.d");
+        s.save(&dir).expect("save");
+        assert_eq!(s.session_dir(), Some(dir.as_path()));
+
+        let journal = || std::fs::read_to_string(dir.join("journal.txt")).expect("journal");
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::MoveClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                at_frame: 4_800,
+            },
+            at_frame: None,
+        })
+        .expect("move");
+        assert!(journal().contains("move_clip t0 c0 4800"), "{}", journal());
+        let after_move = journal().len();
+
+        // Undo and seek both rebuild the session — the directory must survive.
+        assert!(s.undo().expect("undo"));
+        assert_eq!(
+            s.session_dir(),
+            Some(dir.as_path()),
+            "an undo must not lose the session directory"
+        );
+        assert!(s.journal_error().is_none());
+        s.execute(&HostCommand::TransportSeek { frame: 2_400 })
+            .expect("seek");
+        assert_eq!(
+            s.session_dir(),
+            Some(dir.as_path()),
+            "a seek must not lose the session directory"
+        );
+
+        // …so the next edit is autosaved, and the journal has grown.
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::SetClipGain {
+                track: "t0".into(),
+                clip: "c0".into(),
+                gain: 0.5,
+            },
+            at_frame: None,
+        })
+        .expect("gain");
+        let text = journal();
+        assert!(text.contains("set_clip_gain t0 c0 0.5"), "{text}");
+        assert!(
+            text.len() > after_move,
+            "the journal kept growing after the rebuild"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The gate's finding #2**: `save` re-pointed the live session at the pool copy
+    /// but left the history naming the original, so a later replay re-adopted it (and
+    /// failed if the original was gone). An undo after a save must still play.
+    #[test]
+    fn an_undo_after_a_save_uses_the_session_pool() {
+        let root = std::env::temp_dir().join(format!("host-rebase-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("elsewhere");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = session_with_pool("rebase", &pool);
+        let dir = root.join("song.d");
+        s.save(&dir).expect("save");
+        let reference = bounce(&mut s, 2_400, &root.join("a.wav"));
+
+        // The original pool disappears — exactly a "save as" that left the source
+        // behind — and then the session *rebuilds*: the seek and the undo both replay
+        // the history, which must now name the session's own pool copy.
+        std::fs::remove_dir_all(&pool).expect("remove the original pool");
+        s.execute(&HostCommand::TransportSeek { frame: 0 })
+            .expect("a seek after a save replays against the pool copy");
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::MoveClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                at_frame: 4_800,
+            },
+            at_frame: None,
+        })
+        .expect("move");
+
+        // The undo rebuilds from history — which must name the session's own pool.
+        assert!(s.undo().expect("undo"));
+        let audio = bounce(&mut s, 2_400, &root.join("b.wav"));
+        assert!(
+            audio.iter().any(|x| x.abs() > 1e-3),
+            "the replay found the pool copy and played"
+        );
+        assert_eq!(audio, reference, "and the audio is unchanged");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The gate's findings #3/#4**: a stale journal (a crash between the script
+    /// rename and the journal reset) replays on the new baseline. Its commands are
+    /// already in the script, so they are refused — dropped and reported, never a
+    /// session that will not open.
+    #[test]
+    fn a_stale_journal_is_dropped_not_fatal() {
+        let root = std::env::temp_dir().join(format!("host-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = session_with_pool("stale", &pool);
+        let dir = root.join("song.d");
+        s.save(&dir).expect("save");
+
+        // The stale journal re-adds the clip the script already has, then adds a
+        // legitimate edit that must survive.
+        std::fs::write(
+            dir.join("journal.txt"),
+            "arrange add_clip t0 c0 s1 0 4800 0 0 0 1.0\narrange set_clip_gain t0 c0 0.25\n",
+        )
+        .expect("stale journal");
+
+        let mut loaded = HostSession::new();
+        loaded
+            .load_session(&dir)
+            .expect("a stale journal must not stop the load");
+        let recovery = loaded.last_recovery().cloned().expect("a report");
+        assert_eq!(recovery.refused, 1, "the duplicate add_clip was refused");
+        assert!(
+            recovery.refused_reason.is_some(),
+            "and the refusal is reported"
+        );
+        assert_eq!(recovery.applied, 1, "the legitimate edit applied");
+        assert_eq!(clip_of(&loaded).gain, 0.25, "the edit is in the session");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A save that cannot be reproduced is **refused**, not written. The word-based
+    /// `host v1` form cannot express an id with whitespace, and it has no form at all
+    /// for a region play — writing either would produce a file that opens as a
+    /// *different* session. (A pool *path* with whitespace is fine: the save copies the
+    /// pool into the session, so the log names the copy.)
+    #[test]
+    fn a_save_that_cannot_round_trip_is_refused() {
+        let root = std::env::temp_dir().join(format!("host-lossy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("my pool"); // the space is only in the *source* path
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = session_with_pool("lossy", &pool);
+        let dir = root.join("song.d");
+        // A clip id with a space is what survives into the log and cannot be written.
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: media::Clip {
+                    id: "c 0".into(),
+                    source: "s1".into(),
+                    src_start: 0,
+                    src_len: 2_400,
+                    at_frame: 0,
+                    fade_in: 0,
+                    fade_out: 0,
+                    gain: 1.0,
+                    loop_len: None,
+                },
+            },
+            at_frame: None,
+        })
+        .expect("the timeline itself accepts the id");
+        let refused = s.save(&dir);
+        assert!(refused.is_err(), "an id with whitespace cannot be saved");
+        assert!(
+            !dir.join("session.txt").exists(),
+            "nothing was written: {}",
+            refused.expect_err("the error")
+        );
+
+        // A whole-file play saves; a region play does not. (A clean path here: a
+        // whitespace path in a `play` line is refused by the same self-check, which is
+        // what the case above just proved.)
+        let clean = root.join("clean");
+        std::fs::create_dir_all(&clean).expect("clean dir");
+        write_tone(&clean, "s1", 48_000, 48_000);
+        let mut s2 = HostSession::new();
+        s2.execute(&HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 2.0)],
+            at_frame: Some(0),
+        })
+        .expect("mixer");
+        s2.execute(&HostCommand::Pool { dir: clean.clone() })
+            .expect("pool");
+        s2.execute(&HostCommand::Play {
+            clip: media::ClipRef {
+                path: clean.join("s1.wav"),
+                start: 0,
+                len: 0,
+            },
+            channel: 0,
+            at_frame: None,
+        })
+        .expect("whole-file play");
+        let dir2 = root.join("ok.d");
+        s2.save(&dir2).expect("a whole-file play round-trips");
+        assert!(dir2.join("session.txt").is_file());
+
+        // The region case needs its own session: the reference host plays one clip at
+        // a time, and the point is a *history* that holds a region play.
+        let region = root.join("region.d");
+        let mut s3 = HostSession::new();
+        s3.execute(&HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 2.0)],
+            at_frame: Some(0),
+        })
+        .expect("mixer");
+        s3.execute(&HostCommand::Pool { dir: clean.clone() })
+            .expect("pool");
+        s3.execute(&HostCommand::Play {
+            clip: media::ClipRef {
+                path: clean.join("s1.wav"),
+                start: 100,
+                len: 50,
+            },
+            channel: 0,
+            at_frame: None,
+        })
+        .expect("region play");
+        let refused = s3.save(&region);
+        assert!(
+            refused.is_err(),
+            "a region play has no host v1 form: {refused:?}"
+        );
+        assert!(
+            !region.join("session.txt").exists(),
+            "nothing was written: {}",
+            refused.expect_err("the error")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
