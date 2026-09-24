@@ -139,6 +139,18 @@ impl Clock {
         self.frame += frames;
     }
 
+    /// **Place the clock at `frame` without rendering the frames in between.**
+    ///
+    /// This is only sound when the graph's state at `frame` is already correct: a
+    /// clip reader derives its read position from the block's frame
+    /// (`ArrangerNode::render` is a pure function of `block.frame`), so readers need
+    /// nothing; a *stateful* effect (a compressor's envelope, a delay line) does, and
+    /// the caller owes it a warm-up render ([`crate::Engine::seek`] leaves that to the
+    /// host, which renders a short run-in and proves the equality).
+    pub fn seek_to(&mut self, frame: u64) {
+        self.frame = frame;
+    }
+
     pub fn seconds(&self) -> f64 {
         self.frame as f64 / self.sample_rate as f64
     }

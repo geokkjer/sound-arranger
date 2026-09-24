@@ -157,6 +157,9 @@ pub struct HostOutcome {
     /// The last successful `export`'s report (length, format, peak, RMS) — what a
     /// shell shows after the render-out gesture. `None` until one runs.
     pub last_export: Option<ExportStatus>,
+    /// The last seek: its target frame and whether it was served by a **warm-up** run-in
+    /// (a long jump that did not render the timeline from 0). `None` until one runs.
+    pub last_seek: Option<(u64, bool)>,
     /// The tempo each pool source was performed at (`source_tempo <id> <bpm>`), sorted
     /// by id so a shell can cache it deterministically — what tempo match derives its
     /// ratio from.
@@ -510,6 +513,7 @@ fn build_outcome(session: &HostSession) -> HostOutcome {
         event_count: session.event_count(),
         media_commands: session.media_command_count(),
         arrangement: session.arrangement(),
+        last_seek: session.last_seek(),
         last_export: session.last_export().map(|e| ExportStatus {
             format: crate::ExportFormat::from_code(e.format)
                 .map(|f| f.name())

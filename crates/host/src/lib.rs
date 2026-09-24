@@ -409,6 +409,18 @@ impl HostCommand {
     }
 }
 
+/// How much audio a **seek run-in** renders before the target frame, so every stateful
+/// node reaches the state a full replay would have had at that point.
+///
+/// One second is the alpha profile's honest bound: the only stateful nodes on the mix bus
+/// are the master's compressor (a 10 ms attack / 120 ms release envelope) and its 5 ms
+/// lookahead limiter, all far inside it. A future effect with longer memory (a reverb, a
+/// long delay) must **raise this**, and
+/// [`a_warm_seek_equals_a_replay`](HostSession) is the test that fails if it is too short:
+/// it renders the same window from a warmed seek and from a full replay and compares the
+/// bytes.
+pub const SEEK_WARMUP_FRAMES: u64 = 48_000;
+
 /// The transport position — the value a shell reads to draw the playhead and the
 /// time readout. `frame` is the core clock's absolute position; musical time
 /// (`beat`, `bpm`) is derived through the tempo map (the log's time-basis rule:
@@ -454,6 +466,9 @@ pub struct HostSession {
     /// The last successful export's report (length, format, peak, RMS) — a shell
     /// shows what was written without recomputing the render.
     last_export: Option<media_ops::ExportRecord>,
+    /// The last seek: its target frame and whether the **warm-up** path ran (a jump that
+    /// rendered a one-second run-in rather than the timeline from 0).
+    last_seek: Option<(u64, bool)>,
     /// The tempo each pool source was performed at (`source_tempo <id> <bpm>`), which
     /// is what **tempo match** derives its ratio from. State: the log carries it, a
     /// replay rebuilds it, and the outcome exposes it to a shell.
@@ -567,6 +582,7 @@ impl HostSession {
             pool_dir: None,
             pool_conformed: Vec::new(),
             last_export: None,
+            last_seek: None,
             source_tempos: std::collections::HashMap::new(),
             wired_tracks: std::collections::HashMap::new(),
             arrange_dirty: false,
@@ -1729,6 +1745,12 @@ impl HostSession {
         self.last_export.as_ref()
     }
 
+    /// The last seek and how it was served: `(target, warmed)`. `warmed` means the jump
+    /// rendered only a [`SEEK_WARMUP_FRAMES`] run-in instead of the timeline from 0.
+    pub fn last_seek(&self) -> Option<(u64, bool)> {
+        self.last_seek
+    }
+
     /// **Export the whole arrangement** to `path` — `bounce`'s deliverable sibling.
     ///
     /// The render runs on a **rebuilt clone** of the session, so an export is
@@ -2084,20 +2106,141 @@ impl HostSession {
         Ok(rebuilt)
     }
 
+    /// **Whether a seek to `frame` may start from a short run-in** instead of rendering
+    /// the timeline from 0.
+    ///
+    /// It may when the *whole session state* is already in force at the run-in's start
+    /// (`frame - SEEK_WARMUP_FRAMES`): a state command placed later (a compressor mounted
+    /// mid-piece, an edit stamped after the target) has to be applied at its own frame,
+    /// which only a full replay can place. The legacy recorder-player path (`play`/
+    /// `splice`) is excluded too — its nodes stream with their own buffering rather than
+    /// deriving the read from the block frame.
+    fn can_warm_seek(&self, frame: u64) -> bool {
+        if frame < SEEK_WARMUP_FRAMES {
+            return false;
+        }
+        let start = frame - SEEK_WARMUP_FRAMES;
+        let placed_late = self.history.iter().any(|entry| {
+            entry.iter().any(|cmd| {
+                matches!(cmd, HostCommand::Play { .. } | HostCommand::Splice { .. })
+                    || cmd.at_frame().is_some_and(|at| at > start)
+            })
+        });
+        !placed_late
+    }
+
     /// Rebuild the session from its state-command history and render back to
     /// `frame` — the deterministic reconstruction `seek_to` and undo/redo share.
     /// The transport's playing state and the redo stack survive the rebuild.
     fn replay_to(&mut self, frame: u64) -> Result<(), String> {
+        self.replay_to_kind(frame, true)
+    }
+
+    /// `replay_to` with the report's honesty kept: `is_seek` is false when the rebuild is
+    /// an **edit** (undo/redo), so `last_seek` keeps naming the last real jump instead of
+    /// claiming an edit was a seek.
+    fn replay_to_kind(&mut self, frame: u64, is_seek: bool) -> Result<(), String> {
         // A rebuild replaces the session, which would drop a take in progress. Stop it
         // properly first: the take is finalized (its WAV + peaks land in the pool) **and**
         // reported, instead of vanishing with the old session.
         if self.recording.is_some() {
             let _ = self.stop_recording();
         }
-        let mut rebuilt = self.rebuild(Some(frame))?;
-        rebuilt.last_take = self.last_take.take();
+        // **Seek at scale**: a jump into a long piece does not need the timeline rendered
+        // from 0. The state is applied (cheaply — a state command whose frame is already
+        // past applies at once), the clock is placed just before the target, and a short
+        // run-in gives every stateful node the state a replay would have had. Readers need
+        // nothing (their read is a pure function of the block frame), so the run-in only
+        // has to cover the bus effects' memory. `warm` reports which path ran.
+        let warm = self.can_warm_seek(frame);
+        let mut rebuilt = if warm {
+            let mut session = self.rebuild_prefix(frame - SEEK_WARMUP_FRAMES)?;
+            session.engine.seek(frame - SEEK_WARMUP_FRAMES);
+            session.render_to(frame)?;
+            session
+        } else {
+            self.rebuild(Some(frame))?
+        };
+        rebuilt.carry_over(self, warm, frame, is_seek);
         *self = rebuilt;
         Ok(())
+    }
+
+    /// Adopt a rebuilt session: the fields a replay must carry across (the playing state,
+    /// the redo stack, persistence, and the observability a shell reads), plus the report
+    /// of how this seek was served.
+    fn carry_over(&mut self, from: &mut HostSession, warm: bool, frame: u64, is_seek: bool) {
+        self.last_take = from.last_take.take();
+        self.playing = from.playing;
+        self.redo = from.redo.clone();
+        self.session_dir = from.session_dir.clone();
+        self.journal_error = from.journal_error.clone();
+        self.last_recovery = from.last_recovery.clone();
+        self.last_export = from.last_export.clone();
+        self.last_drain = from.last_drain;
+        // A seek reports itself; an **edit** (undo/redo) carries the last real seek's
+        // report across rather than blanking it — the shell's "why was that fast?" answer
+        // should survive an unrelated undo.
+        self.last_seek = if is_seek {
+            Some((frame, warm))
+        } else {
+            from.last_seek
+        };
+    }
+
+    /// The **full replay** seek: rebuild from the history and render the timeline from 0.
+    /// The warm-up test uses it as the reference the warmed path must equal, byte for
+    /// byte — the shipped path reaches it through `replay_to`'s fallback branch, which is
+    /// why this is a test-only entry point rather than a second public API.
+    #[cfg(test)]
+    fn replay_full(&mut self, frame: u64) -> Result<(), String> {
+        if self.recording.is_some() {
+            let _ = self.stop_recording();
+        }
+        let mut rebuilt = self.rebuild(Some(frame))?;
+        rebuilt.carry_over(self, false, frame, true);
+        *self = rebuilt;
+        Ok(())
+    }
+
+    /// Rebuild the session with every state command applied — **without rendering the
+    /// timeline** (state commands placed in the future apply at once, because the clock
+    /// starts at 0 and the placement render is skipped). This is the warm-up seek's
+    /// starting state; `can_warm_seek` has already proved that nothing placed after the
+    /// run-in's start is in the history, so "at once" is exactly "in force".
+    fn rebuild_prefix(&self, _start: u64) -> Result<HostSession, String> {
+        let mut rebuilt = HostSession::new_at(self.engine.clock.sample_rate);
+        // **Tempo is the exception to `at_now`.** It is frame-placed *value* state (the
+        // tempo map is a function of the frame), so a change at 60 s must sit at 60 s in
+        // the map even when the run-in starts later — otherwise the audio would be right
+        // (the render reads frames) but every beat reading, the ruler and the shell's
+        // position readout would disagree with a full replay. The segment is pushed
+        // directly (no timeline render); the logged command is applied too, so the folded
+        // `params` value and the rebuilt log stay identical to the full path's.
+        for entry in &self.history {
+            for cmd in entry {
+                if let HostCommand::SetTempo {
+                    bpm,
+                    beats_per_bar,
+                    at_frame,
+                } = cmd
+                {
+                    let at = at_frame.unwrap_or(0);
+                    // Place the clock at the command's own frame (no render) and let the
+                    // engine log and **schedule** it there; the run-in render delivers the
+                    // event at its frame, which pushes the segment — exactly the sequence a
+                    // full replay performs, so the map ends up identical (pushing here as
+                    // well would double every segment).
+                    rebuilt.engine.seek(at);
+                    rebuilt.engine.set_tempo(*bpm, *beats_per_bar)?;
+                    continue;
+                }
+                // Everything else: `at_now` for the same reason the export uses it — the
+                // state's *order* decides the value, and the clock must not walk the piece.
+                rebuilt.process(&cmd.at_now())?;
+            }
+        }
+        Ok(rebuilt)
     }
 
     /// Undo the most recent **arrangement** edit: drop it from the state history
@@ -2117,7 +2260,7 @@ impl HostSession {
         };
         let undone = self.history.remove(pos);
         self.redo.push((pos, undone));
-        self.replay_to(self.engine.clock.frame())?;
+        self.replay_to_kind(self.engine.clock.frame(), false)?;
         Ok(true)
     }
 
@@ -2130,7 +2273,7 @@ impl HostSession {
         };
         let at = pos.min(self.history.len());
         self.history.insert(at, cmd);
-        self.replay_to(self.engine.clock.frame())?;
+        self.replay_to_kind(self.engine.clock.frame(), false)?;
         Ok(true)
     }
 
@@ -5265,6 +5408,324 @@ mod tests {
             std::fs::read(&path).expect("bytes"),
             bytes_before,
             "a refused export never touches an existing file"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A warm-up seek is a seek: provably equal to a replay.** The plan's item 15 asks
+    /// for a jump into a long piece to be interactive *and* "provably equal to a replay".
+    /// A jump past [`SEEK_WARMUP_FRAMES`] places the clock one second before the target
+    /// and renders only that run-in (readers need nothing — a clip's read is a pure
+    /// function of the block frame — and the bus effects settle inside a second). This
+    /// test renders the same window from a warmed seek and from a full replay and compares
+    /// the **bytes**, for a session whose stateful bus chain is live across the seek.
+    #[test]
+    fn a_warm_seek_equals_a_replay() {
+        let root = std::env::temp_dir().join(format!("host-warmseek-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 480_000, 48_000);
+
+        // A piece far longer than the run-in, with a master chain and clips spread across
+        // it, so the limiter's state at the target is real work (not silence).
+        let build = || -> HostSession {
+            let mut s = HostSession::new();
+            s.execute(&HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(0),
+            })
+            .expect("mixer");
+            s.execute(&HostCommand::Mount {
+                plugin: "master",
+                params: vec![],
+                at_frame: Some(0),
+            })
+            .expect("master");
+            s.execute(&HostCommand::Patch {
+                from: ("mixer", "audio"),
+                to: ("master", "audio"),
+                at_frame: Some(0),
+            })
+            .expect("patch");
+            s.execute(&HostCommand::SetParam {
+                plugin: "master",
+                param: "threshold",
+                value: -18.0,
+                at_frame: Some(0),
+            })
+            .expect("threshold");
+            s.execute(&HostCommand::SetParam {
+                plugin: "master",
+                param: "ceiling",
+                value: -6.0,
+                at_frame: Some(0),
+            })
+            .expect("ceiling");
+            s.execute(&HostCommand::Pool { dir: pool.clone() })
+                .expect("pool");
+            s.execute(&HostCommand::Arrange {
+                op: media::ArrangeOp::AddTrack { track: "t0".into() },
+                at_frame: None,
+            })
+            .expect("track");
+            // Clips every second for two minutes, so the run-in ends inside material.
+            for k in 0..120u64 {
+                let mut op = add_clip(&format!("c{k}"), k * 48_000);
+                if let media::ArrangeOp::AddClip { clip, .. } = &mut op {
+                    clip.src_start = 0;
+                    clip.src_len = 48_000;
+                }
+                s.execute(&HostCommand::Arrange { op, at_frame: None })
+                    .expect("clip");
+            }
+            s
+        };
+
+        let target = 3_600_000u64; // 75 s in — past the run-in, inside the piece
+        let mut plain = build();
+        // The **reference**: the same session rendered from 0 by the full replay path
+        // (the warm-up path is what `transport seek` takes when it can prove soundness).
+        plain.replay_full(target).expect("full-replay seek");
+        let (_, warmed) = plain.last_seek().expect("a seek ran");
+        assert!(!warmed, "the reference is the un-warmed path");
+
+        let mut warm = build();
+        warm.execute(&HostCommand::TransportSeek { frame: target })
+            .expect("warm seek");
+        let (frame, warmed) = warm.last_seek().expect("a seek ran");
+        assert_eq!(frame, target);
+        assert!(warmed, "the warm-up path is what this test is for");
+        assert_eq!(
+            warm.arrangement().expect("arrangement"),
+            plain.arrangement().expect("arrangement"),
+            "the value agrees"
+        );
+        assert_eq!(
+            warm.position().frame,
+            plain.position().frame,
+            "and the clock lands in the same place"
+        );
+
+        // Byte-identical audio from the target: the limiter's state came out of the run-in
+        // exactly as a replay would have produced it.
+        let plain_audio = bounce(&mut plain, 24_000, &root.join("plain.wav"));
+        let warm_audio = bounce(&mut warm, 24_000, &root.join("warm.wav"));
+        assert_eq!(
+            plain_audio, warm_audio,
+            "a warm-up seek renders the same bytes as a replay"
+        );
+
+        // State placed **inside the run-in** cannot be warmed: a ceiling change at
+        // 3 576 000 (the run-in starts at target - 48 000 = 3 552 000) has to be applied at
+        // its own frame, which only a full replay can place, so the seek falls back.
+        let mut late = build();
+        late.execute(&HostCommand::SetParam {
+            plugin: "master",
+            param: "ceiling",
+            value: -12.0,
+            at_frame: Some(3_576_000),
+        })
+        .expect("late state");
+        late.execute(&HostCommand::TransportSeek { frame: target })
+            .expect("seek with late state");
+        let (_, warmed) = late.last_seek().expect("a seek ran");
+        assert!(
+            !warmed,
+            "state stamped after the run-in's start forces a full replay"
+        );
+        assert_eq!(
+            late.arrangement().expect("arrangement"),
+            plain.arrangement().expect("arrangement")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Tempo is frame-placed value state, and the run-in keeps it placed.** A tempo
+    /// change at 30 s must sit at 30 s even when the run-in starts at 74 s: the audio is
+    /// frame-based either way, but every beat reading (the ruler, the position readout,
+    /// `source_tempo` matching) would disagree with a full replay if the warm prefix
+    /// simply moved it to 0.
+    #[test]
+    fn a_warm_seek_keeps_mid_piece_tempo_placement() {
+        let root = std::env::temp_dir().join(format!("host-warm-tempo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 480_000, 48_000);
+
+        let build = || -> HostSession {
+            let mut s = HostSession::new();
+            s.execute(&HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(0),
+            })
+            .expect("mixer");
+            s.execute(&HostCommand::SetTempo {
+                bpm: 120.0,
+                beats_per_bar: 4,
+                at_frame: Some(0),
+            })
+            .expect("tempo");
+            s.execute(&HostCommand::Pool { dir: pool.clone() })
+                .expect("pool");
+            s.execute(&HostCommand::Arrange {
+                op: media::ArrangeOp::AddTrack { track: "t0".into() },
+                at_frame: None,
+            })
+            .expect("track");
+            // A tempo change at 30 s, well before the run-in of a seek to 75 s.
+            s.execute(&HostCommand::SetTempo {
+                bpm: 90.0,
+                beats_per_bar: 4,
+                at_frame: Some(1_440_000),
+            })
+            .expect("mid-piece tempo");
+            for k in 0..120u64 {
+                let mut op = add_clip(&format!("c{k}"), k * 48_000);
+                if let media::ArrangeOp::AddClip { clip, .. } = &mut op {
+                    clip.src_len = 48_000;
+                }
+                s.execute(&HostCommand::Arrange { op, at_frame: None })
+                    .expect("clip");
+            }
+            s
+        };
+
+        let target = 3_600_000u64;
+        let mut plain = build();
+        plain.replay_full(target).expect("full replay");
+        let mut warm = build();
+        warm.execute(&HostCommand::TransportSeek { frame: target })
+            .expect("warm seek");
+        assert!(warm.last_seek().expect("a seek ran").1, "warmed");
+
+        // The tempo *map* agrees at the target: the same bpm and the same beat count.
+        assert_eq!(
+            warm.position().bpm,
+            plain.position().bpm,
+            "the tempo in force at the target is the mid-piece one, both ways"
+        );
+        assert_eq!(
+            warm.engine.clock.tempo_map.segments().len(),
+            plain.engine.clock.tempo_map.segments().len(),
+            "and the map has the same segments"
+        );
+        assert_eq!(
+            warm.engine.clock.tempo_map.tempo_at(target),
+            plain.engine.clock.tempo_map.tempo_at(target),
+            "with the same bpm in force at the target"
+        );
+        assert_eq!(
+            warm.position().beat,
+            plain.position().beat,
+            "so the beat position agrees to the bit"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **`last_seek` reports seeks, not edits.** Undo and redo rebuild the session through
+    /// the same path a seek does, so without the flag a shell would announce "seek to
+    /// frame X — warmed" after an undo (the gate's should-fix). The report keeps naming the
+    /// last real jump, and an edit never overwrites it.
+    #[test]
+    fn last_seek_ignores_undo_and_redo() {
+        let (mut s, pool) = session_with_clip("last-seek");
+        s.execute(&HostCommand::TransportSeek { frame: 4_800 })
+            .expect("seek");
+        assert_eq!(s.last_seek().map(|(f, _)| f), Some(4_800));
+
+        // An edit, then an undo and a redo: none of them is a seek.
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::SetClipGain {
+                track: "t0".into(),
+                clip: "c0".into(),
+                gain: 0.5,
+            },
+            at_frame: None,
+        })
+        .expect("edit");
+        assert_eq!(
+            s.last_seek().map(|(f, _)| f),
+            Some(4_800),
+            "an edit does not overwrite the last seek's report"
+        );
+        s.execute(&HostCommand::Undo).expect("undo");
+        assert_eq!(s.last_seek().map(|(f, _)| f), Some(4_800), "nor an undo");
+        s.execute(&HostCommand::Redo).expect("redo");
+        assert_eq!(s.last_seek().map(|(f, _)| f), Some(4_800), "nor a redo");
+
+        // …and a real seek still reports itself.
+        s.execute(&HostCommand::TransportSeek { frame: 1_200 })
+            .expect("seek again");
+        assert_eq!(s.last_seek().map(|(f, _)| f), Some(1_200));
+
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// **The warm-up path is equal even when a clip runs past its source.** A session
+    /// whose clip declares more material than the take holds is broken, but the sequential
+    /// path has always played it (silence after EOF); the offset path must not refuse it,
+    /// or an optimisation would turn a working seek into an error. (It did, before
+    /// `ArrangerNode::new` clamped its mount offset to the source's length — found while
+    /// measuring this slice.)
+    #[test]
+    fn a_warm_seek_equals_a_replay_past_a_clips_source_end() {
+        let root = std::env::temp_dir().join(format!("host-warm-eof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        // A 1-second take, declared as a 10-second clip.
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let build = || -> HostSession {
+            let mut s = HostSession::new();
+            s.execute(&HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(0),
+            })
+            .expect("mixer");
+            s.execute(&HostCommand::Pool { dir: pool.clone() })
+                .expect("pool");
+            s.execute(&HostCommand::Arrange {
+                op: media::ArrangeOp::AddTrack { track: "t0".into() },
+                at_frame: None,
+            })
+            .expect("track");
+            let mut op = add_clip("c0", 0);
+            if let media::ArrangeOp::AddClip { clip, .. } = &mut op {
+                clip.src_len = 480_000; // ten times the source
+            }
+            s.execute(&HostCommand::Arrange { op, at_frame: None })
+                .expect("clip");
+            s
+        };
+
+        // A target well past the source's end (and past the run-in).
+        let target = 240_000u64;
+        let mut plain = build();
+        plain.replay_full(target).expect("full replay past EOF");
+        let plain_audio = bounce(&mut plain, 4_800, &root.join("plain.wav"));
+
+        let mut warm = build();
+        warm.execute(&HostCommand::TransportSeek { frame: target })
+            .expect("warm seek past EOF");
+        let (_, warmed) = warm.last_seek().expect("a seek ran");
+        assert!(warmed, "the warmed path is what is under test");
+        let warm_audio = bounce(&mut warm, 4_800, &root.join("warm.wav"));
+        assert_eq!(
+            plain_audio, warm_audio,
+            "both paths play the same silence after the source's end"
+        );
+        assert!(
+            plain_audio.iter().all(|x| *x == 0.0),
+            "and it is silence (the take is long over)"
         );
 
         let _ = std::fs::remove_dir_all(&root);

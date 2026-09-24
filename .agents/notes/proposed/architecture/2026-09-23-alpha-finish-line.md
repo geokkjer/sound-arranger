@@ -221,7 +221,12 @@ from the shared workflow (a key or a `: ` line — never a shell-only feature).
 
 **E — alpha → beta**
 15. **Seek at scale**: checkpoints (a rebuilt session held at intervals, provably equal to a replay) so a
-    jump into a 30-minute arrangement is interactive.
+    jump into a 30-minute arrangement is interactive. *Done (2026-09-24), by a different mechanism than
+    the parenthetical*: a held rebuilt session is single-use (a `HostSession` cannot be cloned), so it
+    costs exactly the render it saves — replaced by a **warm-up seek** that places the clock one second
+    before the target and renders only that run-in (readers are frame-pure; the bus effects settle
+    inside a second), proved byte-equal to a full replay and measured at 10.6 s → 0.10 s on a
+    30-minute, four-track piece ([note](../../implemented/feature/2026-09-24-seek-at-scale-warm-up.md)).
 16. **Onboarding + honesty**: a first-session doc for the Rust shell, a capability/limitations statement,
     the beta acceptance checklist, and the README/RESEARCH refresh.
 

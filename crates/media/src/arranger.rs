@@ -128,9 +128,16 @@ impl ArrangerNode {
             crate::timeline::validate_clip(c).map_err(|e| format!("arranger: {e}"))?;
             let path = resolve(&c.source)
                 .ok_or_else(|| format!("arranger: pool has no source '{}'", c.source))?;
-            let src_rate = crate::wav::WavReader::open(&path)
-                .map_err(|e| format!("arranger: source {}: {e}", c.source))?
-                .sample_rate();
+            let source_reader = crate::wav::WavReader::open(&path)
+                .map_err(|e| format!("arranger: source {}: {e}", c.source))?;
+            let src_rate = source_reader.sample_rate();
+            // The source's own length: a clip whose declared region runs past its source
+            // (a session that says "play 24 s of an 8 s take") is tolerated, not an error —
+            // it plays what the source has and silence after. That is what a **warm-up
+            // seek** needs: it mounts readers *at an offset* (a full replay warms them
+            // from 0 instead), and mounting past EOF must behave like the full path, not
+            // refuse, or a seek that used to work would fail after the optimisation.
+            let src_frames = source_reader.total_frames();
             if src_rate != session_rate {
                 return Err(format!(
                     "clip '{}' source is {src_rate} Hz but the session is {session_rate} Hz (a pool source is converted to the session rate when the pool is adopted — import it through `Pool::import`/`Pool::conform`, or re-point the pool)",
@@ -138,9 +145,24 @@ impl ArrangerNode {
                 ));
             }
             // How far into the clip the transport already is. If the clip hasn't
-            // started (`from_frame <= at_frame`) this is 0 (read from its start);
-            // if it has already ended, clamp to the length (reader emits silence).
-            let off0 = from_frame.saturating_sub(c.at_frame).min(c.src_len);
+            // started (`from_frame <= at_frame`) this is 0 (read from its start); if it
+            // has already ended, clamp to the length (the reader emits silence).
+            //
+            // The source's own end bounds it too, but **only for a contiguous read**, and
+            // it must be measured from `src_start` — the reader mounts at
+            // `src_start + phase`, so the material left is `src_frames - src_start`. A
+            // *looped* clip is left alone: its phase is `off0 % loop_len` and its cycle
+            // count is `off0 / loop_len`, both of which the bound would move (the gate
+            // reproduced a debug panic on the alignment invariant and, in release, a warm
+            // seek playing the wrong cycle) — a looping reader past EOF is already dead by
+            // construction, so it needs no help.
+            let phase = from_frame.saturating_sub(c.at_frame);
+            let off0 = match c.loop_len {
+                Some(r) if r > 0 => phase.min(c.src_len),
+                _ => phase
+                    .min(c.src_len)
+                    .min(src_frames.saturating_sub(c.src_start)),
+            };
             let clip_ref = ClipRef {
                 path,
                 start: c.src_start,
@@ -266,6 +288,180 @@ mod tests {
 
     fn tmp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("media-arranger-{name}-{}.wav", std::process::id()))
+    }
+
+    /// **The EOF clamp is measured from `src_start` and never touches a loop's phase.**
+    /// The reader mounts at `src_start + phase`, so the bound is `src_frames - src_start`
+    /// (the gate's repro: `src_start = 24 000` on a 48 000-frame file at a mount of 60 000
+    /// used to fail with `seek_frames(72 000) past end`). A looper is excluded entirely:
+    /// its phase is `off0 % loop_len` and its cycle `off0 / loop_len`, both of which a
+    /// clamp would move — the gate reproduced a wrong-cycle read in release and an
+    /// alignment-invariant panic in debug.
+    #[test]
+    fn the_eof_clamp_respects_src_start_and_loops() {
+        let path = tmp("clamp-src-start");
+        write_ramp(&path, 48_000, 48_000, 480);
+        let source = path.clone();
+        let resolve: crate::PoolResolver =
+            Arc::new(move |id: &str| (id == "s1").then(|| source.clone()));
+        let tempo = engine::TempoMap::new(48_000, 120.0, 4);
+
+        let clip = |src_start: u64, src_len: u64, loop_len: Option<u64>| crate::timeline::Clip {
+            id: "c0".into(),
+            name: None,
+            source: "s1".into(),
+            src_start,
+            src_len,
+            at_frame: 0,
+            fade_in: 0,
+            fade_out: 0,
+            gain: 1.0,
+            loop_len,
+            reversed: false,
+        };
+
+        // **`src_start > 0` with a region running past the source**: mounts (no
+        // `seek_frames past end`) and plays the material it has.
+        let track = crate::timeline::Track {
+            id: "t0".into(),
+            clips: vec![clip(24_000, 96_000, None)],
+        };
+        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, 48_000, 60_000)
+            .expect("a reader past the source's end mounts");
+        let mut out = vec![0.0f32; engine::BLOCK];
+        node.render(
+            &engine::NodeIO {
+                audio_in: &[],
+                audio_ins: [&[], &[], &[], &[], &[], &[], &[], &[]],
+                audio_in_count: 0,
+                audio_out_channels: 1,
+                control_in: 0.0,
+                triggers_in: &[],
+                notes_in: &[],
+            },
+            &mut out,
+            &mut 0.0,
+            &mut engine::EventBuf::new(),
+            &mut engine::EventBuf::new(),
+            engine::RenderBlock {
+                frame: 60_000,
+                sample_rate: 48_000,
+                tempo: &tempo,
+                mode: engine::RenderMode::Timeline,
+            },
+        );
+        assert!(
+            out.iter().all(|x| *x == 0.0),
+            "the source is exhausted at 24 s of material into the clip: silence, not a wrap"
+        );
+
+        // **A looped clip whose region exceeds the source** keeps its phase: the gate's
+        // repro panicked on the alignment invariant and (in release) read the wrong cycle.
+        // It must mount and play the loop it still has.
+        let track = crate::timeline::Track {
+            id: "t0".into(),
+            clips: vec![clip(0, 192_000, Some(48_000))],
+        };
+        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, 48_000, 97_000)
+            .expect("a looped reader mounts at a late frame");
+        let mut out = vec![0.0f32; engine::BLOCK];
+        node.render(
+            &engine::NodeIO {
+                audio_in: &[],
+                audio_ins: [&[], &[], &[], &[], &[], &[], &[], &[]],
+                audio_in_count: 0,
+                audio_out_channels: 1,
+                control_in: 0.0,
+                triggers_in: &[],
+                notes_in: &[],
+            },
+            &mut out,
+            &mut 0.0,
+            &mut engine::EventBuf::new(),
+            &mut engine::EventBuf::new(),
+            engine::RenderBlock {
+                frame: 97_000,
+                sample_rate: 48_000,
+                tempo: &tempo,
+                mode: engine::RenderMode::Timeline,
+            },
+        );
+        // The ramp restarts every 480 frames, so the phase is checkable: at clip frame
+        // 97 000 the loop phase is 97 000 % 48 000 = 1 000, past the file's own end, so the
+        // reader is dead and silent — the point is that it is *not* an error and not a
+        // wrapped read of the wrong cycle.
+        assert!(
+            out.iter().all(|x| x.is_finite()),
+            "a looped reader past EOF stays finite"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **Mounting a reader past the source's end is silence, not an error.** A clip whose
+    /// declared region is longer than its source is a broken session, but the sequential
+    /// path has always tolerated it (the reader hits EOF and emits silence, counted as
+    /// underruns); a seek that mounts readers *at an offset* must behave the same way, or
+    /// the offset path would refuse a session the sequential path plays — which is exactly
+    /// what a warm-up seek does.
+    #[test]
+    fn a_reader_mounted_past_the_source_end_plays_silence() {
+        let path = tmp("past-eof");
+        write_const(&path, 4_800, 48_000, 0.5);
+        let clip = crate::timeline::Clip {
+            id: "c0".into(),
+            name: None,
+            source: "s1".into(),
+            src_start: 0,
+            // Ten times the source's length.
+            src_len: 48_000,
+            at_frame: 0,
+            fade_in: 0,
+            fade_out: 0,
+            gain: 1.0,
+            loop_len: None,
+            reversed: false,
+        };
+        let track = crate::timeline::Track {
+            id: "t0".into(),
+            clips: vec![clip],
+        };
+        let source = path.clone();
+        let resolve: crate::PoolResolver =
+            Arc::new(move |id: &str| (id == "s1").then(|| source.clone()));
+
+        // Mount far past the source's end: this used to be a `seek_frames past end` error.
+        let mut node = ArrangerNode::new(track, &resolve, DEFAULT_RING_CAPACITY, 48_000, 30_000)
+            .expect("a reader mounts past EOF");
+        let mut out = vec![0.0f32; engine::BLOCK];
+        let tempo = engine::TempoMap::new(48_000, 120.0, 4);
+        node.render(
+            &engine::NodeIO {
+                audio_in: &[],
+                audio_ins: [&[], &[], &[], &[], &[], &[], &[], &[]],
+                audio_in_count: 0,
+                audio_out_channels: 1,
+                control_in: 0.0,
+                triggers_in: &[],
+                notes_in: &[],
+            },
+            &mut out,
+            &mut 0.0,
+            &mut engine::EventBuf::new(),
+            &mut engine::EventBuf::new(),
+            engine::RenderBlock {
+                frame: 30_000,
+                sample_rate: 48_000,
+                tempo: &tempo,
+                mode: engine::RenderMode::Timeline,
+            },
+        );
+        assert!(
+            out.iter().all(|x| *x == 0.0),
+            "past the source's end the reader is silent (not an error)"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Write a mono float WAV `frames` long, every sample = `value`.

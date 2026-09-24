@@ -58,6 +58,22 @@ fn main() {
         None => eprintln!("host: no bounce written (no Bounce command or it failed)"),
     }
 
+    // How the last seek was served: a long jump into a piece is a warm-up run-in, not a
+    // render from 0 — worth saying, because it is the difference between interactive and
+    // not on a 30-minute arrangement.
+    if let Some((frame, warmed)) = session.last_seek() {
+        let rate = session.sample_rate().max(1) as f64;
+        let how = if warmed {
+            format!(
+                "warmed (a {:.2} s run-in)",
+                host::SEEK_WARMUP_FRAMES as f64 / rate
+            )
+        } else {
+            "full replay (state placed after the run-in, or a short jump)".to_string()
+        };
+        println!("host: seek to frame {frame} — {how}");
+    }
+
     // The export report (peak/RMS are measured, not guessed, and are read back from
     // the session's record of the last successful export).
     if let Some(record) = session.last_export() {

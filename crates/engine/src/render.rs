@@ -46,6 +46,13 @@ pub enum SchedEvent {
     SetTempo {
         bpm: f64,
         beats_per_bar: u32,
+        /// The frame the change belongs to. Carried so the **segment is stamped at its
+        /// own frame even when the event is delivered later** — the render loop normally
+        /// delivers it exactly at `at_frame`, but a seek that places the clock *past* a
+        /// scheduled change (a warm-up run-in) delivers it late, and stamping it at the
+        /// clock's current position would move the change's effect (the beat count, the
+        /// ruler) without moving the audio.
+        at_frame: u64,
     },
     SetParam {
         plugin: &'static str,
@@ -438,8 +445,14 @@ impl Engine {
             beats_per_bar,
             at_frame,
         });
-        self.scheduler
-            .schedule(at_frame, SchedEvent::SetTempo { bpm, beats_per_bar });
+        self.scheduler.schedule(
+            at_frame,
+            SchedEvent::SetTempo {
+                bpm,
+                beats_per_bar,
+                at_frame,
+            },
+        );
         Ok(())
     }
 
@@ -636,6 +649,7 @@ impl Engine {
                         SchedEvent::SetTempo {
                             bpm: *bpm,
                             beats_per_bar: *beats_per_bar,
+                            at_frame: *at_frame,
                         },
                     );
                 }
@@ -713,8 +727,15 @@ impl Engine {
                 to_plugin,
                 to_port,
             } => self.apply_patch((from_plugin, from_port), (to_plugin, to_port)),
-            SchedEvent::SetTempo { bpm, beats_per_bar } => {
-                self.clock.push_tempo(bpm, beats_per_bar);
+            SchedEvent::SetTempo {
+                bpm,
+                beats_per_bar,
+                at_frame,
+            } => {
+                // Stamp the segment at the frame the change belongs to, not at wherever the
+                // clock happens to be when the event is delivered (the two differ only when
+                // something places the clock past a scheduled change — a warm-up seek).
+                self.clock.tempo_map.push(at_frame, bpm, beats_per_bar);
             }
             SchedEvent::SetParam {
                 plugin,
@@ -844,6 +865,15 @@ impl Engine {
             // A plugin with no audio Out cannot become the bus.
             _ => false,
         }
+    }
+
+    /// **Place the clock at `frame` without rendering 0→frame.** The caller must then
+    /// render a warm-up long enough for every stateful node to reach the state a full
+    /// replay would have ([`Clock::seek_to`] explains the contract); a node whose reads
+    /// are a pure function of the block frame needs nothing. The host's
+    /// `SEEK_WARMUP_FRAMES` is that run-in, and its tests prove the equality.
+    pub fn seek(&mut self, frame: u64) {
+        self.clock.seek_to(frame);
     }
 
     /// Render `frames` samples (frames * channels, interleaved) into a fresh
