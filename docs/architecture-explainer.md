@@ -1,6 +1,6 @@
 # sound-arranger: from architecture up
 
-> 🕒 Last verified against commit `4434756` (2026-09-24). If the code has moved on,
+> 🕒 Last verified against commit `100999a` (2026-09-24). If the code has moved on,
 > trust the code and move this line forward.
 
 > A plain-English (mostly) tour of the Rust code, for a developer with roughly six
@@ -970,7 +970,16 @@ profile: *schedule the intent now, resolve the wiring when both ends exist.*
 `parse_script` turns a line like `patch euclidean.triggers scale.trigger` into a
 `HostCommand::Patch`. It's a tiny recursive-descent parser over `split_whitespace`
 tokens, with `.split_once('=')` for `k=v` params and `host_name()` for
-interning. Keeping the parser a pure function `&str -> Result<Vec<HostCommand>>`
+interning.
+
+A line may also carry **trailing modifiers**, in either order: `@frame` says *when*
+the command applies, and `snap=<frames>` quantizes the frame operand the command
+carries. The second is how a script reproduces a grid edit exactly — it rounds at
+parse time (`arrange move_clip t0 c0 48213 snap=480` → `48000`), so the parser
+needs no tempo knowledge, the logged command already holds the snapped frame, and
+the formatter writes it back without the modifier. A modifier a command cannot use
+is a parse error, never a silent no-op, and `snap=0` is refused (omitting the
+modifier *is* "no grid"). Keeping the parser a pure function `&str -> Result<Vec<HostCommand>>`
 (no I/O, no side effects) makes it trivially testable and lets both the CLI and the
 Tauri bridge command (`run_host_script`) share it.
 
@@ -1053,6 +1062,12 @@ considered, and the code is candid about its edges.
 
 **Cons**
 
+- **UI state is deliberately not in the log**, and the snap grid is the example to
+  copy: the shell quantizes an edit's frame *before* it builds the command
+  (`arrange move_clip t0 c0 48213 snap=480` is the script-side spelling), so the
+  log records "the clip is at frame 48000" and replay never has to know a grid
+  existed. The alternative — logging "snap to the beat" — would put a view setting
+  in the document and change what a log *means* when a user toggles a key.
 - Only *discrete* facts are logged now. **Automation curves** (a fader ride) are a
   *not-yet-implemented* future event type; the log's stated design is to coalesce
   control-rate streams into gestures, but that's unshipped. Until then, a smooth

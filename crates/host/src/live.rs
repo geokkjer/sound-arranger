@@ -38,6 +38,13 @@ pub struct Snapshot {
     pub beat: f64,
     pub bpm: f64,
     pub playing: bool,
+    /// The session's tempo/meter map, so a shell can quantize in the **beat**
+    /// domain (grid snapping, a bar/beat ruler) against the same segments the
+    /// engine plays — not a second copy that could drift. Cloned with the snapshot.
+    pub tempo_map: engine::TempoMap,
+    /// The session's sample rate (the engine clock's) — the frame side of the
+    /// musical math, available even when no device was opened.
+    pub sample_rate: u32,
     /// Per-channel meter peaks (post-gain, pre-mute/solo). Only the first
     /// `channel_count` are meaningful; the rest are zero.
     pub channels: [f32; MIXER_CHANNELS_MAX],
@@ -83,6 +90,10 @@ impl Default for Snapshot {
             beat: 0.0,
             bpm: 120.0,
             playing: false,
+            // The demo/default session shape (4/4 at 120 bpm, 48 kHz) — the same
+            // defaults the shells start from.
+            tempo_map: engine::TempoMap::new(48_000, 120.0, 4),
+            sample_rate: 48_000,
             channels: [0.0; MIXER_CHANNELS_MAX],
             channel_count: 0,
             master: 0.0,
@@ -477,6 +488,11 @@ fn publish(session: &HostSession, shared: &Mutex<Snapshot>, audio: &AudioState) 
     s.beat = p.beat;
     s.bpm = p.bpm;
     s.playing = p.playing;
+    // One clone per publish: the map is the shell's musical time base, and the
+    // sample rate comes with it (they must not disagree).
+    let tempo = session.tempo_map();
+    s.sample_rate = tempo.sample_rate();
+    s.tempo_map = tempo;
     s.channel_count = session.mixer_channels().unwrap_or(0);
     s.can_undo = session.can_undo();
     s.can_redo = session.can_redo();

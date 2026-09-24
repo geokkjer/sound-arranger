@@ -143,6 +143,11 @@ struct Spike {
     history: Vec<String>,
     history_at: usize,
     help: bool,
+    /// The shared workflow's snap grid. iced has no timeline canvas yet, so the
+    /// grid cannot quantize an edit here — but the *state* and its cycling order
+    /// are the workflow's, and the shell says which division is armed rather than
+    /// pretending the key does nothing.
+    grid: workflow::Grid,
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +206,7 @@ impl Spike {
             history: Vec::new(),
             history_at: 0,
             help: false,
+            grid: workflow::Grid::default(),
         };
         spike.adopt();
         spike
@@ -425,6 +431,18 @@ impl Spike {
             }
             Action::Cancel => {
                 self.status.clear();
+            }
+            Action::GridCycle => {
+                self.grid.cycle();
+                self.status = if self.grid.is_on() {
+                    format!(
+                        "snap grid: {} — the grid is workflow state, but the iced timeline \
+                         canvas is not built yet, so nothing snaps here",
+                        self.grid.label()
+                    )
+                } else {
+                    "snap grid off".to_string()
+                };
             }
             other => {
                 self.status = format!(
@@ -853,6 +871,25 @@ mod tests {
         assert_eq!(Spike::gain_param(0, 4), "ch0.gain");
         assert_eq!(Spike::gain_param(3, 4), "ch3.gain");
         assert_eq!(Spike::gain_param(4, 4), "master.gain");
+    }
+
+    /// The iced shell speaks the shared workflow's grid too: the same cycling
+    /// order and the same labels, and it *says* that nothing snaps here yet
+    /// (the timeline canvas is the part that is missing, not the model).
+    #[test]
+    fn the_grid_cycles_and_says_what_it_cannot_do() {
+        let mut spike = Spike::headless();
+        assert!(!spike.grid.is_on());
+        spike.dispatch(workflow::Action::GridCycle);
+        assert_eq!(spike.grid.label(), "bar");
+        assert!(spike.status.contains("bar"), "{}", spike.status);
+        spike.dispatch(workflow::Action::GridCycle);
+        assert_eq!(spike.grid.label(), "beat");
+        assert!(
+            spike.status.contains("not built yet"),
+            "the shell must report the gap, not drop it: {}",
+            spike.status
+        );
     }
 
     /// The dB fader range is the inverse of itself, unity is 0 dB, and silence

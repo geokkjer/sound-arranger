@@ -480,6 +480,8 @@ pub fn draw(
     mode: Mode,
     active_track: usize,
     focused: bool,
+    grid: Option<media::Grid>,
+    tempo: &host::TempoMap,
 ) -> PanelRects {
     let lanes = arrangement.lanes.len();
     let title = format!(
@@ -525,7 +527,7 @@ pub fn draw(
 
     // The ruler spans the envelope area, right of the gutter.
     let ruler_area = Rect::new(inner.x + GUTTER, inner.y, inner.width - GUTTER, 1);
-    draw_ruler(frame, ruler_area, arrangement, view);
+    draw_ruler(frame, ruler_area, arrangement, view, grid, tempo);
     rects.ruler = ruler_area;
 
     let body = Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1);
@@ -557,9 +559,37 @@ pub fn draw(
     rects
 }
 
-/// A time ruler: a labelled tick every round number of seconds, chosen so ticks
+/// The ruler: a **bar/beat** ruler when a snap grid is armed, and the seconds
+/// ruler otherwise.
+///
+/// The musical ruler is what makes the grid legible — you can see the lines an
+/// edit will land on. Bar lines are labelled with the bar number (from the
+/// session's tempo map, so a tempo or meter change moves them with the music) and
+/// beat lines get a light tick; when bars are too dense to label, it degrades to
+/// beat ticks alone rather than printing a smear.
+fn draw_ruler(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    arrangement: &Arrangement,
+    view: &View,
+    grid: Option<media::Grid>,
+    tempo: &host::TempoMap,
+) {
+    if let Some(grid) = grid {
+        draw_musical_ruler(frame, area, arrangement, view, grid, tempo);
+        return;
+    }
+    draw_seconds_ruler(frame, area, arrangement, view);
+}
+
+/// The time ruler: a labelled tick every round number of seconds, chosen so ticks
 /// are at least 10 cells apart.
-fn draw_ruler(frame: &mut ratatui::Frame, area: Rect, arrangement: &Arrangement, view: &View) {
+fn draw_seconds_ruler(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    arrangement: &Arrangement,
+    view: &View,
+) {
     const STEPS: [f64; 10] = [0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0];
     let rate = arrangement.sample_rate.max(1);
     let ms_per_cell = view.ms_per_cell(rate).max(0.0001);
@@ -595,6 +625,114 @@ fn draw_ruler(frame: &mut ratatui::Frame, area: Rect, arrangement: &Arrangement,
         Paragraph::new(text).style(Style::new().fg(Color::Gray)),
         Rect::new(area.x, area.y, area.width, 1),
     );
+}
+
+/// The bar/beat ruler: `|` on a bar (labelled with its number), `·` on a beat.
+///
+/// Driven **by cell**, not by grid line: each column asks "does a bar (or, failing
+/// that, a grid line) fall in me?", which is what makes the ruler honest at every
+/// zoom. Walking grid lines instead would either iterate hundreds of thousands of
+/// steps in a 30-minute view or cap the walk and leave the far end of the row
+/// blank. Bars win a cell over beat ticks, so a number is never lost to a tick.
+fn draw_musical_ruler(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    arrangement: &Arrangement,
+    view: &View,
+    grid: media::Grid,
+    tempo: &host::TempoMap,
+) {
+    let width = area.width as usize;
+    if width == 0 {
+        return;
+    }
+    let rate = arrangement.sample_rate.max(1);
+    // Frames per column, from the viewport's own zoom.
+    let frames_per_cell = view.ms_per_cell(rate) * rate as f64 / 1000.0;
+    if frames_per_cell <= 0.0 || !frames_per_cell.is_finite() {
+        return;
+    }
+    let step = grid.step_beats();
+    if step <= 0.0 {
+        return;
+    }
+
+    let end_frame = view.start + view.visible(area.width as u64);
+    // The meter in force at the viewport's start sets the bar length and the bar
+    // numbering. (A meter change *inside* the view keeps this phase: continuing
+    // the count across a segment boundary needs a bar-phase notion the tempo map
+    // does not have yet — recorded in the slice note as still open.)
+    let bar_beats = tempo.meter_at(view.start).max(1) as f64;
+    let row = ruler_marks(
+        width,
+        view,
+        frames_per_cell,
+        end_frame,
+        grid,
+        tempo,
+        bar_beats,
+    );
+    frame.render_widget(
+        Paragraph::new(String::from_iter(row)).style(Style::new().fg(Color::Gray)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+}
+
+/// The ruler's row, in characters — the draw above is only a render of this, which
+/// keeps the geometry testable without a terminal.
+///
+/// `numbered` is decided by the caller's cell budget (a bar number needs ~4 cells).
+fn ruler_marks(
+    width: usize,
+    view: &View,
+    frames_per_cell: f64,
+    end_frame: u64,
+    grid: media::Grid,
+    tempo: &host::TempoMap,
+    bar_beats: f64,
+) -> Vec<char> {
+    let step = grid.step_beats();
+    let cells_per_beat = (tempo.frame_at(tempo.beat_at(view.start).ceil() + 1.0)
+        - tempo.frame_at(tempo.beat_at(view.start).ceil())) as f64
+        / frames_per_cell;
+    let numbered = cells_per_beat * bar_beats >= 5.0;
+    // The cell a frame falls in, if it is visible at all.
+    let cell_of = |at: u64| -> Option<usize> {
+        (at >= view.start && at <= end_frame)
+            .then(|| ((at - view.start) as f64 / frames_per_cell).floor() as usize)
+            .filter(|cell| *cell < width)
+    };
+
+    let mut row = vec![' '; width];
+    for cell in 0..width {
+        // The beat at the *left edge* of this cell (a cell is ~10 ms wide at the
+        // zoom floor, so one sample of the map per cell is the right resolution).
+        let at = view.start + (cell as f64 * frames_per_cell).round() as u64;
+        let beat = tempo.beat_at(at);
+
+        // A bar in this cell wins: it carries the number.
+        let bar_frame = tempo.frame_at((beat / bar_beats).round() * bar_beats);
+        if cell_of(bar_frame) == Some(cell) {
+            row[cell] = '|';
+            if numbered {
+                let number = ((beat / bar_beats).round() as u64) + 1;
+                for (k, ch) in number.to_string().chars().enumerate() {
+                    if cell + 1 + k < width {
+                        row[cell + 1 + k] = ch;
+                    }
+                }
+            }
+            continue;
+        }
+        // Otherwise, a grid line finer than a bar.
+        if step < bar_beats {
+            let line = tempo.frame_at((beat / step).round() * step);
+            if cell_of(line) == Some(cell) {
+                row[cell] = '·';
+            }
+        }
+    }
+    row
 }
 
 fn format_label(seconds: f64, step: f64) -> String {
@@ -954,6 +1092,47 @@ mod tests {
         assert!(label.contains("(1.000 s)"), "{label}");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The ruler is drawn **by cell**, so it survives a view that spans far more
+    /// grid steps than there are columns — the case that used to stop after a
+    /// fixed number of steps and leave the rest of the row blank (a 30-minute
+    /// arrangement on the 1/4 grid needs ~14 000 steps for 100 columns).
+    #[test]
+    fn the_musical_ruler_fills_the_row_at_any_zoom() {
+        let rate = 48_000u32;
+        let tempo = host::TempoMap::new(rate, 120.0, 4);
+        let grid = media::Grid::new(media::Division::Quarter, 4);
+        let width = 100usize;
+
+        for (seconds, label) in [(1.5f64, "zoomed in"), (1800.0, "30 minutes")] {
+            let frames = (seconds * rate as f64) as u64;
+            let mut view = View::new(frames);
+            view.fit(frames, width as u64);
+            let frames_per_cell = view.visible(width as u64) as f64 / width as f64;
+            let end = view.start + view.visible(width as u64);
+            let row = ruler_marks(width, &view, frames_per_cell, end, grid, &tempo, 4.0);
+
+            assert_eq!(row.len(), width);
+            assert_eq!(row[0], '|', "{label}: the first bar is marked");
+            let marks = row.iter().filter(|c| !c.is_whitespace()).count();
+            // Zoomed in, a fine grid is legitimately sparse (one line every ~8
+            // cells); zoomed out, a bar lands in most cells — either way the row
+            // is marked, never capped.
+            assert!(marks >= 5, "{label}: the row is unmarked ({marks} marks)");
+            if seconds > 60.0 {
+                assert!(
+                    marks >= width / 4,
+                    "{label}: a zoomed-out grid must mark most of the row ({marks} marks)"
+                );
+            }
+            // The far end of the row is drawn too — the bug this test exists for.
+            let tail = &row[width - 10..];
+            assert!(
+                tail.iter().any(|c| !c.is_whitespace()),
+                "{label}: the last columns are blank: {row:?}"
+            );
+        }
     }
 
     #[test]

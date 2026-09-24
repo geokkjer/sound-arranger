@@ -162,6 +162,10 @@ struct App {
     /// A counter for ids the shell generates (split halves) — ids are logged, so
     /// they must be unique and deterministic per session.
     next_id: u64,
+    /// The **snap grid** (alpha slice C): which musical division an edit lands on.
+    /// UI state, never logged — a snapped edit is an edit whose frame was
+    /// quantized *before* the command was issued, so replay is untouched.
+    grid: workflow::Grid,
     panel: timeline::PanelRects,
 }
 
@@ -236,6 +240,9 @@ impl App {
             active_track: 0,
             origin: String::new(),
             next_id: 0,
+            // Off by default: snapping silently would change every existing
+            // gesture, so the grid is armed explicitly with `b`.
+            grid: workflow::Grid::default(),
             panel: timeline::PanelRects::default(),
         };
 
@@ -543,6 +550,9 @@ impl App {
             active_track: 0,
             origin: String::new(),
             next_id: 0,
+            // Off by default: snapping silently would change every existing
+            // gesture, so the grid is armed explicitly with `b`.
+            grid: workflow::Grid::default(),
             panel: timeline::PanelRects::default(),
         }
     }
@@ -586,12 +596,27 @@ impl App {
         self.command("rewind", HostCommand::TransportSeek { frame: 0 });
     }
 
-    /// Seek by whole seconds, clamped at zero. Stops first (see `rewind`).
+    /// Seek by whole seconds, clamped to the arrangement, landing on the armed
+    /// grid. Stops first (see `rewind`). The step is the **session's** second
+    /// (`sample_rate`), not the spike's default: a 44.1 kHz session must move 44 100
+    /// frames per second, and the grid math already uses the session's map.
     fn nudge(&mut self, seconds: i64) {
-        let target = (self.snap.frame as i64 + seconds * SAMPLE_RATE as i64).max(0) as u64;
+        let rate = self.sample_rate() as i64;
+        let raw = (self.snap.frame as i64 + seconds * rate).max(0) as u64;
+        let target = self.clamp_frame(self.snap_frame(raw));
 
         self.stop();
         self.command("seek", HostCommand::TransportSeek { frame: target });
+    }
+
+    /// Keep a seek target inside the arrangement (`0..=frames`) — a playhead past
+    /// the end is a state with nothing to show, and the transport tolerates it
+    /// silently.
+    fn clamp_frame(&self, frame: u64) -> u64 {
+        match self.arrangement.as_ref() {
+            Some(arrangement) => frame.min(arrangement.frames),
+            None => frame,
+        }
     }
 
     fn select(&mut self, delta: i64) {
@@ -721,6 +746,8 @@ impl App {
             Action::TrimEnd => self.timeline_key(|app| app.trim_to_playhead(media::Edge::End)),
             Action::TrimToSelection => self.timeline_key(|app| app.trim_to_selection()),
             Action::Nudge(direction) => self.timeline_key(|app| app.nudge_clip(direction)),
+            Action::SeekGrid(direction) => self.timeline_key(|app| app.seek_grid(direction)),
+            Action::GridCycle => self.cycle_grid(),
             Action::MoveTrack(offset) => self.timeline_key(|app| app.move_clip_to_track(offset)),
             Action::Gain(direction) => {
                 self.timeline_key(|app| app.step_clip_gain(direction as f32))
@@ -985,9 +1012,12 @@ impl App {
         self.next_id += 1;
         let left = format!("{clip_id}-a{}", self.next_id);
         let right = format!("{clip_id}-b{}", self.next_id);
-        let at = self.snap.frame;
+        let at = self.snap_frame(self.snap.frame);
 
-        self.status = format!("split {clip_id} at {at} → {left} + {right}");
+        self.status = format!(
+            "split {clip_id} at {at}{} → {left} + {right}",
+            snapped_note(self.snap.frame, at, self.grid.label()),
+        );
         self.arrange(&format!(
             "razor_split {track} {clip_id} {left} {right} {at}"
         ));
@@ -1060,7 +1090,8 @@ impl App {
             self.status = "no clip under the playhead on the active track".to_string();
             return;
         };
-        let playhead = self.snap.frame as i64;
+        let at = self.snap_frame(self.snap.frame);
+        let playhead = at as i64;
         let (name, by) = match edge {
             media::Edge::Start => ("start", playhead - clip.at_frame as i64),
             media::Edge::End => ("end", playhead - clip.end_frame() as i64),
@@ -1069,7 +1100,11 @@ impl App {
             self.status = format!("{}: the playhead is already its {name}", clip.id);
             return;
         }
-        self.status = format!("trim {} {name} by {by:+} frames", clip.id);
+        self.status = format!(
+            "trim {} {name} by {by:+} frames{}",
+            clip.id,
+            snapped_note(self.snap.frame, at, self.grid.label()),
+        );
         self.arrange(&format!("trim {track} {} {name} {by}", clip.id));
     }
 
@@ -1122,19 +1157,30 @@ impl App {
         }
     }
 
-    /// `H` / `L`: move the clip under the playhead one **beat** earlier / later.
-    /// The step comes from the session clock (bpm × sample rate), so a nudge is
-    /// musical rather than a cell width, and moving left clamps at frame 0.
+    /// `H` / `L`: move the clip under the playhead one **grid step** earlier /
+    /// later — one beat when no grid is armed. The step comes from the session's
+    /// tempo map (beats × bpm × sample rate), so a nudge is musical rather than a
+    /// cell width, and moving left clamps at frame 0. The *target* is quantized, so
+    /// a clip that sat off the grid lands on it.
     fn nudge_clip(&mut self, direction: i32) {
         let Some((track, clip)) = self.active_clip_at(self.snap.frame) else {
             self.status = "no clip under the playhead on the active track".to_string();
             return;
         };
-        let sample_rate = self.sample_rate() as f64;
-        let beat = (60.0 / self.snap.bpm.max(1e-9) * sample_rate).round() as i64;
-        let target = (clip.at_frame as i64 + direction as i64 * beat).max(0) as u64;
-        let beats = direction as i64;
-        self.status = format!("move {} {beats:+} beat ({beat} frames) → {target}", clip.id);
+        let step = self.grid_step_frames(clip.at_frame);
+        let raw = (clip.at_frame as i64 + direction as i64 * step).max(0) as u64;
+        let target = self.snap_frame(raw);
+        self.status = format!(
+            "move {} {:+} {} ({step} frames) → {target} [grid {}]",
+            clip.id,
+            direction,
+            if self.grid.is_on() {
+                "grid step"
+            } else {
+                "beat"
+            },
+            self.grid.label(),
+        );
         self.arrange(&format!("move_clip {track} {} {target}", clip.id));
     }
 
@@ -1195,7 +1241,7 @@ impl App {
             self.status = "no clip under the playhead on the active track".to_string();
             return;
         };
-        let playhead = self.snap.frame;
+        let playhead = self.snap_frame(self.snap.frame);
         let (mut new_in, mut new_out) = (clip.fade_in, clip.fade_out);
         let (wanted, capped) = if fade_in {
             let wanted = playhead.saturating_sub(clip.at_frame);
@@ -1218,9 +1264,10 @@ impl App {
             String::new()
         };
         self.status = format!(
-            "{} {which} = {value} frames ({:.3} s){clamped}",
+            "{} {which} = {value} frames ({:.3} s){clamped}{}",
             clip.id,
             value as f64 / self.sample_rate() as f64,
+            snapped_note(self.snap.frame, playhead, self.grid.label()),
         );
         self.arrange(&format!(
             "set_clip_fade {track} {} {new_in} {new_out}",
@@ -1234,6 +1281,80 @@ impl App {
             .as_ref()
             .map_or(48_000, |a| a.sample_rate)
             .max(1)
+    }
+
+    // -- the snap grid ------------------------------------------------------
+
+    /// `b`: arm the next grid division (off → bar → beat → 1/2 → 1/4 → off). The
+    /// cycle is the shared workflow's; the shell only says what it is now.
+    fn cycle_grid(&mut self) {
+        self.grid.cycle();
+        self.status = if self.grid.is_on() {
+            let era = self.snap.tempo_map.meter_at(self.snap.frame);
+            format!(
+                "snap grid: {} ({} beat{} per bar — `H`/`L` and every edit land on it)",
+                self.grid.label(),
+                era,
+                if era == 1 { "" } else { "s" },
+            )
+        } else {
+            "snap grid off — edits land on the exact frame".to_string()
+        };
+    }
+
+    /// The frame an **edit** lands on: quantized to the armed grid in the *beat*
+    /// domain, through the session's own tempo map (so a tempo change moves the
+    /// grid with the music). With no grid armed the frame is returned unchanged.
+    fn snap_frame(&self, frame: u64) -> u64 {
+        let map = &self.snap.tempo_map;
+        let Some(grid) = self.grid.grid(map.meter_at(frame)) else {
+            return frame;
+        };
+        map.frame_at(grid.nearest(map.beat_at(frame)))
+    }
+
+    /// One grid step in frames at `frame`'s tempo — the nudge distance when the
+    /// grid is armed, and one beat when it is not.
+    fn grid_step_frames(&self, frame: u64) -> i64 {
+        let map = &self.snap.tempo_map;
+        match self.grid.grid(map.meter_at(frame)) {
+            Some(grid) => {
+                let here = map.beat_at(frame);
+                (map.frame_at(grid.nearest(here) + grid.step_beats())
+                    - map.frame_at(grid.nearest(here))) as i64
+            }
+            None => (60.0 / self.snap.bpm.max(1e-9) * self.sample_rate() as f64).round() as i64,
+        }
+    }
+
+    /// `[`/`]`: move the playhead to the previous/next grid line (a beat when the
+    /// grid is off). Stops first, like every other seek.
+    fn seek_grid(&mut self, direction: i32) {
+        let map = &self.snap.tempo_map;
+        let here = self.snap.frame;
+        let target = match self.grid.grid(map.meter_at(here)) {
+            Some(grid) => {
+                let beat = map.beat_at(here);
+                let line = if direction > 0 {
+                    grid.ceil(beat + grid.step_beats() / 2.0)
+                } else {
+                    grid.floor(beat - grid.step_beats() / 2.0)
+                };
+                map.frame_at(line.max(0.0))
+            }
+            None => {
+                let step = self.grid_step_frames(here);
+                (here as i64 + direction as i64 * step).max(0) as u64
+            }
+        };
+        let target = self.clamp_frame(target);
+        self.status = format!(
+            "seek {} to frame {target} (grid {})",
+            if direction > 0 { "forward" } else { "back" },
+            self.grid.label()
+        );
+        self.stop();
+        self.command("seek", HostCommand::TransportSeek { frame: target });
     }
 
     // -- the `:` command line ----------------------------------------------
@@ -1329,13 +1450,20 @@ impl App {
     }
 
     /// A click on the timeline seeks the transport to that point — the mouse
-    /// dispatching exactly the command a key would, so there is one log.
+    /// dispatching exactly the command a key would, so there is one log. An armed
+    /// grid quantizes the click like every other playhead move (the status line
+    /// says so when it moved), and the target stays inside the arrangement.
     fn timeline_seek(&mut self, position: Position) {
         let (Some(arrangement), Some(view)) = (&self.arrangement, &self.view) else {
             return;
         };
         let cell = position.x.saturating_sub(self.panel.ruler.x) as u64;
-        let frame = view.frame_at(cell).min(arrangement.frames);
+        let raw = view.frame_at(cell).min(arrangement.frames);
+        let frame = self.clamp_frame(self.snap_frame(raw));
+        self.status = format!(
+            "seek to frame {frame}{}",
+            snapped_note(raw, frame, self.grid.label())
+        );
         self.stop();
         self.command("seek", HostCommand::TransportSeek { frame });
     }
@@ -1508,6 +1636,9 @@ impl App {
             self.mode,
             self.active_track,
             self.focus == Panel::Timeline,
+            self.grid
+                .grid(self.snap.tempo_map.meter_at(self.snap.frame)),
+            &self.snap.tempo_map,
         );
         self.panel = panel;
     }
@@ -1741,9 +1872,15 @@ impl App {
             )
         };
 
-        // Which panel the keys act on, the active track, the viewport, and the
-        // selection — all of it on one line so the state is never guessed.
-        let focus = format!("focus {}   ", self.focus.label());
+        // Which panel the keys act on, the armed snap grid, the active track, the
+        // viewport, and the selection — all of it on one line so the state is never
+        // guessed. The grid is on the line because it is invisible otherwise: an
+        // edit that lands somewhere unexpected must be explained by the state.
+        let focus = format!(
+            "focus {}   grid {}   ",
+            self.focus.label(),
+            self.grid.label()
+        );
         let timeline = match (&self.arrangement, &self.view) {
             (Some(arrangement), Some(view)) => {
                 let selection = view
@@ -2142,6 +2279,16 @@ fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
     }
 
     text
+}
+
+/// A status suffix that says the grid moved the frame (an edit that landed
+/// somewhere other than the playhead must say so, or the grid looks like a bug).
+fn snapped_note(raw: u64, snapped: u64, grid: &str) -> String {
+    if raw == snapped {
+        String::new()
+    } else {
+        format!(" (snapped from {raw} on the {grid} grid)")
+    }
 }
 
 fn audio_label(snap: &Snapshot) -> String {
@@ -2617,6 +2764,193 @@ mod tests {
         drop_pool();
     }
 
+    /// `b` arms the snap grid, and the state line says which division is live —
+    /// an invisible grid is a trap (an edit lands somewhere unexplained), so the
+    /// mode, like the mode indicator, is always on screen.
+    #[test]
+    fn the_grid_cycles_from_the_keyboard_and_is_shown() {
+        let mut app = App::demo();
+        let press =
+            |app: &mut App| app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::empty()));
+
+        assert!(!app.grid.is_on(), "off until asked");
+        assert!(rendered(&mut app).contains("grid off"));
+
+        for label in ["grid bar", "grid beat", "grid 1/2", "grid 1/4"] {
+            press(&mut app);
+            let screen = rendered(&mut app);
+            assert!(
+                screen.contains(label),
+                "the state line must show `{label}`:\n{screen}"
+            );
+            assert!(app.status.contains("snap grid"), "{}", app.status);
+        }
+        press(&mut app);
+        assert!(!app.grid.is_on(), "the cycle returns to off");
+        assert!(app.status.contains("snap grid off"), "{}", app.status);
+    }
+
+    /// The grid quantizes in the **beat** domain through the session's tempo map:
+    /// at the demo's 120 bpm and 48 kHz a beat is 24 000 frames and a 4/4 bar is
+    /// 96 000, so an edit either lands on a musical line or is left alone.
+    #[test]
+    fn the_grid_quantizes_frames_in_the_beat_domain() {
+        let mut app = App::demo();
+        assert_eq!(app.snap_frame(96_123), 96_123, "no grid, no snapping");
+
+        let press =
+            |app: &mut App| app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::empty()));
+        press(&mut app); // bar
+        assert_eq!(app.snap_frame(96_000), 96_000, "a bar line stays put");
+        assert_eq!(app.snap_frame(150_000), 192_000, "150 000 is nearest bar 2");
+        assert_eq!(
+            app.snap_frame(47_000),
+            0,
+            "the first bar wins below the half"
+        );
+        assert_eq!(app.snap_frame(49_000), 96_000);
+
+        press(&mut app); // beat
+        assert_eq!(app.snap_frame(96_123), 96_000, "the beat grid is finer");
+        assert_eq!(app.snap_frame(108_100), 120_000);
+        assert_eq!(app.grid_step_frames(96_000), 24_000, "one beat at 120 bpm");
+
+        press(&mut app); // 1/2
+        assert_eq!(app.grid_step_frames(96_000), 12_000);
+        press(&mut app); // 1/4
+        assert_eq!(app.grid_step_frames(96_000), 6_000);
+    }
+
+    /// The grid is quantized in the **beat** domain through the session's tempo
+    /// map, so a tempo change moves the lines with the music instead of leaving
+    /// them at fixed frames. (Snapping in the frame domain would drift the moment
+    /// the tempo changed — the reason the plan puts the math in beats.)
+    #[test]
+    fn the_grid_follows_a_tempo_change() {
+        let mut app = App::demo();
+        // A bar grid, then a tempo change at 96 000 (bar 2 start): 120 → 60 bpm,
+        // so beats are twice as long from there on.
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::empty()));
+        assert_eq!(app.grid.label(), "bar");
+        app.snap.tempo_map.push(96_000, 60.0, 4);
+        // At 60 bpm a beat is 48 000 frames and a bar 192 000.
+        assert_eq!(app.grid_step_frames(96_000), 192_000);
+        assert_eq!(app.snap_frame(96_000), 96_000, "the boundary is a bar line");
+        assert_eq!(
+            app.snap_frame(150_000),
+            96_000,
+            "nearest bar is still bar 2"
+        );
+        assert_eq!(app.snap_frame(250_000), 288_000, "and then bar 3");
+        assert_eq!(app.snap_frame(300_000), 288_000);
+
+        // The meter comes from the map too: in 3/4 a "bar" is three beats, so
+        // the lines are 72 000 frames apart at 120 bpm.
+        let mut app = App::demo();
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::empty()));
+        app.snap.tempo_map = host::TempoMap::new(48_000, 120.0, 3);
+        assert_eq!(app.grid_step_frames(0), 72_000);
+        assert_eq!(app.snap_frame(0), 0);
+        assert_eq!(app.snap_frame(100_000), 72_000, "nearest 3/4 bar");
+        assert_eq!(app.snap_frame(200_000), 216_000);
+    }
+
+    /// `[`/`]` step the playhead to the previous/next grid line, so a seek is a
+    /// musical motion, not a scroll nudge. With the grid off it is one beat.
+    #[test]
+    fn the_brackets_step_the_playhead_a_grid_line() {
+        let mut app = App::demo();
+        // `[`/`]` are timeline keys: the focus is what scopes a key to a panel.
+        app.focus = Panel::Timeline;
+        let press = |app: &mut App, c: char| {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()))
+        };
+
+        // Unarmed, the step is one beat from where the playhead is (100 000 +
+        // 24 000): the keys always move it somewhere musical.
+        app.snap.frame = 100_000;
+        press(&mut app, ']');
+        assert!(app.status.contains("124000"), "{}", app.status);
+        press(&mut app, '[');
+        assert!(app.status.contains("76000"), "{}", app.status);
+
+        // Armed at a beat, they land on the grid lines either side.
+        press(&mut app, 'b'); // bar
+        press(&mut app, 'b'); // beat
+        assert_eq!(app.grid.label(), "beat");
+        app.snap.frame = 100_000;
+        press(&mut app, ']');
+        assert!(
+            app.status.contains("120000"),
+            "`]` takes the next grid line: {}",
+            app.status
+        );
+        // The transport follows the seek (the host publishes the new frame).
+        app.snap.frame = 120_000;
+        press(&mut app, '[');
+        assert!(
+            app.status.contains("96000"),
+            "`[` takes the previous grid line: {}",
+            app.status
+        );
+
+        // A coarse grid moves further: a bar is 96 000 frames at 120 bpm in 4/4.
+        press(&mut app, 'b'); // 1/2
+        press(&mut app, 'b'); // 1/4
+        press(&mut app, 'b'); // off
+        press(&mut app, 'b'); // bar
+        assert_eq!(app.grid.label(), "bar");
+        app.snap.frame = 100_000;
+        press(&mut app, ']');
+        assert!(app.status.contains("192000"), "{}", app.status);
+    }
+
+    /// The ruler is the grid made visible: armed, it draws bar lines with their
+    /// number and beat ticks; off, it stays the seconds ruler.
+    #[test]
+    fn the_ruler_draws_bars_and_beats_when_the_grid_is_armed() {
+        /// The ruler row: the line above the first lane (the lane gutter marks it).
+        fn ruler_row(screen: &str) -> String {
+            screen
+                .lines()
+                .zip(screen.lines().skip(1))
+                .find(|(_, next)| next.contains('▸'))
+                .map(|(row, _)| row.to_string())
+                .unwrap_or_default()
+        }
+
+        let _pool = pool_guard();
+        let path = wav_fixture("ruler");
+        let mut app = App::idle();
+        app.open_wave(&path);
+
+        let seconds = ruler_row(&rendered(&mut app));
+        assert!(
+            seconds.contains("|0.50"),
+            "the ungridded ruler is the seconds ruler:\n{seconds}"
+        );
+        assert!(!seconds.contains('·'), "no beat ticks without a grid");
+
+        for _ in 0..2 {
+            app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::empty()));
+        }
+        assert_eq!(app.grid.label(), "beat");
+        let musical = ruler_row(&rendered(&mut app));
+        assert!(
+            musical.contains('·'),
+            "the beat grid draws beat ticks:\n{musical}"
+        );
+        // Bar 1 sits under the playhead marker (`┃`), so check bar 2 — the
+        // ruler is labelled with bar numbers, not seconds.
+        assert!(musical.contains("|2"), "bar 2 is labelled:\n{musical}");
+        assert!(
+            !musical.contains("|0.50"),
+            "the musical ruler replaces the seconds one:\n{musical}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// A **stereo** file keeps both of its channels: `--wave` splits it into one
     /// pool source per channel, places each on its own track, and pans them hard
     /// left/right through the host's own script — so the right channel is played
@@ -2989,6 +3323,18 @@ mod tests {
             "the cap is reported: {}",
             app.status
         );
+
+        // With the grid armed, a fade point that moved says where it came from —
+        // every playhead-based edit reports the snap, or a grid looks like a bug.
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::empty())); // bar
+        app.snap.frame = 100_000; // off the bar grid (96 000 / 192 000)
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::empty()));
+        assert!(
+            app.status.contains("snapped from 100000"),
+            "a snapped fade is reported: {}",
+            app.status
+        );
+        assert_eq!(clip(&app).fade_in, 96_000, "{}", app.status);
 
         let _ = std::fs::remove_dir_all(&pool);
     }

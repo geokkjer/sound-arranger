@@ -1,6 +1,6 @@
 # The clip arranger — an arrangement is data
 
-> 🕒 Last verified against commit `4434756` (2026-09-24). If the code has moved on,
+> 🕒 Last verified against commit `100999a` (2026-09-24). If the code has moved on,
 > trust the code and move this line forward.
 
 **What this is.** The engine ([`architecture-explainer.md`](architecture-explainer.md)) is a
@@ -219,6 +219,11 @@ clip editor end-to-end with no GUI.
   multi-channel file as `{id}.ch0`/`{id}.ch1`, placed on two panned tracks), but a genuine
   stereo *clip* (one source, two channels) is still forthcoming, and there are no effects
   (the "sound sculptor" offline profile is separate and deferred).
+- **The snap grid is shell state, not document state.** `b` arms off → bar → beat → 1/2 → 1/4,
+  every positional edit quantizes through the session's tempo map before the command is built,
+  and a script asks for the same with `snap=<frames>` on the line. The log therefore still holds
+  absolute frames and nothing about the grid is stored — which is what keeps replay a pure
+  function of the log. The grid resets per run (a shell preference, not yet persisted).
 - **Underrun surfacing is a hard requirement.** A bounce with `underruns != 0` must be treated
   as an error, not a quiet glitch.
 

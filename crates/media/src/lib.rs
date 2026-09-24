@@ -40,6 +40,7 @@ pub mod pool;
 pub mod record;
 pub mod resample;
 pub mod ring;
+pub mod snap;
 pub mod stream;
 pub mod timeline;
 pub mod wav;
@@ -55,6 +56,7 @@ pub use pool::{Conform, ConformReport, Import, Pool, PoolIndex, PoolSource, Reco
 pub use record::{RecordNode, Recorder, WavRecorder};
 pub use resample::Resampler;
 pub use ring::Spsc;
+pub use snap::{Division, Grid, quantize_frames, to_grid};
 pub use stream::{
     ClipRef, DEFAULT_RING_CAPACITY, FilePlayer, Mailbox, PlaybackNode, SpliceCmd, mailbox,
 };

@@ -9,3 +9,6 @@ description = "sound-arranger's shell workflow — the modal, key-driven editing
 # The vocabulary the actions dispatch (`host::parse_arrange_line` in a test, and the
 # op names in `Action::command_name`). No UI toolkit, ever: the shells translate.
 host = { path = "../host" }
+# The grid vocabulary (`media::Grid`): the musical divisions an edit snaps to. The
+# *state* (which division is armed) lives in the shell — see the crate docs.
+media = { path = "../media" }

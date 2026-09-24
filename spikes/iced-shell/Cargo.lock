@@ -4685,6 +4685,7 @@ name = "workflow"
 version = "0.1.0"
 dependencies = [
  "host",
+ "media",
 ]
 
 [[package]]

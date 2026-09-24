@@ -120,14 +120,18 @@ from the shared workflow (a key or a `: ` line — never a shell-only feature).
    alpha needs.
 
 **B — the grid and the edit vocabulary (the owner's core ask)**
-5. **Grid snap, in the language and in the shell.** The log keeps absolute frames: a snapped edit is an
-   edit whose frame was quantized *before* the command was issued, so determinism is untouched and the
-   grid is UI state (never logged — it changes no audio). `snap::to_grid(frame, division, tempo, rate)`
-   lives in `media`; the shell uses it for the playhead and every edit target; the parser gains an
-   additive `snap=<frames>` modifier so a *script* snaps identically
-   (`arrange move_clip t0 c0 48213 snap=480` → 48000). Plus a **bar/beat ruler** and grid nudging.
-   Zero-crossing snap is deferred (a second quantizer behind the same seam); click-freedom comes from
-   default micro-fades instead.
+5. **Grid snap, in the language and in the shell.** *Done (2026-09-24):* `media::snap` holds the math
+   (`Division`/`Grid` in the **beat** domain, `quantize_frames` for the parser), `workflow::Grid` holds
+   the armed division (off → bar → beat → 1/2 → 1/4, `b`), and the shell quantizes every edit target
+   through the session's own tempo map (`Snapshot::tempo_map`) — seeks, split, fade, trim and the
+   clip-move target, with `[`/`]` stepping the playhead a grid line and `H`/`L` moving a grid step. The
+   parser's additive `snap=<frames>` modifier snaps a *script* identically
+   (`arrange move_clip t0 c0 48213 snap=480` → 48000) by quantizing at parse time, so the log still
+   holds absolute frames and nothing about the grid is stored. An armed grid replaces the seconds ruler
+   with a **bar/beat ruler** (numbered bars, beat ticks), and the state line always names the grid
+   ([note](../../implemented/feature/2026-09-24-grid-snap-and-the-bar-beat-ruler.md)). Zero-crossing
+   snap stays deferred (a second quantizer behind the same seam); click-freedom comes from default
+   micro-fades instead.
 6. **Clipboard: copy / cut / paste.** The clipboard is a shell-owned **value** (`Vec<(track_delta, Clip)>`
    normalised to the selection's first frame) and is **never logged** — copying changes nothing. Paste
    *is* logged, as one compound gesture with minted ids (`paste.{k}`, the `chop` precedent), onto a

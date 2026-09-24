@@ -36,6 +36,11 @@ use media::{
 pub mod live;
 pub mod media_ops;
 
+/// The session's tempo/meter map — re-exported because a shell reads it off the
+/// snapshot to do its own beat-domain math (grid snapping, a bar/beat ruler), and
+/// a public field needs a nameable type.
+pub use engine::TempoMap;
+
 use media_ops::{BounceRecord, MediaSession, PlayerIntent, SpliceIntent};
 
 /// The Host API contract version. The text format's first line must be
@@ -1441,6 +1446,13 @@ impl HostSession {
         self.mixer_channels
     }
 
+    /// The session's tempo/meter map (a clone: the engine owns the live one).
+    /// Shells read it off the snapshot to quantize in the beat domain — the grid is
+    /// UI state, so the *shell* does the snapping, not the host.
+    pub fn tempo_map(&self) -> engine::TempoMap {
+        self.engine.clock.tempo_map.clone()
+    }
+
     /// The transport position (frame + derived musical time + playing). A shell
     /// polls this to draw the playhead; reading it never renders.
     pub fn position(&self) -> Position {
@@ -2123,18 +2135,31 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
         }
         let at = header_line + lineno + 1; // header line + loop offset (lineno is 0-based)
         let mut words: Vec<&str> = line.split_whitespace().collect();
-        // optional trailing @frame token
-        let at_frame = match words.last() {
-            Some(tok) if tok.starts_with('@') => {
-                let f = tok[1..]
-                    .parse::<u64>()
-                    .map_err(|_| format!("line {at}: bad frame '{tok}'"))?;
-                words.pop();
-                Some(f)
+        // Optional trailing modifiers, in either order: `@frame` says *when* the
+        // command is applied, `snap=<frames>` quantizes the frame operand it
+        // carries (the grid is UI state — the log records the frame it produced).
+        let mut at_frame = None;
+        let mut snap: Option<u64> = None;
+        loop {
+            match words.last().copied() {
+                Some(tok) if tok.starts_with('@') && at_frame.is_none() => {
+                    let f = tok[1..]
+                        .parse::<u64>()
+                        .map_err(|_| format!("line {at}: bad frame '{tok}'"))?;
+                    words.pop();
+                    at_frame = Some(f);
+                }
+                Some(tok) if tok.starts_with("snap=") && snap.is_none() => {
+                    snap = Some(parse_snap(tok, at)?);
+                    words.pop();
+                }
+                _ => break,
             }
-            _ => None,
-        };
+        }
         let kind = words.first().copied().unwrap_or("");
+        // Which commands consumed the `snap=` modifier (one that cannot use it is
+        // a parse error, never a silent no-op).
+        let mut snap_used = false;
         // What this line pushes lands after `mark`; a fold at the end of the line
         // moves it into the open group (if any).
         let mark = commands.len();
@@ -2219,6 +2244,8 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
             "transport" => {
                 let what = word(&words, 1, at)?;
                 match what {
+                    // (the `seek` arm below consumes `snap=`, so it is marked used
+                    // there rather than here)
                     "play" => {
                         exact(&words, 2, at, "transport play")?;
                         commands.push(HostCommand::TransportPlay);
@@ -2232,6 +2259,13 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
                         let frame = word(&words, 2, at)?
                             .parse::<u64>()
                             .map_err(|_| format!("line {at}: transport seek needs a frame"))?;
+                        let frame = match snap {
+                            Some(step) => {
+                                snap_used = true;
+                                media::quantize_frames(frame, step)
+                            }
+                            None => frame,
+                        };
                         commands.push(HostCommand::TransportSeek { frame });
                     }
                     other => {
@@ -2324,10 +2358,16 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
                 commands.push(HostCommand::Load { dir });
             }
             "arrange" => {
-                let op = parse_arrange(&words[1..], at)?;
+                let op = parse_arrange(&words[1..], at, snap)?;
+                snap_used = snap.is_some();
                 commands.push(HostCommand::Arrange { op, at_frame });
             }
             other => return Err(format!("line {at}: unknown command '{other}'")),
+        }
+        if snap.is_some() && !snap_used {
+            return Err(format!(
+                "line {at}: snap=<frames> applies to a command with a frame operand (arrange add_clip|move_clip|move_clip_to_track|razor_split, transport seek)"
+            ));
         }
         // Fold this line's command(s) into the open gesture. A `group end` pushed
         // the closed group itself and is not folded (nesting is refused above).
@@ -2360,22 +2400,30 @@ pub fn parse_arrange_line(line: &str) -> Result<(media::ArrangeOp, Option<u64>),
         return Err("empty arrange line".into());
     }
     let mut words: Vec<&str> = line.split_whitespace().collect();
-    let at_frame = match words.last() {
-        Some(tok) if tok.starts_with('@') => {
-            let f = tok[1..]
-                .parse::<u64>()
-                .map_err(|_| format!("bad frame '{tok}'"))?;
-            words.pop();
-            Some(f)
+    let mut at_frame = None;
+    let mut snap: Option<u64> = None;
+    loop {
+        match words.last().copied() {
+            Some(tok) if tok.starts_with('@') && at_frame.is_none() => {
+                let f = tok[1..]
+                    .parse::<u64>()
+                    .map_err(|_| format!("bad frame '{tok}'"))?;
+                words.pop();
+                at_frame = Some(f);
+            }
+            Some(tok) if tok.starts_with("snap=") && snap.is_none() => {
+                snap = Some(parse_snap(tok, 1)?);
+                words.pop();
+            }
+            _ => break,
         }
-        _ => None,
-    };
+    }
     let operands = if words.first() == Some(&"arrange") {
         &words[1..]
     } else {
         &words[..]
     };
-    let op = parse_arrange(operands, 1)?;
+    let op = parse_arrange(operands, 1, snap)?;
     Ok((op, at_frame))
 }
 
@@ -2395,12 +2443,34 @@ pub fn parse_arrange_line(line: &str) -> Result<(media::ArrangeOp, Option<u64>),
 /// arrange set_clip_fade t0 c0 64 128 @0
 /// arrange loop_region t0 c0 3 @0
 /// arrange chop t0 c0 4 pre @0    # split c0 into 4 contiguous pieces (ids pre.0..pre.3)
+/// arrange move_clip t0 c0 48213 snap=480 @0   # → move_clip t0 c0 48000 (a snapped edit)
 /// ```
-fn parse_arrange(words: &[&str], at: usize) -> Result<media::ArrangeOp, String> {
+///
+/// `snap=<frames>` is an additive modifier on any command with a frame operand
+/// (`add_clip`, `move_clip`, `move_clip_to_track`, `razor_split`, `transport
+/// seek`): the frame is rounded to the nearest multiple of `<frames>` **at parse
+/// time**, so a script snaps exactly like the shell and the log still records one
+/// absolute frame. A grid is never stored, and `snap=0` is refused.
+fn parse_arrange(words: &[&str], at: usize, snap: Option<u64>) -> Result<media::ArrangeOp, String> {
     let op = words
         .first()
         .copied()
         .ok_or_else(|| format!("line {at}: arrange needs an op"))?;
+    // Which operand is the op's **frame** — the one `snap=<frames>` quantizes.
+    // A frame the shell produced is a frame the script can reproduce: the op is
+    // logged already snapped, so replay is untouched and no grid is stored.
+    let frame_operand = match op {
+        "add_clip" => Some(6),
+        "move_clip" => Some(3),
+        "move_clip_to_track" => Some(4),
+        "razor_split" => Some(5),
+        _ => None,
+    };
+    if snap.is_some() && frame_operand.is_none() {
+        return Err(format!(
+            "line {at}: arrange {op} has no frame operand for snap="
+        ));
+    }
     // helpers: operand i is `words[i]` — `words[0]` is the op name, so the first
     // real operand (e.g. add_track's track) is `words[1]` = operand 1. Error
     // messages number operands the way a script author counts them (`i`, not i+1).
@@ -2412,9 +2482,13 @@ fn parse_arrange(words: &[&str], at: usize) -> Result<media::ArrangeOp, String> 
             .ok_or_else(|| format!("line {at}: arrange {op} missing operand {i}"))
     };
     let u = |i: usize| -> Result<u64, String> {
-        s(i)?
+        let value: u64 = s(i)?
             .parse()
-            .map_err(|_| format!("line {at}: arrange {op} operand {i} must be a frame/count"))
+            .map_err(|_| format!("line {at}: arrange {op} operand {i} must be a frame/count"))?;
+        Ok(match snap {
+            Some(step) if frame_operand == Some(i) => media::quantize_frames(value, step),
+            _ => value,
+        })
     };
     let i64 = |i: usize| -> Result<i64, String> {
         s(i)?
@@ -2595,6 +2669,21 @@ fn exact(words: &[&str], want: usize, at: usize, what: &str) -> Result<(), Strin
         ));
     }
     Ok(())
+}
+
+/// Parse a `snap=<frames>` modifier. A zero step is refused rather than treated
+/// as "no grid": omitting the modifier *is* "no grid", and a zero divisor would
+/// quantize every frame to zero.
+fn parse_snap(token: &str, at: usize) -> Result<u64, String> {
+    let step = token["snap=".len()..]
+        .parse::<u64>()
+        .map_err(|_| format!("line {at}: bad snap modifier '{token}' (want snap=<frames>)"))?;
+    if step == 0 {
+        return Err(format!(
+            "line {at}: snap=0 is not a grid — omit the modifier for no snapping"
+        ));
+    }
+    Ok(step)
 }
 
 /// The `idx`-th word of a command line; a missing operand is a clean parse error
@@ -4245,6 +4334,67 @@ mod tests {
         assert!(matches!(&parsed[1], HostCommand::RecordStop));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A grid is UI state, a snapped frame is the log's.** `snap=<frames>` is a
+    /// parse-time modifier: it quantizes the frame operand, so a *script* snaps
+    /// exactly like the shell without the log ever learning what a grid is. The
+    /// formatter therefore writes the snapped frame and no modifier.
+    #[test]
+    fn the_snap_modifier_quantizes_the_frame_operand() {
+        // The plan's example: 48 213 frames on a 480-frame grid is 48 000.
+        let (op, at) = parse_arrange_line("arrange move_clip t0 c0 48213 snap=480 @0").unwrap();
+        assert_eq!(at, Some(0));
+        let media::ArrangeOp::MoveClip { at_frame, .. } = op else {
+            panic!("expected move_clip, got {op:?}");
+        };
+        assert_eq!(at_frame, 48_000);
+        assert_eq!(
+            format_command(
+                &HostCommand::Arrange {
+                    op: media::ArrangeOp::MoveClip {
+                        track: "t0".into(),
+                        clip: "c0".into(),
+                        at_frame,
+                    },
+                    at_frame: Some(0),
+                },
+                None,
+            )
+            .as_deref(),
+            Some("arrange move_clip t0 c0 48000 @0"),
+            "the log records the snapped frame, never the grid"
+        );
+
+        // Every op with a frame operand takes it, and the modifier may precede
+        // the `@frame` token or follow it.
+        let script = "host v1\nmount mixer channels=2 @0\narrange add_clip t0 c0 s1 0 4000 48213 0 0 1.0 snap=24000\narrange razor_split t0 c0 cL cR 48213 snap=480 @0\narrange move_clip_to_track t0 c0 t1 48213 snap=480\ntransport seek 48213 snap=480\n";
+        let commands = parse_script(script).expect("the modifier parses anywhere it applies");
+        let frames: Vec<u64> = commands
+            .iter()
+            .filter_map(|c| match c {
+                HostCommand::Arrange { op, .. } => match op {
+                    media::ArrangeOp::AddClip { clip, .. } => Some(clip.at_frame),
+                    media::ArrangeOp::RazorSplit { at_frame, .. } => Some(*at_frame),
+                    media::ArrangeOp::MoveClipToTrack { at_frame, .. } => Some(*at_frame),
+                    _ => None,
+                },
+                HostCommand::TransportSeek { frame } => Some(*frame),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(frames, vec![48_000, 48_000, 48_000, 48_000]);
+
+        // A modifier that cannot apply is an error, never a silent no-op.
+        for bad in [
+            "host v1\narrange delete t0 c0 snap=480\n",
+            "host v1\nmount mixer channels=2 snap=480 @0\n",
+            "host v1\narrange move_clip t0 c0 48213 snap=0\n",
+            "host v1\narrange move_clip t0 c0 48213 snap=abc\n",
+            "host v1\ntransport stop snap=480\n",
+        ] {
+            assert!(parse_script(bad).is_err(), "refused: {bad:?}");
+        }
     }
 
     /// **A stray operand is a typo, not something to ignore.** Found the hard way: a

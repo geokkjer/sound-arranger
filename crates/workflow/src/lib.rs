@@ -22,8 +22,12 @@
 //! "ride the fader / fader to unity"; and `j`/`k` are [`Action::Vertical`], a channel
 //! or a track. The key is shared, the meaning is the focus's.
 //!
-//! The crate is UI-toolkit-free on purpose (no `crossterm`, no `iced`), and its one
-//! dependency is `host`, whose `host v1` vocabulary it is a keyboard face of.
+//! The crate is UI-toolkit-free on purpose (no `crossterm`, no `iced`). It depends on
+//! `host` (whose `host v1` vocabulary it is a keyboard face of) and on `media`, whose
+//! [`Grid`](media::Grid) — the musical divisions an edit snaps to — is **shell state**:
+//! the model names the divisions, the shell remembers which one is armed. The grid is
+//! never logged (a snapped edit is an edit whose frame was quantized before the command
+//! was issued), so this is vocabulary, not document.
 
 /// Which editing mode the shell is in. Always on screen: a modal UI that hides its
 /// mode is a trap.
@@ -43,6 +47,66 @@ impl Mode {
             Mode::Normal => "NORMAL",
             Mode::Visual => "VISUAL",
             Mode::Command => "COMMAND",
+        }
+    }
+}
+
+/// The shell's **snap grid**: which musical division an edit is quantized to, or
+/// `None` for no grid. This is UI state and is deliberately *not* logged: a snapped
+/// edit is an edit whose frame was quantized before the command was issued, so the log
+/// keeps absolute frames and replay stays deterministic.
+///
+/// The cycling order is the workflow's, not a shell's — two shells must not disagree
+/// about what `b` means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Grid {
+    division: Option<media::Division>,
+}
+
+impl Grid {
+    /// No grid (the default: snapping changes an existing workflow, so it is armed
+    /// explicitly).
+    pub fn off() -> Self {
+        Grid { division: None }
+    }
+
+    /// A grid already armed at `division` (a shell restoring a preference).
+    pub fn new(division: media::Division) -> Self {
+        Grid {
+            division: Some(division),
+        }
+    }
+
+    pub fn division(self) -> Option<media::Division> {
+        self.division
+    }
+
+    pub fn is_on(self) -> bool {
+        self.division.is_some()
+    }
+
+    /// The next step in the cycle: off → bar → beat → 1/2 → 1/4 → off. (Coarser
+    /// first, so the first press from off gives the most useful grid.)
+    pub fn cycle(&mut self) {
+        self.division = match self.division {
+            None => Some(media::Division::Bar),
+            Some(media::Division::Bar) => Some(media::Division::Beat),
+            Some(media::Division::Beat) => Some(media::Division::Half),
+            Some(media::Division::Half) => Some(media::Division::Quarter),
+            Some(media::Division::Quarter) => None,
+        };
+    }
+
+    /// The step in beats under a meter of `beats_per_bar`, or `None` when off.
+    pub fn grid(self, beats_per_bar: u32) -> Option<media::Grid> {
+        self.division.map(|d| media::Grid::new(d, beats_per_bar))
+    }
+
+    /// A short label for a status line (`off`, `bar`, `beat`, `1/2`, `1/4`).
+    pub fn label(self) -> &'static str {
+        match self.division {
+            None => "off",
+            Some(d) => d.label(),
         }
     }
 }
@@ -99,8 +163,14 @@ pub enum Action {
     TrimStart,
     TrimEnd,
     TrimToSelection,
-    /// Move the clip a beat earlier (-1) / later (+1).
+    /// Move the clip one grid step earlier (-1) / later (+1) — a beat when no grid
+    /// is armed.
     Nudge(i32),
+    /// Move the playhead to the previous (-1) / next (+1) grid line (a beat when no
+    /// grid is armed).
+    SeekGrid(i32),
+    /// Cycle the snap grid: off → bar → beat → 1/2 → 1/4 → off.
+    GridCycle,
     /// Move the clip to the track below (+1) / above (-1).
     MoveTrack(i32),
     /// Step the clip's gain in dB.
@@ -142,7 +212,9 @@ impl Action {
             Action::Delete => "delete the clip",
             Action::TrimStart | Action::TrimEnd => "trim the clip",
             Action::TrimToSelection => "trim to the selection",
-            Action::Nudge(_) => "move the clip a beat",
+            Action::Nudge(_) => "move the clip a grid step",
+            Action::SeekGrid(_) => "step the playhead a grid line",
+            Action::GridCycle => "the snap grid",
             Action::MoveTrack(_) => "move the clip to another track",
             Action::Gain(_) => "clip gain",
             Action::Fade(_) => "fade",
@@ -342,6 +414,19 @@ pub static KEYMAP: &[Binding] = &[
             (Key::Char('K'), Action::MoveTrack(-1)),
         ],
         "timeline: move the clip to the track below / above",
+    ),
+    bind(
+        "[  ]",
+        &[
+            (Key::Char('['), Action::SeekGrid(-1)),
+            (Key::Char(']'), Action::SeekGrid(1)),
+        ],
+        "timeline: move the playhead to the previous / next grid line",
+    ),
+    bind(
+        "b",
+        &[(Key::Char('b'), Action::GridCycle)],
+        "cycle the snap grid: off → bar → beat → 1/2 → 1/4 (the grid is never logged)",
     ),
     bind(
         "g  G",
@@ -565,6 +650,31 @@ mod tests {
     }
 
     /// The help's spelling must contain every key it *names*, or the overlay lies
+    /// The grid cycle is the workflow's, coarser to finer and back to off, so two
+    /// shells cannot disagree about what `b` does.
+    #[test]
+    fn the_grid_cycles_off_bar_beat_half_quarter() {
+        let mut grid = Grid::default();
+        assert!(!grid.is_on());
+        assert_eq!(grid.label(), "off");
+        assert_eq!(grid.grid(4), None);
+
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            grid.cycle();
+            seen.push(grid.label());
+        }
+        assert_eq!(seen, vec!["bar", "beat", "1/2", "1/4", "off"]);
+        assert!(!grid.is_on(), "the cycle returns to off");
+
+        // Armed, it hands out the beat-domain math the shell quantizes through.
+        let bar = Grid::new(media::Division::Bar).grid(4).expect("a grid");
+        assert_eq!(bar.step_beats(), 4.0);
+        assert_eq!(bar.nearest(5.9), 4.0);
+        let quarter = Grid::new(media::Division::Quarter).grid(4).expect("a grid");
+        assert_eq!(quarter.step_beats(), 0.25);
+    }
+
     /// about what to press. Aliases are exempt by design (they are documented in the
     /// table, not printed).
     #[test]

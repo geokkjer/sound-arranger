@@ -35,6 +35,13 @@ What this spike adds, because it is what a TUI has to answer for:
 - **edits that go through the host's own language** — `x` splits and `d` deletes
   by building an `arrange …` line and handing it to the host's parser, so a key
   runs exactly what a script writes, and the engine logs it like any command;
+  a **snap grid** (`b` cycles off → bar → beat → 1/2 → 1/4) quantizes every edit
+  target through the session's tempo map — seeks, split, fade, trim and the
+  clip-move target — `[`/`]` step the playhead a grid line, `H`/`L` move a grid
+  step, and an armed grid replaces the seconds ruler with numbered **bar/beat
+  lines**. The grid is shell state: the frame is quantized before the command is
+  built, so the log still records absolute frames and replay is untouched
+  (`arrange move_clip t0 c0 48213 snap=480` is how a *script* asks for the same);
 - **panel focus** — `Tab`/`Shift-Tab` move between the mixer and the timeline, the
   focused panel shows a lit border, and `j`/`k` mean "channel" or "track"
   depending on where you are;
@@ -242,7 +249,9 @@ pointless), so the shell falls back to the wide meter bars under the transport.
 | `d` | timeline: delete the clip under the playhead |
 | `<` / `>` | timeline: trim the clip's **start / end to the playhead** |
 | `t` | **visual**: trim the clip to the selection (consumes the selection; **one undo**) |
-| `H` / `L` | timeline: move the clip **one beat** earlier / later (clamps at 0) |
+| `H` / `L` | timeline: move the clip **one grid step** earlier / later (a beat when the grid is off; clamps at 0) |
+| `[` / `]` | timeline: move the playhead to the previous / next grid line (a beat when the grid is off) |
+| `b` | cycle the **snap grid**: off → bar → beat → 1/2 → 1/4 (never logged — see the note) |
 | `J` / `K` | timeline: move the clip to the track **below / above**, keeping its time |
 | `g` / `G` | timeline: clip gain **−1 dB / +1 dB** (the range is the console fader's) |
 | `f` / `F` | timeline: fade in / fade out **to the playhead** (absolute, not a nudge) |
