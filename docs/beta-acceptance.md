@@ -1,6 +1,6 @@
 # Beta acceptance — the checklist
 
-> 🕒 Last verified against commit `c62bde2` (2026-09-24). If the code has moved on,
+> 🕒 Last verified against commit `971524b` (2026-09-24). If the code has moved on,
 > trust the code and move this line forward.
 
 This is the checklist a **second person** runs to accept the alpha. The point of
