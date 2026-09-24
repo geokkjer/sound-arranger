@@ -42,6 +42,7 @@ pub mod resample;
 pub mod ring;
 pub mod snap;
 pub mod stream;
+pub mod stretch;
 pub mod timeline;
 pub mod wav;
 
@@ -60,6 +61,7 @@ pub use snap::{Division, Grid, quantize_frames, to_grid};
 pub use stream::{
     ClipRef, DEFAULT_RING_CAPACITY, FilePlayer, Mailbox, PlaybackNode, SpliceCmd, mailbox,
 };
+pub use stretch::Stretch;
 pub use timeline::{ArrangeOp, Clip, Edge, Frame, Id, Timeline, Track};
 pub use wav::{WavReader, WavWriter};
 
