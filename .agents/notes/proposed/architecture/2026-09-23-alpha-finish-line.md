@@ -77,7 +77,10 @@ Ordered so that nothing is built on sand. Each slice: tests + note + docs in the
 from the shared workflow (a key or a `: ` line — never a shell-only feature).
 
 **A — the document has a life (foundations)**
-1. **Compound gestures — one gesture, one undo.** At the **host** level: `history: Vec<HostCommand>`
+1. ~~**Compound gestures — one gesture, one undo.**~~ **DONE** (2026-09-23): implemented as
+   [`HostCommand::Group`](../2026-09-23-compound-gestures-one-undo-step.md) with the host history as
+   entries; `t` in the TUI is the first gesture. The rest of the item is preserved below as the design
+   of record. At the **host** level: `history: Vec<HostCommand>`
    becomes `Vec<Vec<HostCommand>>` (a bare command is a one-element group); a gesture opens a group,
    streams its `Arrange` commands, closes it, and the group applies all-or-nothing (folded over a clone
    first, so a refused member never enters history). The **engine log is unchanged**, so replay and the

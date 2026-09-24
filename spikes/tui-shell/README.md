@@ -135,7 +135,9 @@ typed instead of pressed:
 
 One line is one command; the prompt wraps it in the `host v1` header the format requires and hands
 it to `host::parse_script`, so a key, a script line and a typed line are the same command with the
-same logging and the same errors. A refused line is shown and **not logged**. `↑`/`↓` walk the
+same logging and the same errors. A **gesture** — several arrangement ops that are one user action,
+like `t`'s two trims — is one command too (`group begin` … `group end`), so it is one undo step:
+the host validates the whole group before applying any of it. A refused line is shown and **not logged**. `↑`/`↓` walk the
 history (including the line that failed, which is the one worth fixing). The status line becomes
 the command line while it is open, and the mode badge reads `COMMAND` — a modal UI that hides its
 mode is a trap.
@@ -216,7 +218,7 @@ pointless), so the shell falls back to the wide meter bars under the transport.
 | `x` | timeline: razor-split the clip under the playhead |
 | `d` | timeline: delete the clip under the playhead |
 | `<` / `>` | timeline: trim the clip's **start / end to the playhead** |
-| `t` | **visual**: trim the clip to the selection (consumes the selection) |
+| `t` | **visual**: trim the clip to the selection (consumes the selection; **one undo**) |
 | `H` / `L` | timeline: move the clip **one beat** earlier / later (clamps at 0) |
 | `J` / `K` | timeline: move the clip to the track **below / above**, keeping its time |
 | `g` / `G` | timeline: clip gain **−1 dB / +1 dB** (the range is the console fader's) |

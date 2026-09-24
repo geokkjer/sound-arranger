@@ -166,6 +166,18 @@ pub enum HostCommand {
     /// device input path is not wired into the reference host — its refusal
     /// names the gap).
     Record { take_id: String },
+    /// **A gesture**: several arrangement ops that apply as one unit and undo as
+    /// **one step**. Members must be arrangement ops sharing one `at_frame` (a
+    /// gesture happens at one moment, which is what makes a replay's
+    /// skip-after-target rule safe to apply to the whole group).
+    ///
+    /// The group applies **all-or-nothing**: the whole thing is folded over a
+    /// snapshot of the arrangement value first, so a member the model would refuse
+    /// means no member is applied and nothing is logged. The engine's own log still
+    /// receives each member, so replay and the byte-identical bounce tests are
+    /// unaffected by construction — only the *host history* (and therefore
+    /// undo/redo, `can_undo` and a saved session) sees one entry.
+    Group { commands: Vec<HostCommand> },
     /// An arrangement edit (the clip editor's ACID op) — a **logged command**
     /// carrying `at_frame`. The host applies it to the clip editor's value and
     /// wires the arrangement nodes into the mixer before rendering. This is the
@@ -193,6 +205,10 @@ impl HostCommand {
             | HostCommand::Unmount { at_frame, .. }
             | HostCommand::Play { at_frame, .. }
             | HostCommand::Arrange { at_frame, .. } => *at_frame,
+            // A group's members share one frame (validated on the way in), so the
+            // group's frame is the first member's — the whole gesture is skipped or
+            // applied together by `replay_to`.
+            HostCommand::Group { commands } => commands.first().and_then(|c| c.at_frame()),
             _ => None,
         }
     }
@@ -213,6 +229,7 @@ impl HostCommand {
                 | HostCommand::Pool { .. }
                 | HostCommand::Play { .. }
                 | HostCommand::Splice { .. }
+                | HostCommand::Group { .. }
         )
     }
 }
@@ -269,12 +286,17 @@ pub struct HostSession {
     /// What the last offline `Bounce` drained (tail frames + capped). The live
     /// transport hard-cuts, so this stays default until a bounce runs.
     last_drain: DrainOutcome,
-    /// The **state** commands applied so far, in order — replayed by `seek_to`
-    /// to rebuild the session at a target frame. Actions are not recorded.
-    history: Vec<HostCommand>,
-    /// The edits undone since the last edit, each with the history position it
+    /// The **state** commands applied so far, in order — replayed by `seek_to` to
+    /// rebuild the session at a target frame. Actions are not recorded.
+    ///
+    /// One entry is **one gesture**: a bare state command is a one-element entry,
+    /// and a [`HostCommand::Group`] pushes its members as a single entry. Undo and
+    /// redo move whole entries, so a gesture that takes several ops (a paste, a
+    /// trim-to-selection, a stretch) is one undo step.
+    history: Vec<Vec<HostCommand>>,
+    /// The gestures undone since the last edit, each with the history position it
     /// came from, so a redo reconstructs the same session. Cleared by a new edit.
-    redo: Vec<(usize, HostCommand)>,
+    redo: Vec<(usize, Vec<HostCommand>)>,
     /// The media intent value (pool dir, player, splices, bounce records). The
     /// media-op handlers rebuild it on replay, so a replayed log reproduces the
     /// media session — media determinism is in the one log, not a parallel seam.
@@ -397,6 +419,66 @@ impl HostSession {
     /// draws against in-process shells (kimi nit 16).
     pub fn engine_ref(&self) -> &Engine {
         &self.engine
+    }
+
+    /// Apply a **gesture** ([`HostCommand::Group`]): validate the whole thing on a
+    /// snapshot of the arrangement value, then apply and log each member.
+    ///
+    /// All-or-nothing is the point: a paste that would collide with an existing
+    /// clip id, or a trim sequence whose second edge would empty the clip, must
+    /// leave the session exactly as it was — not half-edited, and with nothing
+    /// logged. Members are arrangement ops sharing one frame, so the group is one
+    /// moment in time and `replay_to` can skip or apply it whole.
+    fn execute_group(&mut self, commands: &[HostCommand]) -> Result<(), String> {
+        if commands.is_empty() {
+            return Ok(());
+        }
+        self.ensure_editor()?;
+        if self.pool_resolver.is_none() {
+            return Err("arrange requires set_pool first (clips need pool-source paths)".into());
+        }
+
+        let mut frame: Option<Option<u64>> = None;
+        for cmd in commands {
+            let HostCommand::Arrange { at_frame, .. } = cmd else {
+                return Err(
+                    "a group may only contain arrangement ops (a gesture is one edit at one moment)"
+                        .into(),
+                );
+            };
+            match frame {
+                None => frame = Some(*at_frame),
+                Some(seen) if seen == *at_frame => {}
+                Some(_) => return Err("a group's arrangement ops must share one frame".into()),
+            }
+        }
+
+        // Fold over a snapshot first: the value is a pure transform, so validating
+        // on a clone and then applying for real cannot diverge.
+        let mut probe = self
+            .editor
+            .as_ref()
+            .ok_or("clip editor not initialized")?
+            .snapshot()?;
+        for cmd in commands {
+            let HostCommand::Arrange { op, .. } = cmd else {
+                unreachable!("members were checked above");
+            };
+            probe = probe
+                .apply(op)
+                .map_err(|e| format!("gesture refused, nothing applied: {e}"))?;
+        }
+
+        let editor = self.editor.as_mut().ok_or("clip editor not initialized")?;
+        for cmd in commands {
+            let HostCommand::Arrange { op, .. } = cmd else {
+                unreachable!("members were checked above");
+            };
+            editor.apply(&mut self.engine, op)?;
+        }
+        self.arrange_dirty = true;
+        self.media_commands += commands.len();
+        Ok(())
     }
 
     /// Resolve a parsed clip (len 0 = "open the file at apply") to its real
@@ -537,6 +619,7 @@ impl HostSession {
             HostCommand::Record { .. } => {
                 Err("recording requires a device — the device input path exists in media::devices (open_input) but is not wired into the host; the reference host renders offline via Bounce".into())
             }
+            HostCommand::Group { commands } => self.execute_group(commands),
             HostCommand::Arrange { op, .. } => {
                 self.ensure_editor()?;
                 if self.pool_resolver.is_none() {
@@ -983,16 +1066,23 @@ impl HostSession {
         let redo = std::mem::take(&mut self.redo);
         let playing = self.playing;
         let mut rebuilt = HostSession::new();
-        for cmd in &history {
+        for entry in &history {
             // State that takes effect *after* the target is not yet in force at
             // `frame`. Applying it would render the clock past the target — which
             // makes a backward seek a no-op, because `process` renders up to the
-            // command's `at_frame`. Skip it: the rebuild reconstructs the session
-            // as it was at `frame`.
-            if cmd.at_frame().is_some_and(|at| at > frame) {
+            // command's `at_frame`. The skip is per **entry**, so a gesture is
+            // never half-applied: the rebuild reconstructs the session as it was at
+            // `frame`.
+            if entry
+                .first()
+                .and_then(|c| c.at_frame())
+                .is_some_and(|at| at > frame)
+            {
                 continue;
             }
-            rebuilt.process(cmd)?;
+            for cmd in entry {
+                rebuilt.process(cmd)?;
+            }
         }
         rebuilt.render_to(frame)?;
         rebuilt.playing = playing;
@@ -1008,11 +1098,12 @@ impl HostSession {
     /// Only `Arrange` ops are undoable — a `Mount`/`Pool`/`SetTempo` is session
     /// setup, not an edit, and undoing one would tear down the graph under the UI.
     pub fn undo(&mut self) -> Result<bool, String> {
-        let Some(pos) = self
-            .history
-            .iter()
-            .rposition(|c| matches!(c, HostCommand::Arrange { .. }))
-        else {
+        // One *entry* is one gesture: a group of arrangement ops undoes as a unit.
+        let Some(pos) = self.history.iter().rposition(|entry| {
+            entry
+                .iter()
+                .any(|c| matches!(c, HostCommand::Arrange { .. }))
+        }) else {
             return Ok(false);
         };
         let undone = self.history.remove(pos);
@@ -1036,9 +1127,11 @@ impl HostSession {
 
     /// Whether there is an arrangement edit to undo — the shell's `⟲` button.
     pub fn can_undo(&self) -> bool {
-        self.history
-            .iter()
-            .any(|c| matches!(c, HostCommand::Arrange { .. }))
+        self.history.iter().any(|entry| {
+            entry
+                .iter()
+                .any(|c| matches!(c, HostCommand::Arrange { .. }))
+        })
     }
 
     /// Whether there is an undone edit to redo — the shell's `⟳` button.
@@ -1101,7 +1194,13 @@ impl HostSession {
             // deterministically (actions are not state). A new state change also
             // makes any undone branch unreachable, so the redo stack clears.
             if cmd.is_state() {
-                self.history.push(cmd.clone());
+                // One entry = one gesture: a group's members land as one entry, a bare
+                // command as a one-element entry.
+                let entry = match cmd {
+                    HostCommand::Group { commands } => commands.clone(),
+                    other => vec![other.clone()],
+                };
+                self.history.push(entry);
                 self.redo.clear();
             }
         }
@@ -1127,6 +1226,10 @@ impl HostSession {
 /// transport stop
 /// play /abs/clip.wav ch0 @0
 /// splice 4000 /abs/clip2.wav 512
+/// group begin                                 # a gesture: one undo step
+/// arrange trim t0 c0 start 4800
+/// arrange trim t0 c0 end -4800
+/// group end
 /// pool /data/takes                           # the media pool dir (adopting it
 ///                                             # resamples foreign-rate sources)
 /// arrange add_track t0 @0                    # the clip editor (P1.3.4)
@@ -1135,7 +1238,11 @@ impl HostSession {
 /// ```
 pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
     let mut lines = text.lines();
-    let mut commands = Vec::new();
+    let mut commands: Vec<HostCommand> = Vec::new();
+    // `group begin` … `group end` brackets one **gesture**: its members are pushed
+    // into `commands` by the arms below and folded into a `Group` here, so a saved
+    // script round-trips the gesture structure (and a replay undoes it as one step).
+    let mut group: Option<Vec<HostCommand>> = None;
 
     // version line (the first non-empty, non-comment line), tracking the
     // 1-based line number so error messages stay correct even with leading
@@ -1175,7 +1282,30 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
             _ => None,
         };
         let kind = words.first().copied().unwrap_or("");
+        // What this line pushes lands after `mark`; a fold at the end of the line
+        // moves it into the open group (if any).
+        let mark = commands.len();
         match kind {
+            "group" => match word(&words, 1, at)? {
+                "begin" => {
+                    if group.is_some() {
+                        return Err(format!("line {at}: `group begin` inside a group"));
+                    }
+                    group = Some(Vec::new());
+                }
+                "end" => {
+                    let members = group
+                        .take()
+                        .ok_or_else(|| format!("line {at}: `group end` without `group begin`"))?;
+                    if members.is_empty() {
+                        return Err(format!("line {at}: an empty group changes nothing"));
+                    }
+                    commands.push(HostCommand::Group { commands: members });
+                }
+                other => {
+                    return Err(format!("line {at}: group takes begin|end, got '{other}'"));
+                }
+            },
             "mount" => {
                 let plugin = in_list(HOST_PLUGINS, word(&words, 1, at)?, "plugin")?;
                 let mut params = Vec::new();
@@ -1302,6 +1432,16 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
             }
             other => return Err(format!("line {at}: unknown command '{other}'")),
         }
+        // Fold this line's command(s) into the open gesture. A `group end` pushed
+        // the closed group itself and is not folded (nesting is refused above).
+        if kind != "group"
+            && let Some(members) = group.as_mut()
+        {
+            members.extend(commands.drain(mark..));
+        }
+    }
+    if group.is_some() {
+        return Err("unterminated `group begin` (want a matching `group end`)".into());
     }
     Ok(commands)
 }
@@ -1956,5 +2096,226 @@ mod tests {
             HostCommand::TransportSeek { frame } => assert_eq!(*frame, 4_800),
             other => panic!("expected a seek, got {other:?}"),
         }
+    }
+
+    // ---- gestures: one entry, one undo, all-or-nothing ----
+
+    /// Build a session with a mixer, a pool holding one take, and one 4800-frame
+    /// clip at frame 0 on `t0`.
+    fn session_with_clip(name: &str) -> (HostSession, std::path::PathBuf) {
+        let pool = std::env::temp_dir().join(format!("host-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_take(&pool, "s1", 48_000);
+        let mut s = HostSession::new();
+        s.execute(&HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 2.0)],
+            at_frame: Some(0),
+        })
+        .expect("mount mixer");
+        s.execute(&HostCommand::Pool { dir: pool.clone() })
+            .expect("pool");
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::AddTrack { track: "t0".into() },
+            at_frame: None,
+        })
+        .expect("add track");
+        s.execute(&HostCommand::Arrange {
+            op: add_clip("c0", 0),
+            at_frame: None,
+        })
+        .expect("add clip");
+        (s, pool)
+    }
+
+    fn clip_of(s: &HostSession) -> media::Clip {
+        s.arrangement().expect("tl").tracks[0].clips[0].clone()
+    }
+
+    fn gesture(ops: Vec<media::ArrangeOp>) -> HostCommand {
+        HostCommand::Group {
+            commands: ops
+                .into_iter()
+                .map(|op| HostCommand::Arrange { op, at_frame: None })
+                .collect(),
+        }
+    }
+
+    /// **One gesture is one undo.** A group of two trims lands as a single history
+    /// entry: one `undo` restores the clip whole (not half-trimmed), and one `redo`
+    /// re-applies the whole gesture.
+    #[test]
+    fn a_group_is_one_undo_step() {
+        let (mut s, pool) = session_with_clip("gesture-undo");
+        let before = clip_of(&s);
+
+        // Two edges move: the exact shape that used to take two undos.
+        s.execute(&gesture(vec![
+            media::ArrangeOp::Trim {
+                track: "t0".into(),
+                clip: "c0".into(),
+                edge: media::Edge::Start,
+                by_frames: 1_200,
+            },
+            media::ArrangeOp::Trim {
+                track: "t0".into(),
+                clip: "c0".into(),
+                edge: media::Edge::End,
+                by_frames: -600,
+            },
+        ]))
+        .expect("the gesture applies");
+
+        let after = clip_of(&s);
+        assert_eq!(
+            (after.at_frame, after.src_start, after.src_len),
+            (1_200, 1_200, 3_000),
+            "both trims landed"
+        );
+
+        assert!(s.undo().expect("undo works"), "the gesture is undoable");
+        assert_eq!(clip_of(&s), before, "one undo restores the whole gesture");
+        assert!(s.can_redo(), "and it can be redone");
+
+        assert!(s.redo().expect("redo works"));
+        assert_eq!(clip_of(&s), after, "redo re-applies the whole gesture");
+
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// **All-or-nothing.** A member the model refuses means no member is applied and
+    /// nothing is logged — the session is exactly as it was.
+    #[test]
+    fn a_refused_group_changes_nothing() {
+        let (mut s, pool) = session_with_clip("gesture-atomic");
+        let before = clip_of(&s);
+        let events = s.event_count();
+        let commands = s.media_command_count();
+
+        // The second trim would consume the whole clip — the model refuses it.
+        let refused = s.execute(&gesture(vec![
+            media::ArrangeOp::Trim {
+                track: "t0".into(),
+                clip: "c0".into(),
+                edge: media::Edge::Start,
+                by_frames: 1_200,
+            },
+            media::ArrangeOp::Trim {
+                track: "t0".into(),
+                clip: "c0".into(),
+                edge: media::Edge::End,
+                by_frames: -4_800,
+            },
+        ]));
+        assert!(refused.is_err(), "the group is refused");
+        let message = refused.expect_err("an error");
+        assert!(
+            message.contains("nothing applied"),
+            "the refusal says so: {message}"
+        );
+        assert_eq!(clip_of(&s), before, "the first trim was rolled back");
+        assert_eq!(s.event_count(), events, "and nothing was logged");
+        assert_eq!(
+            s.media_command_count(),
+            commands,
+            "no media command counted"
+        );
+        assert!(s.undo().is_ok(), "the session is still usable");
+
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// A gesture is one moment over arrangement ops: a non-arrange member, or members
+    /// at different frames, is refused (a group must be skippable/appliable whole by
+    /// `replay_to`).
+    #[test]
+    fn a_group_is_one_frame_of_arrangement_ops() {
+        let (mut s, pool) = session_with_clip("gesture-shape");
+
+        let mixed_frames = s.execute(&HostCommand::Group {
+            commands: vec![
+                HostCommand::Arrange {
+                    op: move_clip("c0", 1_000),
+                    at_frame: None,
+                },
+                HostCommand::Arrange {
+                    op: move_clip("c0", 2_000),
+                    at_frame: Some(4_800),
+                },
+            ],
+        });
+        assert!(mixed_frames.is_err(), "one gesture happens at one frame");
+
+        let not_arrangement = s.execute(&HostCommand::Group {
+            commands: vec![HostCommand::SetParam {
+                plugin: "mixer",
+                param: "master.gain",
+                value: 0.5,
+                at_frame: None,
+            }],
+        });
+        assert!(not_arrangement.is_err(), "a group is arrangement ops only");
+
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// The text form round-trips gestures, and grouping changes the **host history**,
+    /// not the engine's log: the same ops grouped and ungrouped produce the same
+    /// events and the same audio.
+    #[test]
+    fn a_grouped_script_round_trips_and_logs_the_same_events() {
+        let pool = std::env::temp_dir().join(format!("host-group-script-{}", std::process::id()));
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_take(&pool, "s1", 48_000);
+
+        let head = format!(
+            "host v1\nmount mixer channels=2 @0\npool {}\narrange add_track t0\narrange add_clip t0 c0 s1 0 4800 0 0 0 1.0\n",
+            pool.display()
+        );
+        let grouped = format!(
+            "{head}group begin\narrange trim t0 c0 start 1200\narrange trim t0 c0 end -600\ngroup end\n"
+        );
+        let loose = format!("{head}arrange trim t0 c0 start 1200\narrange trim t0 c0 end -600\n");
+
+        // The markers parse into one Group command.
+        let parsed = parse_script(&grouped).expect("the grouped script parses");
+        match parsed.last().expect("a command") {
+            HostCommand::Group { commands } => assert_eq!(commands.len(), 2, "two members"),
+            other => panic!("expected a group, got {other:?}"),
+        }
+
+        let grouped_session = run_script(&parse_script(&grouped).expect("parse")).expect("run");
+        let loose_session = run_script(&parse_script(&loose).expect("parse")).expect("run");
+        assert_eq!(
+            grouped_session.arrangement().expect("tl"),
+            loose_session.arrangement().expect("tl"),
+            "grouping does not change the value"
+        );
+        assert_eq!(
+            grouped_session.event_count(),
+            loose_session.event_count(),
+            "grouping does not change the engine's log"
+        );
+
+        // …and it is one undo step, where the loose form takes two.
+        let mut grouped_session = grouped_session;
+        assert!(grouped_session.undo().expect("undo"));
+        assert_eq!(
+            clip_of(&grouped_session).src_len,
+            4_800,
+            "one undo restores the grouped gesture whole"
+        );
+
+        // Malformed group syntax is refused loudly.
+        for bad in [
+            "host v1\ngroup begin\narrange add_track t0\n",
+            "host v1\ngroup end\n",
+            "host v1\ngroup begin\ngroup begin\n",
+            "host v1\ngroup begin\ngroup end\n",
+        ] {
+            assert!(parse_script(bad).is_err(), "refused: {bad:?}");
+        }
+
+        let _ = std::fs::remove_dir_all(&pool);
     }
 }

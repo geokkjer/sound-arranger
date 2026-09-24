@@ -907,6 +907,28 @@ impl App {
 
     // -- editing: the shell speaks the host's own text format ---------------
 
+    /// Dispatch several `arrange` lines as **one gesture**: the host applies them
+    /// all-or-nothing and records one history entry, so the whole thing is one undo
+    /// step. (A paste or a stretch will need exactly this; trim-to-selection is the
+    /// first gesture that takes more than one op.)
+    fn arrange_group(&mut self, lines: &[String]) {
+        if lines.is_empty() {
+            return;
+        }
+        let mut commands = Vec::with_capacity(lines.len());
+        for line in lines {
+            match host::parse_arrange_line(line) {
+                Ok((op, at_frame)) => commands.push(HostCommand::Arrange { op, at_frame }),
+                Err(e) => {
+                    self.status = format!("arrange: {e}");
+                    return;
+                }
+            }
+        }
+        self.command("arrange", HostCommand::Group { commands });
+        self.refresh_arrangement();
+    }
+
     /// Dispatch an `arrange` line **through the host's parser**, so the shell and
     /// the CLI share one vocabulary: the ops a key runs are the ops a script
     /// writes, and the host logs them like any other command.
@@ -1047,16 +1069,20 @@ impl App {
             new_end as i64 - clip.end_frame() as i64,
         );
         self.status = format!(
-            "trim {} to {new_start}–{new_end} ({} frames)",
+            "trim {} to {new_start}–{new_end} ({} frames, one undo)",
             clip.id,
             new_end - new_start
         );
+        // One gesture: both edges (when both move) are a single history entry, so
+        // `u` after a trim-to-selection restores the clip whole.
+        let mut lines = Vec::new();
         if start_by != 0 {
-            self.arrange(&format!("trim {track} {} start {start_by}", clip.id));
+            lines.push(format!("trim {track} {} start {start_by}", clip.id));
         }
         if end_by != 0 {
-            self.arrange(&format!("trim {track} {} end {end_by}", clip.id));
+            lines.push(format!("trim {track} {} end {end_by}", clip.id));
         }
+        self.arrange_group(&lines);
 
         self.mode = Mode::Normal;
         if let Some(view) = self.view.as_mut() {
@@ -2655,6 +2681,28 @@ mod tests {
         assert!(
             app.view.as_ref().expect("a view").selection.is_none(),
             "the selection is dropped"
+        );
+
+        // **One gesture, one undo**: the two trims are a single history entry.
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::empty()));
+        let restored = clip(&app).expect("a clip");
+        assert_eq!(
+            (restored.at_frame, restored.src_start, restored.src_len),
+            (96_000, 96_000, 48_000),
+            "one undo restores the clip whole (not half-trimmed): {}",
+            app.status
+        );
+        // …and one redo re-applies the whole gesture. The shell's redo guard reads
+        // the *published* snapshot (the event loop refreshes it every frame, and the
+        // tests' snapshot is a synthetic one), so refresh it the same way first.
+        app.snap = app.host.snapshot();
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        let again = clip(&app).expect("a clip");
+        assert_eq!(
+            (again.at_frame, again.src_start, again.src_len),
+            (100_000, 100_000, 20_000),
+            "one redo re-applies the gesture: {}",
+            app.status
         );
 
         // `H` / `L` nudge by one beat — 24 000 frames at 120 bpm — and clamp at 0.
