@@ -187,6 +187,9 @@ struct App {
     /// value and survives a load, but the pool a source id names may not — so a
     /// paste checks it here and says so, instead of logging a clip the panel drops.
     pool_ids: Vec<String>,
+    /// What a *prefilled* prompt was opened with (`R`'s rename line): walking the
+    /// history and coming back to the live line must return this, not blank.
+    prompt_prefill: Option<String>,
     panel: timeline::PanelRects,
 }
 
@@ -268,6 +271,7 @@ impl App {
             clipboard_origin: 0,
             next_paste: 1,
             pool_ids: Vec::new(),
+            prompt_prefill: None,
             panel: timeline::PanelRects::default(),
         };
 
@@ -592,6 +596,7 @@ impl App {
             clipboard_origin: 0,
             next_paste: 1,
             pool_ids: Vec::new(),
+            prompt_prefill: None,
             panel: timeline::PanelRects::default(),
         }
     }
@@ -802,6 +807,10 @@ impl App {
             Action::Cut => self.timeline_key(|app| app.cut()),
             Action::Paste => self.timeline_key(|app| app.paste(false)),
             Action::PasteAppend => self.timeline_key(|app| app.paste(true)),
+            Action::TrackAdd => self.timeline_key(|app| app.add_track()),
+            Action::TrackRename => self.timeline_key(|app| app.rename_track_prompt()),
+            Action::TrackDelete => self.timeline_key(|app| app.delete_track()),
+            Action::ReorderTrack(direction) => self.timeline_key(|app| app.move_track(direction)),
             Action::MoveTrack(offset) => self.timeline_key(|app| app.move_clip_to_track(offset)),
             Action::Gain(direction) => {
                 self.timeline_key(|app| app.step_clip_gain(direction as f32))
@@ -811,6 +820,7 @@ impl App {
             Action::Redo => self.redo(),
             Action::Prompt => {
                 self.prompt = Some(String::new());
+                self.prompt_prefill = None;
                 self.history_at = self.history.len();
             }
             Action::Help => {
@@ -1060,6 +1070,139 @@ impl App {
                 false
             }
         }
+    }
+
+    // -- tracks (alpha slice D2) ---------------------------------------------
+
+    /// The first free `t{n}` — the shell mints track ids (they are logged), so it
+    /// fills a gap rather than counting up blindly.
+    fn free_track_id(&self) -> String {
+        let taken: Vec<&str> = self
+            .arrangement
+            .as_ref()
+            .map(|arrangement| {
+                arrangement
+                    .lanes
+                    .iter()
+                    .map(|lane| lane.id.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for n in 0.. {
+            let candidate = format!("t{n}");
+            if !taken.contains(&candidate.as_str()) {
+                return candidate;
+            }
+        }
+        unreachable!("a free track id always exists")
+    }
+
+    /// `a`: add a track and make it the active one (you just made it, so that is
+    /// where the next clip goes).
+    fn add_track(&mut self) {
+        let Some(arrangement) = self.arrangement.as_ref() else {
+            self.status = "nothing to add a track to — load a timeline first".to_string();
+            return;
+        };
+        let track = self.free_track_id();
+        let index = arrangement.lanes.len();
+        let channels = self.snap.channel_count;
+        if self.arrange(&format!("add_track {track}")) {
+            self.active_track = index;
+            // The value op is permissive; the *mixer* decides whether the track can
+            // render (track `ti` feeds `ch{ti}`). Announcing "its mixer channel is
+            // 4" when the mixer has four channels is a lie the user only discovers
+            // when the transport fails.
+            self.status = if channels > 0 && index >= channels {
+                format!(
+                    "added track {track} — the mixer has {channels} channels, so it will not \
+                     render until it is wider (`: mount mixer channels={}`)",
+                    index + 1,
+                )
+            } else {
+                format!("added track {track} — `R` renames it, ch{index} is its mixer channel")
+            };
+        }
+    }
+
+    /// `R`: open the command line **prefilled** with the rename line, so the name is
+    /// typed through the host's own format (one prompt, one parser, no second text
+    /// widget to keep in sync).
+    fn rename_track_prompt(&mut self) {
+        let Some(track) = self.active_lane_id() else {
+            self.status = "no active track to rename".to_string();
+            return;
+        };
+        let prefill = format!("arrange rename_track {track} ");
+        self.prompt = Some(prefill.clone());
+        self.prompt_prefill = Some(prefill);
+        self.history_at = self.history.len();
+        self.status = format!("rename {track}: type the new name and press Enter");
+    }
+
+    /// `D`: delete the active track **and its clips**, as one gesture — the op drops
+    /// the track, so the clips have to go explicitly, and one `u` brings both back.
+    fn delete_track(&mut self) {
+        let Some(arrangement) = self.arrangement.as_ref() else {
+            self.status = "no arrangement to delete a track from".to_string();
+            return;
+        };
+        let Some(lane) = arrangement.lanes.get(self.active_track) else {
+            self.status = "no active track to delete".to_string();
+            return;
+        };
+        let (track, clips) = (lane.id.clone(), lane.clips.len());
+        let mut lines: Vec<String> = lane
+            .clips
+            .iter()
+            .map(|clip| format!("delete {track} {}", clip.id))
+            .collect();
+        lines.push(format!("remove_track {track}"));
+        if self.arrange_group(&lines) {
+            self.active_track = self.active_track.saturating_sub(1);
+            self.status = format!(
+                "deleted track {track} and {clips} clip{} (one `u` brings them back)",
+                if clips == 1 { "" } else { "s" },
+            );
+        }
+    }
+
+    /// `{`/`}`: move the active track up / down. The mixer channel each track feeds
+    /// follows its position, so the console reorders with the timeline — and the
+    /// *view* stays on the track that moved.
+    fn move_track(&mut self, direction: i32) {
+        let Some(arrangement) = self.arrangement.as_ref() else {
+            self.status = "no arrangement to reorder".to_string();
+            return;
+        };
+        let Some(lane) = arrangement.lanes.get(self.active_track) else {
+            self.status = "no active track to move".to_string();
+            return;
+        };
+        let track = lane.id.clone();
+        let from = self.active_track as i64;
+        let to = from + direction as i64;
+        if to < 0 || to as usize >= arrangement.lanes.len() {
+            self.status = format!(
+                "track {track} is already {}",
+                if direction < 0 { "first" } else { "last" }
+            );
+            return;
+        }
+        if self.arrange(&format!("move_track {track} {to}")) {
+            self.active_track = to as usize;
+            self.status =
+                format!("moved track {track} to position {to} (its mixer channel follows)");
+        }
+    }
+
+    /// The active lane's id (a track is a mixer channel `ch{ti}`).
+    fn active_lane_id(&self) -> Option<String> {
+        self.arrangement
+            .as_ref()?
+            .lanes
+            .get(self.active_track)
+            .map(|lane| lane.id.clone())
     }
 
     // -- the clipboard (alpha slice D) ---------------------------------------
@@ -1670,9 +1813,18 @@ impl App {
         let Some(raw) = self.prompt.take() else {
             return;
         };
+        let prefill = self.prompt_prefill.take();
         let line = raw.trim().to_string();
         if line.is_empty() {
             self.status.clear();
+            return;
+        }
+        // A prefilled line the user did not finish (`R` then Enter) gets a hint
+        // instead of the parser's operand count.
+        if let Some(prefill) = &prefill
+            && line == prefill.trim()
+        {
+            self.status = format!("{line} needs the new value after the last space");
             return;
         }
         self.history.push(line.clone());
@@ -1713,7 +1865,12 @@ impl App {
             (self.history_at + 1).min(self.history.len())
         };
         self.history_at = next;
-        self.prompt = Some(self.history.get(next).cloned().unwrap_or_default());
+        // Past the end is the "live line": for a prefilled prompt that is the
+        // prefill, not a blank line that silently drops what the key opened.
+        self.prompt = Some(match self.history.get(next) {
+            Some(line) => line.clone(),
+            None => self.prompt_prefill.clone().unwrap_or_default(),
+        });
     }
 
     /// `n`/`N`: jump the playhead to the next/previous clip boundary on the
@@ -3990,6 +4147,128 @@ mod tests {
                 .clips
                 .is_empty(),
             "one undo removes the whole multi-clip paste: {}",
+            app.status
+        );
+
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// **Tracks are part of the arrangement value, not a side table**: `a` adds one
+    /// with a minted id and makes it active, `R` renames through the host's own
+    /// format (the prompt is prefilled), `D` deletes the track *and its clips* as one
+    /// gesture, and `{`/`}` reorder — the mixer channel follows the position, so the
+    /// console reorders with the timeline.
+    #[test]
+    fn tracks_add_rename_delete_and_reorder() {
+        let (pool, script_path) = pool_script(
+            "tracks",
+            "arrange add_track t1\narrange add_clip t0 c1 s1 0 24000 48000 0 0 1.0\n",
+        );
+        let mut app = App::idle();
+        app.snap = App::demo_snapshot();
+        app.open_script(&script_path);
+        let press = |app: &mut App, c: char| {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()))
+        };
+        let ids = |app: &App| -> Vec<String> {
+            app.arrangement
+                .as_ref()
+                .expect("an arrangement")
+                .lanes
+                .iter()
+                .map(|lane| lane.id.clone())
+                .collect()
+        };
+
+        // Add: the first free id, and it becomes the track the keys act on. (The
+        // demo mixer mounts 4 channels, so track index 2 exists and the status
+        // names its channel.)
+        press(&mut app, 'a');
+        assert_eq!(ids(&app), vec!["t0", "t1", "t2"], "{}", app.status);
+        assert_eq!(app.active_track, 2, "the new track is active");
+        assert!(app.status.contains("ch2"), "{}", app.status);
+        press(&mut app, 'u');
+        assert_eq!(ids(&app), vec!["t0", "t1"]);
+
+        // Rename: `R` opens the command line prefilled with the host's own line.
+        app.active_track = 0;
+        press(&mut app, 'R');
+        let prefill = app.prompt.clone().expect("the prompt is open");
+        assert_eq!(prefill, "arrange rename_track t0 ");
+        for c in "lead".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(ids(&app), vec!["lead", "t1"], "{}", app.status);
+        assert!(app.prompt.is_none(), "Enter closes the prompt");
+
+        // Reorder: `}` moves the active track down and the view follows it; the
+        // edges say so instead of sending a command.
+        press(&mut app, '}');
+        assert_eq!(ids(&app), vec!["t1", "lead"], "{}", app.status);
+        assert_eq!(app.active_track, 1, "the moved track stays active");
+        press(&mut app, '}');
+        assert!(app.status.contains("already last"), "{}", app.status);
+        press(&mut app, '{');
+        assert_eq!(ids(&app), vec!["lead", "t1"], "{}", app.status);
+        assert_eq!(app.active_track, 0);
+        press(&mut app, '{');
+        assert!(app.status.contains("already first"), "{}", app.status);
+
+        // Delete: the track *and its two clips* go in one gesture, and one undo
+        // brings the whole lot back.
+        app.active_track = 0;
+        press(&mut app, 'D');
+        assert_eq!(ids(&app), vec!["t1"], "{}", app.status);
+        assert!(app.status.contains("2 clips"), "{}", app.status);
+        press(&mut app, 'u');
+        assert_eq!(ids(&app), vec!["lead", "t1"], "the track is back");
+        assert_eq!(
+            app.arrangement.as_ref().expect("arrangement").lanes[0]
+                .clips
+                .len(),
+            2,
+            "and so are its clips"
+        );
+
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// **The mixer's width is the limit, and the status says so.** Track `ti` feeds
+    /// `ch{ti}`, so a track past the mounted channel count renders nothing — the
+    /// value op is permissive, and the *shell* is where the limit is visible.
+    #[test]
+    fn a_track_past_the_mixers_width_is_reported() {
+        let (pool, script_path) = pool_script(
+            "narrow",
+            // t0 from the fixture, plus two more: three tracks, so the next `a`
+            // fills the mixer's fourth channel and the one after that does not.
+            "arrange add_track t1\narrange add_track t2\n",
+        );
+        let mut app = App::idle();
+        app.snap = App::demo_snapshot(); // the demo mixer mounts 4 channels
+        app.open_script(&script_path);
+        assert_eq!(app.snap.channel_count, 4);
+
+        // The fourth track fits…
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()));
+        assert_eq!(
+            app.arrangement.as_ref().expect("arrangement").lanes.len(),
+            4
+        );
+        assert!(app.status.contains("ch3"), "{}", app.status);
+
+        // …the fifth cannot play, and the status says why and what to mount.
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()));
+        assert_eq!(
+            app.arrangement.as_ref().expect("arrangement").lanes.len(),
+            5,
+            "the value op stays permissive"
+        );
+        assert!(
+            app.status.contains("mixer has 4 channels")
+                && app.status.contains("mount mixer channels=5"),
+            "the limit and its fix are named: {}",
             app.status
         );
 

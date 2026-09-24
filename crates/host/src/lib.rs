@@ -1934,6 +1934,8 @@ pub fn format_arrange(op: &media::ArrangeOp) -> String {
     match op {
         Op::AddTrack { track } => format!("add_track {track}"),
         Op::RemoveTrack { track } => format!("remove_track {track}"),
+        Op::RenameTrack { track, to } => format!("rename_track {track} {to}"),
+        Op::MoveTrack { track, index } => format!("move_track {track} {index}"),
         Op::AddClip { track, clip } => {
             let mut line = format!(
                 "add_clip {track} {} {} {} {} {} {} {} {}",
@@ -2432,6 +2434,8 @@ pub fn parse_arrange_line(line: &str) -> Result<(media::ArrangeOp, Option<u64>),
 ///
 /// ```text
 /// arrange add_track t0 @0
+/// arrange rename_track t0 lead @0
+/// arrange move_track t0 1 @0
 /// arrange add_clip t0 c0 s1 0 4000 0 0 0 1.0 [loop_len] @0
 /// arrange razor_split t0 c0 cL cR 3000 @0
 /// arrange trim t0 c0 start 500 @0
@@ -2527,6 +2531,21 @@ fn parse_arrange(words: &[&str], at: usize, snap: Option<u64>) -> Result<media::
         "remove_track" => {
             arity(2)?;
             Ok(media::ArrangeOp::RemoveTrack { track: s(1)? })
+        }
+        "rename_track" => {
+            arity(3)?;
+            Ok(media::ArrangeOp::RenameTrack {
+                track: s(1)?,
+                to: s(2)?,
+            })
+        }
+        "move_track" => {
+            arity(3)?;
+            Ok(media::ArrangeOp::MoveTrack {
+                track: s(1)?,
+                index: usize::try_from(u(2)?)
+                    .map_err(|_| format!("line {at}: arrange move_track index is too large"))?,
+            })
         }
         "add_clip" => {
             // add_clip track c0 source src_start src_len at_frame fade_in fade_out gain [loop_len]
@@ -3448,6 +3467,14 @@ mod tests {
                 prefix: "pre".into(),
             },
             media::ArrangeOp::RemoveTrack { track: "t1".into() },
+            media::ArrangeOp::RenameTrack {
+                track: "t0".into(),
+                to: "lead".into(),
+            },
+            media::ArrangeOp::MoveTrack {
+                track: "t0".into(),
+                index: 1,
+            },
         ];
 
         let mut commands: Vec<HostCommand> = vec![
@@ -3699,6 +3726,102 @@ mod tests {
 
     /// The session directory is **movable**: the script's pool path is relative, so
     /// renaming the directory keeps the session playable (the plan's path trap).
+    /// **A rename and a reorder survive the round trip.** Found by the slice's gate:
+    /// the note claimed this end-to-end but only the format/parse round-trip was
+    /// committed — which never *applies* the ops. This saves a session with
+    /// `rename_track` + `move_track`, loads it back, and checks the order (the mixer
+    /// channel each track feeds is its index, so the order is the thing that matters).
+    #[test]
+    fn a_renamed_and_reordered_session_reloads_in_order() {
+        let root = std::env::temp_dir().join(format!("host-tracks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = HostSession::new();
+        s.execute(&HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 4.0)],
+            at_frame: Some(0),
+        })
+        .expect("mixer");
+        s.execute(&HostCommand::Pool { dir: pool.clone() })
+            .expect("pool");
+        for track in ["t0", "t1"] {
+            s.execute(&HostCommand::Arrange {
+                op: media::ArrangeOp::AddTrack {
+                    track: track.into(),
+                },
+                at_frame: None,
+            })
+            .expect("track");
+        }
+        s.execute(&HostCommand::Arrange {
+            op: add_clip("c0", 0),
+            at_frame: None,
+        })
+        .expect("clip");
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::RenameTrack {
+                track: "t0".into(),
+                to: "lead".into(),
+            },
+            at_frame: None,
+        })
+        .expect("rename");
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::MoveTrack {
+                track: "lead".into(),
+                index: 1,
+            },
+            at_frame: None,
+        })
+        .expect("reorder");
+
+        let order = |s: &HostSession| -> Vec<String> {
+            s.arrangement()
+                .expect("arrangement")
+                .tracks
+                .iter()
+                .map(|track| track.id.clone())
+                .collect()
+        };
+        assert_eq!(order(&s), vec!["t1", "lead"]);
+
+        let dir = root.join("tracks.d");
+        s.save(&dir).expect("save");
+
+        // The saved text names both ops (they are state, so they are in the log)…
+        let script = std::fs::read_to_string(dir.join("session.txt")).expect("script");
+        assert!(
+            script.contains("rename_track t0 lead"),
+            "the rename is in the session:\n{script}"
+        );
+        assert!(
+            script.contains("move_track lead 1"),
+            "the reorder is in the session:\n{script}"
+        );
+
+        // …and loading it back reproduces the same order and the same clip.
+        let mut reloaded = HostSession::new();
+        reloaded.load_session(&dir).expect("load");
+        assert_eq!(
+            order(&reloaded),
+            vec!["t1", "lead"],
+            "the order round-trips"
+        );
+        let arrangement = reloaded.arrangement().expect("arrangement");
+        assert_eq!(
+            arrangement.tracks[1].clips.len(),
+            1,
+            "the clip is in `lead`"
+        );
+        assert_eq!(arrangement.tracks[1].clips[0].id, "c0");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_saved_session_can_be_moved() {
         let root = std::env::temp_dir().join(format!("host-move-{}", std::process::id()));

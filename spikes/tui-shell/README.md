@@ -258,6 +258,10 @@ pointless), so the shell falls back to the wide meter bars under the transport.
 | `b` | cycle the **snap grid**: off → bar → beat → 1/2 → 1/4 (never logged — see the note) |
 | `y` / `c` | copy / cut the selection (or the clip under the playhead) — a shell value, not a log entry |
 | `p` / `P` | paste at the playhead / **appended** after the track's last clip (one `group`, one undo step) |
+| `a` | add a track (the first free `t{n}`), and make it active |
+| `R` | rename the active track — opens the command line prefilled with `arrange rename_track …` |
+| `D` | delete the active track **and its clips** as one gesture (one undo brings both back) |
+| `{` / `}` | move the active track up / down (its mixer channel follows the position) |
 | `J` / `K` | timeline: move the clip to the track **below / above**, keeping its time |
 | `g` / `G` | timeline: clip gain **−1 dB / +1 dB** (the range is the console fader's) |
 | `f` / `F` | timeline: fade in / fade out **to the playhead** (absolute, not a nudge) |

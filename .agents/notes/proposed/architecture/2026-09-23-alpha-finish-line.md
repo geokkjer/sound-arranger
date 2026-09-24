@@ -145,6 +145,12 @@ from the shared workflow (a key or a `: ` line — never a shell-only feature).
    clip (the arrangement's end when the track is empty), and the paste target is deliberately not
    clamped — a seek clamps, a paste extends the piece. Value ops stay absolute-frame-only.
 8. **Tracks**: add / rename / delete / reorder by key; the strip already exists as channel `ch{ti}`.
+   *Done (2026-09-24):* `RenameTrack` and `MoveTrack` are arrangement ops (rename keeps the index, so
+   the mixer channel does not move; move carries the clips and the channel follows the position), and
+   `a` / `R` / `D` / `{` / `}` drive them — `R` opens the command line prefilled with the host's own
+   `rename_track` line, and `D` deletes a track *and its clips* as one gesture
+   ([note](../../implemented/feature/2026-09-24-tracks-in-the-arrangement.md)). `add_track`'s id
+   validation is the one gap left (a live command can name a track with a space).
 9. **Pool panel**: browse sources (name, length, rate, peaks), place at the playhead or on a track, and
    **audition** first. Also where the pool-before-arrange requirement becomes an affordance instead of an
    error string.

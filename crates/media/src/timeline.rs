@@ -114,6 +114,18 @@ pub enum ArrangeOp {
     RemoveTrack {
         track: Id,
     },
+    /// Rename a track in place. The *index* is what feeds `ch{ti}`, so a rename
+    /// never moves the audio: the same track keeps its mixer channel.
+    RenameTrack {
+        track: Id,
+        to: Id,
+    },
+    /// Move a track to `index` (0-based), shifting the others — the mixer channel
+    /// each track feeds follows its position, which is what a reorder means.
+    MoveTrack {
+        track: Id,
+        index: usize,
+    },
     AddClip {
         track: Id,
         clip: Clip,
@@ -186,6 +198,19 @@ fn add_signed(base: u64, delta: i64) -> Option<u64> {
     }
 }
 
+/// A track id must be a word the `host v1` text format can carry **back**: it is
+/// written as an operand (`add_clip <track> …`), so it must be one whitespace-free
+/// token and must not look like one of the parser's own tokens — a leading `@`
+/// (`@frame`), a leading `snap=`, or a `#` (which starts a comment). A name the
+/// parser would strip is not an id; it is a session that cannot be reopened.
+pub fn valid_track_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.split_whitespace().count() == 1
+        && !id.starts_with('@')
+        && !id.starts_with("snap=")
+        && !id.contains('#')
+}
+
 /// Validates a clip's invariant fields; `Err` names the first violation.
 pub fn validate_clip(c: &Clip) -> Result<(), String> {
     if c.src_len == 0 {
@@ -252,6 +277,9 @@ impl Timeline {
     fn apply_mut(&mut self, op: &ArrangeOp) -> Result<(), String> {
         match op {
             ArrangeOp::AddTrack { track } => {
+                if !valid_track_id(track) {
+                    return Err(format!("'{track}' is not usable as a track id"));
+                }
                 if self.track_index(track).is_some() {
                     return Err(format!("track '{track}' already exists"));
                 }
@@ -266,6 +294,38 @@ impl Timeline {
                     .track_index(track)
                     .ok_or_else(|| format!("no track '{track}'"))?;
                 self.tracks.remove(ti);
+                Ok(())
+            }
+            ArrangeOp::RenameTrack { track, to } => {
+                let ti = self
+                    .track_index(track)
+                    .ok_or_else(|| format!("no track '{track}'"))?;
+                // A track id is written into the `host v1` format, so it must stay
+                // one whitespace-free word — otherwise the rename produces a
+                // session that cannot be parsed back.
+                if !valid_track_id(to) {
+                    return Err(format!("'{to}' is not usable as a track id"));
+                }
+                if self.track_index(to).is_some() {
+                    return Err(format!("track '{to}' already exists"));
+                }
+                self.tracks[ti].id = to.clone();
+                Ok(())
+            }
+            ArrangeOp::MoveTrack { track, index } => {
+                let ti = self
+                    .track_index(track)
+                    .ok_or_else(|| format!("no track '{track}'"))?;
+                if *index >= self.tracks.len() {
+                    return Err(format!(
+                        "track index {index} is out of range (0..{})",
+                        self.tracks.len()
+                    ));
+                }
+                if *index != ti {
+                    let moved = self.tracks.remove(ti);
+                    self.tracks.insert(*index, moved);
+                }
                 Ok(())
             }
             ArrangeOp::AddClip { track, clip } => {
@@ -588,6 +648,108 @@ mod tests {
         assert_eq!(t.tracks[0].id, "t0");
         assert!(
             t.apply(&ArrangeOp::AddTrack { track: "t0".into() })
+                .is_err()
+        );
+    }
+
+    /// Renaming keeps a track's **position** (so the mixer channel it feeds does
+    /// not move) and refuses a name the text format could not carry back; moving a
+    /// track carries its clips and shifts the others.
+    #[test]
+    fn tracks_rename_and_move_with_their_audio() {
+        let mut t = two_tracks();
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 0, 480),
+            })
+            .unwrap();
+        // `AddTrack` validates the same way, so a track can never be *created* with
+        // a name it could not be renamed to (the library-level hole the gate found).
+        for bad in ["", "two words", "@48000", "snap=480", "a#b"] {
+            assert!(
+                t.apply(&ArrangeOp::AddTrack { track: bad.into() }).is_err(),
+                "add_track {bad:?} must be refused"
+            );
+        }
+
+        t = t
+            .apply(&ArrangeOp::RenameTrack {
+                track: "t0".into(),
+                to: "lead".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            t.tracks
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lead", "t1"],
+            "a rename keeps the position"
+        );
+        assert_eq!(t.tracks[0].clips.len(), 1, "and its clips");
+
+        // Refusals: the old name is gone, a taken name is a collision, and an id
+        // the `host v1` format cannot carry back is refused rather than written —
+        // whitespace, emptiness, a comment marker, and the parser's own tokens.
+        for (track, to) in [
+            ("t0", "gone"),
+            ("lead", "t1"),
+            ("lead", "two words"),
+            ("lead", ""),
+            ("lead", "@48000"),
+            ("lead", "snap=480"),
+            ("lead", "lead#1"),
+            ("nope", "fine"),
+        ] {
+            assert!(
+                t.apply(&ArrangeOp::RenameTrack {
+                    track: track.into(),
+                    to: to.into(),
+                })
+                .is_err(),
+                "rename {track} → {to:?} must be refused"
+            );
+        }
+
+        // Move: index 1 swaps the pair, carrying the clip.
+        let mut moved = t
+            .apply(&ArrangeOp::MoveTrack {
+                track: "lead".into(),
+                index: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            moved
+                .tracks
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["t1", "lead"]
+        );
+        assert_eq!(moved.tracks[1].clips.len(), 1, "the clip moved with it");
+        // Moving to its own index is a no-op, not an error; out of range and an
+        // unknown track are refused.
+        moved = moved
+            .apply(&ArrangeOp::MoveTrack {
+                track: "lead".into(),
+                index: 1,
+            })
+            .unwrap();
+        assert!(
+            moved
+                .apply(&ArrangeOp::MoveTrack {
+                    track: "lead".into(),
+                    index: 2,
+                })
+                .is_err()
+        );
+        assert!(
+            moved
+                .apply(&ArrangeOp::MoveTrack {
+                    track: "nope".into(),
+                    index: 0,
+                })
                 .is_err()
         );
     }

@@ -67,6 +67,20 @@ pub fn encode_op(i: &mut Interner, op: &ArrangeOp) -> (&'static str, Vec<(&'stat
         ArrangeOp::RemoveTrack { track } => {
             ("RemoveTrack", vec![("track", Value::Str(i.intern(track)))])
         }
+        ArrangeOp::RenameTrack { track, to } => (
+            "RenameTrack",
+            vec![
+                ("track", Value::Str(i.intern(track))),
+                ("to", Value::Str(i.intern(to))),
+            ],
+        ),
+        ArrangeOp::MoveTrack { track, index } => (
+            "MoveTrack",
+            vec![
+                ("track", Value::Str(i.intern(track))),
+                ("index", Value::U64(*index as u64)),
+            ],
+        ),
         ArrangeOp::AddClip { track, clip } => {
             // loop_len must be > 0 (validate_clip enforces it); Some(0) would silently
             // encode as None. Guard here so a direct encode of a hand-built clip is
@@ -258,6 +272,14 @@ pub fn decode_op(op: &str, fields: &[(&'static str, Value)]) -> Result<ArrangeOp
         "RemoveTrack" => Ok(ArrangeOp::RemoveTrack {
             track: str_field(fields, "track")?,
         }),
+        "RenameTrack" => Ok(ArrangeOp::RenameTrack {
+            track: str_field(fields, "track")?,
+            to: str_field(fields, "to")?,
+        }),
+        "MoveTrack" => Ok(ArrangeOp::MoveTrack {
+            track: str_field(fields, "track")?,
+            index: u64_field(fields, "index")? as usize,
+        }),
         "AddClip" => {
             let src_len = u64_field(fields, "src_len")?;
             let loop_len = u64_field(fields, "loop")?;
@@ -374,6 +396,8 @@ pub fn register_handlers(
 pub const ALL_OPS: &[&str] = &[
     "AddTrack",
     "RemoveTrack",
+    "RenameTrack",
+    "MoveTrack",
     "AddClip",
     "RazorSplit",
     "Trim",

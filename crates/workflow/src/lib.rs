@@ -182,6 +182,16 @@ pub enum Action {
     /// Paste **appended** after the active track's last clip (the arrangement's end
     /// when the track is empty) — no new op, just a different target frame.
     PasteAppend,
+    /// Add a track (the shell mints its id) and make it active.
+    TrackAdd,
+    /// Rename the active track: the shell opens the command line prefilled with the
+    /// `rename_track` line, so the name is typed through the host's own format.
+    TrackRename,
+    /// Delete the active track **and its clips** as one gesture.
+    TrackDelete,
+    /// Reorder the active track down (+1) / up (-1), keeping it active. (Not
+    /// `MoveTrack` — that one moves a *clip* between tracks.)
+    ReorderTrack(i32),
     /// Move the clip to the track below (+1) / above (-1).
     MoveTrack(i32),
     /// Step the clip's gain in dB.
@@ -230,6 +240,10 @@ impl Action {
             Action::Cut => "cut to the clipboard",
             Action::Paste => "paste at the playhead",
             Action::PasteAppend => "paste appended to the track",
+            Action::TrackAdd => "add a track",
+            Action::TrackRename => "rename the track",
+            Action::TrackDelete => "delete the track",
+            Action::ReorderTrack(_) => "reorder the track",
             Action::MoveTrack(_) => "move the clip to another track",
             Action::Gain(_) => "clip gain",
             Action::Fade(_) => "fade",
@@ -259,6 +273,10 @@ impl Action {
             // group of `add_clip`s, which is why it needs no vocabulary of its own.
             Action::Cut => Some("delete"),
             Action::Paste | Action::PasteAppend => Some("add_clip"),
+            Action::TrackAdd => Some("add_track"),
+            Action::TrackRename => Some("rename_track"),
+            Action::TrackDelete => Some("remove_track"),
+            Action::ReorderTrack(_) => Some("move_track"),
             _ => None,
         }
     }
@@ -464,6 +482,23 @@ pub static KEYMAP: &[Binding] = &[
         "paste at the playhead / appended after the track's last clip (one undo step)",
     ),
     bind(
+        "a  R  D",
+        &[
+            (Key::Char('a'), Action::TrackAdd),
+            (Key::Char('R'), Action::TrackRename),
+            (Key::Char('D'), Action::TrackDelete),
+        ],
+        "timeline: add a track / rename the active track / delete it and its clips",
+    ),
+    bind(
+        "{  }",
+        &[
+            (Key::Char('{'), Action::ReorderTrack(-1)),
+            (Key::Char('}'), Action::ReorderTrack(1)),
+        ],
+        "timeline: move the active track up / down (the mixer channel follows)",
+    ),
+    bind(
         "g  G",
         &[
             (Key::Char('g'), Action::Gain(-1)),
@@ -627,6 +662,10 @@ mod tests {
         // own text format.
         let samples: &[(&str, &str)] = &[
             ("add_clip", "add_clip t0 c0 s1 0 48000 0 64 64 1.0"),
+            ("add_track", "add_track t1"),
+            ("rename_track", "rename_track t0 lead"),
+            ("remove_track", "remove_track t1"),
+            ("move_track", "move_track t0 1"),
             ("razor_split", "razor_split t0 c0 L R 48000"),
             ("delete", "delete t0 c0"),
             ("trim", "trim t0 c0 start 4800"),
