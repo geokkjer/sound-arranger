@@ -55,6 +55,9 @@ pub struct Snapshot {
     /// mounted: output peaks per side and the gain reduction the compressor +
     /// limiter applied to the last block, in dB (≥ 0, `0` = transparent).
     pub mastering: Option<MasteringStatus>,
+    /// The last successful `export`'s report (length, format, peak, RMS), for a shell
+    /// to show what was written. `None` until one runs.
+    pub last_export: Option<ExportStatus>,
     /// The audio output's state: `None` when the host runs silent (no device was
     /// requested), otherwise the negotiated rate/layout and the played counters.
     pub audio: Option<AudioStatus>,
@@ -74,6 +77,23 @@ pub struct MasteringStatus {
     pub peak_r: f32,
     /// Gain reduction in dB (≥ 0): how much the chain pulled the block down.
     pub reduction_db: f32,
+}
+
+/// What the last export wrote, as a shell reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportStatus {
+    /// The sample format's `host v1` name (`f32` / `s16`).
+    pub format: &'static str,
+    /// Frames the **arrangement** occupies (the render's length).
+    pub frames: u64,
+    /// Frames the drain added after it (tails), so the *file* is
+    /// `frames + drained_frames` long — a shell that says only `frames` under-reports the
+    /// file it just wrote.
+    pub drained_frames: u64,
+    /// Peak of the rendered mix (linear; 1.0 is full scale).
+    pub peak: f32,
+    /// RMS of the rendered mix (linear).
+    pub rms: f32,
 }
 
 /// The audio output's negotiated state and counters.
@@ -112,6 +132,7 @@ impl Default for Snapshot {
             channel_count: 0,
             master: 0.0,
             mastering: None,
+            last_export: None,
             audio: None,
             can_undo: false,
             can_redo: false,
@@ -133,6 +154,9 @@ pub struct HostOutcome {
     /// The arrangement value; `Err` if the snapshot errors (a poisoned timeline)
     /// — never a silent empty value.
     pub arrangement: Result<media::Timeline, String>,
+    /// The last successful `export`'s report (length, format, peak, RMS) — what a
+    /// shell shows after the render-out gesture. `None` until one runs.
+    pub last_export: Option<ExportStatus>,
     /// The tempo each pool source was performed at (`source_tempo <id> <bpm>`), sorted
     /// by id so a shell can cache it deterministically — what tempo match derives its
     /// ratio from.
@@ -486,6 +510,15 @@ fn build_outcome(session: &HostSession) -> HostOutcome {
         event_count: session.event_count(),
         media_commands: session.media_command_count(),
         arrangement: session.arrangement(),
+        last_export: session.last_export().map(|e| ExportStatus {
+            format: crate::ExportFormat::from_code(e.format)
+                .map(|f| f.name())
+                .unwrap_or("?"),
+            frames: e.frames,
+            drained_frames: e.drained_frames,
+            peak: e.peak,
+            rms: e.rms,
+        }),
         source_tempos: {
             let mut tempos: Vec<(String, f64)> = session
                 .source_tempos()
@@ -536,6 +569,15 @@ fn publish(session: &HostSession, shared: &Mutex<Snapshot>, audio: &AudioState) 
             s.master = 0.0;
         }
     }
+    s.last_export = session.last_export().map(|e| ExportStatus {
+        format: crate::ExportFormat::from_code(e.format)
+            .map(|f| f.name())
+            .unwrap_or("?"),
+        frames: e.frames,
+        drained_frames: e.drained_frames,
+        peak: e.peak,
+        rms: e.rms,
+    });
     s.mastering = session.master_meters().map(|m| MasteringStatus {
         peak_l: m.peak_l(),
         peak_r: m.peak_r(),

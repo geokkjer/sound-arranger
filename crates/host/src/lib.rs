@@ -248,9 +248,125 @@ pub enum HostCommand {
     /// Render `frames` from the current position and write the master to a
     /// 16-bit WAV.
     Bounce { frames: usize, path: PathBuf },
+    /// **Export the whole arrangement** — `bounce`'s sibling, not an overload of it.
+    /// `bounce` keeps its hand-computed frame count, 16-bit WAV and byte-identical
+    /// test role; `export` is the *deliverable*: it replays to frame 0 (so the
+    /// compressor's ballistics and the render are reproducible), measures the
+    /// arrangement's own length instead of asking for a count, writes **f32** by
+    /// default (bit-exact, golden-file testable) or **s16 with fixed-seed TPDF
+    /// dither**, reports peak/RMS, and **refuses rather than writing a clipped file**.
+    /// An action (it writes a file), like `Bounce`.
+    Export { path: PathBuf, format: ExportFormat },
+}
+
+/// The sample format an [`HostCommand::Export`] writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExportFormat {
+    /// 32-bit float WAV — the mix exactly as rendered, no quantisation.
+    #[default]
+    F32,
+    /// 16-bit PCM with fixed-seed TPDF dither (a reproducible, decorrelated floor).
+    S16,
+}
+
+impl ExportFormat {
+    /// The word the `host v1` form uses (`export <path> [f32|s16]`).
+    pub fn name(self) -> &'static str {
+        match self {
+            ExportFormat::F32 => "f32",
+            ExportFormat::S16 => "s16",
+        }
+    }
+
+    /// The recorded code (a stable small number, so the log line does not depend on
+    /// the spelling of a name).
+    pub fn code(self) -> u32 {
+        match self {
+            ExportFormat::F32 => 0,
+            ExportFormat::S16 => 1,
+        }
+    }
+
+    pub fn from_code(code: u32) -> Option<Self> {
+        match code {
+            0 => Some(ExportFormat::F32),
+            1 => Some(ExportFormat::S16),
+            _ => None,
+        }
+    }
 }
 
 impl HostCommand {
+    /// The same command with every frame placement removed, members included.
+    ///
+    /// This is the **export rebuild**'s transform: an export wants the session's
+    /// *current* value (order decides, the last writer wins), rendered from the start,
+    /// without the clock walking the timeline while the state is applied. A seek keeps
+    /// its frame-gated replay — the two questions are different ("what is the session
+    /// now" vs "what was it at frame N").
+    pub fn at_now(&self) -> HostCommand {
+        let now = |_at: &Option<u64>| None;
+        match self {
+            HostCommand::Mount {
+                plugin,
+                params,
+                at_frame,
+            } => HostCommand::Mount {
+                plugin,
+                params: params.clone(),
+                at_frame: now(at_frame),
+            },
+            HostCommand::Patch { from, to, at_frame } => HostCommand::Patch {
+                from: *from,
+                to: *to,
+                at_frame: now(at_frame),
+            },
+            HostCommand::SetParam {
+                plugin,
+                param,
+                value,
+                at_frame,
+            } => HostCommand::SetParam {
+                plugin,
+                param,
+                value: *value,
+                at_frame: now(at_frame),
+            },
+            HostCommand::SetTempo {
+                bpm,
+                beats_per_bar,
+                at_frame,
+            } => HostCommand::SetTempo {
+                bpm: *bpm,
+                beats_per_bar: *beats_per_bar,
+                at_frame: now(at_frame),
+            },
+            HostCommand::Unmount { plugin, at_frame } => HostCommand::Unmount {
+                plugin,
+                at_frame: now(at_frame),
+            },
+            HostCommand::Arrange { op, at_frame } => HostCommand::Arrange {
+                op: op.clone(),
+                at_frame: now(at_frame),
+            },
+            HostCommand::Play {
+                clip,
+                channel,
+                at_frame,
+            } => HostCommand::Play {
+                clip: clip.clone(),
+                channel: *channel,
+                at_frame: now(at_frame),
+            },
+            HostCommand::Group { commands } => HostCommand::Group {
+                commands: commands.iter().map(HostCommand::at_now).collect(),
+            },
+            // Commands whose frame is **content** (a splice's timeline position) or that
+            // have none are already "now": they carry the value, not a placement.
+            other => other.clone(),
+        }
+    }
+
     fn at_frame(&self) -> Option<u64> {
         match self {
             HostCommand::Mount { at_frame, .. }
@@ -271,7 +387,9 @@ impl HostCommand {
     /// Whether this command defines *state* — replayed to rebuild a session on a
     /// seek (see `seek_to`). The media commands that shape the session
     /// (`pool`/`play`/`splice`, and the arrangement ops) are state; pure actions
-    /// (`bounce`, the transport ops, `record`) are not.
+    /// (`bounce`, `export`, the transport ops, `record`) are not. An export *renders*
+    /// the session, so replaying it would be both useless and expensive — but its
+    /// report is logged (`MediaExport`, like `MediaBounce`).
     fn is_state(&self) -> bool {
         matches!(
             self,
@@ -333,6 +451,9 @@ pub struct HostSession {
     /// The sources the last `set_pool` resampled to the session rate (see
     /// [`HostSession::pool_conformed`]).
     pool_conformed: Vec<media::Conform>,
+    /// The last successful export's report (length, format, peak, RMS) — a shell
+    /// shows what was written without recomputing the render.
+    last_export: Option<media_ops::ExportRecord>,
     /// The tempo each pool source was performed at (`source_tempo <id> <bpm>`), which
     /// is what **tempo match** derives its ratio from. State: the log carries it, a
     /// replay rebuilds it, and the outcome exposes it to a shell.
@@ -445,6 +566,7 @@ impl HostSession {
             pool_resolver: None,
             pool_dir: None,
             pool_conformed: Vec::new(),
+            last_export: None,
             source_tempos: std::collections::HashMap::new(),
             wired_tracks: std::collections::HashMap::new(),
             arrange_dirty: false,
@@ -1308,6 +1430,7 @@ impl HostSession {
                 self.media_commands += 1;
                 Ok(())
             }
+            HostCommand::Export { path, format } => self.export(path, *format),
             HostCommand::Bounce { frames, path } => {
                 // Offline bounce: render + drain buffered tails. A capped drain
                 // is a *different, truncated* piece, so it fails loud rather than
@@ -1479,7 +1602,7 @@ impl HostSession {
     /// first). A wiring failure (e.g. the mixer was unmounted after a `play`) is
     /// a clean `Err`, never a panic in a host.
     pub fn render(&mut self, frames: usize) -> Result<Vec<f32>, String> {
-        Self::check_bounce_budget(frames)?;
+        Self::check_bounce_budget("a render", frames)?;
         self.wire_pending()?;
         self.wire_arranger()?;
         Ok(self.engine.render(frames))
@@ -1490,7 +1613,7 @@ impl HostSession {
     /// cut): a stopped device is paused, so there is nowhere for a tail to ring.
     pub fn render_with_drain(&mut self, frames: usize) -> Result<(Vec<f32>, DrainOutcome), String> {
         // The drain can add up to MAX_DRAIN_FRAMES on top of `frames`.
-        Self::check_bounce_budget(frames.saturating_add(MAX_DRAIN_FRAMES))?;
+        Self::check_bounce_budget("a render", frames.saturating_add(MAX_DRAIN_FRAMES))?;
         // **Materialize everything scheduled before measuring anything.** The aligned
         // render below derives its head trim from the *wired* graph, and `wire_pending`
         // only flushes when it has player cords to lay, `wire_arranger` only when the
@@ -1508,15 +1631,21 @@ impl HostSession {
             .render_with_drain_aligned(frames, DrainPolicy::Tails, MAX_DRAIN_FRAMES))
     }
 
-    /// The offline bounce budget: the master may be stereo (L/R), so a frame
-    /// costs up to 2 * 4 bytes; a malformed `bounce` must not OOM.
-    fn check_bounce_budget(frames: usize) -> Result<(), String> {
+    /// The offline render budget: the master may be stereo (L/R), so a frame costs up
+    /// to 2 * 4 bytes, and the whole mix is held in memory (the render is one buffer, not
+    /// a stream). ~1 GiB is therefore about **46 minutes** of stereo at 48 kHz — a
+    /// deliberate bound (a malformed frame count must not OOM) that a long jam will
+    /// eventually reach, which is why the refusal names the *command* the user ran and
+    /// the memory reason, not just a number.
+    fn check_bounce_budget(what: &str, frames: usize) -> Result<(), String> {
         let budget = frames
             .saturating_mul(std::mem::size_of::<f32>())
             .saturating_mul(2);
         if budget > Self::MAX_BOUNCE_BYTES {
             return Err(format!(
-                "bounce of {frames} frames exceeds the ~{:.0} MiB budget",
+                "{what} of {frames} frames (~{:.0} s of stereo) exceeds the ~{:.0} MiB \
+                 in-memory render budget",
+                frames as f64 / 48_000.0,
                 Self::MAX_BOUNCE_BYTES / (1 << 20)
             ));
         }
@@ -1591,6 +1720,122 @@ impl HostSession {
     /// a bounce runs.
     pub fn last_drain(&self) -> DrainOutcome {
         self.last_drain
+    }
+
+    /// What the last [`HostCommand::Export`] wrote: the measured length, format,
+    /// peak and RMS. `None` until one runs (and it is *not* cleared by a later
+    /// failure — a shell reports the last thing that was written).
+    pub fn last_export(&self) -> Option<&media_ops::ExportRecord> {
+        self.last_export.as_ref()
+    }
+
+    /// **Export the whole arrangement** to `path` — `bounce`'s deliverable sibling.
+    ///
+    /// The render runs on a **rebuilt clone** of the session, so an export is
+    /// side-effect free: the transport does not move, the graph is not disturbed, and a
+    /// take in progress is not finalized by a file-write gesture (the gate measured the
+    /// playhead jumping to the arrangement's end, and `replay_to` stopping a recording).
+    /// The clone applies **every** state command at the present instant (order decides),
+    /// so the export is the session's *current* value rendered from the start — a
+    /// limiter mounted halfway through a session masters the whole file rather than
+    /// silently missing from the deliverable. The length is the arrangement's own
+    /// ([`media::Timeline::end_frame`]), never a hand-computed count. The output is
+    /// **f32** (bit-exact) or **s16 with fixed-seed TPDF dither** (reproducible), and a
+    /// mix whose peak exceeds full scale is **refused with nothing written** — "never a
+    /// clipped file" is a property of the command, not of the user's care.
+    pub fn export(&mut self, path: &std::path::Path, format: ExportFormat) -> Result<(), String> {
+        // The clone: current state, clock at 0, and no rendering while the state is
+        // applied (`at_now`), so this is cheap even for a long session.
+        let mut fresh = self.rebuild(None)?;
+        let frames = self.arrangement()?.end_frame();
+        if frames == 0 {
+            return Err("nothing to export: the arrangement has no clips".into());
+        }
+        if frames > usize::MAX as u64 {
+            return Err(format!(
+                "the arrangement is {frames} frames long — too long"
+            ));
+        }
+        let (mut out, drain) = fresh.render_with_drain(frames as usize)?;
+        if drain.capped {
+            return Err(format!(
+                "export drain hit the {MAX_DRAIN_FRAMES}-frame bound with output still pending — \
+                 the tail would be truncated"
+            ));
+        }
+        // Measure, counting non-finite samples instead of folding them away: `f32::max`
+        // *ignores* a NaN, so a naive peak would report 0 for a mix of NaNs and the
+        // export would write them.
+        let mut peak = 0.0f32;
+        let mut sum_sq = 0.0f64;
+        let mut non_finite = 0usize;
+        for x in &out {
+            if x.is_finite() {
+                peak = peak.max(x.abs());
+                sum_sq += (*x as f64) * (*x as f64);
+            } else {
+                non_finite += 1;
+            }
+        }
+        let rms = (sum_sq / out.len().max(1) as f64).sqrt() as f32;
+        if non_finite > 0 {
+            return Err(format!(
+                "export refused: {non_finite} of {} samples are not finite (a NaN or infinity \
+                 reached the mix) — the file was not written",
+                out.len()
+            ));
+        }
+        if peak > 1.0 {
+            // Refuse rather than write it: a file whose samples leave full scale is
+            // silently clipped by every 16-bit player and by most converters. An
+            // existing file at `path` is left alone — a failed export never destroys
+            // what an earlier one wrote.
+            let db = if peak > 0.0 {
+                20.0 * peak.log10()
+            } else {
+                f32::NEG_INFINITY
+            };
+            return Err(format!(
+                "export would clip: the mix peaks at {peak:.4} ({db:.1} dBFS) — lower the mix or \
+                 mount a master chain with a ceiling; the file was not written"
+            ));
+        }
+        let rate = fresh.engine.clock.sample_rate;
+        let channels = fresh.engine.graph.out_channels().max(1) as u16;
+        match format {
+            ExportFormat::F32 => {
+                let mut w = media::WavWriter::create_float(path, rate, channels)?;
+                w.write(&out)?;
+                w.finalize()?;
+            }
+            ExportFormat::S16 => {
+                // Fixed-seed TPDF dither: reproducible, and the quantisation error's
+                // mean and its correlation with the signal both go to zero.
+                let mut dither = media::TpdfDither::new(media::DITHER_SEED);
+                dither.quantize_s16(&mut out);
+                let mut w = media::WavWriter::create(path, rate, channels)?;
+                w.write(&out)?;
+                w.finalize()?;
+            }
+        }
+        let record = media_ops::ExportRecord {
+            frames,
+            format: format.code(),
+            peak,
+            rms,
+            drained_frames: drain.tail_frames,
+        };
+        let (op, fields) = media_ops::encode_export(&record);
+        self.engine.arrange_logged(op, fields)?;
+        self.media
+            .lock()
+            .map_err(|_| "media session poisoned")?
+            .exports
+            .push(record.clone());
+        self.last_drain = drain;
+        self.last_export = Some(record);
+        self.media_commands += 1;
+        Ok(())
     }
 
     /// The clip editor's arrangement value (read-only snapshot). `Ok(default)`
@@ -1785,6 +2030,60 @@ impl HostSession {
         self.replay_to(frame)
     }
 
+    /// Build a fresh session from the state-command history.
+    ///
+    /// `upto = Some(frame)` is the **seek** reconstruction: state that takes effect after
+    /// `frame` is not yet in force there, and the rebuild renders the timeline forward to
+    /// `frame`. The skip is per **entry**, so a gesture is never half-applied.
+    ///
+    /// `upto = None` is the **export** reconstruction: every state command is applied
+    /// *at the present instant* (its frame placement removed, order preserved) and the
+    /// clock stays at 0. That is what makes an export the session's **current** value
+    /// rendered from the start: a compressor or limiter mounted halfway through a
+    /// session masters the whole file, rather than silently missing from it — which the
+    /// gate showed as an export clipping where the audible session did not.
+    ///
+    /// Pure with respect to `self`: the caller decides what to adopt and what to carry.
+    fn rebuild(&self, upto: Option<u64>) -> Result<HostSession, String> {
+        let mut rebuilt = HostSession::new_at(self.engine.clock.sample_rate);
+        for entry in &self.history {
+            match upto {
+                Some(frame) => {
+                    if entry
+                        .first()
+                        .and_then(|c| c.at_frame())
+                        .is_some_and(|at| at > frame)
+                    {
+                        continue;
+                    }
+                    for cmd in entry {
+                        rebuilt.process(cmd)?;
+                    }
+                }
+                None => {
+                    // `at_now`: order decides, not timeline position, so applying the
+                    // state does not render the clock through the piece.
+                    for cmd in entry {
+                        rebuilt.process(&cmd.at_now())?;
+                    }
+                }
+            }
+        }
+        rebuilt.render_to(upto.unwrap_or(0))?;
+        rebuilt.playing = self.playing;
+        rebuilt.redo = self.redo.clone();
+        // **Observability survives a rebuild.** A replay replaces the session, so the
+        // session directory (and the autosave state) has to come across or the journal
+        // would silently stop after the first undo/seek; the last export's report comes
+        // across too, because a shell's readout should not vanish under a seek.
+        rebuilt.session_dir = self.session_dir.clone();
+        rebuilt.journal_error = self.journal_error.clone();
+        rebuilt.last_recovery = self.last_recovery.clone();
+        rebuilt.last_export = self.last_export.clone();
+        rebuilt.last_drain = self.last_drain;
+        Ok(rebuilt)
+    }
+
     /// Rebuild the session from its state-command history and render back to
     /// `frame` — the deterministic reconstruction `seek_to` and undo/redo share.
     /// The transport's playing state and the redo stack survive the rebuild.
@@ -1795,38 +2094,8 @@ impl HostSession {
         if self.recording.is_some() {
             let _ = self.stop_recording();
         }
-        let history = self.history.clone();
-        let redo = std::mem::take(&mut self.redo);
-        let playing = self.playing;
-        let mut rebuilt = HostSession::new_at(self.engine.clock.sample_rate);
-        for entry in &history {
-            // State that takes effect *after* the target is not yet in force at
-            // `frame`. Applying it would render the clock past the target — which
-            // makes a backward seek a no-op, because `process` renders up to the
-            // command's `at_frame`. The skip is per **entry**, so a gesture is
-            // never half-applied: the rebuild reconstructs the session as it was at
-            // `frame`.
-            if entry
-                .first()
-                .and_then(|c| c.at_frame())
-                .is_some_and(|at| at > frame)
-            {
-                continue;
-            }
-            for cmd in entry {
-                rebuilt.process(cmd)?;
-            }
-        }
-        rebuilt.render_to(frame)?;
-        rebuilt.playing = playing;
-        rebuilt.redo = redo;
-        // **Persistence survives a rebuild.** A replay replaces the session, so the
-        // session directory (and the autosave state) has to come across or the
-        // journal would silently stop after the first undo/seek.
+        let mut rebuilt = self.rebuild(Some(frame))?;
         rebuilt.last_take = self.last_take.take();
-        rebuilt.session_dir = self.session_dir.clone();
-        rebuilt.journal_error = self.journal_error.take();
-        rebuilt.last_recovery = self.last_recovery.take();
         *self = rebuilt;
         Ok(())
     }
@@ -2157,6 +2426,7 @@ pub fn format_command(cmd: &HostCommand, session_dir: Option<&std::path::Path>) 
         | HostCommand::Record { .. }
         | HostCommand::RecordStop
         | HostCommand::Bounce { .. }
+        | HostCommand::Export { .. }
         | HostCommand::Stretch { .. }
         | HostCommand::Save { .. }
         | HostCommand::Load { .. } => return None,
@@ -2587,6 +2857,27 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
                     .map_err(|_| format!("line {at}: bad frames"))?;
                 let path = PathBuf::from(word(&words, 2, at)?);
                 commands.push(HostCommand::Bounce { frames, path });
+            }
+            "export" => {
+                // `export <path> [f32|s16]` — f32 when the format is omitted.
+                if words.len() != 2 && words.len() != 3 {
+                    return Err(format!(
+                        "line {at}: export takes 1 or 2 operand(s), got {}",
+                        words.len() - 1
+                    ));
+                }
+                let path = PathBuf::from(word(&words, 1, at)?);
+                let format = match words.get(2) {
+                    None => ExportFormat::F32,
+                    Some(&"f32") => ExportFormat::F32,
+                    Some(&"s16") => ExportFormat::S16,
+                    Some(other) => {
+                        return Err(format!(
+                            "line {at}: unknown export format '{other}' (use f32 or s16)"
+                        ));
+                    }
+                };
+                commands.push(HostCommand::Export { path, format });
             }
             "stretch" => {
                 exact(&words, 5, at, "stretch")?;
@@ -3422,6 +3713,44 @@ mod tests {
             HostCommand::TransportSeek { frame } => assert_eq!(*frame, 4_800),
             other => panic!("expected a seek, got {other:?}"),
         }
+    }
+
+    /// `export <path> [f32|s16]` — f32 when the format is omitted, `s16` when asked,
+    /// a bad format refused (and never logged: an action has no log form).
+    #[test]
+    fn export_lines_parse() {
+        let cmds = parse_script("host v1\nexport /tmp/a.wav\nexport /tmp/b.wav s16\n")
+            .expect("export lines parse");
+        match (&cmds[0], &cmds[1]) {
+            (
+                HostCommand::Export { path, format },
+                HostCommand::Export {
+                    path: p2,
+                    format: f2,
+                },
+            ) => {
+                assert_eq!(path, &PathBuf::from("/tmp/a.wav"));
+                assert_eq!(*format, ExportFormat::F32, "f32 is the default");
+                assert_eq!(p2, &PathBuf::from("/tmp/b.wav"));
+                assert_eq!(*f2, ExportFormat::S16);
+            }
+            other => panic!("expected two exports, got {other:?}"),
+        }
+        assert!(
+            parse_script("host v1\nexport /tmp/a.wav flac\n").is_err(),
+            "an unknown format is refused"
+        );
+        assert!(
+            format_command(
+                &HostCommand::Export {
+                    path: PathBuf::from("/tmp/a.wav"),
+                    format: ExportFormat::F32,
+                },
+                None
+            )
+            .is_none(),
+            "an export is an action: it has no log form (its report is logged instead)"
+        );
     }
 
     // ---- gestures: one entry, one undo, all-or-nothing ----
@@ -4511,6 +4840,335 @@ mod tests {
         assert!(
             dry_again_peak > compressed_peak,
             "the dry path is back and uncompressed: {dry_again_peak} vs a compressed ~{compressed_peak}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **`export` is the deliverable sibling of `bounce`.** It renders the whole
+    /// arrangement from frame 0 (not from wherever the playhead is), measures the
+    /// length itself, writes f32 by default or s16 with fixed-seed TPDF dither, and
+    /// **refuses rather than writing a clipped file**. Verified: the length is the
+    /// arrangement's own, the file starts at the piece (aligned), two exports are
+    /// byte-identical (dither included), the report is the mix's real peak/RMS, and a
+    /// hot mix leaves no file behind.
+    #[test]
+    fn export_writes_the_whole_arrangement_and_refuses_to_clip() {
+        let root = std::env::temp_dir().join(format!("host-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = HostSession::new();
+        s.execute(&HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 2.0)],
+            at_frame: Some(0),
+        })
+        .expect("mixer");
+        s.execute(&HostCommand::Pool { dir: pool.clone() })
+            .expect("pool");
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::AddTrack { track: "t0".into() },
+            at_frame: None,
+        })
+        .expect("track");
+        // Two clips: the arrangement ends at 9 600, and the playhead is parked
+        // somewhere else entirely (an export must not care).
+        for (id, at) in [("c0", 0u64), ("c1", 4_800)] {
+            s.execute(&HostCommand::Arrange {
+                op: add_clip(id, at),
+                at_frame: None,
+            })
+            .expect("clip");
+        }
+        s.execute(&HostCommand::TransportSeek { frame: 2_000 })
+            .expect("playhead elsewhere");
+
+        let f32_path = root.join("mix.wav");
+        s.execute(&HostCommand::Export {
+            path: f32_path.clone(),
+            format: ExportFormat::F32,
+        })
+        .expect("export f32");
+        let record = s.last_export().cloned().expect("a report");
+        assert_eq!(record.frames, 9_600, "the arrangement's own length");
+        assert_eq!(record.format, ExportFormat::F32.code());
+        assert!(
+            record.peak > 0.1 && record.peak <= 1.0,
+            "peak {} is the mix's",
+            record.peak
+        );
+        assert!(record.rms > 0.0 && record.rms < record.peak);
+
+        // The file is the piece: the arrangement length (+ the drain's tail), stereo,
+        // and f32 (the pool's float reader reads it back exactly).
+        let mut r = media::WavReader::open(&f32_path).expect("wav");
+        assert_eq!(r.channels(), 2, "the master bus is stereo");
+        let frames = r.total_frames();
+        assert!(
+            (9_600..9_600 + 4_096).contains(&frames),
+            "exported {frames} frames for a 9 600-frame arrangement"
+        );
+        // `read_into` returns **frames** and fills one channel (channel 0).
+        let mut buf = vec![0.0f32; frames as usize];
+        let n = r.read_into(&mut buf);
+        buf.truncate(n);
+        assert!(
+            buf[..2_000].iter().any(|x| x.abs() > 0.01),
+            "the file starts at the piece, not after the (absent) latency"
+        );
+
+        // Deterministic, twice over — and the second export is a *different* run of
+        // the same session from a different playhead position.
+        let again = root.join("mix2.wav");
+        s.execute(&HostCommand::TransportSeek { frame: 7_000 })
+            .expect("move the playhead again");
+        s.execute(&HostCommand::Export {
+            path: again.clone(),
+            format: ExportFormat::F32,
+        })
+        .expect("export again");
+        assert_eq!(
+            std::fs::read(&f32_path).expect("bytes"),
+            std::fs::read(&again).expect("bytes"),
+            "an export depends on the session, not on the playhead"
+        );
+
+        // s16 with the fixed-seed dither: also byte-identical across runs, and a
+        // 16-bit file (half the sample width).
+        let s16_a = root.join("mix-s16-a.wav");
+        let s16_b = root.join("mix-s16-b.wav");
+        for path in [&s16_a, &s16_b] {
+            s.execute(&HostCommand::Export {
+                path: path.clone(),
+                format: ExportFormat::S16,
+            })
+            .expect("export s16");
+        }
+        assert_eq!(
+            std::fs::read(&s16_a).expect("bytes"),
+            std::fs::read(&s16_b).expect("bytes"),
+            "the dither is seeded, so an export is reproducible"
+        );
+        let mut r16 = media::WavReader::open(&s16_a).expect("wav");
+        assert_eq!(r16.channels(), 2, "the s16 export is stereo too");
+        assert_eq!(r16.total_frames(), frames, "same length as the f32 export");
+        let mut buf16 = vec![0.0f32; frames as usize];
+        let n16 = r16.read_into(&mut buf16);
+        assert_eq!(n16, buf.len(), "and the same frames come back");
+        // The dithered file tracks the float one: a diff of a few LSBs, not a
+        // different performance.
+        let worst = buf16
+            .iter()
+            .zip(&buf)
+            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(
+            worst < 8.0 / 32767.0,
+            "s16 is the same mix within a few LSBs: {worst}"
+        );
+
+        // **Never a clipped file**: make the mix exceed full scale (two tracks, each
+        // clipped at +6 dB, summing into the same span) and check that the export
+        // refuses *and* leaves nothing behind.
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::SetClipGain {
+                track: "t0".into(),
+                clip: "c0".into(),
+                gain: 2.0,
+            },
+            at_frame: None,
+        })
+        .expect("gain");
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::AddTrack { track: "t1".into() },
+            at_frame: None,
+        })
+        .expect("second track");
+        let mut hot_clip = match add_clip("c2", 0) {
+            media::ArrangeOp::AddClip { clip, .. } => clip,
+            other => panic!("add_clip built {other:?}"),
+        };
+        hot_clip.gain = 2.0;
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::AddClip {
+                track: "t1".into(),
+                clip: hot_clip,
+            },
+            at_frame: None,
+        })
+        .expect("hot clip");
+        let hot = root.join("hot.wav");
+        let err = s
+            .execute(&HostCommand::Export {
+                path: hot.clone(),
+                format: ExportFormat::S16,
+            })
+            .expect_err("a clipping export is refused");
+        assert!(
+            err.contains("would clip") && err.contains("the file was not written"),
+            "the refusal explains itself: {err}"
+        );
+        assert!(
+            !hot.exists(),
+            "and no clipped file was written ({})",
+            hot.display()
+        );
+
+        // An empty arrangement has nothing to export (and says so).
+        let empty = HostSession::new();
+        let mut empty = empty;
+        let e = empty
+            .export(&root.join("empty.wav"), ExportFormat::F32)
+            .expect_err("nothing to export");
+        assert!(e.contains("no clips"), "{e}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **An export is side-effect free and takes the session's current state.** The
+    /// gate measured two must-fixes here: the playhead jumping to the arrangement's end
+    /// (and a take in progress being finalized) because the export rendered *through the
+    /// live session*, and state stamped `@frame > 0` being absent from the export — so a
+    /// limiter mounted mid-session mastered the audible mix but not the deliverable.
+    /// Both are fixed by rendering a rebuilt clone that applies every state command at
+    /// the present instant.
+    #[test]
+    fn an_export_leaves_the_session_alone_and_includes_later_state() {
+        let root = std::env::temp_dir().join(format!("host-export-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        // Two tracks, each clipped at +4 dB, summing over full scale: without a limiter
+        // the mix cannot be exported, with one it can. (`add_clip`'s 0.5 tone × 1.6 × the
+        // equal-power pan's 0.707 ≈ 0.57 per track ≈ 1.13 together.)
+        let hot_tracks = |s: &mut HostSession| {
+            for (track, clip) in [("t0", "c0"), ("t1", "c1")] {
+                s.execute(&HostCommand::Arrange {
+                    op: media::ArrangeOp::AddTrack {
+                        track: track.into(),
+                    },
+                    at_frame: None,
+                })
+                .expect("track");
+                let mut c = match add_clip(clip, 0) {
+                    media::ArrangeOp::AddClip { clip, .. } => clip,
+                    other => panic!("add_clip built {other:?}"),
+                };
+                c.gain = 1.6;
+                s.execute(&HostCommand::Arrange {
+                    op: media::ArrangeOp::AddClip {
+                        track: track.into(),
+                        clip: c,
+                    },
+                    at_frame: None,
+                })
+                .expect("clip");
+            }
+        };
+
+        let mut s = HostSession::new();
+        s.execute(&HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 2.0)],
+            at_frame: Some(0),
+        })
+        .expect("mixer");
+        s.execute(&HostCommand::Pool { dir: pool.clone() })
+            .expect("pool");
+        hot_tracks(&mut s);
+
+        // A limiter mounted at frame 5 000 — *after* the export's start.
+        for (cmd, what) in [
+            (
+                HostCommand::Mount {
+                    plugin: "master",
+                    params: vec![],
+                    at_frame: Some(5_000),
+                },
+                "mid-session master",
+            ),
+            (
+                HostCommand::Patch {
+                    from: ("mixer", "audio"),
+                    to: ("master", "audio"),
+                    at_frame: Some(5_000),
+                },
+                "mid-session patch",
+            ),
+            (
+                HostCommand::SetParam {
+                    plugin: "master",
+                    param: "ceiling",
+                    value: -6.0,
+                    at_frame: Some(5_000),
+                },
+                "mid-session ceiling",
+            ),
+        ] {
+            s.execute(&cmd).expect(what);
+        }
+
+        // Park the playhead somewhere specific and export: it must not move.
+        s.execute(&HostCommand::TransportSeek { frame: 7_000 })
+            .expect("seek");
+        let before = s.position().frame;
+        let path = root.join("mix.wav");
+        s.execute(&HostCommand::Export {
+            path: path.clone(),
+            format: ExportFormat::F32,
+        })
+        .expect("export");
+        assert_eq!(
+            s.position().frame,
+            before,
+            "an export is a file write, not a seek"
+        );
+        assert_eq!(before, 7_000);
+
+        // The mid-session limiter is in the export: the whole file respects the ceiling.
+        let ceiling = 10f32.powf(-6.0 / 20.0);
+        let mut r = media::WavReader::open(&path).expect("wav");
+        let frames = r.total_frames();
+        let mut buf = vec![0.0f32; frames as usize];
+        let n = r.read_into(&mut buf);
+        buf.truncate(n);
+        let peak = buf.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(
+            peak > 0.3,
+            "the fixture is over full scale dry, so the limiter had work to do: {peak}"
+        );
+        assert!(
+            peak <= ceiling + 1e-4,
+            "the limiter mounted at 5 000 masters the whole export: {peak} vs {ceiling}"
+        );
+
+        // **A refusal leaves an existing file alone.** The same mix without a limiter
+        // must refuse, and the earlier export's bytes stay exactly as they were.
+        let bytes_before = std::fs::read(&path).expect("bytes");
+        let mut plain = HostSession::new_at(48_000);
+        plain
+            .execute(&HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(0),
+            })
+            .expect("mixer");
+        plain
+            .execute(&HostCommand::Pool { dir: pool.clone() })
+            .expect("pool");
+        hot_tracks(&mut plain);
+        let err = plain
+            .export(&path, ExportFormat::F32)
+            .expect_err("a limiterless +4 dB pair exceeds full scale");
+        assert!(err.contains("would clip"), "{err}");
+        assert_eq!(
+            std::fs::read(&path).expect("bytes"),
+            bytes_before,
+            "a refused export never touches an existing file"
         );
 
         let _ = std::fs::remove_dir_all(&root);

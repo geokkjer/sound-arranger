@@ -191,6 +191,9 @@ struct App {
     /// rows, and what a paste checks its sources against (the clipboard is a value
     /// and survives a load, but the pool a source id names may not).
     pool: Vec<media::PoolSource>,
+    /// The last export the shell has reported (`frames`, `format`), so the status
+    /// line announces a *new* one once instead of on every refresh.
+    last_export_seen: Option<(u64, &'static str, u32, u32)>,
     /// The tempo each pool source was performed at (`source_tempo`), as of the last
     /// adoption — what `W` (warp) derives its stretch ratio from.
     source_tempos: std::collections::HashMap<String, f64>,
@@ -290,6 +293,7 @@ impl App {
             pool: Vec::new(),
             pool_selected: 0,
             source_tempos: std::collections::HashMap::new(),
+            last_export_seen: None,
             prompt_prefill: None,
             panel: timeline::PanelRects::default(),
             pool_rect: Rect::default(),
@@ -406,6 +410,41 @@ impl App {
                 "● recording {} — {} ch, {} frames, {} dropped (`:record stop` ends it)",
                 rec.take_id, rec.channels, rec.frames, rec.dropped
             );
+        }
+        // A finished export is a deliverable: say what was written, once (the report
+        // replaces the command line's echo, because it is what the user wanted to know).
+        // The dedupe key is the whole report, not just (length, format): two exports of
+        // the same shape but different content must both be announced. And when the host
+        // has no report at all (a fresh session after a load), forget the last one — so
+        // repeating an export after a rebuild is announced again.
+        match &outcome.last_export {
+            Some(export) => {
+                let seen = (
+                    export.frames,
+                    export.format,
+                    export.peak.to_bits(),
+                    export.rms.to_bits(),
+                );
+                if self.last_export_seen != Some(seen) {
+                    self.last_export_seen = Some(seen);
+                    let db = |x: f32| {
+                        if x > 0.0 {
+                            20.0 * x.log10()
+                        } else {
+                            f32::NEG_INFINITY
+                        }
+                    };
+                    self.status = format!(
+                        "exported {} frames ({}, +{} tail) — peak {:.1} dBFS, rms {:.1} dBFS",
+                        export.frames + export.drained_frames,
+                        export.format,
+                        export.drained_frames,
+                        db(export.peak),
+                        db(export.rms)
+                    );
+                }
+            }
+            None => self.last_export_seen = None,
         }
         // A finished take is pool material: announce it once, and say what to do next.
         if let Some(take) = &outcome.last_take
@@ -619,6 +658,7 @@ impl App {
             pool: Vec::new(),
             pool_selected: 0,
             source_tempos: std::collections::HashMap::new(),
+            last_export_seen: None,
             prompt_prefill: None,
             panel: timeline::PanelRects::default(),
             pool_rect: Rect::default(),
@@ -842,6 +882,7 @@ impl App {
             Action::Silence => self.timeline_key(|app| app.silence_clip()),
             Action::TrimToContent => self.timeline_key(|app| app.trim_to_content()),
             Action::StretchToTempo => self.timeline_key(|app| app.stretch_to_tempo()),
+            Action::ExportMix => self.export_prompt(),
             Action::MoveTrack(offset) => self.timeline_key(|app| app.move_clip_to_track(offset)),
             Action::Gain(direction) => {
                 self.timeline_key(|app| app.step_clip_gain(direction as f32))
@@ -1311,6 +1352,25 @@ impl App {
         self.prompt_prefill = Some(prefill);
         self.history_at = self.history.len();
         self.status = format!("rename {track}: type the new name and press Enter");
+    }
+
+    /// `X`: **export the whole arrangement** — opens the command line prefilled with
+    /// `export <dir>/mix.wav f32`, so what will be written (and in which format) is on
+    /// screen before anything is. Enter runs it; typing `s16` before Enter asks for the
+    /// dithered 16-bit file instead. The default path is beside the script the session
+    /// was opened from (or `mix.wav` in the working directory for the demo snapshot).
+    fn export_prompt(&mut self) {
+        let path = match std::path::Path::new(&self.origin) {
+            p if p.parent().is_some_and(|d| !d.as_os_str().is_empty()) => {
+                p.parent().expect("checked").join("mix.wav")
+            }
+            _ => std::path::PathBuf::from("mix.wav"),
+        };
+        let prefill = format!("export {} f32", path.display());
+        self.prompt = Some(prefill.clone());
+        self.prompt_prefill = Some(prefill);
+        self.history_at = self.history.len();
+        self.status = "export the whole arrangement: edit the path/format, then Enter".to_string();
     }
 
     /// `D`: delete the active track **and its clips**, as one gesture — the op drops
@@ -2264,8 +2324,11 @@ impl App {
             return;
         }
         // A prefilled line the user did not finish (`R` then Enter) gets a hint
-        // instead of the parser's operand count.
+        // instead of the parser's operand count. The trailing space is the tell: `R`
+        // pre-fills `arrange rename_track t0 ` (a value still to come), while `X`
+        // pre-fills a *complete* `export <path> f32` line that Enter may run as-is.
         if let Some(prefill) = &prefill
+            && prefill.ends_with(' ')
             && line == prefill.trim()
         {
             self.status = format!("{line} needs the new value after the last space");
@@ -5452,6 +5515,52 @@ mod tests {
             "and the gesture it was told to make now works: {}",
             app.status
         );
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// `X` pre-fills a **complete** export line (path and format), so Enter runs it as
+    /// it stands and writes the file the status then reports; the `R` pre-fill is the
+    /// other shape (a value still to come), and the command line tells them apart by
+    /// the trailing space.
+    #[test]
+    fn the_export_gesture_prefills_a_runnable_line_and_reports() {
+        let (pool, script_path) = pool_script("exportgesture", "");
+        let mut app = App::idle();
+        app.snap = App::demo_snapshot();
+        app.open_script(&script_path);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::empty()));
+        let prefill = app.prompt.clone().expect("the command line opens");
+        assert!(prefill.starts_with("export "), "{prefill}");
+        assert!(prefill.ends_with(" f32"), "{prefill}");
+
+        // Enter with the pre-filled line unchanged writes the default file (beside the
+        // script the session was opened from) and reports what it wrote.
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(
+            app.status.contains("exported") && app.status.contains("peak"),
+            "the report: {}",
+            app.status
+        );
+        let default_path = std::path::Path::new(&script_path)
+            .parent()
+            .expect("a script dir")
+            .join("mix.wav");
+        assert!(
+            default_path.is_file(),
+            "the default export is beside the script ({})",
+            default_path.display()
+        );
+
+        // The `s16` spelling asks for the dithered 16-bit file instead.
+        app.prompt = Some(format!("export {} s16", pool.join("mix16.wav").display()));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(
+            pool.join("mix16.wav").is_file(),
+            "and a 16-bit export is one word away"
+        );
+        assert!(app.status.contains("s16"), "{}", app.status);
+
         let _ = std::fs::remove_dir_all(&pool);
     }
 

@@ -23,9 +23,11 @@ pub const OP_POOL: &str = "MediaPool";
 pub const OP_PLAY: &str = "MediaPlay";
 pub const OP_SPLICE: &str = "MediaSplice";
 pub const OP_BOUNCE: &str = "MediaBounce";
+/// The export op: rendered length, format, and the mix's peak/RMS.
+pub const OP_EXPORT: &str = "MediaExport";
 
 /// Every media op name, for registration iteration.
-pub const ALL_OPS: &[&str] = &[OP_POOL, OP_PLAY, OP_SPLICE, OP_BOUNCE];
+pub const ALL_OPS: &[&str] = &[OP_POOL, OP_PLAY, OP_SPLICE, OP_BOUNCE, OP_EXPORT];
 
 /// A resolved `play` request: a clip region into a mixer channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +60,23 @@ pub struct BounceRecord {
     pub capped: bool,
 }
 
+/// A completed **export**, recorded in the log for observability like the bounce.
+/// The output path is *not* recorded (an action target, not session state — two
+/// identical sessions exporting to different files must log identically), but the
+/// measurements are: they are a pure function of the render, so recording them keeps
+/// a replay's log byte-identical and lets a shell report what was written.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportRecord {
+    pub frames: u64,
+    /// The [`crate::ExportFormat`] code (0 = f32, 1 = s16).
+    pub format: u32,
+    /// Peak of the rendered mix (linear).
+    pub peak: f32,
+    /// RMS of the rendered mix (linear).
+    pub rms: f32,
+    pub drained_frames: u64,
+}
+
 /// The media intent value: what the session asked the media layer to do. The host
 /// reconciles the graph from this; a replayed log reconstructs it exactly.
 #[derive(Debug, Default)]
@@ -66,6 +85,7 @@ pub struct MediaSession {
     pub player: Option<PlayerIntent>,
     pub splices: Vec<SpliceIntent>,
     pub bounces: Vec<BounceRecord>,
+    pub exports: Vec<ExportRecord>,
 }
 
 // ------------------------------------------------------------------- encode
@@ -120,6 +140,20 @@ pub fn encode_bounce(b: &BounceRecord) -> (&'static str, Vec<(&'static str, Valu
     )
 }
 
+/// Encode an `export` report (length, format, peak, RMS, drain).
+pub fn encode_export(e: &ExportRecord) -> (&'static str, Vec<(&'static str, Value)>) {
+    (
+        OP_EXPORT,
+        vec![
+            ("frames", Value::U64(e.frames)),
+            ("format", Value::U32(e.format)),
+            ("peak", Value::F32(e.peak)),
+            ("rms", Value::F32(e.rms)),
+            ("drained", Value::U64(e.drained_frames)),
+        ],
+    )
+}
+
 // ------------------------------------------------------------------- decode
 
 fn field<'a>(fields: &'a [(&'static str, Value)], name: &str) -> Result<&'a Value, String> {
@@ -148,6 +182,13 @@ fn u32_field(fields: &[(&'static str, Value)], name: &str) -> Result<u32, String
     match field(fields, name)? {
         Value::U32(n) => Ok(*n),
         other => Err(format!("field '{name}' must be a U32, got {other:?}")),
+    }
+}
+
+fn f32_field(fields: &[(&'static str, Value)], name: &str) -> Result<f32, String> {
+    match field(fields, name)? {
+        Value::F32(x) => Ok(*x),
+        other => Err(format!("field '{name}' must be an F32, got {other:?}")),
     }
 }
 
@@ -188,6 +229,15 @@ pub fn register_handlers(
                         frames: u64_field(fields, "frames")?,
                         drained_frames: u64_field(fields, "drained")?,
                         capped: u32_field(fields, "capped")? != 0,
+                    });
+                }
+                OP_EXPORT => {
+                    s.exports.push(ExportRecord {
+                        frames: u64_field(fields, "frames")?,
+                        format: u32_field(fields, "format")?,
+                        peak: f32_field(fields, "peak")?,
+                        rms: f32_field(fields, "rms")?,
+                        drained_frames: u64_field(fields, "drained")?,
                     });
                 }
                 other => return Err(format!("unknown media op '{other}'")),

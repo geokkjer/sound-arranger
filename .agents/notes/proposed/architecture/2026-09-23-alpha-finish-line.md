@@ -209,7 +209,9 @@ from the shared workflow (a key or a `: ` line — never a shell-only feature).
     hand-computed frame count, and it renders from frame 0 so the compressor's ballistics are
     reproducible), writes **f32 WAV by default** (bit-exact, golden-file testable) or s16 with
     **fixed-seed TPDF dither** (deterministic, never thread-local randomness), reports peak/RMS, and
-    **fails rather than writes a clipped file**. Stems and compressed formats follow.
+    **fails rather than writes a clipped file**. Stems and compressed formats follow. *Done
+    (2026-09-24)*, with the TUI's `X` gesture (a prefilled, editable export line) and a shell-visible
+    report ([note](../../implemented/feature/2026-09-24-export-f32-s16-dither.md)).
 14. **Markers/sections and clip naming** (logged lines + shell list + keys) so a 30-minute piece is
     navigable and recognisable.
 

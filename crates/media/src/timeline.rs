@@ -273,6 +273,19 @@ pub fn validate_clip(c: &Clip) -> Result<(), String> {
 }
 
 impl Timeline {
+    /// The **end of the arrangement**: the last frame any clip occupies (exclusive),
+    /// or 0 when there are no clips. This is the length an export renders — measured
+    /// from the value, not handed in, so a mix cannot be exported short by a stale
+    /// frame count.
+    pub fn end_frame(&self) -> Frame {
+        self.tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .map(|c| c.end())
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

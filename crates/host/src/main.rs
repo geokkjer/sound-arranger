@@ -57,5 +57,44 @@ fn main() {
         ),
         None => eprintln!("host: no bounce written (no Bounce command or it failed)"),
     }
+
+    // The export report (peak/RMS are measured, not guessed, and are read back from
+    // the session's record of the last successful export).
+    if let Some(record) = session.last_export() {
+        let path = script
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                host::HostCommand::Export { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let db = |x: f32| {
+            if x > 0.0 {
+                20.0 * x.log10()
+            } else {
+                f32::NEG_INFINITY
+            }
+        };
+        println!(
+            "host: exported {} frames ({}) to {} — peak {:.4} ({:.1} dBFS), rms {:.4} ({:.1} dBFS), \
+             drained {} frames",
+            record.frames,
+            host::ExportFormat::from_code(record.format)
+                .map(|f| f.name())
+                .unwrap_or("?"),
+            path.display(),
+            record.peak,
+            db(record.peak),
+            record.rms,
+            db(record.rms),
+            record.drained_frames
+        );
+    } else if script
+        .iter()
+        .any(|c| matches!(c, host::HostCommand::Export { .. }))
+    {
+        eprintln!("host: no export written (the Export command failed)");
+    }
     print!("{}", summarize(&session));
 }

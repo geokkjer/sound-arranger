@@ -27,6 +27,10 @@ What this spike adds, because it is what a TUI has to answer for:
   and material stay), and `T` trims it to the audible content from the peak pyramid.
   Every one is an `arrange …` line through the host's parser, so each is one `u`
   away from undone;
+- **export the mix** — `X` opens the command line prefilled with
+  `export <dir>/mix.wav f32`: the whole arrangement rendered from frame 0, f32 by
+  default or `s16` through a fixed-seed TPDF dither, with the peak/RMS reported and a
+  refusal (writing nothing) when the mix would clip;
 - **tempo match — warp to the session tempo** — `W` stretches the clip under the
   playhead through the host's WSOLA renderer and points the clip at the new pool
   source, so a take recorded at 90 bpm sits in a 120 bpm session without changing
@@ -289,6 +293,7 @@ pointless), so the shell falls back to the wide meter bars under the transport.
 | `U` / `i` / `E` | normalize from the peak pyramid / invert polarity / silence (a gain, not a delete) |
 | `T` | trim the clip to its audible content (a compound `trim`, mirror-aware for a reversed clip) |
 | `W` | **warp**: stretch the clip to the session tempo from its `source_tempo` (an offline render into the pool, then one logged `arrange stretch`) |
+| `X` | **export the whole arrangement**: opens the command line prefilled with `export <dir>/mix.wav f32` (add `s16` for a dithered 16-bit file); the status reports peak/RMS, or the refusal if it would clip |
 | `J` / `K` | timeline: move the clip to the track **below / above**, keeping its time |
 | `g` / `G` | timeline: clip gain **−1 dB / +1 dB** (the range is the console fader's) |
 | `f` / `F` | timeline: fade in / fade out **to the playhead** (absolute, not a nudge) |

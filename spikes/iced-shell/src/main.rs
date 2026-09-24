@@ -432,6 +432,14 @@ impl Spike {
             Action::Cancel => {
                 self.status.clear();
             }
+            Action::ExportMix => {
+                // The workflow's export gesture, prefilled like the TUI's: the iced shell
+                // has the same command line, so the render-out path is shared rather than
+                // a gap (only the *canvas* is missing, not the gesture).
+                self.prompt = Some("export mix.wav f32".to_string());
+                self.status =
+                    "export the whole arrangement: edit the path/format, then Enter".to_string();
+            }
             Action::GridCycle => {
                 self.grid.cycle();
                 self.status = if self.grid.is_on() {

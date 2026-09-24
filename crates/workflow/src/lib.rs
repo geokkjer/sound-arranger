@@ -213,6 +213,10 @@ pub enum Action {
     /// host renders the material into the pool — an offline transform, so it is a
     /// command rather than an arrange op (`undo` still restores the old reference).
     StretchToTempo,
+    /// **Export the whole arrangement**: opens the command line prefilled with an
+    /// `export <path> f32` line, so the path and format are visible and editable
+    /// before anything is written (the render-out gesture, not a hidden write).
+    ExportMix,
     /// Move the clip to the track below (+1) / above (-1).
     MoveTrack(i32),
     /// Step the clip's gain in dB.
@@ -272,6 +276,7 @@ impl Action {
             Action::Silence => "silence the clip",
             Action::TrimToContent => "trim the clip to its content",
             Action::StretchToTempo => "stretch the clip to the session tempo",
+            Action::ExportMix => "export the whole arrangement",
             Action::MoveTrack(_) => "move the clip to another track",
             Action::Gain(_) => "clip gain",
             Action::Fade(_) => "fade",
@@ -545,6 +550,11 @@ pub static KEYMAP: &[Binding] = &[
         "W",
         &[(Key::Char('W'), Action::StretchToTempo)],
         "timeline: warp — stretch the clip to the session tempo (needs `: source_tempo <id> <bpm>`)",
+    ),
+    bind(
+        "X",
+        &[(Key::Char('X'), Action::ExportMix)],
+        "anywhere: export the whole arrangement — opens the command line prefilled with `export <path> f32` (add `s16` for a dithered 16-bit file)",
     ),
     bind(
         "Enter",
