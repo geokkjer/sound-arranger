@@ -128,6 +128,9 @@ struct App {
     /// `host v1` text format** the keys dispatch, so every action is reachable even
     /// before a key exists for it — the modal note's "a widget away, not a project".
     prompt: Option<String>,
+    /// The last finished take the shell has announced, so it says it once (the host
+    /// keeps reporting it until the next take starts).
+    last_take_seen: Option<String>,
     /// Executed command lines, oldest first; `↑`/`↓` walk them.
     history: Vec<String>,
     /// Where the history walk currently is (`history.len()` = the live line).
@@ -214,6 +217,7 @@ impl App {
             help: false,
             help_scroll: 0,
             prompt: None,
+            last_take_seen: None,
             history: Vec::new(),
             history_at: 0,
             mouse: true,
@@ -338,6 +342,28 @@ impl App {
         // failure, and the shell says so (an edit is not failed by it).
         if let Some(err) = &outcome.journal_error {
             self.status = format!("autosave failed: {err}");
+        }
+        // A take in progress is a live state, not a one-shot message — the indicator
+        // re-renders on every refresh, with the frames the demux has written.
+        if let Some(rec) = &outcome.recording {
+            self.status = format!(
+                "● recording {} — {} ch, {} frames, {} dropped (`:record stop` ends it)",
+                rec.take_id, rec.channels, rec.frames, rec.dropped
+            );
+        }
+        // A finished take is pool material: announce it once, and say what to do next.
+        if let Some(take) = &outcome.last_take
+            && self.last_take_seen.as_deref() != Some(take.take_id.as_str())
+        {
+            self.last_take_seen = Some(take.take_id.clone());
+            self.status = format!(
+                "take {} — {} ch, {:.1} s ({} frames) → sources {}: place one with an `arrange add_clip` line",
+                take.take_id,
+                take.channels,
+                take.frames as f64 / take.sample_rate.max(1) as f64,
+                take.frames,
+                take.sources.join(", "),
+            );
         }
         let timeline = match outcome.arrangement {
             Ok(timeline) => timeline,
@@ -498,6 +524,7 @@ impl App {
             help: false,
             help_scroll: 0,
             prompt: None,
+            last_take_seen: None,
             history: Vec::new(),
             history_at: 0,
             mouse: true,
@@ -3053,5 +3080,60 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&pool);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Recording is reachable from the command line like everything else, and its
+    /// refusals are the host's own words (here: no pool, so the take has nowhere to
+    /// land — no device is touched, so the test runs anywhere).
+    #[test]
+    fn the_command_line_records_and_reports_refusals() {
+        let (pool, script_path) = pool_script("record", "");
+        let mut app = App::idle();
+        app.snap = App::demo_snapshot();
+        app.open_script(&script_path);
+
+        // `record stop` with nothing recording is refused by the host — and touches no
+        // device, so this test runs anywhere.
+        let line = "record stop".to_string();
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::empty()));
+        for c in line.chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(
+            app.status.starts_with(": record stop") && app.status.contains("no take"),
+            "the refusal is reported in the status line: {}",
+            app.status
+        );
+
+        // An extra word is a typo, not a take id (`record bad id!` must not start a
+        // take called "bad").
+        let line = "record bad id!".to_string();
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::empty()));
+        for c in line.chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(
+            app.status.contains("takes 1 operand"),
+            "a stray word is a parse error: {}",
+            app.status
+        );
+
+        // …and the command line still works afterwards.
+        let line = format!("arrange set_clip_gain t0 c0 0.4");
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::empty()));
+        for c in line.chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(
+            app.arrangement.as_ref().expect("an arrangement").lanes[0].clips[0].gain,
+            0.4,
+            "{}",
+            app.status
+        );
+
+        let _ = std::fs::remove_dir_all(&pool);
     }
 }

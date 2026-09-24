@@ -162,10 +162,15 @@ pub enum HostCommand {
         clip: ClipRef,
         crossfade: u32,
     },
-    /// Capture device input into a take (declared for the device path; the
-    /// device input path is not wired into the reference host — its refusal
-    /// names the gap).
+    /// **Record a take** from the default input device into the session's pool:
+    /// `{take_id}.ch{k}` sources land beside the other pool material, at the session
+    /// rate (the device's clock is drift-compensated), ready to be placed on a track.
+    /// An **action**, not state: what the log records is the *clip* you make from the
+    /// take, not the recording session.
     Record { take_id: String },
+    /// Stop the take in progress and finalize it (headers, peaks). A no-op-looking
+    /// error when nothing is recording — never a silent half-take.
+    RecordStop,
     /// **A gesture**: several arrangement ops that apply as one unit and undo as
     /// **one step**. Members must be arrangement ops sharing one `at_frame` (a
     /// gesture happens at one moment, which is what makes a replay's
@@ -309,6 +314,12 @@ pub struct HostSession {
     /// The gestures undone since the last edit, each with the history position it
     /// came from, so a redo reconstructs the same session. Cleared by a new edit.
     redo: Vec<(usize, Vec<HostCommand>)>,
+    /// The take in progress, if any (see [`HostSession::record`]). The device stream
+    /// lives here because a cpal `Stream` is `!Send` and the session never leaves the
+    /// thread that opened it.
+    recording: Option<Recording>,
+    /// The last finished take, for the shell to report once.
+    last_take: Option<TakeReport>,
     /// The session directory, when the session has one (`Save`/`Load`): the journal
     /// — the autosave — is appended here.
     session_dir: Option<PathBuf>,
@@ -388,6 +399,8 @@ impl HostSession {
             last_drain: DrainOutcome::default(),
             history: Vec::new(),
             redo: Vec::new(),
+            recording: None,
+            last_take: None,
             session_dir: None,
             journal_error: None,
             last_recovery: None,
@@ -514,6 +527,145 @@ impl HostSession {
         self.arrange_dirty = true;
         self.media_commands += commands.len();
         Ok(())
+    }
+
+    // -- recording: the input device becomes pool material -------------------
+
+    /// Start a take from an already-open source ring — the seam that makes recording
+    /// testable without a device (see [`Self::record`] for the device path).
+    ///
+    /// The take is written by `media::Capture` as one mono float WAV per input channel
+    /// (`{take_id}.ch{k}.wav`) plus a `.peaks` sidecar each, **at the session rate**:
+    /// the device clock is drift-compensated into session frames, so the material is
+    /// immediately arrangeable. The caller owns `source` and pushes interleaved
+    /// frames into it; `input_rate` is the clock that ring runs at.
+    pub fn start_recording(
+        &mut self,
+        take_id: &str,
+        source: std::sync::Arc<media::Spsc<f32>>,
+        input_rate: u32,
+        channels: usize,
+    ) -> Result<(), String> {
+        if self.recording.is_some() {
+            return Err("a take is already recording — run `record stop` first".into());
+        }
+        let pool = self
+            .pool_dir
+            .clone()
+            .ok_or("record requires set_pool first (the take lands in the pool)")?;
+        if self.engine.clock.sample_rate == 0 {
+            return Err("the session has no sample rate".into());
+        }
+        // A take id is pool material: re-recording over it would silently change the
+        // content of every clip that already references `{take_id}.ch{k}`. Refuse, and
+        // say which file is in the way.
+        let existing = pool.join(format!("{take_id}.ch0.wav"));
+        if existing.is_file() {
+            return Err(format!(
+                "the pool already has a take '{take_id}' ({}) — record under another id, or remove it",
+                existing.display()
+            ));
+        }
+        let capture = media::Capture::start(
+            &pool,
+            take_id,
+            channels,
+            self.engine.clock.sample_rate,
+            input_rate,
+            source,
+        )?;
+        let sources = (0..channels).map(|k| format!("{take_id}.ch{k}")).collect();
+        self.last_take = None;
+        self.recording = Some(Recording {
+            handle: None,
+            capture,
+            take_id: take_id.to_string(),
+            sources,
+        });
+        Ok(())
+    }
+
+    /// Start a take from the **default input device** — the `record <take_id>` line.
+    ///
+    /// The device is opened at its own default config (its channel count and rate), and
+    /// the take lands in the session's pool at the session rate. Recording is
+    /// independent of the transport: the take is not aligned to the playhead (that is
+    /// the jam layer's fixed-offset problem), it is material for the arrangement.
+    pub fn record(&mut self, take_id: &str) -> Result<(), String> {
+        // Fail before opening anything if the take could not be written anyway.
+        if self.recording.is_some() {
+            return Err("a take is already recording — run `record stop` first".into());
+        }
+        if self.pool_dir.is_none() {
+            return Err("record requires set_pool first (the take lands in the pool)".into());
+        }
+        let ring = std::sync::Arc::new(media::Spsc::new(1 << 16));
+        // One call: the handle carries the **stream's** rate and channel count, so the
+        // capture cannot be sized from a config that raced a device swap.
+        let handle = media::devices::open_input(std::sync::Arc::clone(&ring))?;
+        let rate = handle.sample_rate;
+        let channels = (handle.channels as usize).clamp(1, 8);
+        self.start_recording(take_id, ring, rate, channels)?;
+        if let Some(rec) = self.recording.as_mut() {
+            rec.handle = Some(handle);
+        }
+        Ok(())
+    }
+
+    /// Stop the take in progress: drain, finalize the WAV headers, write the peaks
+    /// sidecars, and close the device. The takes are pool sources from here on.
+    pub fn stop_recording(&mut self) -> Result<TakeReport, String> {
+        let Some(rec) = self.recording.take() else {
+            return Err("no take is recording".into());
+        };
+        let Recording {
+            handle,
+            capture,
+            take_id,
+            sources,
+        } = rec;
+        // Stop feeding first, then drain and finalize what the device already delivered.
+        drop(handle);
+        // Build the report **before** the stop's result is propagated: a take that
+        // finalizes with a complaint (a partial tail frame, a peaks write) has still
+        // landed in the pool, and the shell must be able to place clips from it.
+        let stop = capture.stop();
+        let report = TakeReport {
+            take_id,
+            frames: capture.frames(),
+            dropped: capture.dropped(),
+            channels: capture.channels(),
+            sources,
+            sample_rate: self.engine.clock.sample_rate,
+        };
+        self.last_take = Some(report.clone());
+        match stop {
+            Ok(()) => Ok(report),
+            Err(e) => Err(format!(
+                "the take '{}' was finalized ({} frames, {} ch) but stopping reported: {e}",
+                report.take_id, report.frames, report.channels
+            )),
+        }
+    }
+
+    /// The take in progress, for a live "recording" indicator.
+    pub fn recording(&self) -> Option<RecordingStatus> {
+        self.recording.as_ref().map(|rec| RecordingStatus {
+            take_id: rec.take_id.clone(),
+            frames: rec.capture.frames(),
+            dropped: rec.capture.dropped(),
+            channels: rec.capture.channels(),
+        })
+    }
+
+    /// The last finished take, until the next one starts.
+    pub fn last_take(&self) -> Option<&TakeReport> {
+        self.last_take.as_ref()
+    }
+
+    /// Keep the finished take for the outcome (the shell reports it once).
+    fn status_take(&mut self, take: &TakeReport) {
+        self.last_take = Some(take.clone());
     }
 
     // -- persistence: a session is a directory -------------------------------
@@ -755,12 +907,15 @@ impl HostSession {
         match cmd {
             HostCommand::Mount { plugin, params, .. } => self.engine.mount(plugin, params),
             HostCommand::Patch { from, to, .. } => self.engine.patch(*from, *to),
-            HostCommand::SetParam { plugin, param, value, .. } => {
-                self.engine.set_param(plugin, param, *value)
-            }
-            HostCommand::SetTempo { bpm, beats_per_bar, .. } => {
-                self.engine.set_tempo(*bpm, *beats_per_bar)
-            }
+            HostCommand::SetParam {
+                plugin,
+                param,
+                value,
+                ..
+            } => self.engine.set_param(plugin, param, *value),
+            HostCommand::SetTempo {
+                bpm, beats_per_bar, ..
+            } => self.engine.set_tempo(*bpm, *beats_per_bar),
             HostCommand::Unmount { plugin, .. } => {
                 let r = self.engine.unmount(plugin);
                 if *plugin == "mixer" {
@@ -791,7 +946,9 @@ impl HostSession {
                     "play requires the mixer to be mounted first (mount mixer channels=N)",
                 )?;
                 if *channel >= channels {
-                    return Err(format!("play channel ch{channel} is beyond the mixer's {channels} channels"));
+                    return Err(format!(
+                        "play channel ch{channel} is beyond the mixer's {channels} channels"
+                    ));
                 }
                 if self.player_mailbox.is_some() {
                     return Err("the reference host plays one clip at a time".into());
@@ -822,9 +979,17 @@ impl HostSession {
                 let underruns = node.underrun_counter();
                 let deferred = node.deferred_counter();
                 let node = NodeKind::Opaque(Box::new(node));
-                let ports = vec![Port { name: "audio", direction: Direction::Out, kind: SignalKind::Audio, channels: 1 }];
+                let ports = vec![Port {
+                    name: "audio",
+                    direction: Direction::Out,
+                    kind: SignalKind::Audio,
+                    channels: 1,
+                }];
                 let id = match self.engine.graph.out_node {
-                    Some(mixer) => self.engine.graph.insert_before(mixer, node, ports)
+                    Some(mixer) => self
+                        .engine
+                        .graph
+                        .insert_before(mixer, node, ports)
                         .map_err(|e| format!("play node: {e}"))?,
                     None => self.engine.graph.add_node(node, ports),
                 };
@@ -832,11 +997,18 @@ impl HostSession {
                 self.player_underruns = Some(underruns);
                 self.player_deferred = Some(deferred);
                 self.pending_cords.push((id, *channel));
-                self.media.lock().map_err(|_| "media session poisoned")?.player = Some(intent);
+                self.media
+                    .lock()
+                    .map_err(|_| "media session poisoned")?
+                    .player = Some(intent);
                 self.media_commands += 1;
                 Ok(())
             }
-            HostCommand::Splice { at_frame, clip, crossfade } => {
+            HostCommand::Splice {
+                at_frame,
+                clip,
+                crossfade,
+            } => {
                 if self.player_mailbox.is_none() {
                     return Err("splice requires a playing clip".into());
                 }
@@ -853,17 +1025,27 @@ impl HostSession {
                 let (op, fields) = media_ops::encode_splice(&mut self.media_intern, &intent);
                 self.engine.arrange_logged(op, fields)?;
                 let mailbox = self.player_mailbox.as_ref().expect("checked above");
-                mailbox.lock().map_err(|_| "player mailbox poisoned")?.push_back(SpliceCmd {
-                    at_frame: *at_frame,
-                    incoming,
-                    crossfade: *crossfade,
-                });
-                self.media.lock().map_err(|_| "media session poisoned")?.splices.push(intent);
+                mailbox
+                    .lock()
+                    .map_err(|_| "player mailbox poisoned")?
+                    .push_back(SpliceCmd {
+                        at_frame: *at_frame,
+                        incoming,
+                        crossfade: *crossfade,
+                    });
+                self.media
+                    .lock()
+                    .map_err(|_| "media session poisoned")?
+                    .splices
+                    .push(intent);
                 self.media_commands += 1;
                 Ok(())
             }
-            HostCommand::Record { .. } => {
-                Err("recording requires a device — the device input path exists in media::devices (open_input) but is not wired into the host; the reference host renders offline via Bounce".into())
+            HostCommand::Record { take_id } => self.record(take_id),
+            HostCommand::RecordStop => {
+                let take = self.stop_recording()?;
+                self.status_take(&take);
+                Ok(())
             }
             // Context, validated: a session's rate is set at construction.
             HostCommand::SessionRate { hz } => {
@@ -885,7 +1067,9 @@ impl HostSession {
             HostCommand::Arrange { op, .. } => {
                 self.ensure_editor()?;
                 if self.pool_resolver.is_none() {
-                    return Err("arrange requires set_pool first (clips need pool-source paths)".into());
+                    return Err(
+                        "arrange requires set_pool first (clips need pool-source paths)".into(),
+                    );
                 }
                 let editor = self.editor.as_mut().ok_or("clip editor not initialized")?;
                 editor.apply(&mut self.engine, op)?;
@@ -896,9 +1080,13 @@ impl HostSession {
             HostCommand::Pool { dir } => {
                 // Validate + resolve, then log (a refused pool is never logged).
                 self.set_pool(dir.clone())?;
-                let (op, fields) = media_ops::encode_pool(&mut self.media_intern, &dir.to_string_lossy());
+                let (op, fields) =
+                    media_ops::encode_pool(&mut self.media_intern, &dir.to_string_lossy());
                 self.engine.arrange_logged(op, fields)?;
-                self.media.lock().map_err(|_| "media session poisoned")?.pool_dir = Some(dir.clone());
+                self.media
+                    .lock()
+                    .map_err(|_| "media session poisoned")?
+                    .pool_dir = Some(dir.clone());
                 self.media_commands += 1;
                 Ok(())
             }
@@ -913,7 +1101,8 @@ impl HostSession {
                     ));
                 }
                 let channels = self.engine.graph.out_channels().max(1) as u16;
-                let mut w = media::WavWriter::create(path, self.engine.clock.sample_rate, channels)?;
+                let mut w =
+                    media::WavWriter::create(path, self.engine.clock.sample_rate, channels)?;
                 w.write(&out)?;
                 w.finalize()?;
                 // Record the bounce in the log (frames, path, the drain policy's
@@ -926,7 +1115,11 @@ impl HostSession {
                 };
                 let (op, fields) = media_ops::encode_bounce(&record);
                 self.engine.arrange_logged(op, fields)?;
-                self.media.lock().map_err(|_| "media session poisoned")?.bounces.push(record);
+                self.media
+                    .lock()
+                    .map_err(|_| "media session poisoned")?
+                    .bounces
+                    .push(record);
                 self.last_drain = drain;
                 self.media_commands += 1;
                 Ok(())
@@ -1352,6 +1545,12 @@ impl HostSession {
     /// `frame` — the deterministic reconstruction `seek_to` and undo/redo share.
     /// The transport's playing state and the redo stack survive the rebuild.
     fn replay_to(&mut self, frame: u64) -> Result<(), String> {
+        // A rebuild replaces the session, which would drop a take in progress. Stop it
+        // properly first: the take is finalized (its WAV + peaks land in the pool) **and**
+        // reported, instead of vanishing with the old session.
+        if self.recording.is_some() {
+            let _ = self.stop_recording();
+        }
         let history = self.history.clone();
         let redo = std::mem::take(&mut self.redo);
         let playing = self.playing;
@@ -1379,8 +1578,8 @@ impl HostSession {
         rebuilt.redo = redo;
         // **Persistence survives a rebuild.** A replay replaces the session, so the
         // session directory (and the autosave state) has to come across or the
-        // journal would silently stop after the first undo/seek — the session would
-        // look saved while nothing was written any more.
+        // journal would silently stop after the first undo/seek.
+        rebuilt.last_take = self.last_take.take();
         rebuilt.session_dir = self.session_dir.clone();
         rebuilt.journal_error = self.journal_error.take();
         rebuilt.last_recovery = self.last_recovery.take();
@@ -1516,6 +1715,40 @@ const SESSION_FILE: &str = "session.txt";
 const JOURNAL_FILE: &str = "journal.txt";
 /// The pool's subdirectory inside a session directory.
 const POOL_DIR: &str = "pool";
+
+/// A take in progress: the capture demux writing the pool, plus the input device
+/// stream that feeds it (kept here because a cpal `Stream` is `!Send`).
+struct Recording {
+    handle: Option<media::devices::InputHandle>,
+    capture: media::Capture,
+    take_id: String,
+    /// The pool source ids the take will produce (`take.ch0`, `take.ch1`, …).
+    sources: Vec<String>,
+}
+
+/// A finished take: what the shell needs to say what happened, and what the pool
+/// listing will show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TakeReport {
+    pub take_id: String,
+    /// Session frames written per channel.
+    pub frames: u64,
+    /// Source frames the capture had to drop (the ring was full).
+    pub dropped: u64,
+    pub channels: usize,
+    /// The pool source ids to place on a track (`{take_id}.ch{k}`).
+    pub sources: Vec<String>,
+    pub sample_rate: u32,
+}
+
+/// A take in progress, for a live indicator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordingStatus {
+    pub take_id: String,
+    pub frames: u64,
+    pub dropped: u64,
+    pub channels: usize,
+}
 
 /// What a load recovered from the journal.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1675,6 +1908,7 @@ pub fn format_command(cmd: &HostCommand, session_dir: Option<&std::path::Path>) 
         | HostCommand::Undo
         | HostCommand::Redo
         | HostCommand::Record { .. }
+        | HostCommand::RecordStop
         | HostCommand::Bounce { .. }
         | HostCommand::Save { .. }
         | HostCommand::Load { .. } => return None,
@@ -1844,6 +2078,8 @@ fn copy_pool(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String>
 /// arrange trim t0 c0 start 4800
 /// arrange trim t0 c0 end -4800
 /// group end
+/// record jam1                                 # capture the input device into the pool
+/// record stop                                 # finalize the take
 /// session_rate 48000                          # the session's rate (context)
 /// save /data/mysong.d                         # write the session directory
 /// load /data/mysong.d                         # read it back (+ its journal)
@@ -1942,11 +2178,13 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
                 });
             }
             "patch" => {
+                exact(&words, 3, at, "patch")?;
                 let from = port_ref(&words, 1, at)?;
                 let to = port_ref(&words, 2, at)?;
                 commands.push(HostCommand::Patch { from, to, at_frame });
             }
             "set_param" => {
+                exact(&words, 4, at, "set_param")?;
                 let plugin = in_list(HOST_PLUGINS, word(&words, 1, at)?, "plugin")?;
                 let param = in_list(HOST_PARAMS, word(&words, 2, at)?, "param")?;
                 let value = word(&words, 3, at)?
@@ -1960,6 +2198,7 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
                 });
             }
             "set_tempo" => {
+                exact(&words, 3, at, "set_tempo")?;
                 let bpm = word(&words, 1, at)?
                     .parse()
                     .map_err(|_| format!("line {at}: bad bpm"))?;
@@ -1973,15 +2212,23 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
                 });
             }
             "unmount" => {
+                exact(&words, 2, at, "unmount")?;
                 let plugin = in_list(HOST_PLUGINS, word(&words, 1, at)?, "plugin")?;
                 commands.push(HostCommand::Unmount { plugin, at_frame });
             }
             "transport" => {
                 let what = word(&words, 1, at)?;
                 match what {
-                    "play" => commands.push(HostCommand::TransportPlay),
-                    "stop" => commands.push(HostCommand::TransportStop),
+                    "play" => {
+                        exact(&words, 2, at, "transport play")?;
+                        commands.push(HostCommand::TransportPlay);
+                    }
+                    "stop" => {
+                        exact(&words, 2, at, "transport stop")?;
+                        commands.push(HostCommand::TransportStop);
+                    }
                     "seek" => {
+                        exact(&words, 3, at, "transport seek")?;
                         let frame = word(&words, 2, at)?
                             .parse::<u64>()
                             .map_err(|_| format!("line {at}: transport seek needs a frame"))?;
@@ -1994,9 +2241,16 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
                     }
                 }
             }
-            "undo" => commands.push(HostCommand::Undo),
-            "redo" => commands.push(HostCommand::Redo),
+            "undo" => {
+                exact(&words, 1, at, "undo")?;
+                commands.push(HostCommand::Undo);
+            }
+            "redo" => {
+                exact(&words, 1, at, "redo")?;
+                commands.push(HostCommand::Redo);
+            }
             "play" => {
+                exact(&words, 3, at, "play")?;
                 let clip = ClipRef {
                     path: PathBuf::from(word(&words, 1, at)?),
                     start: 0,
@@ -2010,6 +2264,7 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
                 });
             }
             "splice" => {
+                exact(&words, 4, at, "splice")?;
                 let at_frame = word(&words, 1, at)?
                     .parse()
                     .map_err(|_| format!("line {at}: bad frame"))?;
@@ -2028,11 +2283,18 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
                 });
             }
             "record" => {
-                commands.push(HostCommand::Record {
-                    take_id: word(&words, 1, at)?.to_string(),
-                });
+                exact(&words, 2, at, "record")?;
+                let take_id = word(&words, 1, at)?;
+                if take_id == "stop" {
+                    commands.push(HostCommand::RecordStop);
+                } else {
+                    commands.push(HostCommand::Record {
+                        take_id: take_id.to_string(),
+                    });
+                }
             }
             "bounce" => {
+                exact(&words, 3, at, "bounce")?;
                 let frames = word(&words, 1, at)?
                     .parse()
                     .map_err(|_| format!("line {at}: bad frames"))?;
@@ -2040,20 +2302,24 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
                 commands.push(HostCommand::Bounce { frames, path });
             }
             "pool" => {
+                exact(&words, 2, at, "pool")?;
                 let dir = PathBuf::from(word(&words, 1, at)?);
                 commands.push(HostCommand::Pool { dir });
             }
             "session_rate" => {
+                exact(&words, 2, at, "session_rate")?;
                 let hz = word(&words, 1, at)?
                     .parse::<u32>()
                     .map_err(|_| format!("line {at}: bad session_rate (want Hz)"))?;
                 commands.push(HostCommand::SessionRate { hz });
             }
             "save" => {
+                exact(&words, 2, at, "save")?;
                 let dir = PathBuf::from(word(&words, 1, at)?);
                 commands.push(HostCommand::Save { dir });
             }
             "load" => {
+                exact(&words, 2, at, "load")?;
                 let dir = PathBuf::from(word(&words, 1, at)?);
                 commands.push(HostCommand::Load { dir });
             }
@@ -2315,6 +2581,20 @@ fn parse_arrange(words: &[&str], at: usize) -> Result<media::ArrangeOp, String> 
         }
         other => Err(format!("line {at}: unknown arrange op '{other}'")),
     }
+}
+
+/// A command with a fixed word count: an **extra** word is a typo, not something to
+/// ignore. Silently ignoring it is how `record bad id!` becomes a take called `bad`
+/// (found by a test that then opened the real input device).
+fn exact(words: &[&str], want: usize, at: usize, what: &str) -> Result<(), String> {
+    if words.len() != want {
+        return Err(format!(
+            "line {at}: {what} takes {} operand(s), got {}",
+            want - 1,
+            words.len() - 1
+        ));
+    }
+    Ok(())
 }
 
 /// The `idx`-th word of a command line; a missing operand is a clean parse error
@@ -3786,5 +4066,224 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- recording: the input device becomes pool material ----
+
+    /// Feed an interleaved tone into a ring, the way a device callback would.
+    fn feed_tone(ring: &media::Spsc<f32>, frames: usize, channels: usize, rate: u32) {
+        let mut i = 0usize;
+        while i < frames {
+            let phase = std::f64::consts::TAU * 440.0 * (i as f64) / rate as f64;
+            let sample = (phase.sin() * 0.5) as f32;
+            for _ in 0..channels {
+                // Bounded: the ring is big, but a full ring is not a test failure.
+                let _ = ring.try_push(sample);
+            }
+            i += 1;
+        }
+    }
+
+    /// **The loop's first half**: a take recorded through the host lands in the pool
+    /// as `{take_id}.ch{k}` sources with peaks, is arrangeable, and is audible — the
+    /// whole record → arrange → render path, with the device replaced by the ring
+    /// seam.
+    #[test]
+    fn a_take_records_into_the_pool_and_plays() {
+        let root = std::env::temp_dir().join(format!("host-record-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+
+        let mut s = HostSession::new();
+        s.execute(&HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 2.0)],
+            at_frame: Some(0),
+        })
+        .expect("mixer");
+        s.execute(&HostCommand::Pool { dir: pool.clone() })
+            .expect("pool");
+
+        let rate = s.sample_rate();
+        let ring = std::sync::Arc::new(media::Spsc::new(1 << 16));
+        s.start_recording("jam", std::sync::Arc::clone(&ring), rate, 2)
+            .expect("record starts");
+        let status = s.recording().expect("a status while recording");
+        assert_eq!(status.take_id, "jam");
+        assert_eq!(status.channels, 2);
+
+        // Push a second of interleaved tone, then stop.
+        feed_tone(&ring, rate as usize, 2, rate);
+        std::thread::sleep(std::time::Duration::from_millis(120)); // let the demux drain
+        let take = s.stop_recording().expect("record stops");
+        assert_eq!(take.take_id, "jam");
+        assert_eq!(take.channels, 2);
+        assert_eq!(
+            take.sources,
+            vec!["jam.ch0".to_string(), "jam.ch1".to_string()]
+        );
+        assert!(
+            take.frames > rate as u64 / 2,
+            "a second of input produced {} frames",
+            take.frames
+        );
+        assert!(s.recording().is_none(), "the take is finished");
+        assert_eq!(s.last_take(), Some(&take));
+
+        // The takes are pool sources, with peaks — and they are at the session rate.
+        let index = media::Pool::open(&pool)
+            .expect("pool")
+            .list()
+            .expect("list");
+        for (k, source) in index.sources.iter().enumerate() {
+            assert_eq!(source.id, format!("jam.ch{k}"));
+            assert_eq!(source.sample_rate, rate, "the take is at the session rate");
+            assert!(!source.peaks_missing, "the peaks are written");
+        }
+
+        // …and they play: place ch0 on a track and render it.
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::AddTrack { track: "t0".into() },
+            at_frame: None,
+        })
+        .expect("track");
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: media::Clip {
+                    id: "c0".into(),
+                    source: "jam.ch0".into(),
+                    src_start: 0,
+                    src_len: take.frames.min(rate as u64),
+                    at_frame: 0,
+                    fade_in: 0,
+                    fade_out: 0,
+                    gain: 1.0,
+                    loop_len: None,
+                },
+            },
+            at_frame: None,
+        })
+        .expect("clip from the take");
+        let audio = bounce(&mut s, 4_800, &root.join("t.wav"));
+        assert!(
+            audio.iter().any(|x| x.abs() > 1e-3),
+            "the recorded take is audible"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Recording is one take at a time, needs somewhere to put it, and stopping
+    /// nothing is an error — never a silent half-take or a panic.
+    #[test]
+    fn recording_refuses_what_it_cannot_do() {
+        let root = std::env::temp_dir().join(format!("host-record-refuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+
+        // No pool: the take has nowhere to land.
+        let mut s = HostSession::new();
+        let ring = std::sync::Arc::new(media::Spsc::<f32>::new(64));
+        let refused = s.start_recording("jam", std::sync::Arc::clone(&ring), 48_000, 1);
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(
+            refused.expect_err("the reason").contains("set_pool"),
+            "the refusal names the fix"
+        );
+
+        // With a pool: one at a time, and a stop with nothing recording is refused.
+        s.execute(&HostCommand::Pool { dir: root.clone() })
+            .expect("pool");
+        s.start_recording("jam", std::sync::Arc::clone(&ring), 48_000, 1)
+            .expect("first take starts");
+        assert!(
+            s.start_recording("jam2", std::sync::Arc::clone(&ring), 48_000, 1)
+                .is_err(),
+            "one take at a time"
+        );
+        let take = s.stop_recording().expect("the take stops");
+        assert_eq!(take.take_id, "jam");
+        assert!(s.stop_recording().is_err(), "stopping nothing is an error");
+
+        // A bad take id is refused by the media layer, with its rule stated.
+        let refused = s.start_recording("bad id!", std::sync::Arc::clone(&ring), 48_000, 1);
+        assert!(refused.is_err(), "a take id goes into filenames");
+
+        // Re-recording over an existing take is refused: a clip that already references
+        // `{take_id}.ch0` must not silently change content.
+        let again = s.start_recording("jam", std::sync::Arc::clone(&ring), 48_000, 1);
+        assert!(again.is_err(), "an existing take id is refused");
+        assert!(
+            again
+                .expect_err("the reason")
+                .contains("already has a take"),
+            "and it says which file is in the way"
+        );
+
+        // A rebuild (`transport seek`) stops a take in progress — finalized, and the
+        // report survives the rebuild so the shell can still place it.
+        s.start_recording("later", std::sync::Arc::clone(&ring), 48_000, 1)
+            .expect("a second take under a new id");
+        s.execute(&HostCommand::TransportSeek { frame: 0 })
+            .expect("the seek rebuilds the session");
+        assert!(s.recording().is_none(), "the take was stopped, not dropped");
+        let interrupted = s
+            .last_take()
+            .cloned()
+            .expect("the interrupted take is reported");
+        assert_eq!(interrupted.take_id, "later");
+        assert!(
+            root.join("later.ch0.wav").is_file(),
+            "and its WAV was finalized in the pool"
+        );
+
+        // The text form: `record <take_id>` starts, `record stop` stops.
+        let parsed = parse_script("host v1\nrecord jam1\nrecord stop\n").expect("parse");
+        assert!(matches!(&parsed[0], HostCommand::Record { take_id } if take_id == "jam1"));
+        assert!(matches!(&parsed[1], HostCommand::RecordStop));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A stray operand is a typo, not something to ignore.** Found the hard way: a
+    /// test typed `record bad id!` and the parser silently started a take called `bad`
+    /// — and opened the real input device. Every fixed-shape command is strict now.
+    #[test]
+    fn a_stray_operand_is_a_parse_error() {
+        for line in [
+            "pool /data/takes extra",
+            "record jam extra",
+            "save /tmp/x extra",
+            "load /tmp/x extra",
+            "session_rate 48000 extra",
+            "unmount tone extra",
+            "bounce 1000 /tmp/x.wav extra",
+            "patch euclidean.triggers scale.trigger extra",
+            "set_param mixer ch0.gain 0.5 extra",
+            "set_tempo 120 4 extra",
+            "play /tmp/a.wav ch0 extra",
+            "splice 100 /tmp/a.wav 64 extra",
+            "undo extra",
+            "redo extra",
+            "transport play extra",
+            "transport stop extra",
+            "transport seek 4800 extra",
+        ] {
+            let script = format!("host v1\n{line}\n");
+            assert!(
+                parse_script(&script).is_err(),
+                "a stray word must be refused: {line}"
+            );
+        }
+
+        // …and the strict forms themselves still parse.
+        let script = "host v1\npool /data/takes\nrecord jam\nrecord stop\nsession_rate 48000\ntransport play\ntransport seek 4800\ntransport stop\nset_param mixer ch0.gain 0.5\nset_tempo 120 4\npatch euclidean.triggers scale.trigger\nunmount tone\nbounce 1000 /tmp/x.wav\nundo\nredo\n";
+        assert!(
+            parse_script(script).is_ok(),
+            "the strict forms must still parse: {:?}",
+            parse_script(script).err()
+        );
     }
 }

@@ -117,6 +117,10 @@ pub struct HostOutcome {
     /// instead of leaving autosave silent.
     pub session_dir: Option<std::path::PathBuf>,
     pub journal_error: Option<String>,
+    /// The take in progress (a live indicator) and the last finished one (a shell
+    /// reports it once, then it is pool material like any other source).
+    pub recording: Option<crate::RecordingStatus>,
+    pub last_take: Option<crate::TakeReport>,
     /// The session's current parameter values, folded from the log — what a
     /// shell reads instead of keeping its own copy (see `HostSession::params`).
     /// A live fader change is just the next `SetParam` in the log.
@@ -457,6 +461,8 @@ fn build_outcome(session: &HostSession) -> HostOutcome {
         mixer_channels: session.mixer_channels(),
         session_dir: session.session_dir().map(std::path::Path::to_path_buf),
         journal_error: session.journal_error().map(str::to_string),
+        recording: session.recording(),
+        last_take: session.last_take().cloned(),
         params: session.params(),
     }
 }

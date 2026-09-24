@@ -98,7 +98,12 @@ from the shared workflow (a key or a `: ` line — never a shell-only feature).
    rename). **Crash safety is an append-only journal**: every committed group is appended and flushed;
    autosave *is* the journal; a torn trailing line is dropped on load and reported. Not saved (rebuilt by
    replay): wiring, counters, the timeline snapshot, the clipboard, grid/UI state, bounce outputs.
-3. **Recording into the host.** Wire `media::Capture` (which already has drift compensation, crash
+3. ~~**Recording into the host.**~~ **DONE** (2026-09-23): `record <take_id>` captures the default input
+   device into the pool at the session rate, `record stop` finalizes it, and a test drives the same seam
+   with a ring instead of a device
+   ([note](../2026-09-23-recording-into-the-host.md)). The gate's stand-in review returned `do not
+   merge` on a real blocker (a mono input ring demuxed as multi-channel: every take silently corrupt);
+   fixed in the slice, with a hardware-gated test. The design below is preserved as the record. Wire `media::Capture` (which already has drift compensation, crash
    recovery and per-channel writers) behind the existing `record <take_id>` line: the host opens the input
    device, mounts `CaptureNode`s into the pool, and the take lands as pool sources (`{take_id}.ch{N}`)
    that the pool panel can then place. This is the loop's missing first half.

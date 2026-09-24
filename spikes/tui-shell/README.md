@@ -133,7 +133,13 @@ typed instead of pressed:
 : set_param mixer ch0.gain 0.5          # the console reads it back out of the log
 : save /tmp/mysong.d                    # write the session (the log + its pool)
 : load /tmp/mysong.d                    # read it back (+ everything since the save)
+: record jam                            # capture the input device into the pool
+: record stop                           # finalize the take (then place it with add_clip)
 ```
+
+**Recording** is a pool action, not an arrangement edit: while it runs the state line shows
+`● recording jam — 2 ch, 48000 frames, 0 dropped`, and on `record stop` the shell announces the take and
+its source ids (`jam.ch0`, `jam.ch1`) to place with an `arrange add_clip` line.
 
 **Sessions are directories.** `: save <dir>` writes `session.txt` (this session's log, in the same
 `host v1` form the prompt speaks) and copies the pool in beside it, so the directory can be moved or

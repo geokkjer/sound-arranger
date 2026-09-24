@@ -73,6 +73,10 @@ impl OutputHandle {
 pub struct InputHandle {
     pub stream: cpal::Stream,
     pub sample_rate: u32,
+    /// The **stream's** channel count — what the callback actually interleaves. A
+    /// caller must use this (not a separate config call, which can race the device
+    /// swap) to size the ring's frames.
+    pub channels: u16,
     pub overruns: Arc<AtomicU64>,
 }
 
@@ -299,6 +303,7 @@ pub fn open_input(ring: Arc<Spsc<f32>>) -> Result<InputHandle, String> {
         .default_input_config()
         .map_err(|e| format!("input config: {e}"))?;
     let sample_rate = config.sample_rate();
+    let config_channels = config.channels();
     let stream_config: cpal::StreamConfig = config.into();
     let err: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
     let err_cb = {
@@ -325,6 +330,7 @@ pub fn open_input(ring: Arc<Spsc<f32>>) -> Result<InputHandle, String> {
     Ok(InputHandle {
         stream,
         sample_rate,
+        channels: config_channels,
         overruns,
     })
 }
@@ -352,22 +358,27 @@ where
         .map_err(|e| format!("build input stream: {e}"))
 }
 
-/// Fill a mono source ring from an interleaved input buffer, **per frame**:
-/// push one sample per frame (channel 0) — the mirror of `fill_output`. Without
-/// it a stereo input pushes L,R,L,R into the mono ring (every sample of an
-/// interleaved buffer), recording at 2× rate with channels alternated — the
-/// input-side twin of the output bug.
+/// Fill the source ring from an input buffer, **interleaved**: every channel of every
+/// frame, in order. The ring therefore carries what `Capture` demuxes — `channels`
+/// interleaved samples per frame — and a multi-channel take is real, at the device's
+/// full frame rate.
+///
+/// This used to push **channel 0 only** (a "mono ring", the mirror of `fill_output`),
+/// which was fine while nothing captured the device through `open_input`: a caller that
+/// sized the capture from the device's channel count then read a mono stream as
+/// interleaved frames — every multi-channel take silently corrupt (ch1 was ch0's odd
+/// samples, half the duration). `open_input` reports the stream's own channel count
+/// ([`InputHandle::channels`]) so callers size the demux from what actually arrives.
 fn fill_input<T>(data: &[T], ring: &Spsc<f32>, channels: usize, overruns: &AtomicU64)
 where
     T: cpal::SizedSample + cpal::Sample<Float = f32>,
 {
     let channels = channels.max(1);
     for frame in data.chunks(channels) {
-        let Some(&first) = frame.first() else {
-            continue;
-        };
-        if !ring.try_push(first.to_float_sample()) {
-            overruns.fetch_add(1, Ordering::Relaxed);
+        for sample in frame {
+            if !ring.try_push(sample.to_float_sample()) {
+                overruns.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -548,17 +559,33 @@ mod tests {
     }
 
     #[test]
-    fn input_pushes_one_sample_per_frame() {
-        // stereo input buffer interleaved [L0,R0,L1,R1,...]; the mono ring must get
-        // channel 0 per FRAME (not every sample — which would double the rate).
+    fn input_pushes_every_channel_interleaved() {
+        // A stereo input buffer [L0,R0,L1,R1,...] must reach the ring **whole**: that
+        // is what `Capture` demuxes (`channels` interleaved samples per frame). Pushing
+        // channel 0 alone made every multi-channel take silently corrupt — the bug this
+        // test exists to prevent (the device path had no coverage before it).
         let ring = Spsc::new(16);
         let data = [0.1f32, 0.9, 0.2, 0.8, 0.3, 0.7];
         let overruns = AtomicU64::new(0);
         fill_input(&data, &ring, 2, &overruns);
-        assert_eq!(ring.try_pop(), Some(0.1));
-        assert_eq!(ring.try_pop(), Some(0.2));
-        assert_eq!(ring.try_pop(), Some(0.3));
-        assert_eq!(ring.try_pop(), None, "exactly one sample per frame");
+        for expected in data {
+            assert_eq!(
+                ring.try_pop(),
+                Some(expected),
+                "interleaved order is preserved"
+            );
+        }
+        assert_eq!(ring.try_pop(), None, "every sample, in order");
         assert_eq!(overruns.load(Ordering::Relaxed), 0);
+
+        // A full ring drops samples and counts each drop, channel-interleaving intact.
+        let small = Spsc::new(4);
+        let overruns = AtomicU64::new(0);
+        fill_input(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &small, 2, &overruns);
+        assert_eq!(small.try_pop(), Some(1.0));
+        assert_eq!(small.try_pop(), Some(2.0));
+        assert_eq!(small.try_pop(), Some(3.0));
+        assert_eq!(small.try_pop(), Some(4.0));
+        assert_eq!(overruns.load(Ordering::Relaxed), 2, "the rest were counted");
     }
 }
