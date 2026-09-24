@@ -196,6 +196,18 @@ pub enum Action {
     /// pool panel's "load this clip" (the clipboard's `p` is the same idea with the
     /// clipboard as its source).
     PoolPlace,
+    /// Play the clip backwards / forwards again (a clip property, one log line).
+    Reverse,
+    /// Scale the clip's gain so its loudest sample hits full scale (measured from the
+    /// peak pyramid — the shell reads it, the log gets one `set_clip_gain`).
+    Normalize,
+    /// Flip the clip's polarity (a gain of −1).
+    Invert,
+    /// Set the clip's gain to zero (silence, keeping its span and fades).
+    Silence,
+    /// Trim the clip to its audible content (a compound `trim` over the silence at
+    /// its edges, measured from the peak pyramid).
+    TrimToContent,
     /// Move the clip to the track below (+1) / above (-1).
     MoveTrack(i32),
     /// Step the clip's gain in dB.
@@ -249,6 +261,11 @@ impl Action {
             Action::TrackDelete => "delete the track",
             Action::ReorderTrack(_) => "reorder the track",
             Action::PoolPlace => "place the pool source",
+            Action::Reverse => "reverse the clip",
+            Action::Normalize => "normalize the clip",
+            Action::Invert => "invert the clip's polarity",
+            Action::Silence => "silence the clip",
+            Action::TrimToContent => "trim the clip to its content",
             Action::MoveTrack(_) => "move the clip to another track",
             Action::Gain(_) => "clip gain",
             Action::Fade(_) => "fade",
@@ -283,6 +300,9 @@ impl Action {
             Action::TrackDelete => Some("remove_track"),
             Action::ReorderTrack(_) => Some("move_track"),
             Action::PoolPlace => Some("add_clip"),
+            Action::Reverse => Some("reverse"),
+            Action::Normalize | Action::Invert | Action::Silence => Some("set_clip_gain"),
+            Action::TrimToContent => Some("trim"),
             _ => None,
         }
     }
@@ -505,6 +525,17 @@ pub static KEYMAP: &[Binding] = &[
         "timeline: move the active track up / down (the mixer channel follows)",
     ),
     bind(
+        "V  U  i  E  T",
+        &[
+            (Key::Char('V'), Action::Reverse),
+            (Key::Char('U'), Action::Normalize),
+            (Key::Char('i'), Action::Invert),
+            (Key::Char('E'), Action::Silence),
+            (Key::Char('T'), Action::TrimToContent),
+        ],
+        "timeline: reverse / normalize / invert / silence / trim to content (each one log line, one undo)",
+    ),
+    bind(
         "Enter",
         &[(Key::Enter, Action::PoolPlace)],
         "pool: place the selected source on the active track at the playhead \
@@ -678,6 +709,7 @@ mod tests {
             ("rename_track", "rename_track t0 lead"),
             ("remove_track", "remove_track t1"),
             ("move_track", "move_track t0 1"),
+            ("reverse", "reverse t0 c0"),
             ("razor_split", "razor_split t0 c0 L R 48000"),
             ("delete", "delete t0 c0"),
             ("trim", "trim t0 c0 start 4800"),

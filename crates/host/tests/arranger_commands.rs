@@ -304,6 +304,7 @@ fn edit_then_rewire_replays_byte_identically() {
 
 fn clip(id: &str, at: u64, len: u64) -> Clip {
     Clip {
+        reversed: false,
         id: id.into(),
         source: "s1".into(),
         src_start: 0,

@@ -81,6 +81,13 @@ pub fn encode_op(i: &mut Interner, op: &ArrangeOp) -> (&'static str, Vec<(&'stat
                 ("index", Value::U64(*index as u64)),
             ],
         ),
+        ArrangeOp::Reverse { track, clip } => (
+            "Reverse",
+            vec![
+                ("track", Value::Str(i.intern(track))),
+                ("clip", Value::Str(i.intern(clip))),
+            ],
+        ),
         ArrangeOp::AddClip { track, clip } => {
             // loop_len must be > 0 (validate_clip enforces it); Some(0) would silently
             // encode as None. Guard here so a direct encode of a hand-built clip is
@@ -104,6 +111,10 @@ pub fn encode_op(i: &mut Interner, op: &ArrangeOp) -> (&'static str, Vec<(&'stat
                     ("gain", Value::F32(clip.gain)),
                     // loop_len must be > 0; 0 encodes "no loop".
                     ("loop", Value::U64(clip.loop_len.unwrap_or(0))),
+                    // The direction is a clip property, so the op carries it: without
+                    // it, an `AddClip` with `reversed: true` would encode fine and
+                    // decode forward — a silent value change (the gate caught it).
+                    ("reversed", Value::U64(u64::from(clip.reversed))),
                 ],
             )
         }
@@ -280,10 +291,15 @@ pub fn decode_op(op: &str, fields: &[(&'static str, Value)]) -> Result<ArrangeOp
             track: str_field(fields, "track")?,
             index: u64_field(fields, "index")? as usize,
         }),
+        "Reverse" => Ok(ArrangeOp::Reverse {
+            track: str_field(fields, "track")?,
+            clip: str_field(fields, "clip")?,
+        }),
         "AddClip" => {
             let src_len = u64_field(fields, "src_len")?;
             let loop_len = u64_field(fields, "loop")?;
             let clip = Clip {
+                reversed: u64_field(fields, "reversed")? != 0,
                 id: str_field(fields, "id")?,
                 source: str_field(fields, "source")?,
                 src_start: u64_field(fields, "src_start")?,
@@ -398,6 +414,7 @@ pub const ALL_OPS: &[&str] = &[
     "RemoveTrack",
     "RenameTrack",
     "MoveTrack",
+    "Reverse",
     "AddClip",
     "RazorSplit",
     "Trim",
@@ -474,6 +491,7 @@ mod tests {
 
     fn clip(id: &str, at: u64, len: u64) -> Clip {
         Clip {
+            reversed: false,
             id: id.into(),
             source: "pool-1".into(),
             src_start: 0,
@@ -508,6 +526,15 @@ mod tests {
         roundtrip(&ArrangeOp::AddClip {
             track: "t0".into(),
             clip: clip("c0", 100, 400),
+        });
+        // The direction is part of the clip value, so the op carries it: a reversed
+        // clip must survive encode→decode exactly (the gate found it decoding forward).
+        roundtrip(&ArrangeOp::AddClip {
+            track: "t0".into(),
+            clip: Clip {
+                reversed: true,
+                ..clip("c0", 100, 400)
+            },
         });
         roundtrip(&ArrangeOp::RazorSplit {
             track: "t0".into(),

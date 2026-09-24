@@ -7,6 +7,7 @@ use media::{ArrangeOp, Clip, ClipEditor, Timeline};
 
 fn clip(id: &str, at: u64, len: u64) -> Clip {
     Clip {
+        reversed: false,
         id: id.into(),
         source: "s1".into(),
         src_start: 0,

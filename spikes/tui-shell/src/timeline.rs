@@ -87,6 +87,16 @@ impl Source {
     pub fn minmax(&self, start: u64, end: u64) -> (f32, f32) {
         self.peaks.range_minmax(start, end).unwrap_or((0.0, 0.0))
     }
+
+    /// The **true peak** of a source range: the larger magnitude of its two extremes.
+    /// `minmax` returns the signed extremes, and a signal that swings mostly negative
+    /// (or a polarity-inverted clip) has its loudest excursion in `min` — reading only
+    /// `max` would normalize a −0.9 peak as if it were 0.25 and clip the result, and
+    /// would let `trim_to_content` delete a bin that is loud but negative.
+    pub fn peak_of(&self, start: u64, end: u64) -> f32 {
+        let (min, max) = self.minmax(start, end);
+        min.abs().max(max.abs())
+    }
 }
 
 /// The sources an arrangement's clips refer to, loaded once each.
@@ -141,6 +151,9 @@ pub struct Placed {
     pub fade_out: u64,
     /// A baked loop, when the source read wraps every `loop_len` frames.
     pub loop_len: Option<u64>,
+    /// The clip plays its region **backwards** (`media::Clip::reversed`): the first
+    /// timeline frame is the region's top, so the envelope is mirrored too.
+    pub reversed: bool,
 }
 
 impl Placed {
@@ -153,6 +166,21 @@ impl Placed {
     }
 
     /// The source frame for an arrangement frame, honouring a baked loop.
+    /// The **source region the reader plays**, as `(start, exclusive end)` — what the
+    /// peak scans (normalize, trim-to-content) walk, independent of the direction.
+    /// A **looped** clip plays only one loop (`src_len` is `loop_len × times`), so its
+    /// region is one loop long: normalizing over the repeats would measure material
+    /// the listener hears once.
+    pub fn source_region(&self) -> (u64, u64) {
+        let played = match self.loop_len {
+            Some(loop_len) if loop_len > 0 => loop_len,
+            _ => self.src_len,
+        };
+        let start = self.src_start.min(self.source.frames.saturating_sub(1));
+        let end = (self.src_start + played).min(self.source.frames);
+        (start, end.max(start + 1))
+    }
+
     pub fn source_frame(&self, frame: u64) -> Option<u64> {
         if !self.contains(frame) {
             return None;
@@ -162,7 +190,14 @@ impl Placed {
             Some(loop_len) if loop_len > 0 => offset % loop_len,
             _ => offset,
         };
-        Some((self.src_start + offset).min(self.source.frames.saturating_sub(1)))
+        // Reversed: the clip's first frame is the region's top (the mirror of
+        // `Clip::source_frame_at`, which is the engine's own mapping).
+        let frame = if self.reversed {
+            self.src_start + self.src_len.saturating_sub(1).saturating_sub(offset)
+        } else {
+            self.src_start + offset
+        };
+        Some(frame.min(self.source.frames.saturating_sub(1)))
     }
 }
 
@@ -239,6 +274,7 @@ impl Arrangement {
                     fade_in: clip.fade_in,
                     fade_out: clip.fade_out,
                     loop_len: clip.loop_len,
+                    reversed: clip.reversed,
                 });
             }
 
@@ -957,6 +993,7 @@ mod tests {
             tracks: vec![media::Track {
                 id: "t0".to_string(),
                 clips: vec![media::Clip {
+                    reversed: false,
                     id: "c0".to_string(),
                     source: "s1".to_string(),
                     src_start: 0,
@@ -1137,6 +1174,42 @@ mod tests {
                 "{label}: the last columns are blank: {row:?}"
             );
         }
+    }
+
+    /// The peak scans walk the region the **reader plays**: one loop for a looped
+    /// clip (`src_len` is `loop_len × times`), and the whole region otherwise. The
+    /// gate caught the first draft measuring the repeats — normalizing a loop over
+    /// material the listener hears only once.
+    #[test]
+    fn the_scan_region_is_what_the_reader_plays() {
+        let (path, arrangement) = a_wave("scanregion", 48_000);
+        let mut clip = arrangement.lanes[0].clips[0].clone();
+        // The fixture is 48 000 frames; a region that fits is reported verbatim.
+        clip.src_start = 1_000;
+        clip.src_len = 47_000;
+        assert_eq!(
+            clip.source_region(),
+            (1_000, 48_000),
+            "a plain clip plays its whole region"
+        );
+
+        clip.src_start = 0;
+        clip.loop_len = Some(2_400);
+        clip.src_len = 7_200; // three loops
+        assert_eq!(
+            clip.source_region(),
+            (0, 2_400),
+            "a looped clip plays one loop"
+        );
+
+        // A region that runs past the source clamps to the material, and never
+        // yields an empty range (which would make the peak queries meaningless).
+        clip.loop_len = None;
+        clip.src_start = 47_999;
+        clip.src_len = 5_000;
+        let (lo, hi) = clip.source_region();
+        assert!(lo < hi && hi <= clip.source.frames, "{lo}..{hi}");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

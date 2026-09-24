@@ -830,6 +830,11 @@ impl App {
             Action::TrackDelete => self.timeline_key(|app| app.delete_track()),
             Action::ReorderTrack(direction) => self.timeline_key(|app| app.move_track(direction)),
             Action::PoolPlace => self.pool_key(|app| app.place_pool_source()),
+            Action::Reverse => self.timeline_key(|app| app.reverse_clip()),
+            Action::Normalize => self.timeline_key(|app| app.normalize_clip()),
+            Action::Invert => self.timeline_key(|app| app.invert_clip()),
+            Action::Silence => self.timeline_key(|app| app.silence_clip()),
+            Action::TrimToContent => self.timeline_key(|app| app.trim_to_content()),
             Action::MoveTrack(offset) => self.timeline_key(|app| app.move_clip_to_track(offset)),
             Action::Gain(direction) => {
                 self.timeline_key(|app| app.step_clip_gain(direction as f32))
@@ -1565,6 +1570,13 @@ impl App {
                 "add_clip {track} {} {} {} {} {at} {} {} {:.6}{looped}",
                 ids[n], clip.source_id, clip.src_start, clip.src_len, fade_in, fade_out, clip.gain,
             ));
+            // `add_clip` has no direction operand (a clip is added forward and the
+            // `reverse` op flips it), so a reversed clipboard entry carries its own
+            // re-reverse **in the same gesture** — otherwise a paste would silently
+            // play it forwards (the gate caught exactly that).
+            if clip.reversed {
+                lines.push(format!("reverse {track} {}", ids[n]));
+            }
         }
 
         // A paste names pool sources: one this session does not have would be
@@ -1846,6 +1858,185 @@ impl App {
         let gain = 10f32.powf(next_db / 20.0);
         self.status = format!("{} gain {next_db:+.1} dB ({gain:.4})", clip.id);
         self.arrange(&format!("set_clip_gain {track} {} {gain:.6}", clip.id));
+    }
+
+    // -- utility gestures (alpha slice E1) -----------------------------------
+
+    /// `V`: play the clip backwards (or forwards again). One log line, one undo —
+    /// and the *panel* mirrors its envelope, because the value it holds says which
+    /// way the engine will read.
+    fn reverse_clip(&mut self) {
+        let Some((track, clip)) = self.active_clip_at(self.snap.frame) else {
+            self.status = "no clip under the playhead on the active track".to_string();
+            return;
+        };
+        if clip.loop_len.is_some() {
+            self.status = format!(
+                "{} is a looped clip — a reversed loop has no representable phase",
+                clip.id
+            );
+            return;
+        }
+        let direction = if clip.reversed {
+            "forwards"
+        } else {
+            "backwards"
+        };
+        if self.arrange(&format!("reverse {track} {}", clip.id)) {
+            self.status = format!("{} plays {direction}", clip.id);
+        }
+    }
+
+    /// Set a clip's gain from a linear multiplier, with one status line — the shared
+    /// tail of the three gain gestures below.
+    fn set_clip_gain(&mut self, track: &str, clip: &Placed, gain: f32, what: &str) {
+        if (gain - clip.gain).abs() < 1e-6 {
+            self.status = format!("{} is already {what}", clip.id);
+            return;
+        }
+        if self.arrange(&format!("set_clip_gain {track} {} {gain:.6}", clip.id)) {
+            self.status = format!("{} {what} (gain {gain:.4})", clip.id);
+        }
+    }
+
+    /// `U`: normalize — scale the clip so its **loudest sample** hits full scale.
+    /// The peak comes from the pyramid the panel already has (a scan of the clip's
+    /// source region, not a re-read of the audio), and the result is one logged
+    /// `set_clip_gain`. A silent clip is refused rather than amplified to noise.
+    fn normalize_clip(&mut self) {
+        let Some((track, clip)) = self.active_clip_at(self.snap.frame) else {
+            self.status = "no clip under the playhead on the active track".to_string();
+            return;
+        };
+        let (lo, hi) = clip.source_region();
+        let peak = clip.source.peak_of(lo, hi);
+        if peak <= 1e-5 {
+            self.status = format!("{} is silent — nothing to normalize", clip.id);
+            return;
+        }
+        let gain: f32 = 1.0 / peak;
+        // The console's fader range is the ceiling for a clip gain too, so a very
+        // quiet clip is lifted as far as the range allows and the status says so.
+        let ceiling = 10f32.powf(12.0 / 20.0);
+        let gain = gain.min(ceiling);
+        let note = if (gain * peak - 1.0).abs() > 1e-3 {
+            format!("normalized to the +12 dB ceiling (peak was {peak:.4})")
+        } else {
+            format!("normalized from peak {peak:.4}")
+        };
+        self.set_clip_gain(&track, &clip, gain, &note);
+    }
+
+    /// `i`: invert the clip's polarity — a gain of −1 (one logged line, reversible
+    /// with the same key).
+    fn invert_clip(&mut self) {
+        let Some((track, clip)) = self.active_clip_at(self.snap.frame) else {
+            self.status = "no clip under the playhead on the active track".to_string();
+            return;
+        };
+        if clip.gain == 0.0 {
+            self.status = format!("{} is silent — no polarity to flip", clip.id);
+            return;
+        }
+        let gain = -clip.gain;
+        self.set_clip_gain(&track, &clip, gain, "inverted (polarity flipped)");
+    }
+
+    /// `E`: silence the clip — gain 0, keeping its span, fades and place in the
+    /// arrangement (delete is a different key, and a different intent).
+    fn silence_clip(&mut self) {
+        let Some((track, clip)) = self.active_clip_at(self.snap.frame) else {
+            self.status = "no clip under the playhead on the active track".to_string();
+            return;
+        };
+        self.set_clip_gain(&track, &clip, 0.0, "silenced");
+    }
+
+    /// `T`: trim the clip to its **audible content** — scan the peak pyramid in from
+    /// each edge until a bin is above the noise floor, then trim both edges to it in
+    /// one gesture. The scan is in *source* frames; the timeline deltas are mirrored
+    /// for a reversed clip, so "the start of the clip" means what the listener hears.
+    fn trim_to_content(&mut self) {
+        const FLOOR: f32 = 1e-4; // ≈ −80 dBFS: below this a bin is silence
+        let Some((track, clip)) = self.active_clip_at(self.snap.frame) else {
+            self.status = "no clip under the playhead on the active track".to_string();
+            return;
+        };
+        if clip.loop_len.is_some() {
+            self.status = format!("{} is a looped clip — trim its loop first", clip.id);
+            return;
+        }
+        let (lo, hi) = clip.source_region();
+        // Walk in from both ends of the region, one peak bin at a time.
+        let bin = media::PEAK_BASE_BIN as u64;
+        let mut first = lo;
+        let mut last = hi; // exclusive
+        while first < last {
+            let end = (first + bin).min(last);
+            if clip.source.peak_of(first, end) > FLOOR {
+                break;
+            }
+            first = end;
+        }
+        while last > first {
+            let start = last.saturating_sub(bin).max(first);
+            if clip.source.peak_of(start, last) > FLOOR {
+                break;
+            }
+            last = start;
+        }
+        if last - first < bin / 2 {
+            self.status = format!("{} is (near) silent — nothing to trim to", clip.id);
+            return;
+        }
+        // Source silence at each edge, mapped back to *timeline* offsets: for a
+        // reversed clip the clip's start is the region's top, so the two swap.
+        let (lead, trail) = if clip.reversed {
+            (hi - last, first - lo)
+        } else {
+            (first - lo, hi - last)
+        };
+        if lead == 0 && trail == 0 {
+            self.status = format!("{} already starts and ends with audio", clip.id);
+            return;
+        }
+        // A trim can invalidate the clip's fades (`fade_in + fade_out <= src_len`),
+        // and the gesture is the place to fix that: cap them to the new length. The
+        // cap comes **first** in the group — the host validates each op against the
+        // running value, so a trim before the cap would be refused. (Refusing the
+        // gesture instead would make `T` unusable on a clip whose fade-in fills it —
+        // a state `f` and paste both produce.)
+        let new_len = clip.src_len.saturating_sub(lead + trail);
+        let fade_in = clip.fade_in.min(new_len);
+        let fade_out = clip.fade_out.min(new_len.saturating_sub(fade_in));
+        let capped = (fade_in, fade_out) != (clip.fade_in, clip.fade_out);
+        let mut lines = Vec::new();
+        if capped {
+            lines.push(format!(
+                "set_clip_fade {track} {} {fade_in} {fade_out}",
+                clip.id
+            ));
+        }
+        if lead > 0 {
+            lines.push(format!("trim {track} {} start {lead}", clip.id));
+        }
+        if trail > 0 {
+            lines.push(format!("trim {track} {} end -{trail}", clip.id));
+        }
+        if self.arrange_group(&lines) {
+            self.status = format!(
+                "{} trimmed to its content ({} frame{} in, {} out{})",
+                clip.id,
+                lead,
+                if lead == 1 { "" } else { "s" },
+                trail,
+                if capped {
+                    format!(", fades capped to {fade_in}/{fade_out}")
+                } else {
+                    String::new()
+                },
+            );
+        }
     }
 
     /// `f` / `F`: put the clip's **fade-in / fade-out** at the playhead — the DAW
@@ -4768,6 +4959,306 @@ mod tests {
         assert_ne!(app.focus_that_exists(), Panel::Pool);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The utility gestures are one log line each, over vocabulary that already
+    /// exists** (except `reverse`, which is one new clip property): `V` flips the
+    /// read direction, `i` the polarity, `E` silences, `U` normalizes from the peak
+    /// pyramid, and `T` trims to the audible content.
+    #[test]
+    fn the_utility_gestures_are_one_line_each() {
+        let _pool = pool_guard();
+        let dir = std::env::temp_dir().join(format!("tui-shell-utility-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("pool dir");
+        // 1 000 frames of silence, 2 000 of a 0.25 tone, 3 000 of silence — an
+        // asymmetric shape, so a mirrored trim is distinguishable from a forward one.
+        let path = dir.join("shape.wav");
+        let mut w = media::wav::WavWriter::create_float(&path, 48_000, 1).expect("fixture");
+        let samples: Vec<f32> = (0..6_000)
+            .map(|i| {
+                if (1_000..3_000).contains(&i) {
+                    0.25 * (i as f32 * 0.05).sin()
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        w.write(&samples).expect("write");
+        w.finalize().expect("finalize");
+
+        let mut app = App::idle();
+        app.snap = App::demo_snapshot();
+        app.open_wave(&path);
+        let clip = |app: &App| -> Placed {
+            app.arrangement.as_ref().expect("arrangement").lanes[0].clips[0].clone()
+        };
+        // The gestures act on the clip **under the playhead**, so park it inside the
+        // clip before each one (a trim moves the clip, and the demo snapshot's
+        // playhead is 2.000 s — past this 0.125 s fixture).
+        let press = |app: &mut App, c: char| {
+            app.snap.frame = app
+                .arrangement
+                .as_ref()
+                .and_then(|arrangement| arrangement.lanes[0].clips.first())
+                .map(|clip| clip.at_frame + 1)
+                .unwrap_or(0);
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()))
+        };
+
+        // `V` reverses (and says which way), `V` again restores.
+        press(&mut app, 'V');
+        assert!(clip(&app).reversed, "{}", app.status);
+        assert!(app.status.contains("backwards"), "{}", app.status);
+        press(&mut app, 'V');
+        assert!(!clip(&app).reversed, "{}", app.status);
+        assert!(app.status.contains("forwards"), "{}", app.status);
+
+        // `i` inverts the polarity, `i` again restores it.
+        press(&mut app, 'i');
+        assert!((clip(&app).gain + 1.0).abs() < 1e-6, "{}", app.status);
+        press(&mut app, 'i');
+        assert!((clip(&app).gain - 1.0).abs() < 1e-6, "{}", app.status);
+
+        // `E` silences (a gain of zero — the span and the material are untouched).
+        press(&mut app, 'E');
+        assert_eq!(clip(&app).gain, 0.0, "{}", app.status);
+        assert!(clip(&app).src_len > 0, "silence is a gain, not a delete");
+
+        // `U` normalizes from the **source's** peak (0.25 → a gain of 4), which also
+        // un-silences the clip: silence was a gain, not a change to the material.
+        press(&mut app, 'U');
+        let gain = clip(&app).gain;
+        assert!(
+            (gain - 4.0).abs() < 0.05,
+            "normalize to the 0.25 peak: gain {gain} ({})",
+            app.status
+        );
+        assert!(app.status.contains("normalized"), "{}", app.status);
+
+        // `T` trims to the audible content: ~1 000 in and ~3 000 out (the scan works
+        // in whole peak bins, so it lands within one bin of the edge).
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::empty()));
+        press(&mut app, 'T');
+        let c = clip(&app);
+        assert!(
+            (c.src_start as i64 - 1_000).abs() <= media::PEAK_BASE_BIN as i64,
+            "the head silence went: src_start {} ({})",
+            c.src_start,
+            app.status
+        );
+        assert!(
+            (c.src_len as i64 - 2_000).abs() <= 2 * media::PEAK_BASE_BIN as i64,
+            "and the tail: src_len {} ({})",
+            c.src_len,
+            app.status
+        );
+        assert!(c.at_frame > 0, "the clip moved to where the audio is");
+
+        // The **mirror**: on a reversed clip the clip's start is the region's top, so
+        // the same scan trims the *other* edge first — the two removals swap exactly.
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::empty()));
+        let before = clip(&app);
+        let forward = (before.at_frame, before.end_frame());
+        press(&mut app, 'T');
+        let trimmed = clip(&app);
+        let lead = trimmed.at_frame - forward.0;
+        let trail = forward.1 - trimmed.end_frame();
+        assert!(
+            lead > 0 && trail > 0,
+            "both edges had silence: {lead} / {trail}"
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::empty()));
+        let before = clip(&app);
+        let forward = (before.at_frame, before.end_frame());
+        press(&mut app, 'V');
+        press(&mut app, 'T');
+        let trimmed = clip(&app);
+        assert!(trimmed.reversed, "the clip stayed reversed");
+        assert_eq!(
+            (
+                trimmed.at_frame - forward.0,
+                forward.1 - trimmed.end_frame()
+            ),
+            (trail, lead),
+            "a reversed clip trims the other edge first ({} frames became {} then {})",
+            lead + trail,
+            lead,
+            trail
+        );
+
+        // A clip whose fades fill it (reachable with `f` at the end, and what paste
+        // preserves) is trimmed to content with its fades **capped to the new
+        // length**, in the same gesture — refusing instead would make `T` unusable.
+        app.open_wave(&path);
+        {
+            let c = clip(&app);
+            app.snap.frame = c.at_frame + 1;
+        }
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::empty()));
+        for c in format!("arrange set_clip_fade t0 c0 {} 0", clip(&app).src_len).chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(
+            clip(&app).fade_in,
+            6_000,
+            "a full-length fade: {}",
+            app.status
+        );
+        app.snap.frame = clip(&app).at_frame + 1;
+        app.on_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::empty()));
+        let capped = clip(&app);
+        assert!(
+            capped.fade_in + capped.fade_out <= capped.src_len,
+            "the fades fit the trimmed length: {}/{} of {} ({})",
+            capped.fade_in,
+            capped.fade_out,
+            capped.src_len,
+            app.status
+        );
+        assert!(
+            app.status.contains("fades capped"),
+            "and the cap is reported: {}",
+            app.status
+        );
+
+        // A clip whose **source** is silent has nothing to normalize to: refused
+        // rather than amplified into noise.
+        let silent = dir.join("silent.wav");
+        let mut w = media::wav::WavWriter::create_float(&silent, 48_000, 1).expect("fixture");
+        w.write(&vec![0.0f32; 4_800]).expect("write");
+        w.finalize().expect("finalize");
+        app.open_wave(&silent);
+        press(&mut app, 'U');
+        assert!(
+            app.status.contains("silent"),
+            "a silent source is refused: {}",
+            app.status
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        drop_pool();
+    }
+
+    /// **The peak scans use the true peak**, both halves: a signal that swings mostly
+    /// negative (or a polarity-inverted clip) has its loudest excursion in `min`, so
+    /// reading only `max` would normalize a −0.9 peak as if it were silent and would
+    /// let trim-to-content delete a bin that is loud but negative. (The gate found the
+    /// first draft doing exactly that — the panel's own envelope draws both halves.)
+    #[test]
+    fn the_peak_scans_use_both_halves() {
+        let _pool = pool_guard();
+        let dir = std::env::temp_dir().join(format!("tui-shell-negative-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("pool dir");
+        // Silence, then a *constant negative* 0.9 region, then silence.
+        let path = dir.join("negative.wav");
+        let mut w = media::wav::WavWriter::create_float(&path, 48_000, 1).expect("fixture");
+        let samples: Vec<f32> = (0..6_000)
+            .map(|i| {
+                if (1_000..3_000).contains(&i) {
+                    -0.9
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        w.write(&samples).expect("write");
+        w.finalize().expect("finalize");
+
+        let mut app = App::idle();
+        app.snap = App::demo_snapshot();
+        app.open_wave(&path);
+        let at_clip = |app: &mut App| {
+            app.snap.frame = app
+                .arrangement
+                .as_ref()
+                .and_then(|arrangement| arrangement.lanes[0].clips.first())
+                .map(|clip| clip.at_frame + 1)
+                .unwrap_or(0);
+        };
+        let clip = |app: &App| -> Placed {
+            app.arrangement.as_ref().expect("arrangement").lanes[0].clips[0].clone()
+        };
+
+        // Normalize: peak 0.9 → gain 1/0.9 (the first draft saw max = 0 and refused
+        // the clip as silent).
+        at_clip(&mut app);
+        app.on_key(KeyEvent::new(KeyCode::Char('U'), KeyModifiers::empty()));
+        let gain = clip(&app).gain;
+        assert!(
+            (gain - 1.0 / 0.9).abs() < 0.02,
+            "normalize from the negative peak: gain {gain} ({})",
+            app.status
+        );
+        assert!(app.status.contains("peak 0.9000"), "{}", app.status);
+
+        // Trim-to-content: the negative region is content, not silence.
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::empty()));
+        at_clip(&mut app);
+        let before = clip(&app);
+        app.on_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::empty()));
+        let after = clip(&app);
+        assert!(
+            after.src_len < before.src_len,
+            "the silent edges went: {} ({})",
+            after.src_len,
+            app.status
+        );
+        assert!(
+            after.src_len as i64 > 1_000,
+            "but the negative region survived: src_len {}",
+            after.src_len
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        drop_pool();
+    }
+
+    /// A paste carries a **reversed** clip's direction: `add_clip` has no direction
+    /// operand (a clip is added forward and `reverse` flips it), so the paste emits
+    /// its own `reverse` in the same gesture — otherwise a paste would silently play
+    /// it forwards (the gate caught that).
+    #[test]
+    fn a_paste_keeps_a_reversed_clip_reversed() {
+        let (pool, script_path) = pool_script("pasteflip", "arrange add_track t1\n");
+        let mut app = App::idle();
+        app.snap = App::demo_snapshot();
+        app.open_script(&script_path);
+        let press = |app: &mut App, c: char| {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()))
+        };
+
+        // Reverse the clip under the playhead, then copy and paste it.
+        press(&mut app, 'V');
+        assert!(
+            app.arrangement.as_ref().expect("arrangement").lanes[0].clips[0].reversed,
+            "{}",
+            app.status
+        );
+        press(&mut app, 'y');
+        app.active_track = 1;
+        press(&mut app, 'p');
+        let pasted = app.arrangement.as_ref().expect("arrangement").lanes[1].clips[0].clone();
+        assert!(
+            pasted.reversed,
+            "the paste plays it backwards too: {}",
+            app.status
+        );
+
+        // One undo removes the whole paste (the `add_clip` and its `reverse`).
+        press(&mut app, 'u');
+        assert!(
+            app.arrangement.as_ref().expect("arrangement").lanes[1]
+                .clips
+                .is_empty(),
+            "{}",
+            app.status
+        );
+
+        let _ = std::fs::remove_dir_all(&pool);
     }
 
     /// The `:` command line types the same `host v1` format the keys dispatch, so

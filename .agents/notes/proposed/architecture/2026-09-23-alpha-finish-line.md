@@ -170,7 +170,11 @@ from the shared workflow (a key or a `: ` line — never a shell-only feature).
     break the pool's immutability premise); **normalize** measures the peak pyramid and issues
     `set_clip_gain`; **invert** is `set_clip_gain -1`; **silence** is gain 0; **trim-to-content** is a peak
     scan plus the compound `trim`. Four of the five are logged gestures over existing vocabulary, which is
-    why they are cheap.
+    why they are cheap. *Done (2026-09-24):* `Clip.reversed` + the mirrored `source_frame_at`, the toggle
+    op (a looped clip refused), and the ops that compute source offsets — **split, both trims and chop —
+    mirror their arithmetic** (the sign flip on a reversed end-trim was a real bug the tests caught);
+    keys `V`/`U`/`i`/`E`/`T`, with the panel's envelope mirrored too
+    ([note](../../implemented/feature/2026-09-24-utility-gestures.md)).
 11. **Time-stretch / tempo match — offline, materialised into the pool.** A control-side render writes a
     **new pool source**, and the logged compound op rewrites the clip's reference
     (`arrange stretch t0 c0 <new-source> <new-src-len> <num> <den>`), so `Clip` gains no playback-rate

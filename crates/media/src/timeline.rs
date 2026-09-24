@@ -64,6 +64,11 @@ pub struct Clip {
     /// When `Some(r > 0)`, the source read wraps every `r` frames (a baked loop);
     /// `src_len` is then `r * times`. `None` = contiguous read.
     pub loop_len: Option<Frame>,
+    /// Play the region **backwards** (a clip property, not a rewritten pool copy:
+    /// the source stays immutable and the reader reads the other way). A reversed
+    /// clip cannot be looped or re-looped — see [`ArrangeOp::Reverse`].
+    #[serde(default)]
+    pub reversed: bool,
 }
 
 impl Clip {
@@ -86,6 +91,10 @@ impl Clip {
         let off = offset.min(self.src_len.saturating_sub(1));
         match self.loop_len {
             Some(loop_len) if loop_len > 0 => self.src_start + (off % loop_len),
+            // Reversed: the clip's first frame is the region's **top**, so the read
+            // walks down to `src_start`. (Mirror of the forward mapping, which is why
+            // split/trim/chop mirror their source arithmetic when `reversed`.)
+            _ if self.reversed => self.src_start + (self.src_len - 1 - off),
             _ => self.src_start + off,
         }
     }
@@ -125,6 +134,14 @@ pub enum ArrangeOp {
     MoveTrack {
         track: Id,
         index: usize,
+    },
+    /// Play a clip backwards (or forwards again): a **toggle**, so the log stays one
+    /// fact per press and `undo` means what it says. A *looped* clip is refused —
+    /// the loop phase of a reversed read is not representable, the same reason
+    /// razor-split and trim refuse one.
+    Reverse {
+        track: Id,
+        clip: Id,
     },
     AddClip {
         track: Id,
@@ -312,6 +329,19 @@ impl Timeline {
                 self.tracks[ti].id = to.clone();
                 Ok(())
             }
+            ArrangeOp::Reverse { track, clip } => {
+                let (ti, ci) = self
+                    .locate(track, clip)
+                    .ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
+                let c = &self.tracks[ti].clips[ci];
+                if c.loop_len.is_some() {
+                    return Err(
+                        "cannot reverse a looped clip (loop phase is not representable)".into(),
+                    );
+                }
+                self.tracks[ti].clips[ci].reversed = !c.reversed;
+                Ok(())
+            }
             ArrangeOp::MoveTrack { track, index } => {
                 let ti = self
                     .track_index(track)
@@ -381,9 +411,18 @@ impl Timeline {
                 let mut right = c.clone();
                 right.id = new_right.clone();
                 right.at_frame = *at_frame;
-                right.src_start = c.src_start + split_in;
                 right.src_len = c.src_len - split_in;
                 right.fade_in = 0;
+                if c.reversed {
+                    // The clip's *first* frames are the region's **top**, so the left
+                    // half takes the top and the right half the bottom — the mirror of
+                    // the forward split (`clip_tests` pins both).
+                    left.src_start = c.src_start + right.src_len;
+                    right.src_start = c.src_start;
+                } else {
+                    left.src_start = c.src_start;
+                    right.src_start = c.src_start + split_in;
+                }
                 // drop the original clip, then sorted-insert both halves
                 self.tracks[ti].clips.remove(ci);
                 self.tracks[ti].clips.push(left);
@@ -406,16 +445,23 @@ impl Timeline {
                         if c.loop_len.is_some() {
                             return Err("cannot trim the start of a looped clip (loop phase is not representable)".into());
                         }
-                        // move at_frame + src_start together; src_len shrinks/grows the same.
+                        // Forward: move at_frame + src_start together, src_len shrinks.
+                        // Reversed: the clip's first frames are the region's *top*, so
+                        // trimming the start only shrinks `src_len` (the mirror of the
+                        // forward end trim).
                         let at = add_signed(c.at_frame, *by_frames)
                             .ok_or("trim start would move before frame 0")?;
-                        let src_start = add_signed(c.src_start, *by_frames)
-                            .ok_or("trim start would move before the source start")?;
                         let len = add_signed(c.src_len, -(*by_frames))
                             .ok_or("trim start length out of range")?;
                         if len == 0 {
                             return Err("trim start would consume the whole clip".into());
                         }
+                        let src_start = if c.reversed {
+                            c.src_start
+                        } else {
+                            add_signed(c.src_start, *by_frames)
+                                .ok_or("trim start would move before the source start")?
+                        };
                         let mut n = c;
                         n.at_frame = at;
                         n.src_start = src_start;
@@ -431,8 +477,17 @@ impl Timeline {
                         if len == 0 {
                             return Err("trim end would remove the whole clip".into());
                         }
+                        let reversed = c.reversed;
                         let mut n = c;
                         n.src_len = len;
+                        if reversed {
+                            // Reversed: the clip's last frames are the region's
+                            // *bottom*, so moving the end **earlier** (a negative
+                            // `by`) raises `src_start` — the sign flips against the
+                            // forward case.
+                            n.src_start = add_signed(n.src_start, -(*by_frames))
+                                .ok_or("trim end would move before the source start")?;
+                        }
                         validate_clip(&n).map_err(|e| format!("trim end: {e}"))?;
                         self.tracks[ti].clips[ci] = n;
                         Ok(())
@@ -531,6 +586,13 @@ impl Timeline {
                 Ok(())
             }
             ArrangeOp::LoopRegion { track, clip, times } => {
+                if let Some((ti, ci)) = self.locate(track, clip)
+                    && self.tracks[ti].clips[ci].reversed
+                {
+                    return Err(
+                        "cannot loop a reversed clip (loop phase is not representable)".into(),
+                    );
+                }
                 if *times == 0 {
                     return Err("loop times must be >= 1".into());
                 }
@@ -577,7 +639,13 @@ impl Timeline {
                 let base = c.src_len / times_f;
                 let rem = c.src_len % times_f;
                 let mut pieces = Vec::new();
-                let mut src_at = c.src_start;
+                // Forward, the pieces walk up from `src_start`; reversed, they walk
+                // **down** from the region's top (the first piece in time is the top).
+                let mut src_at = if c.reversed {
+                    c.src_start + c.src_len
+                } else {
+                    c.src_start
+                };
                 let mut at = c.at_frame;
                 let mut seen = std::collections::HashSet::new();
                 for i in 0..times_f {
@@ -589,6 +657,9 @@ impl Timeline {
                     // Preserve the clip's outer fades on the first/last piece (as
                     // RazorSplit does) so a chop doesn't silently remove audible
                     // crossfades; interior seams are hard (a SetClipFade follows).
+                    if c.reversed {
+                        src_at -= slen;
+                    }
                     pieces.push(Clip {
                         id: pid,
                         source: c.source.clone(),
@@ -599,8 +670,11 @@ impl Timeline {
                         fade_out: if i + 1 == times_f { c.fade_out } else { 0 },
                         gain: c.gain,
                         loop_len: None,
+                        reversed: c.reversed,
                     });
-                    src_at += slen;
+                    if !c.reversed {
+                        src_at += slen;
+                    }
                     at += slen;
                 }
                 self.tracks[ti].clips.remove(ci);
@@ -618,6 +692,7 @@ mod tests {
 
     fn clip(id: &str, at: Frame, len: Frame) -> Clip {
         Clip {
+            reversed: false,
             id: id.into(),
             source: "pool-1".into(),
             src_start: 0,
@@ -649,6 +724,189 @@ mod tests {
         assert!(
             t.apply(&ArrangeOp::AddTrack { track: "t0".into() })
                 .is_err()
+        );
+    }
+
+    /// **Reversed is a clip property with a mirrored reader.** The clip's first
+    /// frame is the region's *top*, so `source_frame_at` walks down — and the ops
+    /// that compute source offsets (split, trim, chop) must mirror their arithmetic
+    /// with it. This test pins every one of those, because getting one wrong is
+    /// silent audio corruption (the right length, the wrong samples).
+    #[test]
+    fn a_reversed_clip_reads_backwards_and_the_ops_mirror() {
+        let mut t = two_tracks();
+        let mut c = clip("c0", 0, 1_000);
+        c.src_start = 200;
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: c.clone(),
+            })
+            .unwrap();
+
+        // Forward: offset 0 is the region's bottom.
+        assert_eq!(c.source_frame_at(0), 200);
+        assert_eq!(c.source_frame_at(999), 1_199);
+
+        // The op is a **toggle**, so two presses restore the clip exactly…
+        let mut rev = t
+            .apply(&ArrangeOp::Reverse {
+                track: "t0".into(),
+                clip: "c0".into(),
+            })
+            .unwrap();
+        assert!(rev.tracks[0].clips[0].reversed);
+        let back = rev
+            .apply(&ArrangeOp::Reverse {
+                track: "t0".into(),
+                clip: "c0".into(),
+            })
+            .unwrap();
+        assert!(!back.tracks[0].clips[0].reversed);
+        rev = back
+            .apply(&ArrangeOp::Reverse {
+                track: "t0".into(),
+                clip: "c0".into(),
+            })
+            .unwrap();
+
+        // Reversed: offset 0 is the region's top.
+        let r = &rev.tracks[0].clips[0];
+        assert_eq!(r.source_frame_at(0), 1_199);
+        assert_eq!(r.source_frame_at(999), 200);
+
+        // **Split**: in time, the left half is the *top* of the region.
+        let split = rev
+            .apply(&ArrangeOp::RazorSplit {
+                track: "t0".into(),
+                clip: "c0".into(),
+                new_left: "l".into(),
+                new_right: "rr".into(),
+                at_frame: 400,
+            })
+            .unwrap();
+        let left = split.tracks[0]
+            .clips
+            .iter()
+            .find(|c| c.id == "l")
+            .expect("left");
+        let right = split.tracks[0]
+            .clips
+            .iter()
+            .find(|c| c.id == "rr")
+            .expect("right");
+        assert_eq!(
+            (left.src_start, left.src_len),
+            (800, 400),
+            "left is the top"
+        );
+        assert_eq!((right.src_start, right.src_len), (200, 600));
+        assert_eq!(left.source_frame_at(0), 1_199, "and reads down from there");
+        assert_eq!(right.source_frame_at(0), 799);
+
+        // **Trim the start**: the clip's first frames go, the region's top shrinks —
+        // `src_start` does not move (the mirror of the forward start trim).
+        let start = rev
+            .apply(&ArrangeOp::Trim {
+                track: "t0".into(),
+                clip: "c0".into(),
+                edge: Edge::Start,
+                by_frames: 100,
+            })
+            .unwrap();
+        let s = &start.tracks[0].clips[0];
+        assert_eq!((s.at_frame, s.src_start, s.src_len), (100, 200, 900));
+        assert_eq!(
+            s.source_frame_at(0),
+            1_099,
+            "the new first frame is the old offset 100's sample"
+        );
+
+        // **Trim the end**: moving it earlier cuts the region's *bottom*, so
+        // `src_start` rises (the sign flips against the forward case).
+        let end = rev
+            .apply(&ArrangeOp::Trim {
+                track: "t0".into(),
+                clip: "c0".into(),
+                edge: Edge::End,
+                by_frames: -100,
+            })
+            .unwrap();
+        let e = end.tracks[0].clips[0].clone();
+        assert_eq!(
+            (e.at_frame, e.src_start, e.src_len),
+            (0, 300, 900),
+            "the region's bottom rose"
+        );
+        assert_eq!(
+            e.source_frame_at(e.src_len - 1),
+            300,
+            "down to the new bottom"
+        );
+
+        // …and extending the end reaches *below* `src_start`.
+        let grew = rev
+            .apply(&ArrangeOp::Trim {
+                track: "t0".into(),
+                clip: "c0".into(),
+                edge: Edge::End,
+                by_frames: 100,
+            })
+            .unwrap();
+        let g = grew.tracks[0].clips[0].clone();
+        assert_eq!((g.at_frame, g.src_start, g.src_len), (0, 100, 1_100));
+        assert_eq!(g.source_frame_at(g.src_len - 1), 100);
+
+        // **Chop**: the pieces walk *down* from the top.
+        let chopped = rev
+            .apply(&ArrangeOp::ChopClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 4,
+                prefix: "pre".into(),
+            })
+            .unwrap();
+        let pieces: Vec<(u64, u64)> = chopped.tracks[0]
+            .clips
+            .iter()
+            .map(|c| (c.src_start, c.src_len))
+            .collect();
+        assert_eq!(
+            pieces,
+            vec![(950, 250), (700, 250), (450, 250), (200, 250)],
+            "piece 0 in time is the top of the region"
+        );
+        assert!(chopped.tracks[0].clips.iter().all(|c| c.reversed));
+
+        // A looped clip cannot be reversed, and a reversed clip cannot be looped:
+        // the loop phase of a mirrored read is not representable (the same reason
+        // split/trim/chop refuse a looped clip).
+        let mut looped = two_tracks();
+        let mut lc = clip("c0", 0, 1_000);
+        lc.loop_len = Some(500);
+        looped = looped
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: lc,
+            })
+            .unwrap();
+        assert!(
+            looped
+                .apply(&ArrangeOp::Reverse {
+                    track: "t0".into(),
+                    clip: "c0".into(),
+                })
+                .is_err(),
+            "reversing a looped clip is refused"
+        );
+        assert!(
+            rev.apply(&ArrangeOp::LoopRegion {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 2,
+            })
+            .is_err(),
+            "looping a reversed clip is refused"
         );
     }
 

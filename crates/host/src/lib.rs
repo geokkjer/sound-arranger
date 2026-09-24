@@ -1936,6 +1936,7 @@ pub fn format_arrange(op: &media::ArrangeOp) -> String {
         Op::RemoveTrack { track } => format!("remove_track {track}"),
         Op::RenameTrack { track, to } => format!("rename_track {track} {to}"),
         Op::MoveTrack { track, index } => format!("move_track {track} {index}"),
+        Op::Reverse { track, clip } => format!("reverse {track} {clip}"),
         Op::AddClip { track, clip } => {
             let mut line = format!(
                 "add_clip {track} {} {} {} {} {} {} {} {}",
@@ -2436,6 +2437,7 @@ pub fn parse_arrange_line(line: &str) -> Result<(media::ArrangeOp, Option<u64>),
 /// arrange add_track t0 @0
 /// arrange rename_track t0 lead @0
 /// arrange move_track t0 1 @0
+/// arrange reverse t0 c0 @0
 /// arrange add_clip t0 c0 s1 0 4000 0 0 0 1.0 [loop_len] @0
 /// arrange razor_split t0 c0 cL cR 3000 @0
 /// arrange trim t0 c0 start 500 @0
@@ -2547,6 +2549,13 @@ fn parse_arrange(words: &[&str], at: usize, snap: Option<u64>) -> Result<media::
                     .map_err(|_| format!("line {at}: arrange move_track index is too large"))?,
             })
         }
+        "reverse" => {
+            arity(3)?;
+            Ok(media::ArrangeOp::Reverse {
+                track: s(1)?,
+                clip: s(2)?,
+            })
+        }
         "add_clip" => {
             // add_clip track c0 source src_start src_len at_frame fade_in fade_out gain [loop_len]
             // operands (words[0]=op): track(1) id(2) source(3) src_start(4) src_len(5)
@@ -2558,6 +2567,7 @@ fn parse_arrange(words: &[&str], at: usize, snap: Option<u64>) -> Result<media::
                 ));
             }
             let clip = media::Clip {
+                reversed: false,
                 id: s(2)?,
                 source: s(3)?,
                 src_start: u(4)?,
@@ -2820,6 +2830,7 @@ mod tests {
                 &media::ArrangeOp::AddClip {
                     track: "t0".into(),
                     clip: media::Clip {
+                        reversed: false,
                         id: "c0".into(),
                         source: "s1".into(),
                         src_start: 0,
@@ -2979,6 +2990,7 @@ mod tests {
         media::ArrangeOp::AddClip {
             track: "t0".into(),
             clip: media::Clip {
+                reversed: false,
                 id: id.into(),
                 source: "s1".into(),
                 src_start: 0,
@@ -3395,6 +3407,7 @@ mod tests {
     #[test]
     fn the_text_form_round_trips_every_state_command() {
         let clip = media::Clip {
+            reversed: false,
             id: "c0".into(),
             source: "s1".into(),
             src_start: 100,
@@ -3474,6 +3487,10 @@ mod tests {
             media::ArrangeOp::MoveTrack {
                 track: "t0".into(),
                 index: 1,
+            },
+            media::ArrangeOp::Reverse {
+                track: "t0".into(),
+                clip: "c0".into(),
             },
         ];
 
@@ -4193,6 +4210,7 @@ mod tests {
             op: media::ArrangeOp::AddClip {
                 track: "t0".into(),
                 clip: media::Clip {
+                    reversed: false,
                     id: "c 0".into(),
                     source: "s1".into(),
                     src_start: 0,
@@ -4384,6 +4402,7 @@ mod tests {
             op: media::ArrangeOp::AddClip {
                 track: "t0".into(),
                 clip: media::Clip {
+                    reversed: false,
                     id: "c0".into(),
                     source: "jam.ch0".into(),
                     src_start: 0,

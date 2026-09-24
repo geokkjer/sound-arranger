@@ -21,6 +21,12 @@ In scope (identical to the iced spike):
 
 What this spike adds, because it is what a TUI has to answer for:
 
+- **utility gestures, one log line each** — `V` reverses the clip (a *clip property*
+  with a mirrored reader, so the waveform envelope flips too), `U` normalizes it to
+  its peak, `i` inverts polarity, `E` silences it (a gain of zero: the span, fades
+  and material stay), and `T` trims it to the audible content from the peak pyramid.
+  Every one is an `arrange …` line through the host's parser, so each is one `u`
+  away from undone;
 - **the pool panel** — the sources the arrangement is made *from*, listed under the
   timeline (id, length, rate, channels; a crashed take or a missing `.peaks` is
   marked). `Tab` reaches it, `j`/`k` walk it, and `Enter` **places** the selected
@@ -271,6 +277,9 @@ pointless), so the shell falls back to the wide meter bars under the transport.
 | `R` | rename the active track — opens the command line prefilled with `arrange rename_track …` |
 | `D` | delete the active track **and its clips** as one gesture (one undo brings both back) |
 | `{` / `}` | move the active track up / down (its mixer channel follows the position) |
+| `V` | reverse the clip (a clip property: one log line, the envelope mirrors) |
+| `U` / `i` / `E` | normalize from the peak pyramid / invert polarity / silence (a gain, not a delete) |
+| `T` | trim the clip to its audible content (a compound `trim`, mirror-aware for a reversed clip) |
 | `J` / `K` | timeline: move the clip to the track **below / above**, keeping its time |
 | `g` / `G` | timeline: clip gain **−1 dB / +1 dB** (the range is the console fader's) |
 | `f` / `F` | timeline: fade in / fade out **to the playhead** (absolute, not a nudge) |

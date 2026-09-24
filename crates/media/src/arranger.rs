@@ -317,6 +317,7 @@ mod tests {
 
     fn clip(id: &str, source: &str, at: u64, len: u64) -> crate::timeline::Clip {
         crate::timeline::Clip {
+            reversed: false,
             id: id.into(),
             source: source.into(),
             src_start: 0,
