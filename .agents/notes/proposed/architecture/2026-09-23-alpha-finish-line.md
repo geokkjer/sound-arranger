@@ -107,10 +107,11 @@ from the shared workflow (a key or a `: ` line — never a shell-only feature).
    recovery and per-channel writers) behind the existing `record <take_id>` line: the host opens the input
    device, mounts `CaptureNode`s into the pool, and the take lands as pool sources (`{take_id}.ch{N}`)
    that the pool panel can then place. This is the loop's missing first half.
-4. **Material that is actually usable: stereo and bit depths.** Import keeps both channels (per-channel
-   pool sources for a stereo file — the capture convention) and the reader accepts 24-bit PCM (decoded to
-   f32 on the control side). Both are prerequisites for the owner's own takes and both are cheap next to
-   stretch.
+4. **Material that is actually usable: stereo and bit depths.** *Half done (2026-09-23):* the reader
+   accepts **24-bit PCM** (decoded to f32 on the control side; a 32-bit PCM tag is refused, only float is
+   read). **Still open:** keeping both channels of a stereo file — today a stereo source is reduced to
+   channel 0, so the capture convention (`{take}.ch{k}` per channel) has to become the *import*
+   convention too. Both are prerequisites for the owner's own takes.
 
 **B — the grid and the edit vocabulary (the owner's core ask)**
 5. **Grid snap, in the language and in the shell.** The log keeps absolute frames: a snapped edit is an

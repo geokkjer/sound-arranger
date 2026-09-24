@@ -39,7 +39,7 @@ Its most important finding: the substrate is further along than the capability l
 **recording is not wired into the host** (`HostCommand::Record` is a stub), so the record → arrange loop
 has no first half yet, and the session has no save/open.
 
-The audio core works and is tested. **Recording works**: `record <take_id>` captures the input device
+The audio core works and is tested. **Recording works** and the pool reads 16/24-bit PCM and float WAVs: `record <take_id>` captures the input device
 into the pool at the session rate and `record stop` finalizes it ([note](.agents/notes/implemented/feature/2026-09-23-recording-into-the-host.md)).
 What exists today: the minimal core,
 the media engine (disk streaming, recording, splicing, multi-channel capture, pool rate

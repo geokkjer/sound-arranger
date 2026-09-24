@@ -95,10 +95,17 @@ fn parse_header(reader: &mut (impl Read + Seek)) -> Result<Header, String> {
                     "unsupported channel count {channels} (mono/stereo only)"
                 ));
             }
-            if bits != 16 && bits != 32 {
+            // 24-bit PCM is what most other tools write; it decodes to f32 on the
+            // control side like the rest (the pool is float). A 32-bit *PCM* file is
+            // still refused — only 32-bit float is a WAV we write, and guessing
+            // between int and float by format tag would be a silent corruption.
+            if bits != 16 && bits != 24 && bits != 32 {
                 return Err(format!(
-                    "unsupported bit depth {bits} (16-bit PCM or 32-bit float only)"
+                    "unsupported bit depth {bits} (16/24-bit PCM or 32-bit float)"
                 ));
+            }
+            if bits == 32 && format != FMT_FLOAT {
+                return Err("32-bit WAV must be float (format 3), not PCM".to_string());
             }
             fmt = Some((format, channels, rate, bits));
         } else if &chunk[..4] == DATA_TAG {
@@ -211,11 +218,28 @@ impl WavReader {
             let ba = self.block_align() as usize;
             for f in 0..frames {
                 let base = f * ba;
-                let s = if self.bits == 16 {
-                    let v = i16::from_le_bytes([raw[base], raw[base + 1]]);
-                    v as f32 / 32768.0
-                } else {
-                    f32::from_le_bytes([raw[base], raw[base + 1], raw[base + 2], raw[base + 3]])
+                let s = match self.bits {
+                    16 => {
+                        let v = i16::from_le_bytes([raw[base], raw[base + 1]]);
+                        v as f32 / 32768.0
+                    }
+                    // Sign-extend three little-endian bytes and scale by 2^23.
+                    24 => {
+                        let v = i32::from_le_bytes([
+                            raw[base],
+                            raw[base + 1],
+                            raw[base + 2],
+                            if raw[base + 2] & 0x80 != 0 {
+                                0xff
+                            } else {
+                                0x00
+                            },
+                        ]);
+                        v as f32 / 8_388_608.0
+                    }
+                    _ => {
+                        f32::from_le_bytes([raw[base], raw[base + 1], raw[base + 2], raw[base + 3]])
+                    }
                 };
                 out[written] = s;
                 written += 1;
@@ -616,5 +640,76 @@ mod float_tests {
             data_bytes(err_frames, 1, true).is_err(),
             "just over the boundary must refuse"
         );
+    }
+
+    /// Write a 24-bit PCM WAV by hand (the writer only does 16-bit/float — 24-bit is
+    /// what *other* tools write, which is why the reader must accept it).
+    fn write_pcm24(path: &Path, rate: u32, channels: u16, samples: &[f32]) {
+        let data: Vec<u8> = samples
+            .iter()
+            .flat_map(|s| {
+                let v = (s.clamp(-1.0, 1.0) * 8_388_607.0).round() as i32;
+                [v as u8, (v >> 8) as u8, (v >> 16) as u8]
+            })
+            .collect();
+        let mut file = Vec::new();
+        file.extend_from_slice(b"RIFF");
+        file.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        file.extend_from_slice(b"WAVEfmt ");
+        file.extend_from_slice(&16u32.to_le_bytes());
+        file.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        file.extend_from_slice(&channels.to_le_bytes());
+        file.extend_from_slice(&rate.to_le_bytes());
+        file.extend_from_slice(&(rate * channels as u32 * 3).to_le_bytes());
+        file.extend_from_slice(&(channels * 3).to_le_bytes());
+        file.extend_from_slice(&24u16.to_le_bytes());
+        file.extend_from_slice(b"data");
+        file.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        file.extend_from_slice(&data);
+        std::fs::write(path, file).expect("write pcm24");
+    }
+
+    /// 24-bit PCM is what other tools write: it must read back exactly (sign extension
+    /// and the 2^23 scale), and a 32-bit **PCM** file is still refused — only 32-bit
+    /// float is a WAV this pool reads.
+    #[test]
+    fn a_twenty_four_bit_wav_reads_back() {
+        let dir = std::env::temp_dir().join(format!("wav24-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("t24.wav");
+        write_pcm24(&path, 48_000, 1, &[0.0, 0.5, -0.5, 1.0, -1.0]);
+
+        let mut r = WavReader::open(&path).expect("24-bit opens");
+        assert_eq!(r.sample_rate(), 48_000);
+        assert_eq!(r.channels(), 1);
+        assert_eq!(r.total_frames(), 5);
+        let mut back = vec![0.0f32; 5];
+        assert_eq!(r.read_into(&mut back), 5);
+        for (got, want) in back.iter().zip([0.0, 0.5, -0.5, 1.0, -1.0]) {
+            assert!(
+                (got - want).abs() < 1e-5,
+                "24-bit sample {got} != {want} (sign extension or scale wrong)"
+            );
+        }
+
+        // A 32-bit PCM file (format 1) is not a float WAV: refused, not guessed at.
+        let bad = dir.join("bad.wav");
+        let mut file = Vec::new();
+        file.extend_from_slice(b"RIFF");
+        file.extend_from_slice(&40u32.to_le_bytes());
+        file.extend_from_slice(b"WAVEfmt ");
+        file.extend_from_slice(&16u32.to_le_bytes());
+        file.extend_from_slice(&1u16.to_le_bytes()); // PCM, not float
+        file.extend_from_slice(&1u16.to_le_bytes());
+        file.extend_from_slice(&48_000u32.to_le_bytes());
+        file.extend_from_slice(&(48_000u32 * 4).to_le_bytes());
+        file.extend_from_slice(&4u16.to_le_bytes());
+        file.extend_from_slice(&32u16.to_le_bytes());
+        file.extend_from_slice(b"data");
+        file.extend_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&bad, file).expect("write bad");
+        assert!(WavReader::open(&bad).is_err(), "32-bit PCM is refused");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
