@@ -7,6 +7,7 @@
 pub mod euclidean;
 #[cfg(feature = "fundsp")]
 pub mod fundsp_synth;
+pub mod master;
 pub mod mixer;
 pub mod scale;
 pub mod tone;
@@ -19,6 +20,10 @@ use crate::graph::{NodeId, Port};
 use crate::render::SchedEvent;
 
 pub use euclidean::{Euclidean, Rhythm, euclid, euclidean_factory};
+pub use master::{
+    MASTER_CEILING_DB, MASTER_LOOKAHEAD_MS, MASTER_PARAMS, MASTER_PORTS, MasterMeters, MasterNode,
+    MasterPlugin, master_factory,
+};
 pub use mixer::{
     MIXER_CHANNELS, MIXER_CHANNELS_MAX, MIXER_PARAMS, MIXER_PORTS, MeterBank, MixerNode,
     MixerPlugin, mixer_factory,

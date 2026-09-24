@@ -334,6 +334,21 @@ impl Engine {
                 from.1, from_port.kind, to.1, to_port.kind
             ));
         }
+        if from_port.kind == crate::graph::SignalKind::Audio
+            && from_port.channels() != to_port.channels()
+        {
+            // A cord carries one channel count: the destination port's buffer is
+            // `channels * frames`, so a mismatch would silently misread the interleave
+            // (a stereo bus into a mono port would arrive as garbage). Fail loud, and
+            // never log it — validation happens before the patch enters the log.
+            return Err(format!(
+                "patch: channel mismatch — '{}' is {} channel(s), '{}' is {}",
+                from.1,
+                from_port.channels(),
+                to.1,
+                to_port.channels()
+            ));
+        }
         Ok(())
     }
 
@@ -789,18 +804,46 @@ impl Engine {
         self.graph.out_channels().max(1)
     }
 
-    /// Whether applying `event` mid-render would change the master bus width
-    /// (the channel count of the node owning the master out). Only the mixer is
-    /// a stereo master, so a mixer Mount/Unmount is exactly the class that a
-    /// fixed-width output buffer cannot represent mid-call.
-    fn changes_master_width(event: &SchedEvent) -> bool {
-        matches!(
-            event,
-            SchedEvent::Mount {
-                plugin: "mixer",
-                ..
-            } | SchedEvent::Unmount { plugin: "mixer" }
-        )
+    /// Whether applying `event` mid-render could change the master bus **width** —
+    /// the channel count the output buffer of this call was sized for.
+    ///
+    /// Two structural cases, no plugin names: **unmounting the current bus owner**
+    /// (the bus passes to whoever precedes it, which this cannot know) and **mounting
+    /// a plugin whose declared audio Out is a different width from the bus** (it may
+    /// claim the bus, or be handed it by the graph's "first audio provider owns it"
+    /// fallback). The original matched `"mixer"` by name and silently missed the
+    /// second bus plugin — found by the slice's gate.
+    ///
+    /// Parking keeps the width constant across a call, so `render` stays a pure
+    /// function of (log, call boundaries). The cost is that such a mount/unmount is
+    /// deferred by at most one call boundary; both are control-side events.
+    fn changes_master_width(&self, event: &SchedEvent) -> bool {
+        let plugin = match event {
+            SchedEvent::Mount { plugin, .. } | SchedEvent::Unmount { plugin } => *plugin,
+            _ => return false,
+        };
+        if matches!(event, SchedEvent::Unmount { .. })
+            && self
+                .node_of
+                .get(plugin)
+                .is_some_and(|id| self.graph.out_node == Some(*id))
+        {
+            return true;
+        }
+        let declared = self.port_table.get(plugin).and_then(|ports| {
+            ports
+                .iter()
+                .find(|p| {
+                    p.direction == crate::graph::Direction::Out
+                        && p.kind == crate::graph::SignalKind::Audio
+                })
+                .map(|p| p.channels())
+        });
+        match (event, declared) {
+            (SchedEvent::Mount { .. }, Some(ch)) => ch != self.graph.out_channels().max(1),
+            // A plugin with no audio Out cannot become the bus.
+            _ => false,
+        }
     }
 
     /// Render `frames` samples (frames * channels, interleaved) into a fresh
@@ -831,6 +874,41 @@ impl Engine {
                 (out, outcome)
             }
         }
+    }
+
+    /// Render `frames` and drain buffered tails — **latency-aligned**: the render
+    /// runs `frames + flush_frames()` long and the leading `flush_frames()` frames
+    /// (the graph's transit) are dropped, so the returned audio starts at the
+    /// timeline's frame 0 even when a node carries processing latency (the master
+    /// bus's lookahead). Without the trim an offline render would begin with that
+    /// much silence and end that much short; the drain still supplies everything in
+    /// flight, so the result is the piece (plus its tails), not the piece plus
+    /// latency.
+    ///
+    /// The latency is *processing*, not content: the ballistics still see the first
+    /// frames of the piece, exactly as live playback from frame 0 would. The graph
+    /// must be fully wired before this is called (the host's `render_with_drain`
+    /// wires the arrangement first), because the transit is a property of the
+    /// wiring — `flush_frames` computes it from the nodes and cords, not from a
+    /// cached value, so it is exact before the first block.
+    pub fn render_with_drain_aligned(
+        &mut self,
+        frames: usize,
+        policy: DrainPolicy,
+        max_tail_frames: usize,
+    ) -> (Vec<f32>, DrainOutcome) {
+        let latency = self.graph.flush_frames() as usize;
+        let channels = self.graph.out_channels().max(1);
+        if latency == 0 {
+            return self.render_with_drain(frames, policy, max_tail_frames);
+        }
+        let (mut out, outcome) =
+            self.render_with_drain(frames.saturating_add(latency), policy, max_tail_frames);
+        // Drop the head: `latency` frames * channels samples. A render shorter than
+        // the latency is all head (nothing of the piece was produced).
+        let head = (latency * channels).min(out.len());
+        out.drain(..head);
+        (out, outcome)
     }
 
     /// Drain stateful nodes' buffered tails: render extra [`RenderMode::Drain`]
@@ -973,7 +1051,7 @@ impl Engine {
                             );
                             continue;
                         }
-                        if Self::changes_master_width(&event) {
+                        if self.changes_master_width(&event) {
                             // A master-*width* change (the mixer mounts/unmounts
                             // and thus the bus owner's channel count changes)
                             // cannot apply mid-call: the output buffer was sized

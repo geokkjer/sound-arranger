@@ -51,6 +51,10 @@ pub struct Snapshot {
     /// The mixer's mounted channel count (0 when no mixer is mounted).
     pub channel_count: usize,
     pub master: f32,
+    /// The mastering stage's readings (`master` plugin), `None` when it is not
+    /// mounted: output peaks per side and the gain reduction the compressor +
+    /// limiter applied to the last block, in dB (≥ 0, `0` = transparent).
+    pub mastering: Option<MasteringStatus>,
     /// The audio output's state: `None` when the host runs silent (no device was
     /// requested), otherwise the negotiated rate/layout and the played counters.
     pub audio: Option<AudioStatus>,
@@ -60,6 +64,16 @@ pub struct Snapshot {
     /// The last error the pump hit while rendering (a wiring failure) — recorded
     /// so the shell surfaces it instead of a silently moving, silent playhead.
     pub last_error: Option<String>,
+}
+
+/// What the mastering stage is doing, as a shell reads it: the output peaks and
+/// the gain reduction of the last rendered block.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MasteringStatus {
+    pub peak_l: f32,
+    pub peak_r: f32,
+    /// Gain reduction in dB (≥ 0): how much the chain pulled the block down.
+    pub reduction_db: f32,
 }
 
 /// The audio output's negotiated state and counters.
@@ -97,6 +111,7 @@ impl Default for Snapshot {
             channels: [0.0; MIXER_CHANNELS_MAX],
             channel_count: 0,
             master: 0.0,
+            mastering: None,
             audio: None,
             can_undo: false,
             can_redo: false,
@@ -521,6 +536,11 @@ fn publish(session: &HostSession, shared: &Mutex<Snapshot>, audio: &AudioState) 
             s.master = 0.0;
         }
     }
+    s.mastering = session.master_meters().map(|m| MasteringStatus {
+        peak_l: m.peak_l(),
+        peak_r: m.peak_r(),
+        reduction_db: m.reduction_db(),
+    });
     s.audio = match audio {
         AudioState::Off => None,
         AudioState::Failed(e) => Some(AudioStatus {

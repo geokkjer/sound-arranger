@@ -49,7 +49,7 @@ pub const HOST_API_VERSION: u32 = 1;
 
 /// The host registry: plugins, then ports, then parameters — validated per
 /// slot by the parser (a port name is not a plugin name).
-pub const HOST_PLUGINS: &[&str] = &["euclidean", "scale", "tone", "mixer"];
+pub const HOST_PLUGINS: &[&str] = &["euclidean", "scale", "tone", "mixer", "master"];
 
 /// The largest stretch ratio operand (`num` or `den`) the host will render. A tempo
 /// match lives well inside this (a 10:1 ratio is already absurd); beyond it the ratio is
@@ -105,6 +105,14 @@ pub const HOST_PARAMS: &[&str] = &[
     "ch7.mute",
     "ch7.solo",
     "ch7.pan",
+    // The mastering stage's compressor + limiter (`master.<param>` would collide
+    // with the mixer's own `master.gain` fader, so these are the chain's names).
+    "threshold",
+    "ratio",
+    "attack_ms",
+    "release_ms",
+    "makeup",
+    "ceiling",
 ];
 
 fn in_list(list: &'static [&str], s: &str, what: &str) -> Result<&'static str, String> {
@@ -410,6 +418,14 @@ impl HostSession {
             plugins::mixer_factory,
             plugins::mixer::MIXER_PORTS,
             plugins::mixer::MIXER_PARAMS,
+        );
+        // The mastering stage: mounted *after* the mixer, patched from it, and
+        // claiming the output (a stereo cord — the mixer's bus is interleaved).
+        engine.register_factory(
+            "master",
+            plugins::master_factory,
+            plugins::master::MASTER_PORTS,
+            plugins::master::MASTER_PARAMS,
         );
         let media: Arc<Mutex<MediaSession>> = Arc::new(Mutex::new(MediaSession::default()));
         media_ops::register_handlers(&mut engine, media.clone())
@@ -1475,11 +1491,21 @@ impl HostSession {
     pub fn render_with_drain(&mut self, frames: usize) -> Result<(Vec<f32>, DrainOutcome), String> {
         // The drain can add up to MAX_DRAIN_FRAMES on top of `frames`.
         Self::check_bounce_budget(frames.saturating_add(MAX_DRAIN_FRAMES))?;
+        // **Materialize everything scheduled before measuring anything.** The aligned
+        // render below derives its head trim from the *wired* graph, and `wire_pending`
+        // only flushes when it has player cords to lay, `wire_arranger` only when the
+        // arrangement is dirty — so a mid-session `mount master` (no new cords, nothing
+        // dirty) would otherwise be measured as absent and the trim would come out
+        // zero, inserting a full transit of silence at the head of the bounce. (Found
+        // by the slice's gate, with an executed repro.)
+        self.engine.flush_scheduled();
         self.wire_pending()?;
         self.wire_arranger()?;
+        // Aligned: the master bus's lookahead is processing latency, not thirty
+        // milliseconds of silence at the head of every bounce.
         Ok(self
             .engine
-            .render_with_drain(frames, DrainPolicy::Tails, MAX_DRAIN_FRAMES))
+            .render_with_drain_aligned(frames, DrainPolicy::Tails, MAX_DRAIN_FRAMES))
     }
 
     /// The offline bounce budget: the master may be stereo (L/R), so a frame
@@ -1612,6 +1638,15 @@ impl HostSession {
         self.engine
             .ctx
             .get::<std::sync::Arc<MeterBank>>("mixer.meters")
+            .cloned()
+    }
+
+    /// The mastering stage's meters, when a `master` plugin is mounted — the
+    /// compressor + limiter's output peaks and gain reduction.
+    pub fn master_meters(&self) -> Option<std::sync::Arc<engine::plugins::MasterMeters>> {
+        self.engine
+            .ctx
+            .get::<std::sync::Arc<engine::plugins::MasterMeters>>("master.meters")
             .cloned()
     }
 
@@ -3639,6 +3674,26 @@ mod tests {
     // ---- persistence: a session is a directory ----
 
     /// A tone take (not silence) so a bounce can be asserted *audible*.
+    /// A 0.6 sine with a **spike** at `spike_at` (three frames to 1.4): the spike is
+    /// the alignment marker an offline render must not shift, and the sine is what the
+    /// compressor's steady-state gain reduction shows up in.
+    fn write_spiked_tone(dir: &std::path::Path, id: &str, frames: usize, spike_at: usize) {
+        let path = dir.join(format!("{id}.wav"));
+        let mut w = media::WavWriter::create_float(&path, 48_000, 1).expect("wav writer");
+        let samples: Vec<f32> = (0..frames)
+            .map(|i| {
+                let v = (i as f32 * 0.05).sin() * 0.6;
+                if i >= spike_at && i < spike_at + 3 {
+                    1.4
+                } else {
+                    v
+                }
+            })
+            .collect();
+        w.write(&samples).expect("write spiked tone");
+        w.finalize().expect("finalize spiked tone");
+    }
+
     fn write_tone(dir: &std::path::Path, id: &str, frames: usize, rate: u32) {
         let path = dir.join(format!("{id}.wav"));
         let mut w = media::WavWriter::create(&path, rate, 1).expect("wav writer");
@@ -4276,6 +4331,186 @@ mod tests {
             peak(&pool.join("s2.stretch.4800_4800.3_2.wav")),
             0.0,
             "the quiet clip's render is silence — and, crucially, a *different* file"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The mastering chain is a graph node on the bus.** Mounted after the mixer and
+    /// patched from it with a stereo cord, it claims the output, so the live pump and
+    /// the bounce both flow through it. A loud take proves the compressor pulls the
+    /// material down, the limiter holds the ceiling on a spike, the bounce is
+    /// **latency-aligned** (a spike at the clip's frame 0 is at frame 0 of the file, not
+    /// after the lookahead), and it is byte-identical across runs. Unmounting restores
+    /// the mixer as the bus owner.
+    #[test]
+    fn the_master_chain_sits_on_the_bus_and_bounces_aligned() {
+        let root = std::env::temp_dir().join(format!("host-master-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        // A 0.6 sine with a **spike** at frame 5 000: the clip starts at 5 000, so the
+        // spike lands on the clip's frame 0 — the alignment marker — and the steady sine
+        // is what the compressor's gain reduction shows up in.
+        write_spiked_tone(&pool, "s1", 48_000, 5_000);
+
+        let build = |with_master: bool| -> HostSession {
+            let mut s = HostSession::new();
+            s.execute(&HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(0),
+            })
+            .expect("mixer");
+            if with_master {
+                s.execute(&HostCommand::Mount {
+                    plugin: "master",
+                    params: vec![],
+                    at_frame: Some(0),
+                })
+                .expect("master");
+                s.execute(&HostCommand::Patch {
+                    from: ("mixer", "audio"),
+                    to: ("master", "audio"),
+                    at_frame: Some(0),
+                })
+                .expect("patch the bus");
+                for (param, value) in [
+                    ("threshold", -24.0),
+                    ("ratio", 8.0),
+                    ("attack_ms", 1.0),
+                    ("ceiling", -6.0),
+                ] {
+                    s.execute(&HostCommand::SetParam {
+                        plugin: "master",
+                        param,
+                        value,
+                        at_frame: Some(0),
+                    })
+                    .expect("master param");
+                }
+            }
+            s.execute(&HostCommand::Pool { dir: pool.clone() })
+                .expect("pool");
+            s.execute(&HostCommand::Arrange {
+                op: media::ArrangeOp::AddTrack { track: "t0".into() },
+                at_frame: None,
+            })
+            .expect("track");
+            let mut clip = match add_clip("c0", 0) {
+                media::ArrangeOp::AddClip { clip, .. } => clip,
+                other => panic!("add_clip built {other:?}"),
+            };
+            clip.src_start = 5_000;
+            // Long enough that a bounce *after* the two 16 000-frame renders still has
+            // material (the unmount check below renders from the advanced position).
+            clip.src_len = 40_000;
+            s.execute(&HostCommand::Arrange {
+                op: media::ArrangeOp::AddClip {
+                    track: "t0".into(),
+                    clip,
+                },
+                at_frame: None,
+            })
+            .expect("clip");
+            s
+        };
+
+        let mut dry_session = build(false);
+        let dry = bounce(&mut dry_session, 16_000, &root.join("dry.wav"));
+
+        let mut s = build(true);
+        let path = root.join("mix.wav");
+        // The mount and its params are *scheduled*: the first render applies them.
+        let audio = bounce(&mut s, 16_000, &path);
+        assert!(
+            s.master_meters().is_some(),
+            "the mastering stage publishes its meters while mounted"
+        );
+
+        // The brickwall: the spike is caught (the dry file carries it well above the
+        // ceiling; the master file cannot).
+        let ceiling = 10f32.powf(-6.0 / 20.0);
+        let peak = audio.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let dry_peak = dry.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(
+            dry_peak > ceiling * 1.5,
+            "the fixture must exceed the ceiling dry: {dry_peak} vs {ceiling}"
+        );
+        assert!(
+            peak <= ceiling + 1e-4,
+            "the brickwall holds on the bounce: {peak} vs {ceiling}"
+        );
+        assert!(
+            peak > ceiling * 0.9,
+            "and the spike is not ducked to nothing: {peak}"
+        );
+
+        // **Aligned**: the spike is at frame 0 of the file, exactly where the dry
+        // bounce has it — not 240+ frames late, and not preceded by the lookahead's
+        // silence.
+        assert!(
+            audio[0].abs() > 0.3 && audio[1].abs() > 0.3,
+            "the spike is at frame 0, both sides: {:?}",
+            &audio[..4]
+        );
+
+        // The compressor works on the steady material: the second half of the master
+        // bounce is clearly quieter than the dry one (the spike's first block aside).
+        let rms = |v: &[f32], from: usize, to: usize| -> f32 {
+            let s: f32 = v[from..to].iter().map(|x| x * x).sum();
+            (s / (to - from) as f32).sqrt()
+        };
+        let (m, d) = (rms(&audio, 8_000, 15_000), rms(&dry, 8_000, 15_000));
+        assert!(
+            m < d * 0.6,
+            "the compressor pulls the mix down: master rms {m} vs dry {d}"
+        );
+
+        assert!(
+            (audio.len() as i64 - 16_000).abs() < 2_000,
+            "the file is the piece (plus tails), not the piece plus latency: {} frames",
+            audio.len()
+        );
+        assert_eq!(
+            s.engine.graph.out_channels(),
+            2,
+            "the master owns the stereo bus"
+        );
+
+        // Deterministic: rewind and render the same window — byte-identical (the chain
+        // is pure DSP, and the alignment is computed the same way twice).
+        s.execute(&HostCommand::TransportSeek { frame: 0 })
+            .expect("rewind");
+        let again = bounce(&mut s, 16_000, &root.join("mix2.wav"));
+        assert_eq!(audio, again, "the mastering chain is deterministic");
+
+        // Unmounting restores the previous bus owner — dropping the mastering stage
+        // must not leave the graph silent. (The unmount applies at the next render.)
+        s.execute(&HostCommand::Unmount {
+            plugin: "master",
+            at_frame: None,
+        })
+        .expect("unmount master");
+        let dry_again = bounce(&mut s, 4_800, &root.join("dry2.wav"));
+        assert!(s.master_meters().is_none(), "the meters go with the plugin");
+        assert_eq!(
+            s.engine.graph.out_channels(),
+            2,
+            "the mixer still owns the bus after the master is unmounted"
+        );
+        assert!(
+            dry_again.iter().any(|x| x.abs() > 0.01),
+            "and the bus still carries audio (the mixer was restored as out)"
+        );
+        // The same material again, but through the mixer alone: the compressed level
+        // was a fraction of the dry one, so a restored dry path proves the chain is out
+        // of the way (not merely silent).
+        let dry_again_peak = dry_again.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let compressed_peak = rms(&audio, 8_000, 15_000) * 4.0; // a generous multiple
+        assert!(
+            dry_again_peak > compressed_peak,
+            "the dry path is back and uncompressed: {dry_again_peak} vs a compressed ~{compressed_peak}"
         );
 
         let _ = std::fs::remove_dir_all(&root);

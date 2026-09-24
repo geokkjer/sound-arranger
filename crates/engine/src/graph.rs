@@ -208,10 +208,12 @@ pub const MAX_AUDIO_INS: usize = 8;
 /// channels are separate inputs, `audio_ins[..audio_in_count]`); control,
 /// trigger, and note stay single-port per node in Phase 1.
 pub struct NodeIO<'a> {
-    /// the first audio input (convenience for single-input nodes; `&[]` when
-    /// the node declares none)
+    /// The first audio input (convenience for single-input nodes; `&[]` when the
+    /// node declares none). Its length is `channels * frames` — mono for a port that
+    /// declares one channel, interleaved `L,R` for the master bus's stereo input.
     pub audio_in: &'a [f32],
-    /// per audio-In port, in port order; meaningful up to `audio_in_count`
+    /// Per audio-In port, in port order; meaningful up to `audio_in_count`. Each
+    /// slice is `port.channels() * frames` long (interleaved when above 1).
     pub audio_ins: [&'a [f32]; MAX_AUDIO_INS],
     pub audio_in_count: usize,
     /// the node's audio output channel count (1 mono, 2 stereo) — the length
@@ -639,11 +641,16 @@ pub struct RingDelay {
     delay: usize,
 }
 
-/// Maximum per-node latency the interpreter compensates (PDC). 64 samples was
-/// far below real lookahead (~5 ms limiters ≈ 240 samples @48 kHz); 4096 ≈ 85 ms
-/// covers limiters/reverb/PFX. A node whose latency exceeds this is clamped
-/// silently (release) — raise the cap before an effect with more latency lands.
+/// Maximum per-node latency the interpreter compensates (PDC), in **frames**.
+/// 64 samples was far below real lookahead (~5 ms limiters ≈ 240 samples
+/// @48 kHz); 4096 ≈ 85 ms covers limiters/reverb/PFX. A node whose latency
+/// exceeds this is clamped silently (release) — raise the cap before an effect
+/// with more latency lands.
 pub const MAX_PDC: usize = 4096;
+/// The widest channel layout a PDC delay line is sized for (the master bus is
+/// stereo). A delay line holds `frames * channels` samples, so it is allocated
+/// `MAX_PDC * this` once per node.
+pub const MAX_PDC_CHANNELS: usize = 2;
 
 impl RingDelay {
     pub fn with_capacity(cap: usize) -> Self {
@@ -744,13 +751,37 @@ impl Graph {
     }
 
     /// The audio channel count of a node's (single) audio-out port — 1 mono,
-    /// 2 stereo. Non-audio nodes report 1.
+    /// 2 stereo. Non-audio nodes report 1. The count is also the width the PDC delay
+    /// line is sized for ([`MAX_PDC_CHANNELS`]), so a wider declared output is a loud
+    /// programming error rather than a node whose latency is silently clamped.
     fn node_out_channels(ports: &[Port]) -> usize {
-        ports
+        let channels = ports
             .iter()
             .find(|p| p.direction == Direction::Out && p.kind == SignalKind::Audio)
             .map(|p| p.channels())
-            .unwrap_or(1)
+            .unwrap_or(1);
+        assert!(
+            channels <= MAX_PDC_CHANNELS,
+            "node declares a {channels}-channel audio output (max {MAX_PDC_CHANNELS}: \
+             raise MAX_PDC_CHANNELS before a wider bus, so its PDC delay line fits)"
+        );
+        channels
+    }
+
+    /// One fan-in buffer per audio-In port, sized `channels * BLOCK` (a mono port is
+    /// `BLOCK`; a stereo input is `2 * BLOCK`, interleaved). The declared port channel
+    /// count is the seam: a cord copies as many interleaved channels as the
+    /// **destination port** declares, and `patch` refuses a cord whose two ends disagree.
+    fn audio_in_buffers(ports: &[Port], audio_in_ports: &[usize]) -> Vec<Vec<f32>> {
+        audio_in_ports
+            .iter()
+            .map(|&i| vec![0.0; ports[i].channels() * BLOCK])
+            .collect()
+    }
+
+    /// Audio channels on input port `k` of node `i` (the declared count).
+    fn in_channels(&self, i: usize, k: usize) -> usize {
+        self.nodes[i].ports[self.audio_in_ports[i][k]].channels()
     }
 
     pub fn add_node(&mut self, kind: NodeKind, ports: Vec<Port>) -> NodeId {
@@ -778,6 +809,7 @@ impl Graph {
             "node declares {audio_out_ports} audio outputs (max 1 in Phase 1)"
         );
         let out_ch = Self::node_out_channels(&ports);
+        let ins = Self::audio_in_buffers(&ports, &audio_in_ports);
         self.nodes.push(Node { id, kind, ports });
         self.audio_out.push(vec![0.0; out_ch * BLOCK]);
         self.audio_out_ch.push(out_ch);
@@ -786,11 +818,11 @@ impl Graph {
         self.notes_out.push(EventBuf::new());
         self.triggers_in.push(EventBuf::new());
         self.notes_in.push(EventBuf::new());
-        self.audio_ins
-            .push(audio_in_ports.iter().map(|_| vec![0.0; BLOCK]).collect());
+        self.audio_ins.push(ins);
         self.audio_in_ports.push(audio_in_ports);
         self.cum.push(0);
-        self.delays.push(RingDelay::with_capacity(MAX_PDC));
+        self.delays
+            .push(RingDelay::with_capacity(MAX_PDC * MAX_PDC_CHANNELS));
         // The master-bus fallback: only a node with an audio output may claim
         // it (the mixer claims it explicitly on mount; a trigger-only first
         // node must not become the bus — kimi review finding 9).
@@ -847,13 +879,13 @@ impl Graph {
         {
             return Err("connect: control inputs are single-driver in phase 1".into());
         }
-        // Audio cords must also match channel count. Until stereo *connections*
-        // are implemented, a stereo→mono (or mono→stereo) cord would silently sum
-        // the interleaved stereo buffer as mono — refuse loud instead (the
-        // per-port `channels` exists precisely to make this a checked seam).
+        // Audio cords must also match channel count: a cord carries one count, so a
+        // stereo→mono (or mono→stereo) cord would silently read the interleaved buffer
+        // as mono — refuse loud instead. (Stereo cords themselves are supported since
+        // the master-bus slice: equal counts copy interleaved, sample for sample.)
         if in_port.kind == SignalKind::Audio && out_port.channels() != in_port.channels() {
             return Err(format!(
-                "connect: audio channel mismatch — '{from_port}' is {}ch, '{to_port}' is {}ch (stereo cords are not implemented yet)",
+                "connect: audio channel mismatch — '{from_port}' is {}ch, '{to_port}' is {}ch",
                 out_port.channels(),
                 in_port.channels()
             ));
@@ -910,6 +942,7 @@ impl Graph {
             "node declares {audio_out_ports} audio outputs (max 1 in Phase 1)"
         );
         let out_ch = Self::node_out_channels(&ports);
+        let ins = Self::audio_in_buffers(&ports, &audio_in_ports);
         let id = NodeId(self.next_id);
         self.next_id += 1;
         self.nodes.insert(idx, Node { id, kind, ports });
@@ -920,13 +953,11 @@ impl Graph {
         self.notes_out.insert(idx, EventBuf::new());
         self.triggers_in.insert(idx, EventBuf::new());
         self.notes_in.insert(idx, EventBuf::new());
-        self.audio_ins.insert(
-            idx,
-            audio_in_ports.iter().map(|_| vec![0.0; BLOCK]).collect(),
-        );
+        self.audio_ins.insert(idx, ins);
         self.audio_in_ports.insert(idx, audio_in_ports);
         self.cum.insert(idx, 0);
-        self.delays.insert(idx, RingDelay::with_capacity(MAX_PDC));
+        self.delays
+            .insert(idx, RingDelay::with_capacity(MAX_PDC * MAX_PDC_CHANNELS));
         // Nodes at/after the insertion point shifted up by one; re-index cords.
         for cord in self.cords.iter_mut() {
             if cord.from.0 >= idx {
@@ -1002,18 +1033,44 @@ impl Graph {
         self.nodes.iter().any(Node::has_tail)
     }
 
-    /// Frames still in flight after the last rendered block — the flush a drain
-    /// owes so a rendered sample is never dropped. The transit from node `i` is
-    /// `T[i] = d_i + max over consumers c (latency[c] + T[c])` (`T = 0` at a node
-    /// with no consumer), where `d_i` is the PDC delay applied to node `i`;
-    /// `max_cum` alone under-counts chained paths. Computed in reverse node order
-    /// (cords only go forward).
+    /// The cumulative latency of the longest audio path into each node's output —
+    /// the `cum` the PDC delay is derived from (`delay[i] = max_cum - cum[i]`).
+    /// **Pure**: a function of the wiring and the nodes' declared latency, so it is
+    /// correct *before* the first block. That matters because the drain's flush and
+    /// an aligned offline render both need the transit before rendering
+    /// ([`flush_frames`](Self::flush_frames)); `render_inner` keeps its own
+    /// preallocated copy of the same numbers so the render path never allocates.
+    fn cumulative_latency(&self) -> Vec<u32> {
+        let mut cum = vec![0u32; self.nodes.len()];
+        for i in 0..self.nodes.len() {
+            let base = self
+                .cords
+                .iter()
+                .filter(|c| c.to.0 == i && c.kind == SignalKind::Audio)
+                .map(|c| cum[c.from.0])
+                .max()
+                .unwrap_or(0);
+            cum[i] = base
+                .saturating_add(self.nodes[i].latency())
+                .min(MAX_PDC as u32);
+        }
+        cum
+    }
+
+    /// Frames still in flight after the last rendered block — the flush a drain owes
+    /// so a rendered sample is never dropped, and the head an **aligned** offline
+    /// render discards (the output lags the clock by this transit). The transit from
+    /// node `i` is `T[i] = d_i + max over consumers c (latency[c] + T[c])` (`T = 0`
+    /// at a node with no consumer), where `d_i` is the PDC delay applied to node
+    /// `i`; `max_cum` alone under-counts chained paths. Computed in reverse node
+    /// order (cords only go forward).
     pub fn flush_frames(&self) -> u32 {
         let n = self.nodes.len();
-        let max_cum = self.cum.iter().copied().max().unwrap_or(0);
+        let cum = self.cumulative_latency();
+        let max_cum = cum.iter().copied().max().unwrap_or(0);
         let mut transit = vec![0u32; n];
         for i in (0..n).rev() {
-            let d = max_cum.saturating_sub(self.cum[i]);
+            let d = max_cum.saturating_sub(cum[i]);
             let downstream = self
                 .cords
                 .iter()
@@ -1059,8 +1116,9 @@ impl Graph {
             self.notes_out[i].clear();
             self.triggers_in[i].clear();
             self.notes_in[i].clear();
-            for port in self.audio_ins[i].iter_mut() {
-                port[..frames].fill(0.0);
+            for k in 0..self.audio_ins[i].len() {
+                let n = self.in_channels(i, k) * frames;
+                self.audio_ins[i][k][..n].fill(0.0);
             }
         }
 
@@ -1074,7 +1132,10 @@ impl Graph {
                 .map(|c| self.cum[c.from.0])
                 .max()
                 .unwrap_or(0);
-            self.cum[i] = base + self.nodes[i].latency();
+            // Clamped at `MAX_PDC`: the cap is the delay line's contract, so a chain
+            // whose latencies add up beyond it saturates here (loud in debug, silent in
+            // release) instead of asking for a delay the preallocated ring cannot hold.
+            self.cum[i] = (base + self.nodes[i].latency()).min(MAX_PDC as u32);
             max_cum = max_cum.max(self.cum[i]);
         }
 
@@ -1085,13 +1146,14 @@ impl Graph {
             for cord in self.cords.iter().filter(|c| c.to.0 == i) {
                 match cord.kind {
                     SignalKind::Audio => {
-                        // Step-1 mono: every producer/consumer audio port is
-                        // 1 channel, so fan-in sums the flat frame slice. A
-                        // stereo connection (a stereo source into a stereo
-                        // consumer) is deferred with the stereo-clip step; the
-                        // per-port channel count is the seam.
-                        let src = &self.audio_out[cord.from.0][..frames];
-                        let dst = &mut self.audio_ins[i][cord.to.1][..frames];
+                        // Audio is copied **channel-aware**: both ends of a cord declare
+                        // their channel count and `patch` refuses a mismatch, so a stereo
+                        // bus (the mixer's interleaved L,R) reaches a stereo consumer
+                        // intact while the mono path stays a flat sum. Fan-in adds
+                        // like with like, per interleaved sample.
+                        let ch = self.in_channels(i, cord.to.1);
+                        let src = &self.audio_out[cord.from.0][..ch * frames];
+                        let dst = &mut self.audio_ins[i][cord.to.1][..ch * frames];
                         for (acc, s) in dst.iter_mut().zip(src) {
                             *acc += *s;
                         }
@@ -1120,7 +1182,8 @@ impl Graph {
             let mut io_ins = [&[][..]; MAX_AUDIO_INS];
             let count = self.audio_in_ports[i].len().min(MAX_AUDIO_INS);
             for (k, _) in self.audio_in_ports[i].iter().enumerate().take(count) {
-                io_ins[k] = &self.audio_ins[i][k][..frames];
+                let n = self.in_channels(i, k) * frames;
+                io_ins[k] = &self.audio_ins[i][k][..n];
             }
             let out_ch = self.audio_out_ch[i];
             let io = NodeIO {
@@ -1145,9 +1208,17 @@ impl Graph {
             );
 
             // PDC: delay this stage so audio aligns with the longest path.
-            // Delay lines are preallocated (MAX_PDC); only the read offset
-            // changes — no allocation on the render path.
-            self.delays[i].set_delay((max_cum - self.cum[i]) as usize);
+            // Delay lines are preallocated (MAX_PDC * stereo); only the read
+            // offset changes — no allocation on the render path. The delay is
+            // declared in **frames** and the line runs over the interleaved buffer,
+            // so a multichannel node's line advances by `frames * channels`
+            // samples: delaying by the frame count alone halves a stereo node's
+            // delay (240 samples is 240 mono frames but only 120 stereo frames).
+            let pdc = (max_cum.saturating_sub(self.cum[i])).min(MAX_PDC as u32) as usize;
+            let channels = self.audio_out_ch[i].max(1);
+            // `pdc <= MAX_PDC` and `channels <= MAX_PDC_CHANNELS` (asserted at node
+            // creation), so `pdc * channels` always fits the preallocated ring.
+            self.delays[i].set_delay(pdc * channels);
             let d = self.delays[i].delay();
             if d > 0 {
                 for sample in out_audio.iter_mut() {
@@ -1533,5 +1604,166 @@ mod tests {
         // The source's PDC delay (3) *plus* the sink's own latency (3): the
         // cumulative latency alone (3) under-flushes the chained path.
         assert_eq!(g.flush_frames(), 6);
+    }
+
+    /// A constant stereo source: `L = +0.25`, `R = -0.25` on every frame — distinct
+    /// enough that a channel swap, a lost channel or a misread interleave is visible.
+    struct StereoSource;
+
+    impl AudioNode for StereoSource {
+        fn latency(&self) -> u32 {
+            0
+        }
+
+        fn render(
+            &mut self,
+            _io: &NodeIO,
+            out: &mut [f32],
+            _control: &mut f32,
+            _triggers: &mut EventBuf<Trigger, CAP_EVENTS>,
+            _notes: &mut EventBuf<NoteEvent, CAP_EVENTS>,
+            _block: RenderBlock,
+        ) {
+            for frame in out.as_chunks_mut::<2>().0 {
+                frame[0] = 0.25;
+                frame[1] = -0.25;
+            }
+        }
+    }
+
+    /// A stereo pass-through that **marks each channel**, so the test can tell which
+    /// interleaved sample arrived where: `L + 1`, `R + 10`.
+    struct StereoMark;
+
+    impl AudioNode for StereoMark {
+        fn latency(&self) -> u32 {
+            0
+        }
+
+        fn render(
+            &mut self,
+            io: &NodeIO,
+            out: &mut [f32],
+            _control: &mut f32,
+            _triggers: &mut EventBuf<Trigger, CAP_EVENTS>,
+            _notes: &mut EventBuf<NoteEvent, CAP_EVENTS>,
+            _block: RenderBlock,
+        ) {
+            for (i, frame) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                let l = io.audio_in.get(i * 2).copied().unwrap_or(0.0);
+                let r = io.audio_in.get(i * 2 + 1).copied().unwrap_or(0.0);
+                frame[0] = l + 1.0;
+                frame[1] = r + 10.0;
+            }
+        }
+    }
+
+    /// **A stereo cord carries both channels, frame-aligned.** Before this slice a
+    /// cord copied `frames` samples from the producer's flat buffer, so a stereo bus
+    /// reached a consumer as the first *half* of its interleaved block — `L0,R0,L1,…`
+    /// read as if they were consecutive mono samples (a 2× speed garbling), which is
+    /// why the master bus could not exist.
+    #[test]
+    fn a_stereo_cord_carries_both_channels_frame_aligned() {
+        let mut g = Graph::new();
+        let src = g.add_node(
+            NodeKind::Opaque(Box::new(StereoSource)),
+            vec![Port::stereo_audio("audio", Direction::Out)],
+        );
+        let mark = g.add_node(
+            NodeKind::Opaque(Box::new(StereoMark)),
+            vec![
+                Port::stereo_audio("audio", Direction::In),
+                Port::stereo_audio("audio", Direction::Out),
+            ],
+        );
+        g.connect(src, "audio", mark, "audio").unwrap();
+        g.set_out(mark);
+        assert_eq!(g.out_channels(), 2);
+
+        let mut out = [0.0f32; 64];
+        g.render(
+            &mut out,
+            RenderBlock {
+                frame: 0,
+                sample_rate: 48_000,
+                tempo: &tempo(),
+                mode: RenderMode::Timeline,
+            },
+        );
+        for (i, frame) in out.as_chunks::<2>().0.iter().enumerate() {
+            assert_eq!(
+                (frame[0], frame[1]),
+                (1.25, 9.75),
+                "every frame is L,R in order (frame {i})"
+            );
+        }
+    }
+
+    /// **A chain past `MAX_PDC` saturates rather than panicking.** Three stereo nodes
+    /// at 2731 frames of declared latency sum to 8193 > `MAX_PDC`: the cumulative
+    /// latency is clamped at the cap, so every applied PDC delay still fits its
+    /// preallocated `MAX_PDC * 2` ring (the gate reproduced a debug panic here before
+    /// the clamp; the frame-based `* channels` multiplier is what halved the headroom).
+    #[test]
+    fn a_chain_beyond_max_pdc_saturates_instead_of_panicking() {
+        let mut g = Graph::new();
+        let mut prev = g.add_node(
+            NodeKind::Sine(Sine::new(440.0)),
+            vec![Port::stereo_audio("audio", Direction::Out)],
+        );
+        for _ in 0..3 {
+            let delay = g.add_node(
+                NodeKind::Opaque(Box::new(TestDelay { len: 2_731 })),
+                vec![
+                    Port::stereo_audio("in", Direction::In),
+                    Port::stereo_audio("audio", Direction::Out),
+                ],
+            );
+            g.connect(prev, "audio", delay, "in").unwrap();
+            prev = delay;
+        }
+        g.set_out(prev);
+        let mut out = vec![0.0f32; 128 * 2];
+        g.render(
+            &mut out,
+            RenderBlock {
+                frame: 0,
+                sample_rate: 48_000,
+                tempo: &tempo(),
+                mode: RenderMode::Timeline,
+            },
+        );
+        for (i, delay) in g.delays.iter().enumerate() {
+            assert!(
+                delay.delay() <= MAX_PDC * MAX_PDC_CHANNELS,
+                "node {i}: applied delay {} exceeds its ring",
+                delay.delay()
+            );
+        }
+        assert!(g.flush_frames() > 0, "the chain's transit is accounted for");
+    }
+
+    /// A cord whose ends disagree about their channel count is refused, in the graph
+    /// and before the log (`Engine::validate_patch`), never silently misread.
+    #[test]
+    fn a_channel_mismatched_cord_is_refused() {
+        let mut g = Graph::new();
+        let src = g.add_node(
+            NodeKind::Opaque(Box::new(StereoSource)),
+            vec![Port::stereo_audio("audio", Direction::Out)],
+        );
+        let mono = g.add_node(
+            NodeKind::Opaque(Box::new(TestDelay { len: 0 })),
+            vec![
+                Port::audio("audio", Direction::In),
+                Port::audio("audio", Direction::Out),
+            ],
+        );
+        let err = g.connect(src, "audio", mono, "audio").unwrap_err();
+        assert!(
+            err.contains("channel mismatch") && err.contains("2ch") && err.contains("1ch"),
+            "the refusal names both counts: {err}"
+        );
     }
 }

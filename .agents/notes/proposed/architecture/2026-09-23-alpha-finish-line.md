@@ -197,7 +197,13 @@ from the shared workflow (a key or a `: ` line — never a shell-only feature).
     (determinism inherited). Chain: compressor (`threshold`, `ratio`, `attack_ms`, `release_ms`, `makeup`)
     + a lookahead **brickwall limiter** (`ceiling`, default ≈ −0.4 dBFS) whose latency is declared through
     the existing PDC value, with gain-reduction and peak metering. One documented truth: `master.gain` is
-    the fader, `makeup` belongs to the compressor.
+    the fader, `makeup` belongs to the compressor. *Done (2026-09-24)*, together with the two things it
+    turned out to need: **stereo audio cords** (the bus was already stereo, the cords were not — a
+    channel-count mismatch is now a named refusal) and **latency-aligned offline renders** (the transit
+    is trimmed from the head, so a 5 ms lookahead does not make the bounce start with silence); the same
+    slice fixed a real PDC bug (a multichannel node's delay line was advanced in samples, not frames,
+    halving a stereo node's compensation)
+    ([note](../../implemented/feature/2026-09-24-master-bus-stereo-cords-compressor-limiter.md)).
 13. **Export — a sibling of `bounce`, never an overload of it.** `bounce` keeps its 16-bit WAV, drain
     semantics and byte-identical test role. `export <path> [f32|s16]` renders the **whole arrangement** (no
     hand-computed frame count, and it renders from frame 0 so the compressor's ballistics are
