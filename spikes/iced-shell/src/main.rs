@@ -1042,9 +1042,20 @@ mod tests {
     fn shared_actions_work_or_report_their_gap() {
         let mut app = Spike::headless();
 
-        // Transport: space starts it (the actor publishes before the reply).
+        // Transport: space starts it. The live actor publishes its state on its own
+        // thread, so the first read after the key can still be the previous snapshot
+        // under load — wait for the state, do not race it (this test failed once in ~40
+        // full-suite runs for exactly that reason).
         app.on_key(WorkflowKey::Space);
-        assert!(app.host.snapshot().playing, "space plays");
+        let mut playing = false;
+        for _ in 0..200 {
+            if app.host.snapshot().playing {
+                playing = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(playing, "space plays");
 
         // The console: `j` selects, `+` rides the selected fader, `0` returns it.
         assert_eq!(app.selected, 0);

@@ -228,7 +228,12 @@ from the shared workflow (a key or a `: ` line — never a shell-only feature).
     inside a second), proved byte-equal to a full replay and measured at 10.6 s → 0.10 s on a
     30-minute, four-track piece ([note](../../implemented/feature/2026-09-24-seek-at-scale-warm-up.md)).
 16. **Onboarding + honesty**: a first-session doc for the Rust shell, a capability/limitations statement,
-    the beta acceptance checklist, and the README/RESEARCH refresh.
+    the beta acceptance checklist, and the README/RESEARCH refresh. *Done (2026-09-24)*:
+    [`docs/tui-first-session.md`](../../../../docs/tui-first-session.md),
+    [`docs/capabilities.md`](../../../../docs/capabilities.md),
+    [`docs/beta-acceptance.md`](../../../../docs/beta-acceptance.md), with the README's reading order
+    moved to the product and RESEARCH §11 pointing at the plan instead of restating it — and two code
+    fixes the writing found (save is idempotent; markers-do-not-change-the-audio has a test).
 
 **Explicitly out of alpha:** CLAP/VST hosting and export (see the
 [nice-plug note](2026-09-22-clap-export-via-nice-plug.md)), a sound-sculptor profile, network audio,

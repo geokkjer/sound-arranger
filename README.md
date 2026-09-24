@@ -1,6 +1,6 @@
 # sound-arranger (working title)
 
-> 🕒 Last verified against commit `4bc44bd` (2026-09-24). If the code has
+> 🕒 Last verified against commit `c62bde2` (2026-09-24). If the code has
 > moved on, trust the code and move this line forward.
 
 An **audio platform where everything is a plugin**: a minimal core — clock · audio graph
@@ -140,12 +140,17 @@ printf 'host v1\nmount mixer channels=2 @0\npool /data/takes\narrange add_track 
 
 ## Documentation map
 
-**New here?** Read in this order: first operate something
-([docs/FIRST_SESSION.md](docs/FIRST_SESSION.md) — fifteen minutes, no
-prerequisites), then learn the language through the codebase
+**New here?** Read in this order: first **operate the actual product**
+([docs/tui-first-session.md](docs/tui-first-session.md) — twenty minutes in the
+terminal shell: import a jam, cut it, name it, master it, export a mix), then what
+it does and does not do ([docs/capabilities.md](docs/capabilities.md)) and the
+checklist a second person runs ([docs/beta-acceptance.md](docs/beta-acceptance.md)).
+Then, to understand the *host* underneath it, run
+[docs/FIRST_SESSION.md](docs/FIRST_SESSION.md) (fifteen minutes of `host v1`
+scripts, no UI), learn the language through the codebase
 ([docs/rust-course/](docs/rust-course/README.md)), then learn why it is shaped
-that way ([docs/architecture-explainer.md](docs/architecture-explainer.md)),
-then read the *theory* that makes the whole thing one program
+that way ([docs/architecture-explainer.md](docs/architecture-explainer.md)), and
+finally read the *theory* that makes the whole thing one program
 ([docs/theory-of-the-program.md](docs/theory-of-the-program.md) — the what/why;
 the explainer is the how).
 Only then do the research and decision records make sense. To build on the
@@ -158,8 +163,14 @@ engine — e.g. design your own soft-synth voices on fundsp — read
 - [docs/theory-of-the-program.md](docs/theory-of-the-program.md) — the *theory* of the program,
   in Peter Naur's sense (1985): why the whole thing coheres, and how the "understand the
   codebase" debate applies here.
-- [docs/design/](docs/design/) — the Tauri/Vue UI design: `ui-plan.md` (interaction spec),
-  `design-system.md` (token contract), `mocks/` (live mockups).
+- [docs/capabilities.md](docs/capabilities.md) — the capability/limitations statement: what
+  the alpha does, the cuts that are decisions rather than omissions, the known rough edges, and
+  the measured performance numbers.
+- [docs/beta-acceptance.md](docs/beta-acceptance.md) — the checklist a second person runs from
+  the docs alone (their own files, a different session rate, an export they hand to someone else).
+- [docs/design/](docs/design/) — the **retired** Tauri/Vue UI design, kept as history:
+  `ui-plan.md` (interaction spec), `design-system.md` (token contract), `mocks/` (live mockups).
+  The two Rust shells (the terminal one is primary) are the live UI.
 - [RESEARCH.md](RESEARCH.md) — working research & architecture (verified crate versions,
   licensing matrix, latency notes, plugin-architecture research, DAW prior art)
 - [.agents/notes/](.agents/notes/README.md) — decision records (Agent Notes); standing

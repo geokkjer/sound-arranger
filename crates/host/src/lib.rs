@@ -390,6 +390,11 @@ impl HostCommand {
     /// (`bounce`, `export`, the transport ops, `record`) are not. An export *renders*
     /// the session, so replaying it would be both useless and expensive — but its
     /// report is logged (`MediaExport`, like `MediaBounce`).
+    ///
+    /// `session_rate` is **context, not an edit** (its own doc says so): it is fixed when
+    /// the session is created and re-stated by the saved script's header line, so it is
+    /// not recorded. Recording it made `save` write the rate twice and every
+    /// open-and-save cycle grow the script by a line.
     fn is_state(&self) -> bool {
         matches!(
             self,
@@ -403,7 +408,6 @@ impl HostCommand {
                 | HostCommand::Play { .. }
                 | HostCommand::Splice { .. }
                 | HostCommand::Group { .. }
-                | HostCommand::SessionRate { .. }
                 | HostCommand::SetSourceTempo { .. }
         )
     }
@@ -5727,6 +5731,124 @@ mod tests {
             plain_audio.iter().all(|x| *x == 0.0),
             "and it is silence (the take is long over)"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Markers do not touch the audio.** The acceptance checklist tells a second person
+    /// to export before and after adding markers and compare the files; this is that
+    /// claim as a test — the render path does not read markers, and `end_frame` is
+    /// clip-based, so the bytes are identical.
+    #[test]
+    fn markers_do_not_change_the_exported_bytes() {
+        let root = std::env::temp_dir().join(format!("host-marker-bytes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let build = || -> HostSession {
+            let mut s = HostSession::new();
+            s.execute(&HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(0),
+            })
+            .expect("mixer");
+            s.execute(&HostCommand::Pool { dir: pool.clone() })
+                .expect("pool");
+            s.execute(&HostCommand::Arrange {
+                op: media::ArrangeOp::AddTrack { track: "t0".into() },
+                at_frame: None,
+            })
+            .expect("track");
+            s.execute(&HostCommand::Arrange {
+                op: add_clip("c0", 0),
+                at_frame: None,
+            })
+            .expect("clip");
+            s
+        };
+
+        let plain = root.join("plain.wav");
+        let marked = root.join("marked.wav");
+        let mut s = build();
+        s.export(&plain, ExportFormat::F32).expect("export");
+        // Markers, including one *past* the last clip (which must not extend the render).
+        for (frame, name) in [(0u64, "intro"), (4_800, "verse"), (480_000, "outro")] {
+            s.execute(&HostCommand::Arrange {
+                op: media::ArrangeOp::SetMarker {
+                    at_frame: frame,
+                    name: name.into(),
+                },
+                at_frame: None,
+            })
+            .expect("marker");
+        }
+        s.export(&marked, ExportFormat::F32).expect("export again");
+        assert_eq!(
+            std::fs::read(&plain).expect("bytes"),
+            std::fs::read(&marked).expect("bytes"),
+            "markers are navigation: the mix is byte-identical"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Save is idempotent.** `session_rate` is a header line *and* a logged command
+    /// (loading a session records it), so writing both made every open-and-save cycle
+    /// grow the script by a line — two, three, four… (found while writing the onboarding
+    /// docs, which tell a reader to reopen a saved session). One round trip is now a fixed
+    /// point.
+    #[test]
+    fn saving_a_loaded_session_is_idempotent() {
+        let root = std::env::temp_dir().join(format!("host-save-idem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = HostSession::new();
+        s.execute(&HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 2.0)],
+            at_frame: Some(0),
+        })
+        .expect("mixer");
+        s.execute(&HostCommand::Pool { dir: pool.clone() })
+            .expect("pool");
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::AddTrack { track: "t0".into() },
+            at_frame: None,
+        })
+        .expect("track");
+        s.execute(&HostCommand::Arrange {
+            op: add_clip("c0", 0),
+            at_frame: None,
+        })
+        .expect("clip");
+
+        let one = root.join("one");
+        s.save(&one).expect("first save");
+        let first = std::fs::read_to_string(one.join("session.txt")).expect("script");
+        assert_eq!(
+            first.matches("session_rate").count(),
+            1,
+            "the header carries the rate once:\n{first}"
+        );
+
+        // Open it twice more, saving each time: the script must not grow.
+        for (from, to) in [("one", "two"), ("two", "three")] {
+            let mut loaded = HostSession::new();
+            loaded
+                .execute(&HostCommand::Load {
+                    dir: root.join(from),
+                })
+                .expect("load");
+            loaded.save(&root.join(to)).expect("save");
+        }
+        let third = std::fs::read_to_string(root.join("three/session.txt")).expect("script");
+        assert_eq!(first, third, "two more round trips changed nothing");
 
         let _ = std::fs::remove_dir_all(&root);
     }

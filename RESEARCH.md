@@ -2,7 +2,8 @@
 
 > **Working title.** A clip-based **arrangement / composition** tool: record long **generative runs** — a eurorack patch or compositional algorithm producing evolving patterns over drones or stretched audio — then cut, paste, rearrange and shape them into a finished piece, and master the result. No MIDI note sequencing. The generative/edit-as-composition approach (musique concrète, dub, ACID) is *inspiration* — it tells us which gestures are worth having; the *model* is the modern visual computer: clips as first-class objects, cut/paste, paint-to-fit time-stretch (the ACID workflow). The "performer" is a running system, not a human musician.
 >
-> *Status: research draft, rev 6. Locked decisions are marked 🔒. Crate/license facts checked against crates.io / npm / GitHub on 2026-08-13 and listed in §15. Plugin-architecture research added 2026-08-15 (§16); minimal-core architecture reframed 2026-08-15 (§11 + note); tape framing demoted to inspiration 2026-08-15 (§1). Rev 6 (2026-08-15): **umbrella-first locked** — the platform is the goal, sound-arranger is the first profile; offline processing split into the deferred sound-sculptor profile (§3, §11, [umbrella-first note](.agents/notes/proposed/architecture/2026-08-15-umbrella-first-product-direction.md)); second review folded in (per-node latency/PDC, log rate-scoping, varispeed — minimal-core note).*
+> *Status: research draft, rev 6 (the **alpha is implemented** — see §11's status note and
+> [`docs/capabilities.md`](docs/capabilities.md)). Locked decisions are marked 🔒. Crate/license facts checked against crates.io / npm / GitHub on 2026-08-13 and listed in §15. Plugin-architecture research added 2026-08-15 (§16); minimal-core architecture reframed 2026-08-15 (§11 + note); tape framing demoted to inspiration 2026-08-15 (§1). Rev 6 (2026-08-15): **umbrella-first locked** — the platform is the goal, sound-arranger is the first profile; offline processing split into the deferred sound-sculptor profile (§3, §11, [umbrella-first note](.agents/notes/proposed/architecture/2026-08-15-umbrella-first-product-direction.md)); second review folded in (per-node latency/PDC, log rate-scoping, varispeed — minimal-core note).*
 
 ---
 
@@ -542,6 +543,20 @@ Not part of the x86 prototype. Kept here as the target for the eventual ARM phas
 ---
 
 ## 11. Phased plan (revised — core + plugins)
+
+> **Alpha status (2026-09-24).** The reviewed alpha finish line
+> ([plan](.agents/notes/proposed/architecture/2026-09-23-alpha-finish-line.md)) has been executed:
+> foundations (one gesture = one undo, sessions with a crash-safe journal), recording (stereo and
+> 24-bit material), the grid and the edit vocabulary, the shape-and-length gestures (utility
+> transforms and offline WSOLA tempo match), the mastering chain and `export`, markers and clip
+> names, and seeking at scale (a warm-up seek, proved equal to a replay). The plan's item 16 — this
+> documentation pass — is what added [`docs/tui-first-session.md`](docs/tui-first-session.md),
+> [`docs/capabilities.md`](docs/capabilities.md) and
+> [`docs/beta-acceptance.md`](docs/beta-acceptance.md). Each slice's decision lives in its own note
+> under [`.agents/notes/implemented/`](.agents/notes/implemented/), and each architectural one passed a
+> cross-vendor reviewer gate (archived under [`research/architecture/`](research/architecture/)).
+> The deliberate cuts and the measured limits are stated in
+> [`docs/capabilities.md`](docs/capabilities.md), not here.
 
 Architecture: a **minimal core** — clock, audio graph interpreter, session event log, context plumbing (the [minimal-core note](.agents/notes/proposed/architecture/2026-08-15-minimal-core-clock-graph-session-log.md)) — with every capability as a plugin; the product is an assembled profile. "sound-arranger" is the **clip-arranger profile** (ACID-style cut/paste; the tape techniques as inspiration). Direction locked 2026-08-15: **umbrella-first** — the platform is the goal, the phases below build it, and the clip-arranger profile is the first product ([umbrella-first note](.agents/notes/proposed/architecture/2026-08-15-umbrella-first-product-direction.md)).
 
