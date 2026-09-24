@@ -50,6 +50,15 @@ pub const HOST_API_VERSION: u32 = 1;
 /// The host registry: plugins, then ports, then parameters — validated per
 /// slot by the parser (a port name is not a plugin name).
 pub const HOST_PLUGINS: &[&str] = &["euclidean", "scale", "tone", "mixer"];
+
+/// The largest stretch ratio operand (`num` or `den`) the host will render. A tempo
+/// match lives well inside this (a 10:1 ratio is already absurd); beyond it the ratio is
+/// a typo or an attack, and the render allocates its output from it.
+pub const MAX_STRETCH_RATIO: u32 = 1_000;
+/// The longest stretch render the host will materialise, in frames — two hours at
+/// 48 kHz. Bounded because the render allocates its whole output before writing it.
+pub const MAX_STRETCH_FRAMES: u64 = 2 * 60 * 60 * 48_000;
+
 pub const HOST_PORTS: &[&str] = &[
     "triggers", "trigger", "note", "audio", "ch0", "ch1", "ch2", "ch3", "ch4", "ch5", "ch6", "ch7",
 ];
@@ -211,6 +220,23 @@ pub enum HostCommand {
     /// Load a session directory written by [`HostCommand::Save`]: the script, then
     /// its journal (a torn trailing line dropped, and reported). An action.
     Load { dir: PathBuf },
+    /// **Time-stretch a clip into new pool material.** An *action* (like `record`):
+    /// the render writes a new pool source and the logged `ArrangeOp::Stretch`
+    /// rewrites the clip's reference, so the arrangement value never gains a
+    /// playback-rate property and a replay re-derives the same value without
+    /// re-rendering. `num/den` is the ratio as a rational (`output/input`), so the
+    /// render is byte-reproducible. Refused for a looped clip, a 1:1 ratio, a region
+    /// shorter than the transform's window, and a session with no pool.
+    Stretch {
+        track: String,
+        clip: String,
+        num: u32,
+        den: u32,
+    },
+    /// Record the tempo a pool source was performed at (`source_tempo <id> <bpm>`), so
+    /// **tempo match** has a ratio to derive. State: the log carries it, a replay
+    /// rebuilds it, and it is exposed on the outcome for a shell to read.
+    SetSourceTempo { source: String, bpm: f64 },
     /// Render `frames` from the current position and write the master to a
     /// 16-bit WAV.
     Bounce { frames: usize, path: PathBuf },
@@ -252,6 +278,7 @@ impl HostCommand {
                 | HostCommand::Splice { .. }
                 | HostCommand::Group { .. }
                 | HostCommand::SessionRate { .. }
+                | HostCommand::SetSourceTempo { .. }
         )
     }
 }
@@ -298,6 +325,10 @@ pub struct HostSession {
     /// The sources the last `set_pool` resampled to the session rate (see
     /// [`HostSession::pool_conformed`]).
     pool_conformed: Vec<media::Conform>,
+    /// The tempo each pool source was performed at (`source_tempo <id> <bpm>`), which
+    /// is what **tempo match** derives its ratio from. State: the log carries it, a
+    /// replay rebuilds it, and the outcome exposes it to a shell.
+    source_tempos: std::collections::HashMap<String, f64>,
     /// track id → the arranger node mounted for it (avoids re-wiring on a rebuild).
     wired_tracks: std::collections::HashMap<String, engine::NodeId>,
     /// the arrangement value changed since last wiring (re-wire before render).
@@ -398,6 +429,7 @@ impl HostSession {
             pool_resolver: None,
             pool_dir: None,
             pool_conformed: Vec::new(),
+            source_tempos: std::collections::HashMap::new(),
             wired_tracks: std::collections::HashMap::new(),
             arrange_dirty: false,
             playing: false,
@@ -671,6 +703,150 @@ impl HostSession {
     /// Keep the finished take for the outcome (the shell reports it once).
     fn status_take(&mut self, take: &TakeReport) {
         self.last_take = Some(take.clone());
+    }
+
+    // -- time-stretch (alpha slice E2) ---------------------------------------
+
+    /// The tempo each pool source was performed at (`source_tempo <id> <bpm>`), for a
+    /// shell's tempo match.
+    pub fn source_tempos(&self) -> &std::collections::HashMap<String, f64> {
+        &self.source_tempos
+    }
+
+    /// **Time-stretch a clip into new pool material.** The render writes a new pool
+    /// source (a deterministic name, so stretching twice with the same ratio reuses
+    /// the same material instead of piling up copies), and the logged
+    /// [`media::ArrangeOp::Stretch`] then points the clip at it — one history entry,
+    /// so `undo` restores the old reference and the rendered source stays in the pool
+    /// as working material.
+    ///
+    /// The ratio is `output/input` as a rational. A 1:1 ratio is refused (it would
+    /// copy, not stretch), as are a looped clip and a region shorter than the
+    /// transform's window (the WSOLA core explains why: nothing to overlap).
+    ///
+    /// The render allocates its output, so both ends are **bounded** (see
+    /// [`MAX_STRETCH_RATIO`] / [`MAX_STRETCH_FRAMES`]): an unbounded `num` is a typo or
+    /// an attack, and the process must refuse it rather than die in the allocator.
+    pub fn stretch(&mut self, track: &str, clip: &str, num: u32, den: u32) -> Result<(), String> {
+        if num == 0 || den == 0 {
+            return Err(format!("stretch ratio must be non-zero (got {num}/{den})"));
+        }
+        if num == den {
+            return Err("a 1:1 stretch would copy the material — nothing to do".into());
+        }
+        if num > MAX_STRETCH_RATIO || den > MAX_STRETCH_RATIO {
+            return Err(format!(
+                "stretch ratio {num}/{den} is beyond the host's limit of \
+                 {MAX_STRETCH_RATIO}:1 (a tempo match lives well inside it)"
+            ));
+        }
+        let Some(dir) = self.pool_dir.clone() else {
+            return Err("stretch requires a pool (set_pool first)".into());
+        };
+        let timeline = self.arrangement()?;
+        let c = timeline
+            .tracks
+            .iter()
+            .find(|t| t.id == track)
+            .and_then(|t| t.clips.iter().find(|c| c.id == clip))
+            .cloned()
+            .ok_or_else(|| format!("no clip '{clip}' on track '{track}'"))?;
+        if c.loop_len.is_some() {
+            return Err("cannot stretch a looped clip (loop phase is not representable)".into());
+        }
+        let resolver = self
+            .pool_resolver
+            .clone()
+            .ok_or("stretch requires a pool (set_pool first)")?;
+        let path =
+            resolver(&c.source).ok_or_else(|| format!("pool source '{}' is missing", c.source))?;
+
+        // Read the clip's region (channel 0: a pool source is mono; a split import
+        // keeps each channel its own source). A clip's `src_len` is not checked against
+        // the file, so read at most what the file has: a declared length longer than the
+        // material must not size the allocation (the read is truncated below anyway).
+        let mut reader = media::wav::WavReader::open(&path)
+            .map_err(|e| format!("stretch {}: {e}", path.display()))?
+            .with_channel(0)?;
+        reader.seek_frames(c.src_start)?;
+        let want = c
+            .src_len
+            .min(reader.total_frames().saturating_sub(c.src_start)) as usize;
+        let mut region = Vec::new();
+        region.try_reserve_exact(want).map_err(|e| {
+            format!(
+                "stretch: cannot read {want} frames of '{}' into memory: {e}",
+                c.source
+            )
+        })?;
+        region.resize(want, 0.0);
+        let read = reader.read_into(&mut region);
+        region.truncate(read);
+        if region.is_empty() {
+            return Err(format!(
+                "clip '{clip}' reads no frames from '{}' (src_start {})",
+                c.source, c.src_start
+            ));
+        }
+
+        let mut stretcher = media::Stretch::for_len(num, den, region.len() as u64)?;
+        if (region.len() as u64) < stretcher.min_region_frames() {
+            return Err(format!(
+                "the clip's region is {} frames — shorter than the stretch window ({}); \
+                 it is too short to stretch (a stretch needs overlap to work with)",
+                region.len(),
+                stretcher.min_region_frames()
+            ));
+        }
+        // The output is bounded before it is allocated: the ratio cap above fixes
+        // `expected <= region.len() * MAX_STRETCH_RATIO`, and the frame cap refuses a
+        // render longer than the host will materialise.
+        let expected = (region.len() as u64).saturating_mul(num as u64) / den as u64;
+        if expected > MAX_STRETCH_FRAMES {
+            return Err(format!(
+                "the stretch would render {expected} frames — beyond the host's limit of \
+                 {MAX_STRETCH_FRAMES} (two hours at 48 kHz)"
+            ));
+        }
+        let mut rendered = Vec::new();
+        rendered
+            .try_reserve_exact(expected as usize + 4_096)
+            .map_err(|e| format!("stretch: cannot allocate {expected} frames of output: {e}"))?;
+        stretcher.process(&region, &mut rendered);
+        stretcher.flush(&mut rendered);
+        if rendered.is_empty() {
+            return Err("the stretch produced no frames".into());
+        }
+
+        // Deterministic id: the same **region** at the same ratio is the same source.
+        // The region is part of the id, not just the source: two clips of one source at
+        // different offsets render *different* material, and an id keyed on the source
+        // alone would make the second render silently overwrite the first clip's — a
+        // bug this key exists to prevent (`a_stretch_id_keys_on_the_region_not_the_source`).
+        // The region is the *actual* read (`region.len()`), not the clip's declared
+        // `src_len`: the content is what the id must key on, and a clip may declare more
+        // material than its source holds.
+        let id = format!(
+            "{}.stretch.{}_{}.{num}_{den}",
+            c.source,
+            c.src_start,
+            region.len()
+        );
+        let pool = media::Pool::open(&dir)?;
+        let frames = pool.write_source(&id, &rendered, self.engine.clock.sample_rate)?;
+
+        // The op is the state (undoable, replayable); the render was the action.
+        self.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::Stretch {
+                track: track.to_string(),
+                clip: clip.to_string(),
+                source: id,
+                src_len: frames,
+                num,
+                den,
+            },
+            at_frame: None,
+        })
     }
 
     // -- persistence: a session is a directory -------------------------------
@@ -1044,6 +1220,27 @@ impl HostSession {
                     .splices
                     .push(intent);
                 self.media_commands += 1;
+                Ok(())
+            }
+            HostCommand::Stretch {
+                track,
+                clip,
+                num,
+                den,
+            } => self.stretch(track, clip, *num, *den),
+            HostCommand::SetSourceTempo { source, bpm } => {
+                if !bpm.is_finite() || *bpm <= 0.0 {
+                    return Err(format!(
+                        "source_tempo must be finite and positive, got {bpm}"
+                    ));
+                }
+                if !self.source_tempos.contains_key(source) && self.source_tempos.len() >= 1_000 {
+                    return Err("too many source tempos recorded (max 1000)".into());
+                }
+                // The command is **state**, so the history (and the save, and a replay
+                // on seek) already carries it — inserting here is enough: the rebuild
+                // reapplies this arm.
+                self.source_tempos.insert(source.clone(), *bpm);
                 Ok(())
             }
             HostCommand::Record { take_id } => self.record(take_id),
@@ -1913,6 +2110,9 @@ pub fn format_command(cmd: &HostCommand, session_dir: Option<&std::path::Path>) 
             out.push_str("\ngroup end");
             out
         }
+        HostCommand::SetSourceTempo { source, bpm } => {
+            format!("source_tempo {source} {}", fmt_f64(*bpm))
+        }
         // Actions (and the live transport) are not part of a log.
         HostCommand::TransportPlay
         | HostCommand::TransportStop
@@ -1922,6 +2122,7 @@ pub fn format_command(cmd: &HostCommand, session_dir: Option<&std::path::Path>) 
         | HostCommand::Record { .. }
         | HostCommand::RecordStop
         | HostCommand::Bounce { .. }
+        | HostCommand::Stretch { .. }
         | HostCommand::Save { .. }
         | HostCommand::Load { .. } => return None,
     })
@@ -1937,6 +2138,14 @@ pub fn format_arrange(op: &media::ArrangeOp) -> String {
         Op::RenameTrack { track, to } => format!("rename_track {track} {to}"),
         Op::MoveTrack { track, index } => format!("move_track {track} {index}"),
         Op::Reverse { track, clip } => format!("reverse {track} {clip}"),
+        Op::Stretch {
+            track,
+            clip,
+            source,
+            src_len,
+            num,
+            den,
+        } => format!("stretch {track} {clip} {source} {src_len} {num} {den}"),
         Op::AddClip { track, clip } => {
             let mut line = format!(
                 "add_clip {track} {} {} {} {} {} {} {} {}",
@@ -2012,6 +2221,12 @@ pub fn format_arrange(op: &media::ArrangeOp) -> String {
 /// `f32` in the shortest form that parses back to the same bits — the log's values
 /// must survive a save/load round trip exactly.
 fn fmt_f32(value: f32) -> String {
+    format!("{value:?}")
+}
+
+/// `f64` in the shortest form that parses back to the same value (a tempo is a
+/// measurement, and the log must not round it differently than the session did).
+fn fmt_f64(value: f64) -> String {
     format!("{value:?}")
 }
 
@@ -2338,6 +2553,31 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
                 let path = PathBuf::from(word(&words, 2, at)?);
                 commands.push(HostCommand::Bounce { frames, path });
             }
+            "stretch" => {
+                exact(&words, 5, at, "stretch")?;
+                let track = word(&words, 1, at)?.to_string();
+                let clip = word(&words, 2, at)?.to_string();
+                let num = word(&words, 3, at)?
+                    .parse::<u32>()
+                    .map_err(|_| format!("line {at}: stretch num must be a whole number"))?;
+                let den = word(&words, 4, at)?
+                    .parse::<u32>()
+                    .map_err(|_| format!("line {at}: stretch den must be a whole number"))?;
+                commands.push(HostCommand::Stretch {
+                    track,
+                    clip,
+                    num,
+                    den,
+                });
+            }
+            "source_tempo" => {
+                exact(&words, 3, at, "source_tempo")?;
+                let source = word(&words, 1, at)?.to_string();
+                let bpm = word(&words, 2, at)?
+                    .parse::<f64>()
+                    .map_err(|_| format!("line {at}: source_tempo needs a bpm"))?;
+                commands.push(HostCommand::SetSourceTempo { source, bpm });
+            }
             "pool" => {
                 exact(&words, 2, at, "pool")?;
                 let dir = PathBuf::from(word(&words, 1, at)?);
@@ -2438,6 +2678,9 @@ pub fn parse_arrange_line(line: &str) -> Result<(media::ArrangeOp, Option<u64>),
 /// arrange rename_track t0 lead @0
 /// arrange move_track t0 1 @0
 /// arrange reverse t0 c0 @0
+/// arrange stretch t0 c0 c0.stretch.3_2 6000 3 2 @0
+/// stretch t0 c0 3 2                 # the render form: write the material, then log
+/// source_tempo jam.ch0 90
 /// arrange add_clip t0 c0 s1 0 4000 0 0 0 1.0 [loop_len] @0
 /// arrange razor_split t0 c0 cL cR 3000 @0
 /// arrange trim t0 c0 start 500 @0
@@ -2554,6 +2797,23 @@ fn parse_arrange(words: &[&str], at: usize, snap: Option<u64>) -> Result<media::
             Ok(media::ArrangeOp::Reverse {
                 track: s(1)?,
                 clip: s(2)?,
+            })
+        }
+        "stretch" => {
+            // The **logged** form: it names the materialised source and its length, so
+            // a replay reproduces the clip's reference without re-rendering. A script
+            // usually asks for the render instead (`stretch <track> <clip> <num> <den>`
+            // as a command); this op form is what the log and a saved session carry.
+            arity(7)?;
+            Ok(media::ArrangeOp::Stretch {
+                track: s(1)?,
+                clip: s(2)?,
+                source: s(3)?,
+                src_len: u(4)?,
+                num: u32::try_from(u(5)?)
+                    .map_err(|_| format!("line {at}: arrange stretch num does not fit a u32"))?,
+                den: u32::try_from(u(6)?)
+                    .map_err(|_| format!("line {at}: arrange stretch den does not fit a u32"))?,
             })
         }
         "add_clip" => {
@@ -3743,6 +4003,331 @@ mod tests {
 
     /// The session directory is **movable**: the script's pool path is relative, so
     /// renaming the directory keeps the session playable (the plan's path trap).
+    /// **The stretch round trip**: a clip's material is rendered into a new pool
+    /// source at a rational ratio, the logged op points the clip at it, the pitch is
+    /// preserved while the length grows, one undo restores the old reference, and the
+    /// deterministic id means stretching twice reuses the same material instead of
+    /// piling up copies.
+    #[test]
+    fn stretching_a_clip_materialises_a_pool_source() {
+        let root = std::env::temp_dir().join(format!("host-stretch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = HostSession::new();
+        s.execute(&HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 2.0)],
+            at_frame: Some(0),
+        })
+        .expect("mixer");
+        s.execute(&HostCommand::Pool { dir: pool.clone() })
+            .expect("pool");
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::AddTrack { track: "t0".into() },
+            at_frame: None,
+        })
+        .expect("track");
+        s.execute(&HostCommand::Arrange {
+            op: add_clip("c0", 0),
+            at_frame: None,
+        })
+        .expect("clip");
+
+        // A source tempo is state: the log carries it, the outcome exposes it.
+        s.execute(&HostCommand::SetSourceTempo {
+            source: "s1".into(),
+            bpm: 90.0,
+        })
+        .expect("source tempo");
+        assert_eq!(s.source_tempos().get("s1"), Some(&90.0));
+
+        // Refusals first: a 1:1 ratio copies rather than stretches, a zero is not a
+        // ratio, and an unbounded one is refused *before* the allocator sees it (the
+        // gate executed `stretch t0 c0 4294967295 1` and the process died with an
+        // 824 TB allocation failure — a logged line must not be able to do that).
+        assert!(s.stretch("t0", "c0", 1, 1).is_err(), "1:1 is refused");
+        assert!(
+            s.stretch("t0", "c0", 0, 1).is_err(),
+            "a zero ratio is refused"
+        );
+        assert!(
+            s.stretch("t0", "c0", u32::MAX, 1).is_err(),
+            "a ratio beyond the host's limit is refused, not attempted"
+        );
+        assert!(
+            s.stretch("t0", "c0", 1, u32::MAX).is_err(),
+            "and so is an absurd denominator"
+        );
+
+        let before = s.arrangement().expect("arrangement").tracks[0].clips[0].clone();
+        s.stretch("t0", "c0", 3, 2).expect("stretch");
+        let after = s.arrangement().expect("arrangement").tracks[0].clips[0].clone();
+        assert_eq!(
+            after.source, "s1.stretch.0_4800.3_2",
+            "the clip points at the render"
+        );
+        assert_eq!(after.src_start, 0);
+        assert_eq!(
+            after.at_frame, before.at_frame,
+            "its place in time is untouched"
+        );
+        assert!(
+            after.src_len > before.src_len,
+            "the material grew: {} → {}",
+            before.src_len,
+            after.src_len
+        );
+
+        // The material is in the pool, complete, with its peaks.
+        let index = media::Pool::open(&pool)
+            .expect("pool")
+            .list()
+            .expect("list");
+        let rendered = index
+            .sources
+            .iter()
+            .find(|source| source.id == "s1.stretch.0_4800.3_2")
+            .expect("the render is a pool source");
+        assert_eq!(
+            rendered.frames, after.src_len,
+            "the log's length is the file's"
+        );
+        assert!(!rendered.peaks_missing && rendered.finalized);
+        assert_eq!(rendered.sample_rate, 48_000);
+
+        // **Pitch is preserved**: the zero-crossing *rate* is the original's, while the
+        // duration grew (a resample would have raised both together).
+        let crossings = |path: &std::path::Path| -> (usize, u64) {
+            let mut r = media::WavReader::open(path)
+                .expect("wav")
+                .with_channel(0)
+                .expect("mono");
+            let frames = r.total_frames();
+            let mut buf = vec![0.0f32; frames as usize];
+            let n = r.read_into(&mut buf);
+            buf.truncate(n);
+            let c = buf
+                .windows(2)
+                .filter(|w| (w[0] > 0.0) != (w[1] > 0.0))
+                .count();
+            (c, frames)
+        };
+        let (c0, f0) = crossings(&pool.join("s1.wav"));
+        let (c1, f1) = crossings(&pool.join("s1.stretch.0_4800.3_2.wav"));
+        let rate = |c: usize, f: u64| c as f64 / f as f64;
+        assert!(
+            (rate(c1, f1) - rate(c0, f0)).abs() < 0.05 * rate(c0, f0),
+            "the pitch must be preserved: {} → {} crossings/frame",
+            rate(c0, f0),
+            rate(c1, f1)
+        );
+        // The *clip's region* is what was stretched (the fixture's clip reads 4 800
+        // frames of the 48 000-frame tone), and the output is window-aligned.
+        let expect = (before.src_len as f64 * 1.5) as u64;
+        assert!(
+            (f1 as f64 - expect as f64).abs() < 2.5 * 1024.0,
+            "the length must follow the ratio: {} frames → {f1}, expected ~{expect}",
+            before.src_len
+        );
+        let _ = f0;
+
+        // One undo restores the old reference (the material is working material and
+        // stays in the pool).
+        s.execute(&HostCommand::Undo).expect("undo");
+        let undone = s.arrangement().expect("arrangement").tracks[0].clips[0].clone();
+        assert_eq!(undone.source, "s1");
+        assert_eq!(undone.src_len, before.src_len);
+
+        // The same material at the same ratio reuses the same source id (the id is
+        // deterministic), so stretching, undoing and stretching again does not pile up
+        // copies. (Stretching the *already stretched* clip renders new material — that
+        // is a different input, and its own deterministic id says so.)
+        s.stretch("t0", "c0", 3, 2).expect("stretch again");
+        assert_eq!(
+            s.arrangement().expect("arrangement").tracks[0].clips[0].source,
+            "s1.stretch.0_4800.3_2"
+        );
+        let copies = media::Pool::open(&pool)
+            .expect("pool")
+            .list()
+            .expect("list")
+            .sources
+            .iter()
+            .filter(|source| source.id == "s1.stretch.0_4800.3_2")
+            .count();
+        assert_eq!(copies, 1, "one render, reused");
+
+        // `source_tempo` is **state**: it survives a save/load like the rest of the log
+        // (the saved script carries the line, and replaying it rebuilds the map).
+        let dir = root.join("session");
+        s.execute(&HostCommand::Save { dir: dir.clone() })
+            .expect("save");
+        let mut reloaded = HostSession::new();
+        reloaded.execute(&HostCommand::Load { dir }).expect("load");
+        assert_eq!(
+            reloaded.source_tempos().get("s1"),
+            Some(&90.0),
+            "the recorded tempo is part of the document"
+        );
+        assert_eq!(
+            reloaded.arrangement().expect("arrangement").tracks[0].clips[0].source,
+            "s1.stretch.0_4800.3_2",
+            "and the stretch replays as a reference, not a re-render"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A stretch id keys on the region, not just the source.** Two clips of one pool
+    /// source at different offsets are *different material*: an id of
+    /// `{source}.stretch.{num}_{den}` makes the second render silently overwrite the
+    /// first clip's file, and the first clip goes quiet (reproduced before the fix: the
+    /// master dropped from a 0.354 peak to silence). The fixture is half tone, half
+    /// silence so the two renders are distinguishable by content.
+    #[test]
+    fn a_stretch_id_keys_on_the_region_not_the_source() {
+        let root = std::env::temp_dir().join(format!("host-stretch-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+
+        let path = pool.join("s2.wav");
+        let mut w = media::WavWriter::create(&path, 48_000, 1).expect("wav writer");
+        let samples: Vec<f32> = (0..9_600)
+            .map(|i| {
+                if i < 4_800 {
+                    (i as f32 * 0.05).sin() * 0.5
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        w.write(&samples).expect("write fixture");
+        w.finalize().expect("finalize fixture");
+
+        let mut s = HostSession::new();
+        s.execute(&HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 2.0)],
+            at_frame: Some(0),
+        })
+        .expect("mixer");
+        s.execute(&HostCommand::Pool { dir: pool.clone() })
+            .expect("pool");
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::AddTrack { track: "t0".into() },
+            at_frame: None,
+        })
+        .expect("track");
+        for (id, at, src_start) in [("loud", 0u64, 0u64), ("quiet", 9_600, 4_800)] {
+            s.execute(&HostCommand::Arrange {
+                op: media::ArrangeOp::AddClip {
+                    track: "t0".into(),
+                    clip: media::Clip {
+                        reversed: false,
+                        id: id.into(),
+                        source: "s2".into(),
+                        src_start,
+                        src_len: 4_800,
+                        at_frame: at,
+                        fade_in: 0,
+                        fade_out: 0,
+                        gain: 1.0,
+                        loop_len: None,
+                    },
+                },
+                at_frame: None,
+            })
+            .expect("clip");
+        }
+
+        s.stretch("t0", "loud", 3, 2)
+            .expect("stretch the loud clip");
+        s.stretch("t0", "quiet", 3, 2)
+            .expect("stretch the quiet clip");
+
+        let timeline = s.arrangement().expect("arrangement");
+        let source_of = |id: &str| {
+            timeline.tracks[0]
+                .clips
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| c.source.clone())
+                .expect("clip")
+        };
+        assert_eq!(source_of("loud"), "s2.stretch.0_4800.3_2");
+        assert_eq!(source_of("quiet"), "s2.stretch.4800_4800.3_2");
+
+        let peak = |path: &std::path::Path| -> f32 {
+            let mut r = media::WavReader::open(path).expect("wav");
+            let mut buf = vec![0.0f32; r.total_frames() as usize];
+            let n = r.read_into(&mut buf);
+            buf.truncate(n);
+            buf.iter().fold(0.0f32, |m, x| m.max(x.abs()))
+        };
+        assert!(
+            peak(&pool.join("s2.stretch.0_4800.3_2.wav")) > 0.1,
+            "the loud clip's render must still be its own material"
+        );
+        assert_eq!(
+            peak(&pool.join("s2.stretch.4800_4800.3_2.wav")),
+            0.0,
+            "the quiet clip's render is silence — and, crucially, a *different* file"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A region the clip only *declares* is not allocated.** `src_len` is the clip's
+    /// window, not a fact about the file (`validate_clip` bounds it at `i64::MAX`, not at
+    /// the source's length), so a clip claiming ten billion frames must read what the
+    /// source has and stretch *that* — the id keys on the material actually rendered, so
+    /// two clips whose declared windows both run off the end of the same file share one
+    /// render. (The gate found the neighbouring hazard: an unbounded *ratio* reached the
+    /// allocator and killed the process; this is the same class of bug on the input side.)
+    #[test]
+    fn a_declared_region_longer_than_the_source_is_read_to_the_end() {
+        let (mut s, pool) = session_with_clip("stretch-region");
+        let mut long = match add_clip("c9", 9_600) {
+            media::ArrangeOp::AddClip { clip, .. } => clip,
+            other => panic!("add_clip built {other:?}"),
+        };
+        long.src_len = 10_000_000_000;
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: long,
+            },
+            at_frame: None,
+        })
+        .expect("a clip may declare more than the file holds");
+
+        s.stretch("t0", "c9", 3, 2)
+            .expect("read to the end, then stretch");
+        let c9 = s.arrangement().expect("arrangement").tracks[0]
+            .clips
+            .iter()
+            .find(|c| c.id == "c9")
+            .cloned()
+            .expect("c9");
+        assert_eq!(
+            c9.source, "s1.stretch.0_48000.3_2",
+            "the id is the material that was rendered (48 000 frames), not the declared length"
+        );
+        assert!(
+            media::Pool::open(&pool)
+                .expect("pool")
+                .path_for(&c9.source)
+                .is_some(),
+            "and the render is really in the pool"
+        );
+
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
     /// **A rename and a reorder survive the round trip.** Found by the slice's gate:
     /// the note claimed this end-to-end but only the format/parse round-trip was
     /// committed — which never *applies* the ops. This saves a session with

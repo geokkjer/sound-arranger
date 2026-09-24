@@ -81,6 +81,24 @@ pub fn encode_op(i: &mut Interner, op: &ArrangeOp) -> (&'static str, Vec<(&'stat
                 ("index", Value::U64(*index as u64)),
             ],
         ),
+        ArrangeOp::Stretch {
+            track,
+            clip,
+            source,
+            src_len,
+            num,
+            den,
+        } => (
+            "Stretch",
+            vec![
+                ("track", Value::Str(i.intern(track))),
+                ("clip", Value::Str(i.intern(clip))),
+                ("source", Value::Str(i.intern(source))),
+                ("src_len", Value::U64(*src_len)),
+                ("num", Value::U32(*num)),
+                ("den", Value::U32(*den)),
+            ],
+        ),
         ArrangeOp::Reverse { track, clip } => (
             "Reverse",
             vec![
@@ -265,6 +283,16 @@ fn u64_field(fields: &[(&'static str, Value)], name: &str) -> Result<u64, String
     v_u64(field(fields, name)?).ok_or_else(|| format!("field '{name}' must be an integer"))
 }
 
+fn u32_field(fields: &[(&'static str, Value)], name: &str) -> Result<u32, String> {
+    match field(fields, name)? {
+        Value::U32(n) => Ok(*n),
+        Value::U64(n) => {
+            u32::try_from(*n).map_err(|_| format!("field '{name}' does not fit a u32"))
+        }
+        other => Err(format!("field '{name}' must be a U32, got {other:?}")),
+    }
+}
+
 fn f32_field(fields: &[(&'static str, Value)], name: &str) -> Result<f32, String> {
     v_f32(field(fields, name)?).ok_or_else(|| format!("field '{name}' must be an F32"))
 }
@@ -294,6 +322,14 @@ pub fn decode_op(op: &str, fields: &[(&'static str, Value)]) -> Result<ArrangeOp
         "Reverse" => Ok(ArrangeOp::Reverse {
             track: str_field(fields, "track")?,
             clip: str_field(fields, "clip")?,
+        }),
+        "Stretch" => Ok(ArrangeOp::Stretch {
+            track: str_field(fields, "track")?,
+            clip: str_field(fields, "clip")?,
+            source: str_field(fields, "source")?,
+            src_len: u64_field(fields, "src_len")?,
+            num: u32_field(fields, "num")?,
+            den: u32_field(fields, "den")?,
         }),
         "AddClip" => {
             let src_len = u64_field(fields, "src_len")?;
@@ -415,6 +451,7 @@ pub const ALL_OPS: &[&str] = &[
     "RenameTrack",
     "MoveTrack",
     "Reverse",
+    "Stretch",
     "AddClip",
     "RazorSplit",
     "Trim",
@@ -590,6 +627,18 @@ mod tests {
             clip: "c0".into(),
             times: 4,
             prefix: "slice".into(),
+        });
+        roundtrip(&ArrangeOp::Reverse {
+            track: "t0".into(),
+            clip: "c0".into(),
+        });
+        roundtrip(&ArrangeOp::Stretch {
+            track: "t0".into(),
+            clip: "c0".into(),
+            source: "c0.stretch.3_2".into(),
+            src_len: 6_000,
+            num: 3,
+            den: 2,
         });
     }
 

@@ -147,9 +147,28 @@ pub struct Pool {
 
 /// Whether `id` is a plain file stem (no path separators, no `..`, non-empty) —
 /// a clip id is user-craftable, so it must not escape the pool dir (kimi pool
-/// should-fix 5).
+/// should-fix 5). Also refuses **whitespace**: a pool source id has to be nameable in
+/// the space-separated `host v1` log, so an id with a space could exist on disk but
+/// never be named back (the panel marks such a stem; nothing can address it).
 fn valid_id(id: &str) -> bool {
-    !id.is_empty() && !id.contains('/') && !id.contains('\\') && id != "." && id != ".."
+    !id.is_empty()
+        && !id.contains('/')
+        && !id.contains('\\')
+        && !id.chars().any(char::is_whitespace)
+        && id != "."
+        && id != ".."
+}
+
+/// The pool id for an **imported** file's stem. A file may be called `My Take.wav`, but a
+/// pool id is also a clip source id and the `host v1` log splits on whitespace — a stem
+/// the log cannot name is not a usable id, so whitespace becomes `_` rather than failing
+/// the import (`My Take.wav` → `My_Take`). Path separators and the special stems are
+/// still refused by [`valid_id`] instead of mangled: a mangled path would be a surprise,
+/// a mangled space is not.
+fn sanitize_stem(stem: &str) -> String {
+    stem.chars()
+        .map(|c| if c.is_whitespace() { '_' } else { c })
+        .collect()
 }
 
 impl Pool {
@@ -253,6 +272,62 @@ impl Pool {
         Ok(report)
     }
 
+    /// Write a **rendered** source into the pool: `samples` become `{id}.wav` (mono
+    /// float at `sample_rate`) with its `.peaks` derived, and the frames written are
+    /// returned. This is the seam an offline transform uses to materialise new
+    /// material — the time-stretch (and, later, any render-to-pool) — so the pool's
+    /// conventions (float on disk, mono, derived peaks, a temporary file then a rename
+    /// so a crash cannot leave a torn source) stay in one place instead of in the
+    /// caller.
+    ///
+    /// The id is validated: it becomes a clip source id, so it must be a plain,
+    /// whitespace-free name inside the pool (the `host v1` format has to be able to
+    /// name it back).
+    pub fn write_source(&self, id: &str, samples: &[f32], sample_rate: u32) -> Result<u64, String> {
+        if !valid_id(id) {
+            return Err(format!("'{id}' is not usable as a pool id"));
+        }
+        if sample_rate == 0 {
+            return Err("a pool source needs a non-zero sample rate".to_string());
+        }
+        if samples.is_empty() {
+            return Err("refusing to write an empty source".to_string());
+        }
+        let dest = self.dir.join(format!("{id}.wav"));
+        let tmp = dest.with_extension("converting");
+        let frames = {
+            let mut writer = WavWriter::create_float(&tmp, sample_rate, 1)?;
+            writer.write(samples)?;
+            let frames = writer.frames_written();
+            writer.finalize()?;
+            frames
+        };
+        // Replace the destination if it is already there. On POSIX the rename does that
+        // atomically; on Windows `rename` refuses an existing destination, and replacing
+        // is *intended* here (the id is deterministic — the same render is the same
+        // source), so fall back to remove-then-rename rather than failing the gesture.
+        if let Err(e) = fs::rename(&tmp, &dest) {
+            // On Windows the rename refuses an existing destination, and replacing is
+            // *intended* here (the id is deterministic — the same render is the same
+            // source), so fall back to remove-then-rename rather than failing the gesture.
+            let retried = fs::remove_file(&dest).is_ok() && fs::rename(&tmp, &dest).is_ok();
+            if !retried {
+                let _ = fs::remove_file(&tmp);
+                return Err(format!("write {}: {e}", dest.display()));
+            }
+        }
+        if let Err(e) = Self::rebuild_peaks(&dest, &dest.with_extension("peaks")) {
+            // The audio is in place; only the sidecar failed. Say which stage, because the
+            // source is usable-but-unpeaked and the caller's message must not imply a
+            // failed render.
+            return Err(format!(
+                "{} was written, but its peaks could not be built: {e}",
+                dest.display()
+            ));
+        }
+        Ok(frames)
+    }
+
     /// Rebuild a `.peaks` sidecar from a float-WAV, streaming it in chunks.
     fn rebuild_peaks(wav: &Path, peaks: &Path) -> Result<(), String> {
         let mut reader = WavReader::open(wav)
@@ -276,6 +351,10 @@ impl Pool {
     /// foreign rate is resampled once, here, and gets a `.peaks` sidecar.
     /// Importing over an existing id replaces it.
     ///
+    /// The id is the stem **sanitized** (whitespace → `_`, see [`sanitize_stem`]) so a
+    /// file called `My Take.wav` imports as `My_Take` — a stem the `host v1` log can
+    /// actually name back — and the caller reads the id from [`Import::id`].
+    ///
     /// A **multi-channel** file is split at the boundary: one mono source per
     /// channel, `{id}.ch0`, `{id}.ch1`, … — the naming the capture path already
     /// writes — so a clip is always a straight mono read and the mixer (not the
@@ -290,11 +369,11 @@ impl Pool {
         if !src.is_file() {
             return Err(format!("{} is not a file", src.display()));
         }
-        let id = src
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .ok_or_else(|| format!("{} has no usable file stem", src.display()))?
-            .to_string();
+        let id = sanitize_stem(
+            src.file_stem()
+                .and_then(|stem| stem.to_str())
+                .ok_or_else(|| format!("{} has no usable file stem", src.display()))?,
+        );
         // A stem is also a clip id, so it must stay a plain name inside the pool.
         if !valid_id(&id) {
             return Err(format!("'{id}' is not usable as a pool id"));

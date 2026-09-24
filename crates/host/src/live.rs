@@ -118,6 +118,10 @@ pub struct HostOutcome {
     /// The arrangement value; `Err` if the snapshot errors (a poisoned timeline)
     /// — never a silent empty value.
     pub arrangement: Result<media::Timeline, String>,
+    /// The tempo each pool source was performed at (`source_tempo <id> <bpm>`), sorted
+    /// by id so a shell can cache it deterministically — what tempo match derives its
+    /// ratio from.
+    pub source_tempos: Vec<(String, f64)>,
     pub pool_sources: Option<Vec<media::PoolSource>>,
     /// Sources the pool pass resampled to the session rate while adopting the
     /// pool (`set_pool`); empty when the pool already fitted.
@@ -467,6 +471,15 @@ fn build_outcome(session: &HostSession) -> HostOutcome {
         event_count: session.event_count(),
         media_commands: session.media_command_count(),
         arrangement: session.arrangement(),
+        source_tempos: {
+            let mut tempos: Vec<(String, f64)> = session
+                .source_tempos()
+                .iter()
+                .map(|(id, bpm)| (id.clone(), *bpm))
+                .collect();
+            tempos.sort_by(|a, b| a.0.cmp(&b.0));
+            tempos
+        },
         pool_sources: session.pool_sources(),
         pool_conformed: session.pool_conformed().to_vec(),
         mixer_channels: session.mixer_channels(),

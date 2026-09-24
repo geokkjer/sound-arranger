@@ -202,6 +202,27 @@ pub enum ArrangeOp {
         times: u32,
         prefix: Id,
     },
+    /// Point a clip at **time-stretched material**: an offline render (the host's
+    /// `stretch` command) writes a new pool source, and this op rewrites the clip's
+    /// reference — `src_start` 0, `src_len` the frames actually written — so the
+    /// arrangement gains no playback-rate property and the one-frame-domain rule
+    /// survives: the arranger still reads a straight region of an immutable source.
+    ///
+    /// The ratio travels **with** the op (a rational, verbatim) because it is what was
+    /// asked for: the source id and length record what happened, the ratio records the
+    /// intent, and a replay reproduces the same value without re-rendering. Fades are
+    /// capped to the new length, and a *looped* clip is refused (the loop phase of a
+    /// stretched read is not representable — the same reason reverse refuses one).
+    Stretch {
+        track: Id,
+        clip: Id,
+        /// The new pool source (the rendered material).
+        source: Id,
+        /// The frames that source actually holds (the render's own count).
+        src_len: Frame,
+        num: u32,
+        den: u32,
+    },
 }
 
 /// `base + delta` with sign handling; `None` when the result is negative or
@@ -682,6 +703,43 @@ impl Timeline {
                 self.sort_track(ti);
                 Ok(())
             }
+            ArrangeOp::Stretch {
+                track,
+                clip,
+                source,
+                src_len,
+                num,
+                den,
+            } => {
+                if *num == 0 || *den == 0 {
+                    return Err(format!("stretch ratio must be non-zero (got {num}/{den})"));
+                }
+                if *src_len == 0 {
+                    return Err("a stretch must point the clip at a non-empty source".into());
+                }
+                let (ti, ci) = self
+                    .locate(track, clip)
+                    .ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
+                let c = self.tracks[ti].clips[ci].clone();
+                if c.loop_len.is_some() {
+                    return Err(
+                        "cannot stretch a looped clip (loop phase is not representable)".into(),
+                    );
+                }
+                let mut n = c;
+                n.source = source.clone();
+                n.src_start = 0;
+                n.src_len = *src_len;
+                n.loop_len = None;
+                // The clip's fades were legal for the old length; the new one may be
+                // shorter, so cap them (the same rule the clipboard's micro-fades and
+                // trim-to-content follow).
+                n.fade_in = n.fade_in.min(n.src_len);
+                n.fade_out = n.fade_out.min(n.src_len.saturating_sub(n.fade_in));
+                validate_clip(&n).map_err(|e| format!("stretch: {e}"))?;
+                self.tracks[ti].clips[ci] = n;
+                Ok(())
+            }
         }
     }
 }
@@ -907,6 +965,94 @@ mod tests {
             })
             .is_err(),
             "looping a reversed clip is refused"
+        );
+    }
+
+    /// **A stretch points the clip at new material** and leaves the one-frame-domain
+    /// rule intact: the clip still reads a straight region (from `src_start` 0) of an
+    /// immutable source, and the ratio it was rendered at travels with the op as a
+    /// rational. Fades are capped to the new length, and the cases it cannot represent
+    /// (a looped clip, a zero ratio or length) are refused.
+    #[test]
+    fn a_stretch_rewrites_the_reference_and_caps_fades() {
+        let mut t = two_tracks();
+        let mut c = clip("c0", 0, 4_000);
+        c.fade_in = 1_000;
+        c.fade_out = 3_000; // exactly the clip's length: legal, and a stretch shrinks it
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: c.clone(),
+            })
+            .unwrap();
+
+        let stretched = t
+            .apply(&ArrangeOp::Stretch {
+                track: "t0".into(),
+                clip: "c0".into(),
+                source: "c0.stretch.1_2".into(),
+                src_len: 2_000,
+                num: 1,
+                den: 2,
+            })
+            .unwrap();
+        let n = &stretched.tracks[0].clips[0];
+        assert_eq!(n.source, "c0.stretch.1_2", "the clip points at the render");
+        assert_eq!((n.src_start, n.src_len), (0, 2_000));
+        assert_eq!(
+            (n.at_frame, n.gain),
+            (c.at_frame, c.gain),
+            "place and gain stay"
+        );
+        assert_eq!(
+            (n.fade_in, n.fade_out),
+            (1_000, 1_000),
+            "fades capped to fit"
+        );
+        assert_eq!(stretched.tracks[0].clips[0].source_frame_at(0), 0);
+
+        // The refusals: a zero ratio or length, and a looped clip (whose loop phase a
+        // stretched read cannot represent).
+        for (source, src_len, num, den) in [
+            ("s", 2_000u64, 0u32, 2u32),
+            ("s", 2_000, 1, 0),
+            ("s", 0, 1, 2),
+        ] {
+            assert!(
+                stretched
+                    .apply(&ArrangeOp::Stretch {
+                        track: "t0".into(),
+                        clip: "c0".into(),
+                        source: source.into(),
+                        src_len,
+                        num,
+                        den,
+                    })
+                    .is_err(),
+                "stretch {num}/{den} len {src_len} must be refused"
+            );
+        }
+        let mut looped = two_tracks();
+        let mut lc = clip("c0", 0, 4_000);
+        lc.loop_len = Some(1_000);
+        looped = looped
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: lc,
+            })
+            .unwrap();
+        assert!(
+            looped
+                .apply(&ArrangeOp::Stretch {
+                    track: "t0".into(),
+                    clip: "c0".into(),
+                    source: "s".into(),
+                    src_len: 2_000,
+                    num: 1,
+                    den: 2,
+                })
+                .is_err(),
+            "a looped clip cannot be stretched"
         );
     }
 

@@ -183,13 +183,13 @@ from the shared workflow (a key or a `: ` line — never a shell-only feature).
     behaviour that suits recorded material better than a phase vocoder. The **ratio is logged as
     `u32/u32`**, never an f32, so output length and phase are byte-reproducible; tempo match derives it
     from the tempo map plus a logged `source_tempo <id> <bpm>`. Refuses a looped clip (loop phase is not
-    representable) and re-validates fades against the new length. *First half done (2026-09-24):* the
-    WSOLA core (`media::Stretch`) with its tests — a streaming, deterministic, pitch-preserving
-    overlap-add with a correlation search, flat window edges so the material's own edges survive, the
-    tail read held at the material's end, and the output length window-aligned
-    ([note](../../implemented/feature/2026-09-24-offline-time-stretch-wsola.md)). **Next:** the host
-    command that renders a region into a new pool source, `ArrangeOp::Stretch`, the TUI gesture, and
-    `source_tempo`-driven tempo match.
+    representable) and re-validates fades against the new length. *Done (2026-09-24):* the WSOLA core
+    (`media::Stretch`) — a streaming, deterministic, pitch-preserving overlap-add with a correlation
+    search, flat window edges so the material's own edges survive, the tail read held at the material's
+    end, and the output length window-aligned — **and** the materialisation: `HostSession::stretch`
+    renders the clip's region into a new pool source (id keyed on region + ratio), logs one
+    `ArrangeOp::Stretch`, and `: source_tempo <id> <bpm>` (logged state) plus the `W` warp gesture give
+    tempo match end to end ([note](../../implemented/feature/2026-09-24-offline-time-stretch-wsola.md)).
 
 **D — finish the piece**
 12. **Mastering chain, in the graph.** A `master` engine plugin (`HOST_PLUGINS`) mounted after the mixer

@@ -96,10 +96,12 @@ arrangement is made of had no home on screen.
   decision) — neither is in the owner's ask list, where "load clips from the pool" is.
 - **Still open**: importing from the panel
   (a picker, or the `--wave` path surfaced as a command); a filter/search for a large pool; mouse
-  selection in the pool (the panel records its rect but only the keys act on it); `Pool::import`
-  still accepts a whitespace-bearing stem, so an unplaceable row can exist — the panel marks it and
-  the key refuses it, but the pool's own id rule is the place to fix it; a preview/audition (see
-  above).
+  selection in the pool (the panel records its rect but only the keys act on it); a preview/audition
+  (see above). *Closed 2026-09-24:* `Pool::import` no longer accepts a whitespace-bearing stem — the
+  pool's own id rule now refuses whitespace (an id the `host v1` log cannot name back is not an id)
+  and the importer **sanitizes** the stem instead of failing, so `My Take.wav` imports as `My_Take`
+  ([media-pool note](2026-08-24-p1-3-3-media-pool.md)). A file that was *already* in the pool under
+  such a stem is still listed and still unaddressable; the panel marks it.
 
 ## The gate's findings
 

@@ -191,6 +191,9 @@ struct App {
     /// rows, and what a paste checks its sources against (the clipboard is a value
     /// and survives a load, but the pool a source id names may not).
     pool: Vec<media::PoolSource>,
+    /// The tempo each pool source was performed at (`source_tempo`), as of the last
+    /// adoption — what `W` (warp) derives its stretch ratio from.
+    source_tempos: std::collections::HashMap<String, f64>,
     /// The selected row in the pool panel.
     pool_selected: usize,
     /// What a *prefilled* prompt was opened with (`R`'s rename line): walking the
@@ -286,6 +289,7 @@ impl App {
             next_pool: 1,
             pool: Vec::new(),
             pool_selected: 0,
+            source_tempos: std::collections::HashMap::new(),
             prompt_prefill: None,
             panel: timeline::PanelRects::default(),
             pool_rect: Rect::default(),
@@ -421,6 +425,7 @@ impl App {
         // what a paste checks its sources against, so an arrangement error below must
         // not leave both pointing at the previous session's material.
         self.pool = outcome.pool_sources.clone().unwrap_or_default();
+        self.source_tempos = outcome.source_tempos.iter().cloned().collect();
         self.pool_selected = self.pool_selected.min(self.pool.len().saturating_sub(1));
         self.focus = self.focus_that_exists();
 
@@ -613,6 +618,7 @@ impl App {
             next_pool: 1,
             pool: Vec::new(),
             pool_selected: 0,
+            source_tempos: std::collections::HashMap::new(),
             prompt_prefill: None,
             panel: timeline::PanelRects::default(),
             pool_rect: Rect::default(),
@@ -835,6 +841,7 @@ impl App {
             Action::Invert => self.timeline_key(|app| app.invert_clip()),
             Action::Silence => self.timeline_key(|app| app.silence_clip()),
             Action::TrimToContent => self.timeline_key(|app| app.trim_to_content()),
+            Action::StretchToTempo => self.timeline_key(|app| app.stretch_to_tempo()),
             Action::MoveTrack(offset) => self.timeline_key(|app| app.move_clip_to_track(offset)),
             Action::Gain(direction) => {
                 self.timeline_key(|app| app.step_clip_gain(direction as f32))
@@ -2039,6 +2046,82 @@ impl App {
         }
     }
 
+    // -- time-stretch (alpha slice E2) ---------------------------------------
+
+    /// `W`: **warp** — stretch the clip under the playhead so its material plays at the
+    /// session's tempo. The ratio is `source_bpm / session_bpm` (a 90 bpm take in a
+    /// 120 bpm session becomes 3/4 as long), reduced to a rational because the log
+    /// carries it verbatim and the render must be reproducible.
+    fn stretch_to_tempo(&mut self) {
+        let Some((track, clip)) = self.active_clip_at(self.snap.frame) else {
+            self.status = "no clip under the playhead on the active track".to_string();
+            return;
+        };
+        let Some(source_bpm) = self.source_tempos.get(&clip.source_id).copied() else {
+            self.status = format!(
+                "no tempo recorded for source {} — set it with `: source_tempo {} <bpm>`",
+                clip.source_id, clip.source_id
+            );
+            return;
+        };
+        let session_bpm = self.snap.tempo_map.tempo_at(clip.at_frame);
+        let Some((num, den)) = tempo_ratio(source_bpm, session_bpm) else {
+            self.status =
+                format!("cannot derive a ratio from {source_bpm} bpm → {session_bpm} bpm");
+            return;
+        };
+        if num == den {
+            self.status = format!(
+                "{} is already at the session tempo ({session_bpm:.1} bpm)",
+                clip.source_id
+            );
+            return;
+        }
+        self.stretch_clip(&track, &clip, num, den, source_bpm, session_bpm);
+    }
+
+    /// Render a clip through the host's stretch and report what happened. The render
+    /// is offline (it reads the region, transforms it and writes a pool source), so a
+    /// long clip takes a moment — the shell says so by reporting the time it took.
+    fn stretch_clip(
+        &mut self,
+        track: &str,
+        clip: &Placed,
+        num: u32,
+        den: u32,
+        source_bpm: f64,
+        session_bpm: f64,
+    ) {
+        let started = Instant::now();
+        let outcome = self.host.execute(HostCommand::Stretch {
+            track: track.to_string(),
+            clip: clip.id.clone(),
+            num,
+            den,
+        });
+        let elapsed = started.elapsed();
+        match outcome {
+            Ok(()) => {
+                self.last_command = Some(("stretch", elapsed));
+                self.refresh_arrangement();
+                let frames = self
+                    .arrangement
+                    .as_ref()
+                    .and_then(|arrangement| arrangement.lanes.get(self.active_track))
+                    .and_then(|lane| lane.clips.iter().find(|c| c.id == clip.id))
+                    .map(|c| c.src_len)
+                    .unwrap_or(0);
+                self.status = format!(
+                    "warped {} {source_bpm:.1} → {session_bpm:.1} bpm ({num}/{den}, {} → {frames} frames, {:.0} ms)",
+                    clip.id,
+                    clip.src_len,
+                    elapsed.as_secs_f64() * 1000.0
+                );
+            }
+            Err(e) => self.status = format!("stretch refused: {e}"),
+        }
+    }
+
     /// `f` / `F`: put the clip's **fade-in / fade-out** at the playhead — the DAW
     /// gesture ("the fade ends here"), so it is absolute like the trims rather than
     /// a nudge. The model requires `fade_in + fade_out <= src_len`, so the other
@@ -3200,6 +3283,35 @@ fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
     }
 
     text
+}
+
+/// The stretch ratio that makes `source_bpm` material play at `session_bpm`, as a
+/// **reduced rational**: the tempos are scaled by 1000 (so a decimal tempo is exact)
+/// and divided by their gcd. A rational is what the log carries — an `f32` ratio could
+/// print differently on another platform, and the render must be reproducible.
+fn tempo_ratio(source_bpm: f64, session_bpm: f64) -> Option<(u32, u32)> {
+    if !source_bpm.is_finite()
+        || source_bpm <= 0.0
+        || !session_bpm.is_finite()
+        || session_bpm <= 0.0
+    {
+        return None;
+    }
+    let num = (source_bpm * 1000.0).round() as u64;
+    let den = (session_bpm * 1000.0).round() as u64;
+    if num == 0 || den == 0 {
+        return None;
+    }
+    let g = gcd(num, den);
+    let (num, den) = (num / g, den / g);
+    (num <= u32::MAX as u64 && den <= u32::MAX as u64).then_some((num as u32, den as u32))
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a.max(1)
 }
 
 /// A status suffix that says the grid moved the frame (an edit that landed
@@ -5259,6 +5371,103 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// **Warp is tempo match.** With a source tempo recorded (`: source_tempo`), `W`
+    /// renders the clip's material through the host's stretch at `source/session` and
+    /// points the clip at it — one command, one undoable op, and the status says what
+    /// it did. Without a tempo it says how to record one instead of guessing.
+    #[test]
+    fn warp_stretches_a_clip_to_the_session_tempo() {
+        let (pool, script_path) = pool_script("warp", "source_tempo s1 90\n");
+        let mut app = App::idle();
+        app.snap = App::demo_snapshot(); // 120 bpm, the playhead at 96 000
+        app.open_script(&script_path);
+        assert_eq!(app.source_tempos.get("s1"), Some(&90.0), "{}", app.status);
+
+        let before = app.arrangement.as_ref().expect("arrangement").lanes[0].clips[0].clone();
+        app.on_key(KeyEvent::new(KeyCode::Char('W'), KeyModifiers::empty()));
+        assert!(app.status.contains("warped"), "{}", app.status);
+        assert!(app.status.contains("90.0 → 120.0"), "{}", app.status);
+
+        let after = app.arrangement.as_ref().expect("arrangement").lanes[0].clips[0].clone();
+        assert_eq!(
+            after.source_id, "s1.stretch.0_144000.3_4",
+            "the material was rendered"
+        );
+        assert!(
+            after.src_len < before.src_len,
+            "a 90 bpm take is shortened into 120 bpm: {} → {}",
+            before.src_len,
+            after.src_len
+        );
+        let expect = before.src_len as f64 * 0.75;
+        assert!(
+            (after.src_len as f64 - expect).abs() < 2_048.0,
+            "the length follows the ratio: {} vs {expect:.0}",
+            after.src_len
+        );
+        // The panel resolves the new source (it is in the outcome's listing).
+        assert!(
+            app.sources.errors().is_empty(),
+            "the rendered source must resolve in the panel"
+        );
+
+        // One undo restores the original reference.
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::empty()));
+        assert_eq!(
+            app.arrangement.as_ref().expect("arrangement").lanes[0].clips[0].source_id,
+            "s1"
+        );
+
+        let _ = std::fs::remove_dir_all(&pool);
+
+        // Without a tempo, the shell explains the missing fact — and the fix it names
+        // is the fix: typing the line at the command line updates the cache (the
+        // outcome carries the state), and `W` then warps.
+        let (pool, script_path) = pool_script("warpnotempo", "");
+        let mut app = App::idle();
+        app.snap = App::demo_snapshot();
+        app.open_script(&script_path);
+        app.on_key(KeyEvent::new(KeyCode::Char('W'), KeyModifiers::empty()));
+        assert!(
+            app.status.contains("no tempo recorded") && app.status.contains("source_tempo"),
+            "the fix is named: {}",
+            app.status
+        );
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::empty()));
+        for c in "source_tempo s1 90".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(
+            app.source_tempos.get("s1"),
+            Some(&90.0),
+            "the recorded tempo reaches the shell: {}",
+            app.status
+        );
+        app.on_key(KeyEvent::new(KeyCode::Char('W'), KeyModifiers::empty()));
+        assert!(
+            app.status.contains("warped"),
+            "and the gesture it was told to make now works: {}",
+            app.status
+        );
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// The stretch ratio is a **reduced rational**, and a degenerate tempo yields none
+    /// (never a division by zero or a nonsense render).
+    #[test]
+    fn the_tempo_ratio_is_a_reduced_rational() {
+        assert_eq!(tempo_ratio(90.0, 120.0), Some((3, 4)));
+        assert_eq!(tempo_ratio(120.0, 120.0), Some((1, 1)));
+        assert_eq!(tempo_ratio(100.0, 120.0), Some((5, 6)));
+        assert_eq!(tempo_ratio(128.0, 120.0), Some((16, 15)));
+        assert_eq!(tempo_ratio(90.5, 120.0), Some((181, 240)));
+        assert_eq!(tempo_ratio(0.0, 120.0), None);
+        assert_eq!(tempo_ratio(120.0, 0.0), None);
+        assert_eq!(tempo_ratio(f64::NAN, 120.0), None);
+        assert_eq!(tempo_ratio(f64::INFINITY, 120.0), None);
     }
 
     /// The `:` command line types the same `host v1` format the keys dispatch, so

@@ -208,6 +208,11 @@ pub enum Action {
     /// Trim the clip to its audible content (a compound `trim` over the silence at
     /// its edges, measured from the peak pyramid).
     TrimToContent,
+    /// **Tempo match**: time-stretch the clip so its material plays at the session's
+    /// tempo. The ratio comes from the source's logged tempo (`source_tempo`), and the
+    /// host renders the material into the pool — an offline transform, so it is a
+    /// command rather than an arrange op (`undo` still restores the old reference).
+    StretchToTempo,
     /// Move the clip to the track below (+1) / above (-1).
     MoveTrack(i32),
     /// Step the clip's gain in dB.
@@ -266,6 +271,7 @@ impl Action {
             Action::Invert => "invert the clip's polarity",
             Action::Silence => "silence the clip",
             Action::TrimToContent => "trim the clip to its content",
+            Action::StretchToTempo => "stretch the clip to the session tempo",
             Action::MoveTrack(_) => "move the clip to another track",
             Action::Gain(_) => "clip gain",
             Action::Fade(_) => "fade",
@@ -534,6 +540,11 @@ pub static KEYMAP: &[Binding] = &[
             (Key::Char('T'), Action::TrimToContent),
         ],
         "timeline: reverse / normalize / invert / silence / trim to content (each one log line, one undo)",
+    ),
+    bind(
+        "W",
+        &[(Key::Char('W'), Action::StretchToTempo)],
+        "timeline: warp — stretch the clip to the session tempo (needs `: source_tempo <id> <bpm>`)",
     ),
     bind(
         "Enter",

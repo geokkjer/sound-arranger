@@ -118,6 +118,38 @@ fn path_for_maps_stem_to_wav() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// **A file whose name the log could not name still imports.** A space in a stem is
+/// common (`My Take.wav`), but a pool id is a clip source id and `host v1` splits on
+/// whitespace — so the stem is sanitized (`_`) instead of refused, and the caller reads
+/// the real id back from the import. A path separator is still refused (a mangled path
+/// would be a surprise).
+#[test]
+fn import_sanitizes_a_stem_the_log_could_not_name() {
+    let dir = tmp_dir("stem-space");
+    let outside = tmp_dir("stem-space-src");
+    write_tone(&outside, "My Take", 1_000, 48_000, 440.0);
+    let pool = Pool::open(&dir).unwrap();
+
+    let imported = pool
+        .import(&outside.join("My Take.wav"), 48_000)
+        .expect("a space is sanitized, not fatal");
+    assert_eq!(imported.id, "My_Take");
+    assert_eq!(imported.ids(), vec!["My_Take"]);
+    assert!(dir.join("My_Take.wav").is_file());
+    assert_eq!(
+        pool.path_for("My_Take"),
+        Some(dir.join("My_Take.wav")),
+        "and the sanitized id is the one the log can name"
+    );
+    assert!(
+        pool.path_for("My Take").is_none(),
+        "while the raw stem is not an id"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
 /// A 440 Hz sine, so pitch survives as a countable property.
 fn write_tone(dir: &std::path::Path, stem: &str, frames: u64, sample_rate: u32, freq: f64) {
     let mut w = WavWriter::create_float(&dir.join(format!("{stem}.wav")), sample_rate, 1).unwrap();
@@ -586,6 +618,78 @@ fn import_copies_a_matching_rate_bit_for_bit() {
 
     let _ = std::fs::remove_dir_all(&src_dir);
     let _ = std::fs::remove_dir_all(&pool_dir);
+}
+
+/// **A rendered source can be written into the pool** — the seam an offline transform
+/// (the time-stretch) uses to materialise new material. The conventions stay in the
+/// pool: mono float on disk, derived peaks, a temporary file then a rename, and the
+/// frames actually written returned (the log records a measurement, not a guess).
+#[test]
+fn a_rendered_source_is_written_into_the_pool() {
+    let dir = tmp_dir("write-source");
+    let pool = Pool::open(&dir).unwrap();
+
+    let samples: Vec<f32> = (0..4_800).map(|i| (i as f32 / 4_800.0) - 0.5).collect();
+    let frames = pool
+        .write_source("jam.stretch.3_2", &samples, 48_000)
+        .unwrap();
+    assert_eq!(
+        frames, 4_800,
+        "the frame count is the file's, not an estimate"
+    );
+
+    let index = pool.list().unwrap();
+    assert_eq!(index.errors, Vec::new());
+    assert_eq!(index.sources.len(), 1);
+    let source = &index.sources[0];
+    assert_eq!(source.id, "jam.stretch.3_2");
+    assert_eq!(
+        (source.frames, source.sample_rate, source.channels),
+        (4_800, 48_000, 1)
+    );
+    assert!(
+        !source.peaks_missing && source.finalized,
+        "peaks derived, take complete"
+    );
+
+    // The samples come back bit-for-bit (float on disk, mono, one channel).
+    let (back, _, _) = read_all(&dir.join("jam.stretch.3_2.wav"));
+    assert_eq!(back.len(), samples.len());
+    assert!(
+        back.iter()
+            .zip(&samples)
+            .all(|(a, b)| a.to_bits() == b.to_bits())
+    );
+    // …and no temporary file is left behind.
+    assert!(
+        !dir.join("jam.stretch.3_2.converting").exists(),
+        "the staged write is renamed, never left"
+    );
+
+    // Writing the **same id again replaces it** — the deliberate behaviour behind a
+    // deterministic render id (stretch, undo, stretch renders to the same name), and the
+    // one path that needs a remove-then-rename fallback on a platform whose `rename`
+    // refuses an existing destination.
+    let fewer = &samples[..2_400];
+    assert_eq!(
+        pool.write_source("jam.stretch.3_2", fewer, 48_000).unwrap(),
+        2_400
+    );
+    let index = pool.list().unwrap();
+    assert_eq!(index.sources.len(), 1, "replaced, not duplicated");
+    assert_eq!(index.sources[0].frames, 2_400, "the index follows the file");
+
+    // The guards: an unusable id, an empty render, and a zero rate are refused — and so
+    // is a **whitespace-bearing** id, which no `host v1` line could name back (the gate
+    // found `valid_id` accepting one while the doc promised it would not).
+    assert!(pool.write_source("a/b", &samples, 48_000).is_err());
+    assert!(pool.write_source("", &samples, 48_000).is_err());
+    assert!(pool.write_source("two words", &samples, 48_000).is_err());
+    assert!(pool.write_source("tab\tid", &samples, 48_000).is_err());
+    assert!(pool.write_source("ok", &[], 48_000).is_err());
+    assert!(pool.write_source("ok", &samples, 0).is_err());
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
