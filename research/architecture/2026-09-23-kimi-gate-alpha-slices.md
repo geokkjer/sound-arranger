@@ -118,9 +118,13 @@ with a disposition; the substitution is recorded there, not here (this file stay
 Kimi route's state).
 
 **What the owner can unblock it with (2026-09-24):** the API route is the one to try, and the account
-now reports the **5-hour usage window at 100 %** (reset 2026-09-24 14:09 local) with the 7-day window
-at ~21 % — so the failure is the short window, not the key. The owner also relays that the provider
-wants the **256 k-context** variant, i.e. the model id `k3-256k` (the DSH catalog advertises
-`opencode-go/kimi-k3`; an unlisted id is worth trying since adapter membership is advisory). Retry
-after 14:09 with that id, for the A4 brief first and then the owed A1–A3 retro-gate. The CLI's device
-login still answers `403 Forbidden`, and `kimi -p` conflicts with `--auto`.
+reports the **5-hour usage window at 100 %** (reset 2026-09-24 14:09 local) with the 7-day window at
+~21 % — so the failure is the short window, not the key. The owner relays that the provider wants the
+**256 k-context** variant, i.e. the model id `k3-256k`.
+
+**Tried `k3-256k`, 2026-09-24 13:25 — refused before it ran:** the harness answers
+`child LLM route "opencode-go/k3-256k" is not allowed for this Session` (the session's route
+allowlist carries the advertised catalog, which has `opencode-go/kimi-k3`, not the 256k id). So the
+unlisted-id route needs the **harness allowlist widened** (or the catalog to advertise `k3-256k`)
+before it can be used; until then the retry is `opencode-go/kimi-k3` after the 5-hour reset. The
+CLI's device login still answers `403 Forbidden`, and `kimi -p` conflicts with `--auto`.

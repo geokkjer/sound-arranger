@@ -126,6 +126,9 @@ impl Sources {
 #[derive(Clone)]
 pub struct Placed {
     pub id: String,
+    /// The **pool source id** the clip reads (`media::Clip::source`) — what an
+    /// `add_clip` line names, so a copied clip can be pasted as a new clip.
+    pub source_id: String,
     pub source: Arc<Source>,
     /// First source frame of the region.
     pub src_start: u64,
@@ -227,6 +230,7 @@ impl Arrangement {
                 frames = frames.max(clip.at_frame + clip.src_len);
                 clips.push(Placed {
                     id: clip.id.clone(),
+                    source_id: clip.source.clone(),
                     source,
                     src_start: clip.src_start,
                     src_len: clip.src_len,

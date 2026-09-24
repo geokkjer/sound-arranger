@@ -32,9 +32,13 @@ What this spike adds, because it is what a TUI has to answer for:
   into one mono source per channel (`{id}.ch0`, `{id}.ch1`, …) and placed on one
   track each, panned hard left/right, so both channels play instead of only the
   left;
-- **edits that go through the host's own language** — `x` splits and `d` deletes
-  by building an `arrange …` line and handing it to the host's parser, so a key
-  runs exactly what a script writes, and the engine logs it like any command;
+- **edits that go through the host's own language** — `x` splits, `d` deletes and
+  `p` pastes by building `arrange …` lines and handing them to the host's parser, so
+  a key runs exactly what a script writes and the engine logs it like any command.
+  A **paste is one gesture**: the shell mints the ids (`paste.{n}`), gives new
+  boundaries a 64-frame micro-fade and hands the host one `group`, so the whole
+  paste is one `u` away from gone. The **clipboard** itself (`y` copy, `c` cut) is a
+  shell value and is never logged — copying changes nothing;
   a **snap grid** (`b` cycles off → bar → beat → 1/2 → 1/4) quantizes every edit
   target through the session's tempo map — seeks, split, fade, trim and the
   clip-move target — `[`/`]` step the playhead a grid line, `H`/`L` move a grid
@@ -252,6 +256,8 @@ pointless), so the shell falls back to the wide meter bars under the transport.
 | `H` / `L` | timeline: move the clip **one grid step** earlier / later (a beat when the grid is off; clamps at 0) |
 | `[` / `]` | timeline: move the playhead to the previous / next grid line (a beat when the grid is off) |
 | `b` | cycle the **snap grid**: off → bar → beat → 1/2 → 1/4 (never logged — see the note) |
+| `y` / `c` | copy / cut the selection (or the clip under the playhead) — a shell value, not a log entry |
+| `p` / `P` | paste at the playhead / **appended** after the track's last clip (one `group`, one undo step) |
 | `J` / `K` | timeline: move the clip to the track **below / above**, keeping its time |
 | `g` / `G` | timeline: clip gain **−1 dB / +1 dB** (the range is the console fader's) |
 | `f` / `F` | timeline: fade in / fade out **to the playhead** (absolute, not a nudge) |

@@ -132,12 +132,18 @@ from the shared workflow (a key or a `: ` line — never a shell-only feature).
    ([note](../../implemented/feature/2026-09-24-grid-snap-and-the-bar-beat-ruler.md)). Zero-crossing
    snap stays deferred (a second quantizer behind the same seam); click-freedom comes from default
    micro-fades instead.
-6. **Clipboard: copy / cut / paste.** The clipboard is a shell-owned **value** (`Vec<(track_delta, Clip)>`
-   normalised to the selection's first frame) and is **never logged** — copying changes nothing. Paste
-   *is* logged, as one compound gesture with minted ids (`paste.{k}`, the `chop` precedent), onto a
-   target track, failing atomically on an id collision. New boundaries get default micro-fades.
+6. **Clipboard: copy / cut / paste.** *Done (2026-09-24):* the clipboard is a shell-owned **value**
+   (`Vec<(i32, Placed)>` normalised to the selection's first frame) and is **never logged** — copying
+   changes nothing (`y`, or `c` for copy-and-delete as one gesture). Paste *is* logged, as one compound
+   gesture (`group` of `add_clip`s) with minted ids (`paste.{n}`, the `chop` precedent), onto the active
+   track, failing whole before anything is built on an id collision. New boundaries get a default
+   micro-fade (64 frames), a copied fade is kept. `Placed` carries `source_id` so a paste can name the
+   source ([note](../../implemented/feature/2026-09-24-clipboard-and-append.md)). A multi-track
+   selection is deferred (the per-clip track delta is already in the shape).
 7. **Append** needs no new op: `MoveClip`/`AddClip` with `at_frame` = the preceding clip's end or the
-   arrangement's end, computed shell-side. Value ops stay absolute-frame-only.
+   arrangement's end, computed shell-side. *Done (2026-09-24):* `P` pastes after the active track's last
+   clip (the arrangement's end when the track is empty), and the paste target is deliberately not
+   clamped — a seek clamps, a paste extends the piece. Value ops stay absolute-frame-only.
 8. **Tracks**: add / rename / delete / reorder by key; the strip already exists as channel `ch{ti}`.
 9. **Pool panel**: browse sources (name, length, rate, peaks), place at the playhead or on a track, and
    **audition** first. Also where the pool-before-arrange requirement becomes an affordance instead of an

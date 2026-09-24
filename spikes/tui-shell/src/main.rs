@@ -76,6 +76,11 @@ const FRAME: Duration = Duration::from_millis(16);
 /// snapshot carries the device rate only when audio is open, and a TUI should
 /// work headless too.
 const SAMPLE_RATE: u64 = 48_000;
+/// The click guard a **new** clip boundary gets (a paste): ~1.3 ms at 48 kHz —
+/// long enough to kill the discontinuity, short enough not to be a fade. A copied
+/// fade is kept instead of this, and a clip property set by hand is `set_clip_fade`
+/// (logged, undoable).
+const MICRO_FADE: u64 = 64;
 
 /// The keymap now lives in the **shared workflow** (`workflow::KEYMAP`): the
 /// handler matches on its [`workflow::Action`]s and the `?` overlay renders its rows,
@@ -166,6 +171,22 @@ struct App {
     /// UI state, never logged — a snapped edit is an edit whose frame was
     /// quantized *before* the command was issued, so replay is untouched.
     grid: workflow::Grid,
+    /// The shell's **clipboard** (alpha slice D): `(track delta, clip)` values
+    /// measured from `clipboard_origin`. A *value*, never logged — copying changes
+    /// nothing, and only the paste reaches the log. The delta is zero for every
+    /// copy today (a selection is one track); it is in the shape so a multi-track
+    /// selection is a change to the copy, not to the clipboard.
+    clipboard: Vec<(i32, Placed)>,
+    /// The frame the clipboard's offsets are measured from (the earliest copied
+    /// clip's start), so a paste keeps the copied clips' relative spacing.
+    clipboard_origin: u64,
+    /// The next minted paste id (`paste.{n}`), seeded above anything the session
+    /// already has so a paste can never collide with an earlier one.
+    next_paste: u64,
+    /// The session pool's source ids as of the last adoption. The clipboard is a
+    /// value and survives a load, but the pool a source id names may not — so a
+    /// paste checks it here and says so, instead of logging a clip the panel drops.
+    pool_ids: Vec<String>,
     panel: timeline::PanelRects,
 }
 
@@ -243,6 +264,10 @@ impl App {
             // Off by default: snapping silently would change every existing
             // gesture, so the grid is armed explicitly with `b`.
             grid: workflow::Grid::default(),
+            clipboard: Vec::new(),
+            clipboard_origin: 0,
+            next_paste: 1,
+            pool_ids: Vec::new(),
             panel: timeline::PanelRects::default(),
         };
 
@@ -393,6 +418,14 @@ impl App {
         // last asked for.
         self.apply_params(&outcome.params);
 
+        // The pool listing is also what a paste checks the clipboard against; keep
+        // the ids, since `from_host` only borrows the listing.
+        self.pool_ids = outcome
+            .pool_sources
+            .as_ref()
+            .map(|sources| sources.iter().map(|source| source.id.clone()).collect())
+            .unwrap_or_default();
+
         let arrangement = Arrangement::from_host(
             &timeline,
             outcome.pool_sources.as_deref(),
@@ -523,6 +556,8 @@ impl App {
     #[cfg(test)]
     fn idle() -> Self {
         let host = HostHandle::spawn();
+        // The test shell shares the live constructors' shape, so a field added
+        // there must be added here (this is the compiler's checklist, not a fork).
         App {
             snap: host.snapshot(),
             host,
@@ -553,6 +588,10 @@ impl App {
             // Off by default: snapping silently would change every existing
             // gesture, so the grid is armed explicitly with `b`.
             grid: workflow::Grid::default(),
+            clipboard: Vec::new(),
+            clipboard_origin: 0,
+            next_paste: 1,
+            pool_ids: Vec::new(),
             panel: timeline::PanelRects::default(),
         }
     }
@@ -562,14 +601,25 @@ impl App {
     /// Run a host command and record how long it blocked the UI thread. A shell
     /// that binds a command to a key owns this number: `TransportSeek` is
     /// O(target) in the host, so it is the one that will be felt.
-    fn command(&mut self, label: &'static str, command: HostCommand) {
+    ///
+    /// Returns whether the host **applied** it, and puts a refusal in the status
+    /// line. A caller that wants to announce its own success must check this: a
+    /// gesture that overwrites a refusal with "done" is how a refused edit looks
+    /// like data loss.
+    fn command(&mut self, label: &'static str, command: HostCommand) -> bool {
         let started = Instant::now();
         let outcome = self.host.execute(command);
         let elapsed = started.elapsed();
 
         match outcome {
-            Ok(()) => self.last_command = Some((label, elapsed)),
-            Err(e) => self.status = format!("{label} refused: {e}"),
+            Ok(()) => {
+                self.last_command = Some((label, elapsed));
+                true
+            }
+            Err(e) => {
+                self.status = format!("{label} refused: {e}");
+                false
+            }
         }
     }
 
@@ -748,6 +798,10 @@ impl App {
             Action::Nudge(direction) => self.timeline_key(|app| app.nudge_clip(direction)),
             Action::SeekGrid(direction) => self.timeline_key(|app| app.seek_grid(direction)),
             Action::GridCycle => self.cycle_grid(),
+            Action::Yank => self.timeline_key(|app| app.yank()),
+            Action::Cut => self.timeline_key(|app| app.cut()),
+            Action::Paste => self.timeline_key(|app| app.paste(false)),
+            Action::PasteAppend => self.timeline_key(|app| app.paste(true)),
             Action::MoveTrack(offset) => self.timeline_key(|app| app.move_clip_to_track(offset)),
             Action::Gain(direction) => {
                 self.timeline_key(|app| app.step_clip_gain(direction as f32))
@@ -860,7 +914,9 @@ impl App {
         let script = format!("host v1\nset_param mixer {param} {value:.4}\n");
         match host::parse_script(&script) {
             Ok(commands) => match commands.into_iter().next() {
-                Some(command) => self.command("set_param", command),
+                Some(command) => {
+                    self.command("set_param", command);
+                }
                 None => self.status = format!("set_param {param}: nothing parsed"),
             },
             Err(e) => self.status = format!("set_param {param}: {e}"),
@@ -970,9 +1026,9 @@ impl App {
     /// all-or-nothing and records one history entry, so the whole thing is one undo
     /// step. (A paste or a stretch will need exactly this; trim-to-selection is the
     /// first gesture that takes more than one op.)
-    fn arrange_group(&mut self, lines: &[String]) {
+    fn arrange_group(&mut self, lines: &[String]) -> bool {
         if lines.is_empty() {
-            return;
+            return false;
         }
         let mut commands = Vec::with_capacity(lines.len());
         for line in lines {
@@ -980,25 +1036,272 @@ impl App {
                 Ok((op, at_frame)) => commands.push(HostCommand::Arrange { op, at_frame }),
                 Err(e) => {
                     self.status = format!("arrange: {e}");
-                    return;
+                    return false;
                 }
             }
         }
-        self.command("arrange", HostCommand::Group { commands });
+        let applied = self.command("arrange", HostCommand::Group { commands });
         self.refresh_arrangement();
+        applied
     }
 
     /// Dispatch an `arrange` line **through the host's parser**, so the shell and
     /// the CLI share one vocabulary: the ops a key runs are the ops a script
     /// writes, and the host logs them like any other command.
-    fn arrange(&mut self, line: &str) {
+    fn arrange(&mut self, line: &str) -> bool {
         match host::parse_arrange_line(line) {
             Ok((op, at_frame)) => {
-                self.command("arrange", HostCommand::Arrange { op, at_frame });
+                let applied = self.command("arrange", HostCommand::Arrange { op, at_frame });
                 self.refresh_arrangement();
+                applied
             }
-            Err(e) => self.status = format!("arrange: {e}"),
+            Err(e) => {
+                self.status = format!("arrange: {e}");
+                false
+            }
         }
+    }
+
+    // -- the clipboard (alpha slice D) ---------------------------------------
+
+    /// The clips a copy takes: those **intersecting the visual selection** on the
+    /// active track, or the clip under the playhead when there is no selection (a
+    /// selection with no width means "here", so it falls back to the same rule).
+    fn clipboard_scope(&self) -> Vec<Placed> {
+        let Some(arrangement) = self.arrangement.as_ref() else {
+            return Vec::new();
+        };
+        let Some(lane) = arrangement.lanes.get(self.active_track) else {
+            return Vec::new();
+        };
+        let selection = self.view.as_ref().and_then(|view| view.selection);
+        let range = selection.map(|(anchor, head)| (anchor.min(head), anchor.max(head)));
+        match range {
+            Some((from, to)) if to > from => lane
+                .clips
+                .iter()
+                .filter(|clip| clip.at_frame < to && clip.end_frame() > from)
+                .cloned()
+                .collect(),
+            _ => arrangement
+                .clip_at(self.active_track, self.snap.frame)
+                .cloned()
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// Take the clips into the clipboard, normalised to their earliest start.
+    /// Returns what was taken (empty when there was nothing to copy).
+    fn fill_clipboard(&mut self) -> Vec<Placed> {
+        let clips = self.clipboard_scope();
+        if clips.is_empty() {
+            self.status =
+                "nothing to copy — select a range with `v`, or put the playhead on a clip"
+                    .to_string();
+            return Vec::new();
+        }
+        self.clipboard_origin = clips.iter().map(|clip| clip.at_frame).min().unwrap_or(0);
+        self.clipboard = clips.iter().cloned().map(|clip| (0, clip)).collect();
+        self.mode = Mode::Normal;
+        if let Some(view) = self.view.as_mut() {
+            view.selection = None;
+        }
+        clips
+    }
+
+    /// `y`: copy the selection (or the clip under the playhead) to the shell's
+    /// clipboard — a value, so nothing is logged and nothing can be undone.
+    fn yank(&mut self) {
+        let clips = self.fill_clipboard();
+        if clips.is_empty() {
+            return;
+        }
+        let span = clips
+            .iter()
+            .map(|clip| clip.end_frame())
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(self.clipboard_origin);
+        self.status = format!(
+            "copied {} clip{} ({} frames) — `p` pastes at the playhead, `P` appends",
+            clips.len(),
+            if clips.len() == 1 { "" } else { "s" },
+            span,
+        );
+    }
+
+    /// `c`: copy **and** delete, as one gesture — the clipboard is a value, the
+    /// delete is the log entry, and the whole cut is one undo step.
+    fn cut(&mut self) {
+        let clips = self.fill_clipboard();
+        if clips.is_empty() {
+            return;
+        }
+        let Some(lane) = self
+            .arrangement
+            .as_ref()
+            .and_then(|arrangement| arrangement.lanes.get(self.active_track))
+        else {
+            return;
+        };
+        let track = lane.id.clone();
+        let lines: Vec<String> = clips
+            .iter()
+            .map(|clip| format!("delete {track} {}", clip.id))
+            .collect();
+        if self.arrange_group(&lines) {
+            self.status = format!(
+                "cut {} clip{} — `p` pastes them back (one `u` undoes the cut)",
+                clips.len(),
+                if clips.len() == 1 { "" } else { "s" },
+            );
+        }
+    }
+
+    /// The next free `paste.{n}`: the shell mints the ids (they are part of the
+    /// log), so it starts above anything the session already names that way and
+    /// never reuses one within a run.
+    fn max_paste_id(&self) -> u64 {
+        let mut highest = 0;
+        if let Some(arrangement) = self.arrangement.as_ref() {
+            for lane in &arrangement.lanes {
+                for clip in &lane.clips {
+                    if let Some(n) = clip.id.strip_prefix("paste.")
+                        && let Ok(n) = n.parse::<u64>()
+                    {
+                        highest = highest.max(n);
+                    }
+                }
+            }
+        }
+        highest
+    }
+
+    /// `p` (`append = false`) at the playhead / `P` (`append = true`) after the
+    /// active track's last clip — one **gesture**, so the whole paste is one undo
+    /// step. New boundaries get a default micro-fade (a copied fade is kept), and
+    /// the ids are minted here because they are logged.
+    fn paste(&mut self, append: bool) {
+        if self.clipboard.is_empty() {
+            self.status = "the clipboard is empty — `y` copies a clip or a selection".to_string();
+            return;
+        }
+        let Some(arrangement) = self.arrangement.as_ref() else {
+            self.status = "nothing to paste into — load a timeline first".to_string();
+            return;
+        };
+        let Some(lane) = arrangement.lanes.get(self.active_track) else {
+            self.status = "no active track".to_string();
+            return;
+        };
+        // Appending follows the track's own last clip; on an empty track it
+        // appends to the **piece** (the arrangement's end), which is what "add
+        // this at the end" means when there is nothing to follow.
+        let target = if append {
+            lane.clips
+                .iter()
+                .map(|clip| clip.end_frame())
+                .max()
+                .unwrap_or(arrangement.frames)
+        } else {
+            // **Not** clamped to the arrangement: a paste past the end is how the
+            // piece grows. (A *seek* is clamped; there, past the end is a state
+            // with nothing to show.)
+            self.snap_frame(self.snap.frame)
+        };
+
+        self.next_paste = self.next_paste.max(self.max_paste_id() + 1);
+        let ids: Vec<String> = (0..self.clipboard.len())
+            .map(|n| format!("paste.{}", self.next_paste + n as u64))
+            .collect();
+
+        // A collision is refused **whole** before anything is built: the host's
+        // group is atomic, but a silent no-op would look like a broken key.
+        for (n, (delta, _)) in self.clipboard.iter().enumerate() {
+            let Some(lane) = self.lane_at_delta(*delta) else {
+                self.status =
+                    "paste: the clipboard spans tracks this session does not have".to_string();
+                return;
+            };
+            if lane.clips.iter().any(|existing| existing.id == ids[n]) {
+                self.status = format!("paste: a clip is already called {}", ids[n]);
+                return;
+            }
+        }
+
+        let mut lines = Vec::with_capacity(self.clipboard.len());
+        for (n, (delta, clip)) in self.clipboard.iter().enumerate() {
+            let Some(track) = self.lane_at_delta(*delta).map(|lane| lane.id.clone()) else {
+                self.status =
+                    "paste: the clipboard spans tracks this session does not have".to_string();
+                return;
+            };
+            let at = target + clip.at_frame.saturating_sub(self.clipboard_origin);
+            // A copied fade is kept; a **bare** boundary gets the click guard.
+            // The guard is what shrinks when the pair is tight: the model requires
+            // `fade_in + fade_out <= src_len`, so a kept `fade_in = src_len` (legal,
+            // and reachable with `f` at the clip's end) must leave the new fade-out
+            // zero rather than mint an op the host refuses. A one- or two-frame clip
+            // has no room for a guard at all.
+            let micro = MICRO_FADE.min(clip.src_len / 2);
+            let mut fade_in = clip.fade_in;
+            let mut fade_out = clip.fade_out;
+            if clip.fade_in == 0 {
+                fade_in = micro.min(clip.src_len.saturating_sub(fade_out));
+            }
+            if clip.fade_out == 0 {
+                fade_out = micro.min(clip.src_len.saturating_sub(fade_in));
+            }
+            let looped = clip
+                .loop_len
+                .map(|len| format!(" {len}"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "add_clip {track} {} {} {} {} {at} {} {} {:.6}{looped}",
+                ids[n], clip.source_id, clip.src_start, clip.src_len, fade_in, fade_out, clip.gain,
+            ));
+        }
+
+        // A paste names pool sources: one this session does not have would be
+        // logged by the media layer and then dropped by the panel (and refuse to
+        // wire), so say it *here*, before minting anything.
+        if let Some(missing) = self.clipboard.iter().find_map(|(_, clip)| {
+            (!self.pool_ids.contains(&clip.source_id)).then(|| clip.source_id.clone())
+        }) {
+            self.status = format!(
+                "paste: this session's pool has no source '{missing}' — the clipboard came from another session (import it, or copy from a clip here)"
+            );
+            return;
+        }
+
+        self.next_paste += self.clipboard.len() as u64;
+        let count = lines.len();
+        if self.arrange_group(&lines) {
+            // The snap note belongs to the playhead branch: an append target is
+            // the track's last clip, not a quantized playhead.
+            let snapped = if append {
+                String::new()
+            } else {
+                snapped_note(self.snap.frame, target, self.grid.label())
+            };
+            self.status = format!(
+                "{} {count} clip{} at {target}{snapped} (one `u` undoes the paste)",
+                if append { "appended" } else { "pasted" },
+                if count == 1 { "" } else { "s" },
+            );
+        }
+    }
+
+    /// The lane `delta` tracks away from the active one (`None` when the clipboard
+    /// names a track this session does not have).
+    fn lane_at_delta(&self, delta: i32) -> Option<&timeline::Lane> {
+        let lanes = &self.arrangement.as_ref()?.lanes;
+        let index = self.active_track as i32 + delta;
+        if index < 0 || index as usize >= lanes.len() {
+            return None;
+        }
+        lanes.get(index as usize)
     }
 
     /// `x`: razor-split the clip under the playhead on the active track. Both
@@ -3335,6 +3638,360 @@ mod tests {
             app.status
         );
         assert_eq!(clip(&app).fade_in, 96_000, "{}", app.status);
+
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// **Copy and paste are one gesture each.** `y` takes the clip under the
+    /// playhead (or the selection) into the shell's clipboard — a value, so nothing
+    /// is logged — and `p` puts it on the active track at the playhead as one
+    /// `group`, so the whole paste is one undo step. New boundaries get the click
+    /// guard (a copied fade would be kept).
+    #[test]
+    fn copy_and_paste_is_one_logged_gesture() {
+        let (pool, script_path) = pool_script("paste", "arrange add_track t1\n");
+        let mut app = App::idle();
+        app.snap = App::demo_snapshot(); // the playhead sits at 2.000 s (96 000)
+        app.open_script(&script_path);
+
+        let press = |app: &mut App, c: char| {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()))
+        };
+
+        // Copy: the clip under the playhead (no selection is open).
+        press(&mut app, 'y');
+        assert!(app.status.contains("copied 1 clip"), "{}", app.status);
+        assert_eq!(app.clipboard.len(), 1, "the clipboard is a shell value");
+        assert!(
+            app.clipboard[0].1.source_id == "s1",
+            "the source id travels"
+        );
+
+        // Paste onto the second track, at the (ungridded) playhead.
+        app.active_track = 1;
+        press(&mut app, 'p');
+        let arrangement = app.arrangement.as_ref().expect("an arrangement");
+        let pasted = arrangement.lanes[1].clips.first().expect("a pasted clip");
+        assert_eq!(
+            pasted.id, "paste.1",
+            "ids are minted by the shell: {}",
+            app.status
+        );
+        assert_eq!(pasted.source_id, "s1");
+        assert_eq!(pasted.at_frame, 96_000);
+        assert_eq!(pasted.src_len, 144_000);
+        assert_eq!(
+            (pasted.fade_in, pasted.fade_out),
+            (MICRO_FADE, MICRO_FADE),
+            "new boundaries get the click guard"
+        );
+        assert_eq!(pasted.gain, 1.0);
+        assert!(arrangement.lanes[0].clips.len() == 1, "the original stayed");
+
+        // The paste is **one** undo step: `u` removes it whole.
+        press(&mut app, 'u');
+        assert!(
+            app.arrangement.as_ref().expect("arrangement").lanes[1]
+                .clips
+                .is_empty(),
+            "one undo removes the pasted clip: {}",
+            app.status
+        );
+
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// `c` copies **and** deletes, as one gesture, and `P` pastes *appended* after
+    /// the active track's last clip — the owner's "append", which needs no op of
+    /// its own (the target frame is computed shell-side).
+    #[test]
+    fn cut_and_append_are_gestures_over_existing_ops() {
+        let (pool, script_path) = pool_script(
+            "cutappend",
+            "arrange add_clip t0 c1 s1 0 48000 144000 0 0 1.0\n",
+        );
+        let mut app = App::idle();
+        app.snap = App::demo_snapshot();
+        app.open_script(&script_path);
+        let press = |app: &mut App, c: char| {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()))
+        };
+
+        // Put the playhead inside the first clip and append it after the last one.
+        app.snap.frame = 10_000;
+        press(&mut app, 'y');
+        press(&mut app, 'P');
+        let arrangement = app.arrangement.as_ref().expect("an arrangement");
+        let ids: Vec<&str> = arrangement.lanes[0]
+            .clips
+            .iter()
+            .map(|clip| clip.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["c0", "c1", "paste.1"], "{}", app.status);
+        assert_eq!(
+            arrangement.lanes[0].clips[2].at_frame, 192_000,
+            "appended after the track's last clip (144 000 + 48 000)"
+        );
+
+        // Cut the first clip: one gesture, one undo step, and the clipboard keeps
+        // it so `p` can put it back.
+        press(&mut app, 'u'); // undo the paste first
+        app.snap.frame = 10_000;
+        press(&mut app, 'c');
+        assert!(
+            app.status.contains("cut 1 clip"),
+            "the cut is reported: {}",
+            app.status
+        );
+        assert!(
+            !app.arrangement.as_ref().expect("arrangement").lanes[0]
+                .clips
+                .iter()
+                .any(|clip| clip.id == "c0"),
+            "the cut removed it: {}",
+            app.status
+        );
+        press(&mut app, 'u');
+        assert!(
+            app.arrangement.as_ref().expect("arrangement").lanes[0]
+                .clips
+                .iter()
+                .any(|clip| clip.id == "c0"),
+            "one undo restores the cut: {}",
+            app.status
+        );
+
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// A grid-armed paste lands on the grid and says so, and the clipboard survives
+    /// the snap (the paste target is quantized once; the copied clips keep their
+    /// relative spacing).
+    #[test]
+    fn a_paste_lands_on_the_armed_grid() {
+        let (pool, script_path) = pool_script("pastegrid", "arrange add_track t1\n");
+        let mut app = App::idle();
+        app.snap = App::demo_snapshot();
+        app.open_script(&script_path);
+        let press = |app: &mut App, c: char| {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()))
+        };
+
+        press(&mut app, 'b'); // bar grid (96 000 frames at 120 bpm, 4/4)
+        assert_eq!(app.grid.label(), "bar");
+        press(&mut app, 'y');
+        app.active_track = 1;
+        app.snap.frame = 150_000; // between bars: nearest is 192 000
+        press(&mut app, 'p');
+        let arrangement = app.arrangement.as_ref().expect("an arrangement");
+        assert_eq!(arrangement.lanes[1].clips[0].at_frame, 192_000);
+        assert!(
+            app.status.contains("snapped from 150000"),
+            "the snap is reported: {}",
+            app.status
+        );
+
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// **A copied fade pair can be tight and the paste must still land.** The model
+    /// requires `fade_in + fade_out <= src_len`; a clip with `fade_in = src_len` (or
+    /// a fade that leaves less room than the guard) is legal, so the *guard* is what
+    /// gives way — otherwise the paste mints an op the host refuses, the gesture
+    /// fails, and the status would have claimed success.
+    #[test]
+    fn a_tight_copied_fade_pair_pastes_legally() {
+        let (pool, script_path) = pool_script(
+            "fadepair",
+            // On t1 so the playhead can point at it (c0 covers t0's first 144 000).
+            "arrange add_track t1\narrange add_clip t1 c9 s1 0 100 0 60 0 1.0\narrange set_clip_fade t0 c0 144000 0\n",
+        );
+        let mut app = App::idle();
+        app.snap = App::demo_snapshot();
+        app.open_script(&script_path);
+        let press = |app: &mut App, c: char| {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()))
+        };
+
+        // A 100-frame clip with a 60-frame fade-in: 40 frames are left, less than
+        // the 64-frame guard, so the pasted fade-out is 40.
+        app.active_track = 1;
+        app.snap.frame = 50;
+        press(&mut app, 'y');
+        app.snap.frame = 300;
+        press(&mut app, 'p');
+        let arrangement = app.arrangement.as_ref().expect("an arrangement");
+        let pasted = arrangement.lanes[1]
+            .clips
+            .iter()
+            .find(|clip| clip.id.starts_with("paste."))
+            .expect("the tight pair pasted");
+        assert_eq!(pasted.src_len, 100);
+        assert_eq!((pasted.fade_in, pasted.fade_out), (60, 40));
+        assert!(
+            pasted.fade_in + pasted.fade_out <= pasted.src_len,
+            "the model's sum rule holds"
+        );
+        assert!(app.status.contains("pasted 1 clip"), "{}", app.status);
+
+        // The extreme: a fade-in the whole clip long. The pasted clip gets no guard
+        // at all (there is no room), and the paste still lands.
+        app.active_track = 0;
+        app.snap.frame = 10_000; // inside c0 (0..144 000)
+        press(&mut app, 'y');
+        app.active_track = 1;
+        app.snap.frame = 1_000;
+        press(&mut app, 'p');
+        let arrangement = app.arrangement.as_ref().expect("an arrangement");
+        let pasted = arrangement.lanes[1]
+            .clips
+            .iter()
+            .rev()
+            .find(|clip| clip.id.starts_with("paste."))
+            .expect("the full-length fade pasted");
+        assert_eq!((pasted.fade_in, pasted.fade_out), (144_000, 0));
+        assert!(app.status.contains("pasted 1 clip"), "{}", app.status);
+
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// **A refused gesture must not announce success**, and a refusal must leave the
+    /// session alone. `command` returns whether the host applied it; every gesture
+    /// with its own success message checks it, and the clipboard's minted ids are
+    /// seeded above anything the session names — so a paste collision cannot happen
+    /// in the first place.
+    #[test]
+    fn a_refused_gesture_never_claims_success() {
+        let (pool, script_path) = pool_script("refused", "arrange add_track t1\n");
+        let mut app = App::idle();
+        app.snap = App::demo_snapshot();
+        app.open_script(&script_path);
+        let press = |app: &mut App, c: char| {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()))
+        };
+
+        // The mechanism every gesture uses: a refused command returns false and
+        // leaves the refusal in the status line.
+        assert!(
+            !app.command(
+                "test",
+                HostCommand::Arrange {
+                    op: media::ArrangeOp::Delete {
+                        track: "t0".into(),
+                        clip: "nope".into(),
+                    },
+                    at_frame: None,
+                },
+            ),
+            "a refused command reports it"
+        );
+        assert!(app.status.contains("refused"), "{}", app.status);
+        assert!(
+            !app.arrange_group(&["delete t0 nope".to_string()]),
+            "a refused group reports it"
+        );
+
+        // The ids are seeded, so pasting twice mints two ids and never collides —
+        // even after an undo (the counter only moves forward).
+        press(&mut app, 'y');
+        app.active_track = 1;
+        press(&mut app, 'p');
+        press(&mut app, 'u');
+        press(&mut app, 'p');
+        let ids: Vec<String> = app.arrangement.as_ref().expect("an arrangement").lanes[1]
+            .clips
+            .iter()
+            .map(|clip| clip.id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["paste.2"],
+            "the id counter never rewinds: {}",
+            app.status
+        );
+
+        // A clipboard from another session is refused **before** anything is minted,
+        // and says which source is missing.
+        app.clipboard = vec![(
+            0,
+            app.arrangement.as_ref().expect("arrangement").lanes[0].clips[0].clone(),
+        )];
+        app.pool_ids.clear();
+        let before = app.arrangement.as_ref().expect("arrangement").lanes[1]
+            .clips
+            .len();
+        press(&mut app, 'p');
+        assert!(
+            app.status.contains("no source"),
+            "the missing source is named: {}",
+            app.status
+        );
+        assert_eq!(
+            app.arrangement.as_ref().expect("arrangement").lanes[1]
+                .clips
+                .len(),
+            before,
+            "nothing was added"
+        );
+
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// A **multi-clip** selection pastes as one gesture: both clips land, their
+    /// relative spacing is preserved, and **one** undo removes both.
+    #[test]
+    fn a_multi_clip_paste_keeps_spacing_and_is_one_undo() {
+        let (pool, script_path) = pool_script(
+            "multipaste",
+            "arrange add_track t1\narrange add_clip t0 c1 s1 0 24000 48000 0 0 1.0\n",
+        );
+        let mut app = App::idle();
+        app.snap = App::demo_snapshot();
+        app.open_script(&script_path);
+        let press = |app: &mut App, c: char| {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()))
+        };
+
+        // c0 is 0..144 000 and c1 is 48 000..72 000. The selection motion has its
+        // own tests; this one is about the paste, so the range is set directly.
+        app.view.as_mut().expect("a view").selection = Some((0, 72_000));
+        press(&mut app, 'y');
+        assert!(
+            app.status.contains("copied 2 clips"),
+            "the selection took both: {}",
+            app.status
+        );
+        assert_eq!(app.clipboard.len(), 2);
+
+        app.active_track = 1;
+        app.snap.frame = 0;
+        press(&mut app, 'p');
+        let arrangement = app.arrangement.as_ref().expect("an arrangement");
+        let ids: Vec<&str> = arrangement.lanes[1]
+            .clips
+            .iter()
+            .map(|clip| clip.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["paste.1", "paste.2"], "{}", app.status);
+        assert_eq!(
+            arrangement.lanes[1]
+                .clips
+                .iter()
+                .map(|clip| clip.at_frame)
+                .collect::<Vec<_>>(),
+            vec![0, 48_000],
+            "the spacing between the copied clips is kept"
+        );
+        assert_eq!(app.clipboard[1].1.at_frame, 48_000, "and so is the origin");
+
+        press(&mut app, 'u');
+        assert!(
+            app.arrangement.as_ref().expect("arrangement").lanes[1]
+                .clips
+                .is_empty(),
+            "one undo removes the whole multi-clip paste: {}",
+            app.status
+        );
 
         let _ = std::fs::remove_dir_all(&pool);
     }

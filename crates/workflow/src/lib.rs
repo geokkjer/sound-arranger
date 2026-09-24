@@ -171,6 +171,17 @@ pub enum Action {
     SeekGrid(i32),
     /// Cycle the snap grid: off → bar → beat → 1/2 → 1/4 → off.
     GridCycle,
+    /// Copy the selection (or the clip under the playhead) to the shell's
+    /// clipboard — a value, never logged: copying changes nothing.
+    Yank,
+    /// Copy **and** delete in one gesture (the clipboard plus a logged delete).
+    Cut,
+    /// Paste the clipboard at the playhead on the active track, as one logged
+    /// gesture with minted ids.
+    Paste,
+    /// Paste **appended** after the active track's last clip (the arrangement's end
+    /// when the track is empty) — no new op, just a different target frame.
+    PasteAppend,
     /// Move the clip to the track below (+1) / above (-1).
     MoveTrack(i32),
     /// Step the clip's gain in dB.
@@ -215,6 +226,10 @@ impl Action {
             Action::Nudge(_) => "move the clip a grid step",
             Action::SeekGrid(_) => "step the playhead a grid line",
             Action::GridCycle => "the snap grid",
+            Action::Yank => "copy to the clipboard",
+            Action::Cut => "cut to the clipboard",
+            Action::Paste => "paste at the playhead",
+            Action::PasteAppend => "paste appended to the track",
             Action::MoveTrack(_) => "move the clip to another track",
             Action::Gain(_) => "clip gain",
             Action::Fade(_) => "fade",
@@ -240,6 +255,10 @@ impl Action {
             Action::MoveTrack(_) => Some("move_clip_to_track"),
             Action::Gain(_) => Some("set_clip_gain"),
             Action::Fade(_) => Some("set_clip_fade"),
+            // A cut is a logged `delete` (the copy half is a value); a paste is a
+            // group of `add_clip`s, which is why it needs no vocabulary of its own.
+            Action::Cut => Some("delete"),
+            Action::Paste | Action::PasteAppend => Some("add_clip"),
             _ => None,
         }
     }
@@ -429,6 +448,22 @@ pub static KEYMAP: &[Binding] = &[
         "cycle the snap grid: off → bar → beat → 1/2 → 1/4 (the grid is never logged)",
     ),
     bind(
+        "y  c",
+        &[
+            (Key::Char('y'), Action::Yank),
+            (Key::Char('c'), Action::Cut),
+        ],
+        "copy / cut the selection (or the clip under the playhead) — a shell value, not a log entry",
+    ),
+    bind(
+        "p  P",
+        &[
+            (Key::Char('p'), Action::Paste),
+            (Key::Char('P'), Action::PasteAppend),
+        ],
+        "paste at the playhead / appended after the track's last clip (one undo step)",
+    ),
+    bind(
         "g  G",
         &[
             (Key::Char('g'), Action::Gain(-1)),
@@ -591,6 +626,7 @@ mod tests {
         // A syntactically complete line per op the workflow dispatches, in the host's
         // own text format.
         let samples: &[(&str, &str)] = &[
+            ("add_clip", "add_clip t0 c0 s1 0 48000 0 64 64 1.0"),
             ("razor_split", "razor_split t0 c0 L R 48000"),
             ("delete", "delete t0 c0"),
             ("trim", "trim t0 c0 start 4800"),
