@@ -35,6 +35,7 @@ use media::{
 
 pub mod live;
 pub mod media_ops;
+pub mod rig;
 
 /// The session's tempo/meter map — re-exported because a shell reads it off the
 /// snapshot to do its own beat-domain math (grid snapping, a bar/beat ruler), and
@@ -214,6 +215,20 @@ pub enum HostCommand {
         dropped: u64,
         channels: usize,
         at_frame: u64,
+    },
+    /// **A declared rig source** — the set of sources the recorder intends to
+    /// capture, as *state* (see the takes slice): the declaration is data, and a
+    /// replay rebuilds it with no hardware attached. Identity is the stable
+    /// `name` plus a matching *rule*, never a device index (indices renumber
+    /// across reboots and replugs). Binding the name to a real device is a
+    /// device-bound side effect the clock/binding slice adds; nothing here
+    /// opens, binds or probes one.
+    SourceAdd {
+        name: String,
+        kind: &'static str,
+        matcher: String,
+        channels: usize,
+        clock: rig::ClockRole,
     },
     /// **A gesture**: several arrangement ops that apply as one unit and undo as
     /// **one step**. Members must be arrangement ops sharing one `at_frame` (a
@@ -432,6 +447,7 @@ impl HostCommand {
                 | HostCommand::Group { .. }
                 | HostCommand::SetSourceTempo { .. }
                 | HostCommand::Take { .. }
+                | HostCommand::SourceAdd { .. }
         )
     }
 }
@@ -500,6 +516,10 @@ pub struct HostSession {
     /// is what **tempo match** derives its ratio from. State: the log carries it, a
     /// replay rebuilds it, and the outcome exposes it to a shell.
     source_tempos: std::collections::HashMap<String, f64>,
+    /// The declared rig: the sources this session intends to capture. Pure
+    /// state — the log carries the declarations, and no arm of the apply path
+    /// touches a device to produce one.
+    sources: Vec<rig::SourceDecl>,
     /// track id → the arranger node mounted for it (avoids re-wiring on a rebuild).
     wired_tracks: std::collections::HashMap<String, engine::NodeId>,
     /// the arrangement value changed since last wiring (re-wire before render).
@@ -611,6 +631,7 @@ impl HostSession {
             last_export: None,
             last_seek: None,
             source_tempos: std::collections::HashMap::new(),
+            sources: Vec::new(),
             wired_tracks: std::collections::HashMap::new(),
             arrange_dirty: false,
             playing: false,
@@ -898,6 +919,13 @@ impl HostSession {
     /// shell's tempo match.
     pub fn source_tempos(&self) -> &std::collections::HashMap<String, f64> {
         &self.source_tempos
+    }
+
+    /// The declared rig: the sources this session intends to capture (see
+    /// [`HostCommand::SourceAdd`]). Declarations only — binding them to
+    /// devices is a later slice's side effect, never this accessor's business.
+    pub fn sources(&self) -> &[rig::SourceDecl] {
+        &self.sources
     }
 
     /// **Time-stretch a clip into new pool material.** The render writes a new pool
@@ -1466,6 +1494,47 @@ impl HostSession {
                     sources: (0..*channels).map(|k| format!("{take_id}.ch{k}")).collect(),
                     sample_rate: self.engine.clock.sample_rate,
                     at_frame: *at_frame,
+                });
+                Ok(())
+            }
+            // A declared rig source: record the declaration, touch nothing. The
+            // name uses the same discipline as a take id (`media::valid_name`) —
+            // a source name has to stay nameable in the whitespace-split log —
+            // and a duplicate is a bug, not a merge.
+            HostCommand::SourceAdd {
+                name,
+                kind,
+                matcher,
+                channels,
+                clock,
+            } => {
+                if !media::valid_name(name) {
+                    return Err(format!(
+                        "'{name}' is not usable as a source name (one token, no '#', not an \
+                         @frame or snap= modifier)"
+                    ));
+                }
+                if self.sources.iter().any(|s| s.name == *name) {
+                    return Err(format!(
+                        "source '{name}' is already declared — a duplicate address is a bug, \
+                         not a merge"
+                    ));
+                }
+                if matcher.is_empty() {
+                    return Err("a source matcher must not be empty".into());
+                }
+                if !(1..=media::capture::CAPTURE_CHANNELS_SANITY).contains(channels) {
+                    let sanity = media::capture::CAPTURE_CHANNELS_SANITY;
+                    return Err(format!(
+                        "source '{name}' channels must be 1..={sanity}, got {channels}"
+                    ));
+                }
+                self.sources.push(rig::SourceDecl {
+                    name: name.clone(),
+                    kind,
+                    matcher: matcher.clone(),
+                    channels: *channels,
+                    clock: *clock,
                 });
                 Ok(())
             }
@@ -2609,6 +2678,19 @@ pub fn format_command(cmd: &HostCommand, session_dir: Option<&std::path::Path>) 
             channels,
             at_frame,
         } => format!("take {take_id} {frames} {dropped} {channels} {at_frame}"),
+        // `source add <name> kind=<kind> match=<matcher> channels=<n> clock=<role>` —
+        // the matcher is one token, so the line is whitespace-round-trippable (a
+        // matcher with a space has no spelling yet).
+        HostCommand::SourceAdd {
+            name,
+            kind,
+            matcher,
+            channels,
+            clock,
+        } => format!(
+            "source add {name} kind={kind} match={matcher} channels={channels} clock={}",
+            clock.as_str()
+        ),
         HostCommand::SessionRate { hz } => format!("session_rate {hz}"),
         HostCommand::Arrange { op, at_frame } => {
             format!("arrange {}{}", format_arrange(op), frame(at_frame))
@@ -3126,6 +3208,35 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
                     at_frame,
                 });
             }
+            "source" => {
+                let sub = word(&words, 1, at)?;
+                if sub != "add" {
+                    return Err(format!(
+                        "line {at}: unknown source op '{sub}' (use `source add`)"
+                    ));
+                }
+                // name(2) kind=(3) match=(4) channels=(5) clock=(6) — a fixed
+                // shape, so an extra word (e.g. a matcher with a space) is a
+                // typo, not something to ignore. The tokenizer is
+                // whitespace-based, so a matcher is a single token; quoted
+                // matchers await a tokenizer extension, not one grown here.
+                exact(&words, 7, at, "source add")?;
+                let name = word(&words, 2, at)?.to_string();
+                let kind = keyed("kind", word(&words, 3, at)?, at)?;
+                let matcher = keyed("match", word(&words, 4, at)?, at)?.to_string();
+                let channels = keyed("channels", word(&words, 5, at)?, at)?
+                    .parse::<usize>()
+                    .map_err(|_| format!("line {at}: bad source channel count"))?;
+                let clock = rig::ClockRole::parse(keyed("clock", word(&words, 6, at)?, at)?)
+                    .map_err(|e| format!("line {at}: {e}"))?;
+                commands.push(HostCommand::SourceAdd {
+                    name,
+                    kind: rig::source_kind(kind).map_err(|e| format!("line {at}: {e}"))?,
+                    matcher,
+                    channels,
+                    clock,
+                });
+            }
             "bounce" => {
                 exact(&words, 3, at, "bounce")?;
                 let frames = word(&words, 1, at)?
@@ -3600,6 +3711,14 @@ fn exact(words: &[&str], want: usize, at: usize, what: &str) -> Result<(), Strin
     Ok(())
 }
 
+/// A `key=<value>` operand: the prefix is part of the line's grammar, so a
+/// missing one is a parse refusal, not a positional guess.
+fn keyed<'a>(key: &str, token: &'a str, at: usize) -> Result<&'a str, String> {
+    token
+        .strip_prefix(&format!("{key}="))
+        .ok_or_else(|| format!("line {at}: expected {key}=<value>, got '{token}'"))
+}
+
 /// Parse a `snap=<frames>` modifier. A zero step is refused rather than treated
 /// as "no grid": omitting the modifier *is* "no grid", and a zero divisor would
 /// quantize every frame to zero.
@@ -3885,6 +4004,126 @@ mod tests {
         let mut w = media::WavWriter::create(&path, 48_000, 1).expect("wav writer");
         w.write(&vec![0.0f32; frames]).expect("write take");
         w.finalize().expect("finalize take");
+    }
+
+    // -- rig: declared sources are state, never hardware ----------------------
+
+    fn source_add(name: &str) -> HostCommand {
+        HostCommand::SourceAdd {
+            name: name.into(),
+            kind: "alsa",
+            matcher: "hw:USB".into(),
+            channels: 2,
+            clock: rig::ClockRole::Follower,
+        }
+    }
+
+    #[test]
+    fn a_declared_rig_replays_with_no_hardware() {
+        // Format → parse round-trips the exact line, and a rebuilt session
+        // carries the declarations back — no device opened, bound or probed
+        // anywhere on this path (the takes slice's purity rule).
+        let line = format_command(
+            &HostCommand::SourceAdd {
+                name: "synth".into(),
+                kind: "alsa",
+                matcher: "hw:USB".into(),
+                channels: 8,
+                clock: rig::ClockRole::Master,
+            },
+            None,
+        )
+        .expect("a SourceAdd formats");
+        assert_eq!(
+            line,
+            "source add synth kind=alsa match=hw:USB channels=8 clock=master"
+        );
+        let parsed = parse_script(&format!("host v{HOST_API_VERSION}\n{line}\n"))
+            .expect("the line parses back");
+        assert_eq!(parsed.len(), 1);
+        let s = HostSession::from_script(&parsed).expect("a rig rebuilds with no device");
+        let sources = s.sources();
+        assert_eq!(sources.len(), 1, "the declaration survives the rebuild");
+        assert_eq!(sources[0].name, "synth");
+        assert_eq!(sources[0].kind, "alsa");
+        assert_eq!(sources[0].matcher, "hw:USB");
+        assert_eq!(sources[0].channels, 8);
+        assert_eq!(sources[0].clock, rig::ClockRole::Master);
+    }
+
+    #[test]
+    fn source_add_refuses_bad_names_kinds_clocks_and_widths() {
+        let mut s = HostSession::new();
+        s.execute(&source_add("synth")).expect("first declaration");
+
+        // The name goes into the log and (later) a device binding, so it uses the
+        // same character discipline as a take id.
+        let bad_name = s.execute(&HostCommand::SourceAdd {
+            name: "bad name!".into(),
+            kind: "alsa",
+            matcher: "hw:0".into(),
+            channels: 2,
+            clock: rig::ClockRole::Free,
+        });
+        assert!(bad_name.is_err(), "an unusable name is refused");
+
+        // A duplicate address is a bug, not a merge.
+        let dup = s.execute(&source_add("synth"));
+        assert!(dup.is_err(), "a duplicate source name is refused");
+
+        // channels references the capture sanity bound, never a literal.
+        let zero = s.execute(&HostCommand::SourceAdd {
+            name: "zero".into(),
+            kind: "alsa",
+            matcher: "hw:0".into(),
+            channels: 0,
+            clock: rig::ClockRole::Free,
+        });
+        assert!(zero.is_err(), "channels=0 is refused");
+        let absurd = s.execute(&HostCommand::SourceAdd {
+            name: "absurd".into(),
+            kind: "alsa",
+            matcher: "hw:0".into(),
+            channels: media::capture::CAPTURE_CHANNELS_SANITY + 1,
+            clock: rig::ClockRole::Free,
+        });
+        assert!(absurd.is_err(), "an absurd channel count is refused");
+
+        // A refused declaration is never logged: nothing landed in the session.
+        assert_eq!(s.sources().len(), 1, "only the first declaration landed");
+    }
+
+    #[test]
+    fn source_add_parses_loudly_or_not_at_all() {
+        let head = format!("host v{HOST_API_VERSION}\n");
+        // An unknown kind is a parse error naming the registry, not a silent
+        // declaration that can never bind.
+        let err = parse_script(&format!(
+            "{head}source add s kind=firewire match=hw:0 channels=2 clock=free\n"
+        ))
+        .expect_err("unknown kind");
+        assert!(
+            err.contains("unknown source kind"),
+            "and it says why: {err}"
+        );
+
+        // A malformed clock role is refused — no default, no guessing.
+        let err = parse_script(&format!(
+            "{head}source add s kind=alsa match=hw:0 channels=2 clock=slave\n"
+        ))
+        .expect_err("bad clock role");
+        assert!(err.contains("clock role"), "and it says why: {err}");
+
+        // The tokenizer is whitespace-based, so a matcher with a space is one
+        // token too many — refused rather than silently truncated.
+        let err = parse_script(&format!(
+            "{head}source add s kind=alsa match=hw:0 extra channels=2 clock=free\n"
+        ))
+        .expect_err("extra token");
+        assert!(
+            err.contains("operand"),
+            "the extra token is the refusal: {err}"
+        );
     }
 
     fn add_clip(id: &str, at: u64) -> media::ArrangeOp {
