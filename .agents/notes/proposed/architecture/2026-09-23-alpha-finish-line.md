@@ -79,7 +79,7 @@ from the shared workflow (a key or a `: ` line — never a shell-only feature).
 
 **A — the document has a life (foundations)**
 1. ~~**Compound gestures — one gesture, one undo.**~~ **DONE** (2026-09-23): implemented as
-   [`HostCommand::Group`](../2026-09-23-compound-gestures-one-undo-step.md) with the host history as
+   [`HostCommand::Group`](../../implemented/architecture/2026-09-23-compound-gestures-one-undo-step.md) with the host history as
    entries; `t` in the TUI is the first gesture. The rest of the item is preserved below as the design
    of record. At the **host** level: `history: Vec<HostCommand>`
    becomes `Vec<Vec<HostCommand>>` (a bare command is a one-element group); a gesture opens a group,
@@ -91,7 +91,7 @@ from the shared workflow (a key or a `: ` line — never a shell-only feature).
    one-gesture-two-undos bug (`t`) and the paste/append/utility gestures below.
 2. ~~**Session save/open — a session is a directory.**~~ **DONE** (2026-09-23): `session.txt` (the log,
    loaded by the existing parser) + `pool/` + a journal for autosave, all three `host v1` lines
-   (`session_rate`/`save`/`load`) — [note](../2026-09-23-session-directory-save-and-journal.md). The
+   (`session_rate`/`save`/`load`) — [note](../../implemented/architecture/2026-09-23-session-directory-save-and-journal.md). The
    design below is preserved as the record. `mysong.d/session.txt` (the state-command history
    verbatim, with `set_tempo` and a **session-relative** `pool`) + `mysong.d/pool/` (content-addressed
    WAVs, including conformed and stretched material). Load is the *existing* `parse_script` — no second
@@ -102,7 +102,7 @@ from the shared workflow (a key or a `: ` line — never a shell-only feature).
 3. ~~**Recording into the host.**~~ **DONE** (2026-09-23): `record <take_id>` captures the default input
    device into the pool at the session rate, `record stop` finalizes it, and a test drives the same seam
    with a ring instead of a device
-   ([note](../2026-09-23-recording-into-the-host.md)). The gate's stand-in review returned `do not
+   ([note](../../implemented/feature/2026-09-23-recording-into-the-host.md)). The gate's stand-in review returned `do not
    merge` on a real blocker (a mono input ring demuxed as multi-channel: every take silently corrupt);
    fixed in the slice, with a hardware-gated test. The design below is preserved as the record. Wire `media::Capture` (which already has drift compensation, crash
    recovery and per-channel writers) behind the existing `record <take_id>` line: the host opens the input

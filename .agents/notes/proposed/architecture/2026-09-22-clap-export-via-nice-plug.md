@@ -50,7 +50,7 @@ no-sidecars note closed?"**
      our own render-path invariant turned into a test.
    - GUIs: a baseview-based editor API with a first-party **`nice-plug-iced`** adapter (0.4.1,
      ISC), and `iced_audio`'s own `nice-plug` feature exists precisely to bind its widgets to
-     nice-plug parameters — so the [shell decision](2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md)
+     nice-plug parameters — so the [shell decision](../../implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md)
      and the export path share one GUI stack.
 3. **The bridge is a wrapper, not a port.** A `Plugin` implementation owns an `engine` instance
    (graph + clock), maps CLAP's parameters/note events/transport onto the same vocabulary

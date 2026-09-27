@@ -79,7 +79,7 @@ and panned independently, and no reader ever has to de-interleave on the audio p
 
 - **A stereo *clip* (one source, two channels, a stereo port)** — the "genuine" route and
   the one the [stereo-pan
-  note](.agents/notes/implemented/architecture/2026-09-05-stereo-pan-foundation.md)
+  note](../../../../.agents/notes/implemented/architecture/2026-09-05-stereo-pan-foundation.md)
   reserved a seam for.
   Rejected for the alpha: it makes the clip the unit of channel-ness, so every arranger
   node, ring, gain, fade and clip edit grows a channel dimension before any of them is
@@ -127,7 +127,7 @@ and panned independently, and no reader ever has to de-interleave on the audio p
   TUI's pool tests shared one session pool per process without serializing, so one test's
   `drop_pool()` deleted another's material mid-import.
 - **The independent gate (GLM-5.3 stand-in, `merge with changes`) found five more, all
-  fixed** ([review + disposition](research/architecture/2026-09-24-alpha-slice-gate-a4-glm-standin.md)):
+  fixed** ([review + disposition](../../../../research/architecture/2026-09-24-alpha-slice-gate-a4-glm-standin.md)):
   the stale-channel removal stopped at the whole-file source (`jam.ch2`… of a replaced 5.1
   take survived) → `replace_sources` by channel count; channels and siblings were written to
   their final names, so a crash left a torn take that `recover` would "finalize" into a

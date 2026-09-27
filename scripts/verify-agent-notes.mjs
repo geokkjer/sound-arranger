@@ -5,10 +5,11 @@
  * The rules this enforces live in .agents/notes/README.md.
  */
 
-import { readFileSync, readdirSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
 
 const root = resolve(import.meta.dirname, '..', '.agents', 'notes')
+const repoRoot = resolve(import.meta.dirname, '..')
 
 const LIFECYCLES = ['proposed', 'implemented', 'rejected']
 const CLASSES = ['feature', 'bug-fix', 'simplification', 'architecture', 'process']
@@ -104,6 +105,22 @@ for (const lifecycle of LIFECYCLES) {
         for (const h2 of h2s.filter((h) => BANNED_IMPLEMENTED.test(h))) {
           fail(rel, `\`${h2}\` is proposal-era spec-speak; an implemented note states what is (fold it into Decision/Consequences)`)
         }
+      }
+
+      // Cross-references must resolve. A note pointing at a note that moved (or
+      // never existed) is the rot this tree accumulates most quietly, and the
+      // pre-commit gate is the only reader that never gets tired of noticing.
+      // Fenced examples are already excluded (they are not document structure).
+      // A leading `/` is repo-root-relative (how GitHub renders it).
+      for (const link of prose.join('\n').matchAll(/\]\(([^)\s]+)\)/g)) {
+        const target = link[1].split('#')[0]
+        // External references are not ours to resolve (and a gate that needs the
+        // network is a gate that fails on a train).
+        if (!target || target.startsWith('//') || /^[a-z][a-z0-9+.-]*:/i.test(target)) continue
+        const linkPath = target.startsWith('/')
+          ? resolve(repoRoot, `.${target}`)
+          : resolve(dirname(resolve(classDir, file)), target)
+        if (!existsSync(linkPath)) fail(rel, `broken link: ${link[1]}`)
       }
     }
   }

@@ -12,7 +12,7 @@ probe: pump error: clip 'c0' source is 44100 Hz but the session is 48000 Hz (rat
 
 The refusal was deliberate — a rate-mismatched source would play ~8.8% flat with no counter, the
 "clock dishonesty" the [output-negotiation
-note](2026-09-10-audio-output-negotiation.md) rejects — but for a *clip arranger* the outcome was
+note](../feature/2026-09-10-audio-output-negotiation.md) rejects — but for a *clip arranger* the outcome was
 wrong: the most common music rate (44.1 kHz, and equally 88.2/96 kHz) was unusable, and there was no
 import door at all. The only path that put material in the pool, capture, resamples in real time (see
 [wire-driftcompensator-into-capture](../feature/2026-08-24-wire-driftcompensator-into-capture.md)),
@@ -57,7 +57,7 @@ the pool boundary.**
   always a derived `.peaks` sidecar. A **multi-channel** file is split at this boundary into one mono
   source per channel (`{id}.ch0`, `{id}.ch1`, …), so the rate rule and the channel rule are both
   enforced once, where material enters ([stereo-material
-  note](.agents/notes/implemented/feature/2026-09-24-stereo-material-per-channel-pool.md)). This is the
+  note](../../../../.agents/notes/implemented/feature/2026-09-24-stereo-material-per-channel-pool.md)). This is the
   path `--wave` now takes: the spike imports into its own session pool
   (`$TMPDIR/tui-shell-pool-<pid>`) instead of pointing `pool` at the user's directory.
 - **`Pool::conform(session_rate)`** — the maintenance pass (sibling of `Pool::recover`) that makes a

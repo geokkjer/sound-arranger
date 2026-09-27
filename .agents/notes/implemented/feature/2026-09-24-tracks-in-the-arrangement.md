@@ -102,7 +102,7 @@ There was also no key for any of it, and `remove_track` silently dropped the tra
 ## The gate's findings
 
 The slice's gate returned `merge with changes`; both should-fix findings were real and are fixed
-here ([review + disposition](research/architecture/2026-09-24-alpha-slice-gate-d2-glm-standin.md)):
+here ([review + disposition](../../../../research/architecture/2026-09-24-alpha-slice-gate-d2-glm-standin.md)):
 
 1. **`a` announced a mixer channel that may not exist** — the value op is permissive, but
    `track ti` feeds `ch{ti}` and the mixer's width is a mount parameter, so adding the fifth track

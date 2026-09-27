@@ -20,14 +20,14 @@ command was issued — the grid is UI state and is never logged.
 **Two domains, one seam.** Musical positions are *beats*; the language speaks *frames*.
 
 - `crates/media/src/snap.rs` — the pure math, no engine dependency:
-  [`Division`](crates/media/src/snap.rs) (`Bar`/`Beat`/`Half`/`Quarter`, with `beats(beats_per_bar)`,
-  `label`, `parse`, and a cycle), [`Grid`](crates/media/src/snap.rs) (`nearest`/`floor`/`ceil` in
+  [`Division`](../../../../crates/media/src/snap.rs) (`Bar`/`Beat`/`Half`/`Quarter`, with `beats(beats_per_bar)`,
+  `label`, `parse`, and a cycle), [`Grid`](../../../../crates/media/src/snap.rs) (`nearest`/`floor`/`ceil` in
   the beat domain, `nearest_frame` at a constant tempo), the plan's
   `to_grid(frame, division, beats_per_bar, tempo, rate)` convenience, and
   `quantize_frames(frame, step)` — the frame-domain quantizer the parser uses. A degenerate
   meter (0 beats/bar) or tempo (0/NaN/∞) degrades to a usable value instead of dividing by
   zero.
-- `crates/workflow/src/lib.rs` — [`workflow::Grid`](crates/workflow/src/lib.rs): which division is
+- `crates/workflow/src/lib.rs` — [`workflow::Grid`](../../../../crates/workflow/src/lib.rs): which division is
   armed (`Option<Division>`, **off by default**), and `cycle()` in the workflow's own order
   (off → bar → beat → 1/2 → 1/4 → off), so two shells cannot disagree about what `b` means.
   New actions: `GridCycle`, and `SeekGrid(±1)`. New keys: `b`, `[`/`]`.
@@ -99,7 +99,7 @@ command was issued — the grid is UI state and is never logged.
   `[`/`]` on and off the grid, and the ruler switching between seconds and bar/beat; iced
   covers the shared cycle and its report.
 - **The independent gate (GLM-5.3 stand-in, `merge with changes`) found two real defects and
-  four notes, all dispositioned** ([review + disposition](research/architecture/2026-09-24-alpha-slice-gate-c-glm-standin.md)):
+  four notes, all dispositioned** ([review + disposition](../../../../research/architecture/2026-09-24-alpha-slice-gate-c-glm-standin.md)):
   `quantize_frames` could overflow `u64` on a nonsense-but-parsed frame (`transport seek
   u64::MAX snap=2`) — found by self-review first, fixed with a saturating add and a test; a
   **snapped fade did not say so** in its status (every other playhead edit did) — fixed with a

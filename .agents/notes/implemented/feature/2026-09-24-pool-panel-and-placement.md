@@ -106,7 +106,7 @@ arrangement is made of had no home on screen.
 ## The gate's findings
 
 The slice's gate returned `merge with changes`
-([review + disposition](research/architecture/2026-09-24-alpha-slice-gate-d3a-glm-standin.md)):
+([review + disposition](../../../../research/architecture/2026-09-24-alpha-slice-gate-d3a-glm-standin.md)):
 
 1. **The pool was adopted *after* the arrangement branch** — an arrangement error returned early,
    leaving the panel rows and the paste check on the previous session. Fixed by adopting the pool

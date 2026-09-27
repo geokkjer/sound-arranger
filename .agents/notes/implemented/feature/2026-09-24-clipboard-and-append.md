@@ -115,7 +115,7 @@ clip, `delete` removes one, and `group begin … group end` (alpha slice A1) mak
 
 The slice's independent gate returned `merge with changes`; its two must-fix findings were real
 and are fixed here, with tests
-([review + disposition](research/architecture/2026-09-24-alpha-slice-gate-d1-glm-standin.md)):
+([review + disposition](../../../../research/architecture/2026-09-24-alpha-slice-gate-d1-glm-standin.md)):
 
 1. **The fade guard did not guarantee the model's sum rule** when a copied fade was kept on one
    side (`fade_in = 60` of a `src_len = 100` clip left only 40 frames, but the guard asked for

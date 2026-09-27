@@ -115,7 +115,7 @@ that already exist.**
 ## The gate's findings
 
 The slice's gate returned `merge with changes`
-([review + disposition](research/architecture/2026-09-24-alpha-slice-gate-e1-glm-standin.md)):
+([review + disposition](../../../../research/architecture/2026-09-24-alpha-slice-gate-e1-glm-standin.md)):
 
 1. **Normalize and trim-to-content read only the positive half of the peak** (must-fix) — the true
    peak is `max(|min|, max)`, so a −0.9 excursion read as `max = 0.25` gave a gain of 4 and clipped,

@@ -9,8 +9,8 @@ right thing to build first — it proved the UI-as-plugin contract end to end an
 shell that has reached a full editor. But it costs the project its shape: two languages, a
 webview, an IPC wire and a serde surface to keep in step, a `!Send` host session behind a
 mutex, an npm toolchain in the build, and webkit/GPU dependencies on the deploy path. The
-[iced](2026-09-21-iced-shell-evaluation.md) and
-[ratatui](2026-09-21-tui-shell-evaluation.md) spikes exist because the owner's direction is
+[iced](../../proposed/architecture/2026-09-21-iced-shell-evaluation.md) and
+[ratatui](../../proposed/architecture/2026-09-21-tui-shell-evaluation.md) spikes exist because the owner's direction is
 "reduce complexity: one stack, in-process Rust, over the same Host API" — and having now run
 both, the owner's decision is: **retire Tauri, continue with iced and ratatui.**
 
@@ -42,7 +42,7 @@ modal, key-driven workflow across both.**
 3. **The Host API is the shell seam, and two shells now prove it.** Both spikes drive the
    *same* `host::live::HostHandle` the bridge drove (`spikes/iced-shell`, `spikes/tui-shell`),
    each its own isolated workspace so neither framework leaks into the core's build. The
-   [UI-as-plugin note](../2026-08-18-ui-as-plugin-host-api-and-headless-reference.md) argued
+   [UI-as-plugin note](2026-08-18-ui-as-plugin-host-api-and-headless-reference.md) argued
    this seam; the retirement is the first real test of it, and the core crates did not change.
 4. **`iced_audio` is the iced shell's widget library.** `iced_audio 0.17` (MIT, 2026-09-09)
    tracks `iced_core`/`iced_graphics` 0.14 exactly — the version the spike already used — and

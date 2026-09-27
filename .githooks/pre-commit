@@ -1,10 +1,31 @@
 #!/usr/bin/env bash
-# Agent Note gate: verify the notes tree and refuse any change to the frozen archive.
+# Pre-commit gates, in order of how fast they are to satisfy:
+#   1. formatting — rustfmt is the only style authority, and nothing else checks it;
+#   2. the notes tree — structure, and that every cross-reference resolves.
 # Wired via `git config core.hooksPath .githooks`.
+#
+# Every gate here is advisory when its tool is missing: a docs-only checkout, or a
+# machine without the toolchain, should still be able to commit. CI is the authority
+# (a hook is cloned with the repo, but `core.hooksPath` is local config — so the hook
+# is a courtesy to the next reader, never the last line of defence).
 set -euo pipefail
 
+if command -v cargo >/dev/null 2>&1; then
+  if ! fmt_out=$(cargo fmt --all --check 2>&1); then
+    if printf '%s' "$fmt_out" | grep -qiE 'no such command|not installed|unknown command'; then
+      echo "pre-commit: rustfmt unavailable — skipping the format check" >&2
+    else
+      echo "pre-commit: rustfmt is unhappy — run 'cargo fmt --all', then re-commit:" >&2
+      printf '%s\n' "$fmt_out" | head -40 >&2
+      exit 1
+    fi
+  fi
+else
+  echo "pre-commit: cargo not found on PATH — skipping the format check" >&2
+fi
+
 if ! command -v node >/dev/null 2>&1; then
-  echo "pre-commit: node not found on PATH (install node) — skipping Agent Note verification" >&2
+  echo "pre-commit: node not found on PATH — skipping the Agent Note gate" >&2
   exit 0
 fi
 
