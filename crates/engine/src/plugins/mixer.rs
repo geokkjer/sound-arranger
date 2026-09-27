@@ -375,10 +375,7 @@ pub struct MixerNode {
 
 impl MixerNode {
     pub fn new() -> Self {
-        Self::with_channels(
-            MIXER_CHANNELS,
-            Arc::new(MeterBank::new(MIXER_CHANNELS)),
-        )
+        Self::with_channels(MIXER_CHANNELS, Arc::new(MeterBank::new(MIXER_CHANNELS)))
     }
 
     /// Construct with an active channel count and a shared meter bank — the
@@ -639,9 +636,18 @@ mod tests {
             12,
             "one channel input per mounted channel"
         );
-        assert!(ports.iter().any(|p| p.name == "audio"), "the master out is there");
-        assert!(params.iter().any(|p| p.name == "ch11.gain"), "the twelfth channel has params");
-        assert!(!params.iter().any(|p| p.name == "ch12.gain"), "and no thirteenth");
+        assert!(
+            ports.iter().any(|p| p.name == "audio"),
+            "the master out is there"
+        );
+        assert!(
+            params.iter().any(|p| p.name == "ch11.gain"),
+            "the twelfth channel has params"
+        );
+        assert!(
+            !params.iter().any(|p| p.name == "ch12.gain"),
+            "and no thirteenth"
+        );
         // The catalog stays nominal, so the patch bay has something to offer before a
         // mount exists — but it is not what the instance answers with.
         assert_ne!(ports.len(), MIXER_PORTS.len());
