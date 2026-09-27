@@ -2,6 +2,11 @@
 
 Status: implemented
 
+> **Re-evaluated 2026-09-27:** DeepSeek-V4-Flash retired and row 0 (driver / planner) moved to
+> DeepSeek-V4.1-Flash; the remaining rows stand on the independence rule, and the price placement
+> is due for a real pass. See [the roster re-evaluation](2026-09-27-model-roster-re-evaluation.md).
+> The table below is the 2026-08-27 snapshot, left as decided then.
+
 ## Problem
 
 The project is built by one human plus several models, and the loop already runs in practice: DeepSeek-V4-Flash drives the session and plans; Kimi has reviewed every substantive slice since 2026-08-15; GLM-5.3 Flash did a one-off review pass and authored several docs on 2026-08-27. But the routing was implicit — carried in chat and commit trailers, not written down, and spread across a half-dozen review archives. With a fourth model entering (DeepSeek-V4-Pro, which the owner set up but could not place), the arrangement has outgrown what chat can hold, and two questions can no longer be answered from the record: *which model does what*, and *why that model*. The owner asked for the schema documented with a timestamp and a methodology, because the field is a moving target and routing will change.
