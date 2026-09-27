@@ -25,6 +25,11 @@ use crate::wav::WavWriter;
 const DEMUX_BATCH: usize = 512;
 
 /// The live multi-channel capture: pool writer + per-channel monitoring rings.
+/// The widest capture layout a take accepts: a **sanity bound** (a typo guard), not a
+/// design ceiling — nothing is sized by it (a take's rings and WAVs are allocated from
+/// the channel count it was started with), and no interface reports anywhere near it.
+pub const CAPTURE_CHANNELS_SANITY: usize = 64;
+
 pub struct Capture {
     channels: usize,
     channel_rings: Vec<Arc<Spsc<f32>>>,
@@ -57,8 +62,11 @@ impl Capture {
         input_rate: u32,
         source: Arc<Spsc<f32>>,
     ) -> Result<Self, String> {
-        if !(1..=8).contains(&channels) {
-            return Err(format!("capture channels must be 1..=8, got {channels}"));
+        if !(1..=CAPTURE_CHANNELS_SANITY).contains(&channels) {
+            return Err(format!(
+                "capture channels must be 1..={CAPTURE_CHANNELS_SANITY} (a sanity bound, not a \
+                 design limit), got {channels}"
+            ));
         }
         if !take_id
             .chars()

@@ -465,8 +465,8 @@ fn fractional_or_zero_mixer_channels_is_refused() {
         run_script(&zero).is_err(),
         "zero mixer channels must be refused"
     );
-    // over the max (8) refused
-    let big = vec![
+    // A width past the old ceiling is a valid mount now: channels are lanes, not a knob.
+    let wide = vec![
         HostCommand::Mount {
             plugin: "mixer",
             params: vec![("channels", 9.0)],
@@ -475,8 +475,21 @@ fn fractional_or_zero_mixer_channels_is_refused() {
         HostCommand::Pool { dir: pool.clone() },
     ];
     assert!(
-        run_script(&big).is_err(),
-        "channels over the mixer max must be refused"
+        run_script(&wide).is_ok(),
+        "nine channels must mount: the mixer's width is no longer a compile-time limit"
+    );
+    // The only bound left is a sanity guard against gross typos, and it is loud.
+    let absurd = vec![
+        HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 1000.0)],
+            at_frame: Some(0),
+        },
+        HostCommand::Pool { dir: pool.clone() },
+    ];
+    assert!(
+        run_script(&absurd).is_err(),
+        "an absurd channel count must be refused"
     );
     let _ = std::fs::remove_dir_all(&pool);
 }

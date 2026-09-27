@@ -74,3 +74,5 @@ on the take**: the input handle carries no name today, and device identity belon
 - Two tests: a finished take is committed to the document **and** the `record` line is not, and a
   `take` line replays with no device and no pool.
 - The next slice (a capture produces a placement) builds directly on `at_frame`.
+
+*Authored with DeepSeek-V4.1-Flash · DeepSeek Harness, 2026-09-27.*

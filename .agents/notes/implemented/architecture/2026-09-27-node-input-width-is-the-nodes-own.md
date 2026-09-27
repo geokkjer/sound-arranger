@@ -66,3 +66,5 @@ still open.
   hand-written `MIXER_PORTS`/`MIXER_PARAMS`, and the `1..=8` clamp in `capture.rs`. Those need the
   surface to be the instance's — dynamic names, so `Port.name`/`ParamDef.name` stop being
   `&'static str` — which is a 58-site and 44-site sweep, sized and left as the next step.
+
+*Authored with DeepSeek-V4.1-Flash · DeepSeek Harness, 2026-09-27.*

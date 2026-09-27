@@ -826,7 +826,7 @@ impl HostSession {
         // capture cannot be sized from a config that raced a device swap.
         let handle = media::devices::open_input(std::sync::Arc::clone(&ring))?;
         let rate = handle.sample_rate;
-        let channels = (handle.channels as usize).clamp(1, 8);
+        let channels = (handle.channels as usize).clamp(1, media::capture::CAPTURE_CHANNELS_SANITY);
         self.start_recording(take_id, ring, rate, channels)?;
         if let Some(rec) = self.recording.as_mut() {
             rec.handle = Some(handle);
@@ -2400,9 +2400,9 @@ impl HostSession {
                 })
                 .transpose()?
                 .unwrap_or(4);
-            if channels > MIXER_CHANNELS_MAX {
+            if channels > MIXER_CHANNELS_SANITY {
                 return Err(format!(
-                    "mixer channels {channels} exceeds the max {MIXER_CHANNELS_MAX}"
+                    "mixer channels {channels} exceeds the sanity bound {MIXER_CHANNELS_SANITY}"
                 ));
             }
             // Defer committing the channel count until apply succeeds: a refused

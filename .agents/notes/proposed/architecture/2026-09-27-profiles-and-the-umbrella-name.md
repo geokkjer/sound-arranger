@@ -169,3 +169,5 @@ sentiment, because "viable but not focus" decays into "never" without one.
   continuity, and zero new concepts — and it is why criterion 6 is optional rather than required.
   The cost: overdub stacks takes as clips rather than as a distinct take list. If that ever grates,
   it is the signal to split the representations, not a bug to patch.
+
+*Authored with DeepSeek-V4.1-Flash · DeepSeek Harness, 2026-09-27.*

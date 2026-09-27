@@ -23,7 +23,6 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use engine::MIXER_CHANNELS_MAX;
 use media::Spsc;
 use media::devices::OutputHandle;
 
@@ -45,9 +44,9 @@ pub struct Snapshot {
     /// The session's sample rate (the engine clock's) — the frame side of the
     /// musical math, available even when no device was opened.
     pub sample_rate: u32,
-    /// Per-channel meter peaks (post-gain, pre-mute/solo). Only the first
-    /// `channel_count` are meaningful; the rest are zero.
-    pub channels: [f32; MIXER_CHANNELS_MAX],
+    /// Per-channel meter peaks (post-gain, pre-mute/solo), one per mounted mixer
+    /// channel — empty when no mixer is mounted. Sized by the mount, not by a constant.
+    pub channels: Vec<f32>,
     /// The mixer's mounted channel count (0 when no mixer is mounted).
     pub channel_count: usize,
     pub master: f32,
@@ -128,7 +127,7 @@ impl Default for Snapshot {
             // defaults the shells start from.
             tempo_map: engine::TempoMap::new(48_000, 120.0, 4),
             sample_rate: 48_000,
-            channels: [0.0; MIXER_CHANNELS_MAX],
+            channels: Vec::new(),
             channel_count: 0,
             master: 0.0,
             mastering: None,
@@ -558,18 +557,19 @@ fn publish(session: &HostSession, shared: &Mutex<Snapshot>, audio: &AudioState) 
     let tempo = session.tempo_map();
     s.sample_rate = tempo.sample_rate();
     s.tempo_map = tempo;
-    s.channel_count = session.mixer_channels().unwrap_or(0);
+    let channel_count = session.mixer_channels().unwrap_or(0);
+    s.channel_count = channel_count;
     s.can_undo = session.can_undo();
     s.can_redo = session.can_redo();
     match session.meters() {
         Some(bank) => {
-            for k in 0..MIXER_CHANNELS_MAX {
-                s.channels[k] = bank.channel_peak(k);
-            }
+            s.channels.clear();
+            s.channels
+                .extend((0..channel_count).map(|k| bank.channel_peak(k)));
             s.master = bank.master_peak();
         }
         None => {
-            s.channels = [0.0; MIXER_CHANNELS_MAX];
+            s.channels.clear();
             s.master = 0.0;
         }
     }
@@ -652,11 +652,22 @@ mod tests {
             at_frame: Some(0),
         })
         .expect("mount mixer");
-        assert_eq!(
-            host.snapshot().channel_count,
-            2,
-            "the mixer channel count is published"
-        );
+        // The actor publishes on its next pass, so **wait for the state** rather than
+        // racing it — the same fix the shell snapshot test needed. Reading the snapshot
+        // immediately made this fail about one run in eight, under load.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let published = loop {
+            let count = host.snapshot().channel_count;
+            if count == 2 {
+                break count;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the mixer channel count was not published within 2 s"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(published, 2, "the mixer channel count is published");
 
         // The tone plugin is not mounted → the param is refused, but the host
         // (and its session) survive and keep serving commands.

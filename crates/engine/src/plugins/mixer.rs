@@ -1,7 +1,7 @@
 //! The soft mixer plugin (Phase 1): the profile's master bus, **adaptable to
 //! the inputs** (P1.2, user requirement 2026-08-18): the channel count is a
-//! mount parameter (`channels`, 1..=8) the profile sets from the input
-//! device's layout — e.g. the Soundcraft Notepad-12FX's 4 USB capture
+//! mount parameter (`channels`, 1..=[`MIXER_CHANNELS_SANITY`]) the profile sets from
+//! the input device's layout — e.g. the Soundcraft Notepad-12FX's 4 USB capture
 //! channels, or the Scarlett 2i2's 2.
 //!
 //! Per-channel gain / mute / solo; a master fader; per-channel + master
@@ -20,11 +20,80 @@ use crate::graph::{
     RenderBlock, SignalKind, Trigger,
 };
 
-/// Maximum mixer channels (bounded by the graph's [`MAX_AUDIO_INS`]); the
-/// declared port/parameter surfaces cover this maximum.
-pub const MIXER_CHANNELS_MAX: usize = 8;
+/// A **sanity bound** on a mounted channel count: a typo guard, not a design ceiling.
+/// Nothing is sized by it — the node's state, its meter bank and its peak scratch are
+/// allocated at mount from the count the profile chose — and it sits far above any real
+/// rig. It exists so `channels=1000000` cannot allocate gigabytes.
+pub const MIXER_CHANNELS_SANITY: usize = 64;
 /// The default channel count (the Notepad-12FX's four USB capture channels).
 pub const MIXER_CHANNELS: usize = 4;
+
+/// The parameter kinds every mixer channel carries, in catalog order:
+/// `(suffix, min, max)`.
+const MIXER_PARAM_KINDS: &[(&str, f32, f32)] = &[
+    ("gain", 0.0, 2.0),
+    ("mute", 0.0, 1.0),
+    ("solo", 0.0, 1.0),
+    ("pan", -1.0, 1.0),
+];
+
+/// Intern a generated channel name, at most once per name per **process**.
+///
+/// The mounted surface is built from the mount params, so its names cannot be literals —
+/// but a `Port`/`ParamDef` carries `&'static str`, so they have to be. Interning keeps
+/// the cost bounded by the widest layout this process ever mounts, rather than by the
+/// number of mounts (a replay rebuild re-mounts, and per-mount leaking would grow
+/// without bound).
+fn intern(name: &str) -> &'static str {
+    static NAMES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> =
+        std::sync::OnceLock::new();
+    let mut names = NAMES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .expect("the channel-name interner is not poisoned");
+    if let Some(existing) = names.get(name) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+    names.insert(leaked);
+    leaked
+}
+
+/// The ports a mixer mounted with `channels` channels offers: one mono input per
+/// channel, then the stereo master output.
+fn channel_ports(channels: usize) -> Vec<Port> {
+    let mut ports: Vec<Port> = (0..channels)
+        .map(|i| Port::audio(intern(&format!("ch{i}")), Direction::In))
+        .collect();
+    ports.push(Port {
+        name: "audio",
+        direction: Direction::Out,
+        kind: SignalKind::Audio,
+        channels: 2,
+    });
+    ports
+}
+
+/// The parameters a mixer mounted with `channels` channels offers: four per channel
+/// (gain, mute, solo, pan), then the master fader — the catalog's order.
+fn channel_params(channels: usize) -> Vec<ParamDef> {
+    let mut params = Vec::with_capacity(channels * MIXER_PARAM_KINDS.len() + 1);
+    for i in 0..channels {
+        for (kind, min, max) in MIXER_PARAM_KINDS {
+            params.push(ParamDef {
+                name: intern(&format!("ch{i}.{kind}")),
+                min: *min,
+                max: *max,
+            });
+        }
+    }
+    params.push(ParamDef {
+        name: "master.gain",
+        min: 0.0,
+        max: 2.0,
+    });
+    params
+}
 
 /// The mixer's declared port surface: one audio input per channel (up to
 /// [`MIXER_CHANNELS_MAX`]) + the master audio output. Patches to channels
@@ -262,23 +331,28 @@ pub const MIXER_PARAMS: &[ParamDef] = &[
 /// parameter). Meter points: channel meters are **post-gain, pre-mute/solo** —
 /// a muted channel still shows its level; the master meter is
 /// post-master-gain.
-pub struct MeterBank(pub [AtomicU32; MIXER_CHANNELS_MAX + 1]);
+pub struct MeterBank(pub Vec<AtomicU32>);
 
 impl MeterBank {
-    /// Peak of channel `k` (0..MIXER_CHANNELS_MAX) for the last rendered block.
+    /// A bank with one atomic per channel plus the master — sized from the **mount**, so
+    /// the mixer's width is not a compile-time property of the meters either.
+    pub fn new(channels: usize) -> Self {
+        MeterBank(
+            std::iter::repeat_with(|| AtomicU32::new(0.0f32.to_bits()))
+                .take(channels + 1)
+                .collect(),
+        )
+    }
+
+    /// Peak of channel `k` for the last rendered block.
     pub fn channel_peak(&self, k: usize) -> f32 {
         f32::from_bits(self.0[k].load(Ordering::Relaxed))
     }
 
     /// Peak of the master bus for the last rendered block.
     pub fn master_peak(&self) -> f32 {
-        f32::from_bits(self.0[MIXER_CHANNELS_MAX].load(Ordering::Relaxed))
-    }
-}
-
-impl Default for MeterBank {
-    fn default() -> Self {
-        MeterBank(std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())))
+        let slot = self.0.last().expect("a bank always has a master slot");
+        f32::from_bits(slot.load(Ordering::Relaxed))
     }
 }
 
@@ -287,35 +361,40 @@ impl Default for MeterBank {
 /// processes only the first `channels` inputs.
 pub struct MixerNode {
     channels: usize,
-    gains: [f32; MIXER_CHANNELS_MAX],
-    pans: [f32; MIXER_CHANNELS_MAX],
-    mutes: [bool; MIXER_CHANNELS_MAX],
-    solos: [bool; MIXER_CHANNELS_MAX],
+    gains: Vec<f32>,
+    pans: Vec<f32>,
+    mutes: Vec<bool>,
+    solos: Vec<bool>,
     master_gain: f32,
     meters: Arc<MeterBank>,
+    /// Per-block peak scratch — one slot per channel plus the master, allocated at
+    /// construction and cleared each block, so a mount-time channel count costs the
+    /// render path nothing.
+    peaks: Vec<f32>,
 }
 
 impl MixerNode {
     pub fn new() -> Self {
-        Self::with_channels(MIXER_CHANNELS, Arc::new(MeterBank::default()))
+        Self::with_channels(
+            MIXER_CHANNELS,
+            Arc::new(MeterBank::new(MIXER_CHANNELS)),
+        )
     }
 
     /// Construct with an active channel count and a shared meter bank — the
     /// plugin uses this so the profile can read the meters through the
-    /// `mixer.meters` context key.
+    /// `mixer.meters` context key. The bank must agree with `channels`.
     pub fn with_channels(channels: usize, meters: Arc<MeterBank>) -> Self {
-        debug_assert!(
-            (1..=MIXER_CHANNELS_MAX).contains(&channels),
-            "mixer channels out of range"
-        );
+        let channels = channels.clamp(1, MIXER_CHANNELS_SANITY);
         MixerNode {
-            channels: channels.clamp(1, MIXER_CHANNELS_MAX),
-            gains: [1.0; MIXER_CHANNELS_MAX],
-            pans: [0.0; MIXER_CHANNELS_MAX],
-            mutes: [false; MIXER_CHANNELS_MAX],
-            solos: [false; MIXER_CHANNELS_MAX],
+            channels,
+            gains: vec![1.0; channels],
+            pans: vec![0.0; channels],
+            mutes: vec![false; channels],
+            solos: vec![false; channels],
             master_gain: 1.0,
             meters,
+            peaks: vec![0.0; channels + 1],
         }
     }
 
@@ -338,7 +417,7 @@ impl MixerNode {
                 debug_assert!(false, "mixer: malformed channel '{idx}'");
                 return;
             };
-            if i >= MIXER_CHANNELS_MAX {
+            if i >= self.channels {
                 debug_assert!(false, "mixer: channel {i} out of range");
                 return;
             }
@@ -382,11 +461,15 @@ impl AudioNode for MixerNode {
         debug_assert_eq!(io.audio_out_channels, 2, "mixer must be the stereo master");
         let n = io.audio_in_count.min(self.channels);
         let any_solo = self.solos[..n].iter().any(|&s| s);
-        let mut peaks = [0.0f32; MIXER_CHANNELS_MAX + 1];
+        // Cleared and reused each block: a field, so the render path still allocates
+        // nothing even though the width is a mount parameter.
+        for peak in self.peaks.iter_mut() {
+            *peak = 0.0;
+        }
         for (i, sample) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
             let mut sl = 0.0f32;
             let mut sr = 0.0f32;
-            for (ch, peak) in peaks[..n].iter_mut().enumerate() {
+            for (ch, peak) in self.peaks[..n].iter_mut().enumerate() {
                 let channel_in = io.audio_ins.get(ch);
                 let v = channel_in.get(i).copied().unwrap_or(0.0);
                 // Channel meter: post-gain, pre-mute/solo — a muted channel
@@ -408,10 +491,13 @@ impl AudioNode for MixerNode {
             sample[0] = l;
             sample[1] = r;
             let full = l.abs().max(r.abs());
-            peaks[MIXER_CHANNELS_MAX] = peaks[MIXER_CHANNELS_MAX].max(full);
+            self.peaks[self.channels] = self.peaks[self.channels].max(full);
         }
-        for (k, p) in peaks.iter().enumerate() {
-            self.meters.0[k].store(p.to_bits(), Ordering::Relaxed);
+        for (k, p) in self.peaks.iter().enumerate() {
+            match self.meters.0.get(k) {
+                Some(slot) => slot.store(p.to_bits(), Ordering::Relaxed),
+                None => debug_assert!(false, "mixer: the meter bank is narrower than the node"),
+            }
         }
     }
 
@@ -425,18 +511,6 @@ impl AudioNode for MixerNode {
 /// `ctx.get::<Arc<MeterBank>>("mixer.meters")`).
 pub struct MixerPlugin {
     channels: usize,
-}
-
-/// The channel index a mixer **port** name carries (`ch3` → 3), or `None` for a port
-/// that is not a channel input (the master `audio` out).
-fn channel_of(name: &str) -> Option<usize> {
-    name.strip_prefix("ch")?.parse().ok()
-}
-
-/// The channel index a mixer **parameter** name carries (`ch3.gain` → 3), or `None`
-/// for a parameter that is not per-channel (`master.gain`).
-fn param_channel_of(name: &str) -> Option<usize> {
-    name.split_once('.').and_then(|(head, _)| channel_of(head))
 }
 
 impl Plugin for MixerPlugin {
@@ -456,29 +530,19 @@ impl Plugin for MixerPlugin {
         MIXER_PARAMS
     }
 
-    /// Only the channels this instance mounted, plus the stereo master out. The
-    /// catalog declares the full `ch0..ch7` so the patch bay can offer them; the
-    /// instance answers for what it actually mounted, which is what validation uses —
-    /// so a patch to a channel beyond the mounted count is **refused**, and the old
-    /// "accepted but ignored" path is gone.
+    /// The surface this instance **mounted**: derived from the mount's `channels`, so
+    /// the mixer's width is no longer a property of the code. A patch to a channel the
+    /// instance did not mount is refused rather than accepted and ignored.
     fn mounted_ports(&self) -> Vec<Port> {
-        MIXER_PORTS
-            .iter()
-            .copied()
-            .filter(|p| channel_of(p.name).is_none_or(|i| i < self.channels))
-            .collect()
+        channel_ports(self.channels)
     }
 
     fn mounted_params(&self) -> Vec<ParamDef> {
-        MIXER_PARAMS
-            .iter()
-            .copied()
-            .filter(|p| param_channel_of(p.name).is_none_or(|i| i < self.channels))
-            .collect()
+        channel_params(self.channels)
     }
 
     fn apply(&mut self, api: &mut PluginApi) -> Result<(NodeId, Disposer), String> {
-        let meters = Arc::new(MeterBank::default());
+        let meters = Arc::new(MeterBank::new(self.channels));
         // The node declares the surface this instance **mounted**, not the catalog's
         // full `ch0..ch7`: a patch to a channel beyond the mounted count is then
         // refused by the graph itself, so the old "accepted but ignored" path is
@@ -505,8 +569,10 @@ impl Plugin for MixerPlugin {
 }
 
 /// Factory form — the `channels` mount parameter adapts the mixer to the
-/// input device's layout (default [`MIXER_CHANNELS`], clamped to
-/// 1..=[`MIXER_CHANNELS_MAX`]).
+/// input device's layout (default [`MIXER_CHANNELS`]). The only bound is a **sanity**
+/// one ([`MIXER_CHANNELS_SANITY`]): the surface, the node's state and its meters are
+/// all allocated from the count the profile chose, so an arbitrary width costs an
+/// allocation rather than a code change.
 pub fn mixer_factory(params: &[(&'static str, f32)]) -> Result<Box<dyn Plugin>, String> {
     let channels = match params.iter().find(|(name, _)| *name == "channels") {
         Some((_, v)) => {
@@ -517,9 +583,10 @@ pub fn mixer_factory(params: &[(&'static str, f32)]) -> Result<Box<dyn Plugin>, 
         }
         None => MIXER_CHANNELS,
     };
-    if !(1..=MIXER_CHANNELS_MAX).contains(&channels) {
+    if !(1..=MIXER_CHANNELS_SANITY).contains(&channels) {
         return Err(format!(
-            "mixer channels must be 1..={MIXER_CHANNELS_MAX}, got {channels}"
+            "mixer channels must be 1..={MIXER_CHANNELS_SANITY} (a sanity bound, not a design \
+             limit), got {channels}"
         ));
     }
     Ok(Box::new(MixerPlugin { channels }))
@@ -542,10 +609,41 @@ mod tests {
         assert_eq!(m.master_gain, 0.25);
     }
 
+    /// The only bound left is a **sanity** one, and it is not a design ceiling: nine
+    /// channels is a valid mount (it used to be refused), and so is anything up to the
+    /// bound. What the bound protects is gross typos, not width.
     #[test]
-    fn factory_rejects_out_of_range_channels() {
+    fn factory_accepts_any_sane_width_and_refuses_the_absurd() {
         assert!(mixer_factory(&[("channels", 0.0)]).is_err());
-        assert!(mixer_factory(&[("channels", 9.0)]).is_err());
         assert!(mixer_factory(&[("channels", 4.0)]).is_ok());
+        for wide in [9.0, 24.0, MIXER_CHANNELS_SANITY as f32] {
+            assert!(
+                mixer_factory(&[("channels", wide)]).is_ok(),
+                "{wide} channels is a valid mount now"
+            );
+        }
+        assert!(mixer_factory(&[("channels", (MIXER_CHANNELS_SANITY + 1) as f32)]).is_err());
+        // A fractional count is still refused: channels are lanes, not a knob.
+        assert!(mixer_factory(&[("channels", 2.5)]).is_err());
+    }
+
+    /// The mounted surface follows the mount, not a constant: a 12-channel mixer offers
+    /// twelve channel ports and twelve channels' worth of parameters.
+    #[test]
+    fn the_mounted_surface_follows_the_mount() {
+        let plugin = mixer_factory(&[("channels", 12.0)]).expect("a wide mixer mounts");
+        let ports = plugin.mounted_ports();
+        let params = plugin.mounted_params();
+        assert_eq!(
+            ports.iter().filter(|p| p.name.starts_with("ch")).count(),
+            12,
+            "one channel input per mounted channel"
+        );
+        assert!(ports.iter().any(|p| p.name == "audio"), "the master out is there");
+        assert!(params.iter().any(|p| p.name == "ch11.gain"), "the twelfth channel has params");
+        assert!(!params.iter().any(|p| p.name == "ch12.gain"), "and no thirteenth");
+        // The catalog stays nominal, so the patch bay has something to offer before a
+        // mount exists — but it is not what the instance answers with.
+        assert_ne!(ports.len(), MIXER_PORTS.len());
     }
 }

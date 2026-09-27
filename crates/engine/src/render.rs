@@ -125,6 +125,11 @@ pub struct Engine {
     params_table: HashMap<&'static str, &'static [ParamDef]>,
     /// The **mounted** parameter surface per plugin; see [`Self::mounted_ports`].
     mounted_params: HashMap<&'static str, Vec<ParamDef>>,
+    /// Mount params of plugins whose mount is queued but not yet applied. A `Patch` or
+    /// `SetParam` arriving in that window has no instance to ask, so the surface is
+    /// derived by asking the **factory** with these params — the same call
+    /// `validate_mount` already makes.
+    scheduled_params: HashMap<&'static str, Vec<(&'static str, f32)>>,
     /// plugin name → its mounted primary node.
     node_of: HashMap<&'static str, NodeId>,
     disposers: HashMap<&'static str, Disposer>,
@@ -159,6 +164,7 @@ impl Engine {
             params_table: HashMap::new(),
             mounted_ports: HashMap::new(),
             mounted_params: HashMap::new(),
+            scheduled_params: HashMap::new(),
             node_of: HashMap::new(),
             disposers: HashMap::new(),
             scheduled: std::collections::HashSet::new(),
@@ -204,6 +210,7 @@ impl Engine {
             },
         );
         self.scheduled.insert(name);
+        self.scheduled_params.insert(name, params.to_vec());
         Ok(())
     }
 
@@ -277,6 +284,7 @@ impl Engine {
             plugin.apply(&mut api)?
         };
         self.scheduled.remove(name);
+        self.scheduled_params.remove(name);
         self.node_of.insert(id, node);
         self.disposers.insert(id, disposer);
         Ok(())
@@ -331,21 +339,15 @@ impl Engine {
         if !(self.scheduled.contains(tp) || self.node_of.contains_key(tp)) {
             return Err(format!("plugin '{tp}' is neither scheduled nor mounted"));
         }
-        // The **mounted** surface wins: a plugin may mount fewer channels than it
-        // declares, and a patch to one it did not mount must fail here rather than be
-        // accepted and silently ignored downstream.
-        let surface = |p: &'static str| -> &[Port] {
-            self.mounted_ports
-                .get(p)
-                .map(Vec::as_slice)
-                .or_else(|| self.port_table.get(p).copied())
-                .unwrap_or(&[])
-        };
-        let from_port = surface(fp)
+        // The surface the plugin currently offers — the applied instance's, or the one
+        // a queued mount's factory derives from its params. The catalog is nominal.
+        let from_ports = self.ports_of(fp);
+        let to_ports = self.ports_of(tp);
+        let from_port = from_ports
             .iter()
             .find(|p| p.name == from.1)
             .ok_or_else(|| format!("no port '{}' on plugin '{fp}'", from.1))?;
-        let to_port = surface(tp)
+        let to_port = to_ports
             .iter()
             .find(|p| p.name == to.1)
             .ok_or_else(|| format!("no port '{}' on plugin '{tp}'", to.1))?;
@@ -435,6 +437,40 @@ impl Engine {
         Ok(())
     }
 
+    /// The ports a plugin offers **now**, in preference order: the applied instance's
+    /// mounted surface, then the surface a queued mount will have — the factory is
+    /// asked with the params it will be mounted with, the same call `validate_mount`
+    /// already makes — then the registered catalog as the nominal fallback.
+    ///
+    /// The middle rung is what lets a `mount` followed by a `patch` in one script work
+    /// for a plugin whose surface depends on its mount params (the mixer's channels).
+    fn ports_of(&self, name: &'static str) -> Vec<Port> {
+        if let Some(mounted) = self.mounted_ports.get(name) {
+            return mounted.clone();
+        }
+        if let Some(params) = self.scheduled_params.get(name)
+            && let Some(factory) = self.factories.get(name)
+            && let Ok(plugin) = factory(params)
+        {
+            return plugin.mounted_ports();
+        }
+        self.port_table.get(name).copied().unwrap_or(&[]).to_vec()
+    }
+
+    /// The parameters a plugin offers now; see [`Self::ports_of`].
+    fn params_of(&self, name: &'static str) -> Vec<ParamDef> {
+        if let Some(mounted) = self.mounted_params.get(name) {
+            return mounted.clone();
+        }
+        if let Some(params) = self.scheduled_params.get(name)
+            && let Some(factory) = self.factories.get(name)
+            && let Ok(plugin) = factory(params)
+        {
+            return plugin.mounted_params();
+        }
+        self.params_table.get(name).copied().unwrap_or(&[]).to_vec()
+    }
+
     /// Apply an unmount: run the disposer (reversible effects). Idempotent.
     fn apply_unmount(&mut self, name: &'static str) {
         self.scheduled.remove(name);
@@ -501,15 +537,10 @@ impl Engine {
                 "plugin '{plugin}' is neither scheduled nor mounted"
             ));
         }
-        // Prefer the mounted surface: the mixer declares eight channels and may mount
-        // four, and a parameter the instance did not mount is not settable.
+        // The parameters the plugin currently offers: the applied instance's, the
+        // queued mount's derived surface, or the nominal catalog.
         let (min, max) = {
-            let declared = self
-                .mounted_params
-                .get(plugin)
-                .map(Vec::as_slice)
-                .or_else(|| self.params_table.get(plugin).copied())
-                .unwrap_or(&[]);
+            let declared = self.params_of(plugin);
             let Some(def) = declared.iter().find(|d| d.name == param) else {
                 return Err(format!("plugin '{plugin}' has no parameter '{param}'"));
             };

@@ -57,3 +57,5 @@ removal an acceptance criterion.
   `capture.rs` all remain. This slice removes the *silent* path; removing the *ceiling* needs the
   surface to be generated from the mount layout, which needs owned (or interned) names — the step
   the [node-width note](2026-09-27-node-input-width-is-the-nodes-own.md) also names.
+
+*Authored with DeepSeek-V4.1-Flash · DeepSeek Harness, 2026-09-27.*

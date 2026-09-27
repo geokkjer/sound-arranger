@@ -25,7 +25,7 @@ pub use master::{
     MasterPlugin, master_factory,
 };
 pub use mixer::{
-    MIXER_CHANNELS, MIXER_CHANNELS_MAX, MIXER_PARAMS, MIXER_PORTS, MeterBank, MixerNode,
+    MIXER_CHANNELS, MIXER_CHANNELS_SANITY, MIXER_PARAMS, MIXER_PORTS, MeterBank, MixerNode,
     MixerPlugin, mixer_factory,
 };
 pub use scale::{Scale, scale_factory};

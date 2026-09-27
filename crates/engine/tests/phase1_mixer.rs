@@ -475,7 +475,7 @@ fn mixer_ignores_channels_beyond_the_mounted_count() {
             channels: 1,
         }],
     );
-    let mixer_node = MixerNode::with_channels(2, Arc::new(MeterBank::default()));
+    let mixer_node = MixerNode::with_channels(2, Arc::new(MeterBank::new(2)));
     let mixer = g.add_node(NodeKind::Opaque(Box::new(mixer_node)), MIXER_PORTS.to_vec());
     g.set_out(mixer);
     g.connect(s0, "audio", mixer, "ch0").unwrap();
@@ -594,6 +594,62 @@ fn a_patch_to_an_unmounted_channel_is_refused() {
     assert!(err.contains("no port 'ch2'"), "got: {err}");
 }
 
+/// The ceiling is gone on **both** rungs of surface resolution: a queued mount's factory
+/// answers for the width it will have, and once applied the instance answers for the
+/// width it has. Twenty channels used to be impossible.
+#[test]
+fn a_wider_mixer_offers_its_extra_channels_before_and_after_it_applies() {
+    let mut e = engine();
+    e.mount("tone", &[]).unwrap();
+    e.mount("mixer", &[("channels", 20.0)]).unwrap();
+    // Queued: no instance yet, so the surface comes from the factory with these params.
+    e.patch(("tone", "audio"), ("mixer", "ch19"))
+        .expect("a queued mount answers for its own width");
+    let _ = e.render(64);
+    // Applied: the instance's mounted surface answers, and it is just as wide.
+    e.patch(("tone", "audio"), ("mixer", "ch18"))
+        .expect("the applied instance answers for its width too");
+}
+
+/// …and the audio actually reaches the wide channel: twenty sources into twenty mounted
+/// channels, with the last one metered.
+#[test]
+fn a_mixer_wider_than_the_old_ceiling_carries_every_channel() {
+    const WIDE: usize = 20;
+    let mut g = Graph::new();
+    let bank = Arc::new(MeterBank::new(WIDE));
+    let plugin = mixer_factory(&[("channels", WIDE as f32)]).expect("a wide mixer mounts");
+    let ports = plugin.mounted_ports();
+    // Sources first: a cord must run forward in node order.
+    let sources: Vec<NodeId> = (0..WIDE)
+        .map(|i| {
+            g.add_node(
+                NodeKind::Sine(Sine::new(220.0 + i as f32)),
+                vec![Port {
+                    name: "audio",
+                    direction: Direction::Out,
+                    kind: SignalKind::Audio,
+                    channels: 1,
+                }],
+            )
+        })
+        .collect();
+    let mixer = g.add_node(
+        NodeKind::Opaque(Box::new(MixerNode::with_channels(WIDE, Arc::clone(&bank)))),
+        ports,
+    );
+    g.set_out(mixer);
+    for (i, src) in sources.into_iter().enumerate() {
+        g.connect(src, "audio", mixer, &format!("ch{i}"))
+            .expect("every mounted channel takes its source");
+    }
+    let _ = render_node(&mut g, BLOCK);
+    assert!(
+        bank.channel_peak(WIDE - 1) > 0.0,
+        "the twentieth channel carried audio"
+    );
+}
+
 /// The mixer adapts to the input layout (P1.2): mounted with `channels = 2`, only the
 /// first two inputs are processed. Defense in depth — a mounted node declares only its
 /// own channels, so this is the node's own guard rather than a reachable product path.
@@ -627,7 +683,7 @@ fn mixer_adapts_to_channel_count() {
             channels: 1,
         }],
     );
-    let mixer_node = MixerNode::with_channels(2, Arc::new(MeterBank::default()));
+    let mixer_node = MixerNode::with_channels(2, Arc::new(MeterBank::new(2)));
     let mixer = g.add_node(NodeKind::Opaque(Box::new(mixer_node)), MIXER_PORTS.to_vec());
     g.set_out(mixer);
     g.connect(s0, "audio", mixer, "ch0").unwrap();
