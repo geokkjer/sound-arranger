@@ -1,0 +1,155 @@
+# Agent Note: Profiles and the umbrella name — recorder leads, arranger and sculptor follow
+
+Status: proposed
+
+## Problem
+
+Three things share one name. "sound-arranger" is the repository, the platform, and the ACID clip
+editor — and the platform never got a name of its own. The debt was recorded, not paid: RESEARCH
+§14 risk 7 says *"resolve before the first tag"*, and
+[umbrella-first](2026-08-15-umbrella-first-product-direction.md) made it an acceptance criterion
+("the name question is decided … before the first tag/release"). Neither happened, and the
+ambiguity has been doing quiet work ever since: RESEARCH §7 bolds **Capture** and **Arrange**
+alike as "Phase 1 (first profile)", the [alpha finish line](2026-09-23-alpha-finish-line.md) is
+titled *"the arrange loop, end to end"* and wires recording in as its prerequisite, and
+[`docs/capabilities.md`](../../../../docs/capabilities.md) presents recording and arranging as one
+product. The owner's current need — send a clock, receive audio, align it, master it, export it —
+has no owner in that structure.
+
+The cost is measurable, and it is not the UI. The arranger owns **~4.6k of `crates/media`'s 9.0k
+source lines (~51%)** (timeline, arranger node, clip editor, snap, stretch), **33 of
+`workflow::Action`'s 50 variants**, 28 `timeline_key` handlers against 2 `pool_key`, and a
+1,350-line timeline module — while the recorder's two defining capabilities are stubs: MIDI clock
+output is empty marker traits (`MidiSink: EventSink {}`), and there is no alignment model at all
+(`record`'s own doc says the take "is not aligned to the playhead"). The recorder has no gesture
+in the TUI; it is reachable only by typing `:record <id>`.
+
+Worse than unrouted, the recorder is a **subset of the arranger's data model** rather than a
+sibling:
+
+| Coupling | Where | Consequence |
+|---|---|---|
+| Export length is the timeline's | `crates/host/src/lib.rs:1776` → `self.arrangement()?.end_frame()`; `Err("nothing to export: the arrangement has no clips")` at 1778 | A session with a take and no clips **cannot export** |
+| Every render wires the arranger | `render()` 1627 and `render_with_drain()` 1646 both call `wire_arranger()` (1533–1615) | The arranger is on the recorder's render path unconditionally |
+| Recordings are not logged | `HostCommand::Record` absent from `is_state()` (398–413) | A session's recording is not in the document; `load` would re-open the device |
+| The core's vocabulary is B's | `Event::Arrangement` documented as "the clip-editor's ACID ops" | The mechanism is generic; the naming and one graph affordance (`Graph::insert_before`) are not |
+
+## Proposal
+
+**Name the platform `audio`, and assemble it from three profiles: `recorder` (focus), `arranger`,
+`sculptor` (deferred).**
+
+- **The umbrella is `audio`** — repo and remote slug included; the owner's call, made rather than
+  deferred. The register is right: the platform is *infrastructure*, not a product, and the
+  profiles carry product identity, so `audio recorder` / `audio arranger` / `audio sculptor` reads
+  as a family without the umbrella claiming a personality. The acknowledged cost is that
+  `~/Projects/audio` is the least distinguishing name among its audio siblings (`music/*`,
+  `vcv-rack`, `tidal-lsp`, `pi5-daisy-synth-rig`); accepted, because the profiles are what anyone
+  actually names. Mechanically the rename is **prose-only** — the crates are `engine`, `media`,
+  `host`, `workflow`, `[workspace.package]` carries no name, and no code identifier contains
+  "sound-arranger" — so the only real cost is ~20 doc mentions.
+- **One active front.** `recorder` is the focus and the architecture's proof; `arranger` is
+  committed and sequenced after it; `sculptor` stays deferred per
+  [external-programs-not-sidecars](2026-09-21-external-programs-not-sidecars.md).
+- **The recorder is the proof of the architecture — with one named gap.** It proves the
+  capture → align → mix → master → export spine, the seams (device registry, external programs,
+  the log), determinism, and the realtime path. It does **not** prove *structural live editing* —
+  graph swap under load — which is the substrate's hardest invariant. That corner stays the
+  arranger's, and stays on the list below, so "the recorder is the proof" remains a measurement
+  rather than a hope.
+- **A profile becomes a declared thing, minimally**: a name, the ops it exposes, the plugins it
+  mounts, and the UI surface it shows. Not a loader, not a framework. Two products is exactly the
+  "real second provider" the budget rule waits for; a profile *selection* (`--profile`, or the
+  shell's own choice) is what earns it now.
+- **Profiles are runtime instances, and they compose across the process boundary.** Two instances
+  on one machine are legitimate: an **arranger instance's audio output routed into a recorder
+  instance's input**, where the recorder declares it as a source by name and captures it alongside
+  the hardware sources — one take per source, no summing, per the
+  [capture-topology note](2026-09-25-capture-topology-aligned-stems.md). The recorder owns the
+  clock (it is the tape), so the arranger takes the `follower` clock role that note already
+  defines; and because both instances sit in one audio-device graph, that source is the *easy*
+  one — same clock, no drift, alignment by construction. The mechanism is the
+  [external-programs rule](2026-09-21-external-programs-not-sidecars.md)'s, applied to our own
+  binary: a partner is something we can start or address, sync and record.
+- **The recorder overdubs.** "Just hit record again" over playback is cheap and expected: the
+  player path already exists for it (`Play`/`Splice` "remain for the recorder player path"), and
+  an overdub is simply another aligned take.
+- **The recorder's first slices are the sibling changes, not the UI**: (1) recordings as logged
+  state; (2) an explicit render length independent of the timeline; (3) a render path that does
+  not wire the arranger; then (4) MIDI clock out; (5) an alignment/offset model. A record gesture
+  in the shell is a small, separate follow-on.
+
+### What this phase does not prove (the arranger's corner, owned and written down)
+
+Structural live editing (graph swap under load) · clip/region semantics in the value schema · the
+33 document gestures · time-stretch and tempo match · whatever session-format pressure heavy
+editing applies. The arranger **resumes** when the recorder's acceptance criteria below pass and a
+real session has been captured, aligned, mastered and exported end to end — a trigger, not a
+sentiment, because "viable but not focus" decays into "never" without one.
+
+## Alternatives considered
+
+- **Leave the arranger as the first profile (status quo).** Rejected: measured above, it built the
+  half that is not the current need and left the recorder's defining capabilities stubbed, with
+  the recorder modelled as the arranger's input rather than a product.
+- **Name the umbrella `sound`.** Rejected: the other pre-registered candidate, and it has both of
+  `audio`'s weaknesses — generic where it needs to disambiguate, and it reads as a *product*
+  rather than a platform.
+- **A distinctive umbrella name (`algedonic`).** Rejected in favour of `audio` (the owner's call).
+  It is the better *identity* — it disambiguates among the owner's audio projects, and because no
+  code carries the name the switch would be cheap. But `audio recorder/arranger/sculptor` is the
+  better family reading, and in Beer's VSM an *algedonic signal* is the affect/emergency channel
+  that **bypasses** the normal reporting hierarchy — close to the opposite of this platform's
+  logged-flow thesis. Worth remembering if `audio` ever grates.
+- **A fourth profile for dub / live console mixing.** Rejected: it is a *usage pattern*, not a
+  product — run the arranger instance, route its output into the recorder instance, and perform
+  the mix while the tape runs. The vocabulary already exists (sources by name, clock roles,
+  fixed-offset alignment), so a fourth profile would restate what two instances express.
+- **Make the recorder a profile in name only.** Rejected: leaving A a subset of B's data model
+  keeps all four couplings, and they would surface later as bugs (an unexportable recording; a
+  device re-opened on load) instead of being decided now.
+- **Build a real profile/loader abstraction.** Rejected: two profiles justify a name, an op set
+  and a mount set — not machinery. The budget rule is binding.
+- **Rename the crates to `audio-*`.** Rejected for now: no code carries the project name, so the
+  prefix buys nothing and costs churn across every `use`. Revisit if the crates are ever published.
+
+## Acceptance criteria
+
+1. The repo and remote are renamed to `audio` — prose-only (~20 doc mentions; no crate, package or
+   source identifier changes), discharging RESEARCH §14 risk 7 before the first tag.
+2. The conflation is gone from the artifacts: RESEARCH §7's feature groups, `capabilities.md` and
+   the clip-arranger explainer each name the profile they describe, and nothing calls the arranger
+   "the first profile" without qualification.
+3. A profile is selectable between `recorder` and `arranger` (`sculptor` absent while deferred):
+   the recorder exposes no document ops and no timeline surface; the arranger exposes them.
+4. A recorded take's identity — id, device, channel count, rate, origin — survives save/load
+   **without re-opening a device**, and a saved session's log describes its own material.
+5. A session with a take and **no clips** masters and exports, with the length taken from an
+   explicit session/take length rather than `Timeline::end_frame()`.
+6. `render`/`render_with_drain` work with the arranger plugin unmounted.
+7. MIDI clock out and an alignment/offset model exist and are measured on captured material, or
+   are listed as the recorder's remaining gaps — never assumed done.
+8. Overdub works: recording again over playback yields another take, and the alignment model's
+   unit is the take, not a track-and-clip placement.
+9. The two-instance pattern is exercised once end to end: an arranger instance's output declared
+   as a recorder source by name, captured alongside the hardware sources with no summing.
+
+## Risks
+
+- **The recorder is not the small scope.** The [capture-topology note](2026-09-25-capture-topology-aligned-stems.md)
+  is unbounded if allowed to be, by its own admission. Mitigation: the seam is the deliverable —
+  `source` declaration plus `source check` — and per-device coverage is not.
+- **The unproven corner hardens.** If structural live editing goes unexercised for a long stretch,
+  the substrate's hardest invariant rots behind a green build. Mitigation: the honesty list above,
+  plus keeping the arranger's tests in the always-on set as the canary even while its product is
+  deferred.
+- **Profile-abstraction creep.** "Profile" quietly becomes a loader/config framework. Mitigation:
+  the budget rule — name, op set, mount set, and nothing else until a third provider demands more.
+- **Rename churn at the wrong moment.** Prose-only today; the longer it waits, the more prose
+  there is. Mitigation: decide here, execute at the tag.
+- **Recorder-first starves the arranger.** Mitigation: the written trigger above, and the
+  acceptance criteria naming the arranger's corner explicitly.
+- **Overdub quietly re-imports the timeline.** "Record again over playback" needs a playback
+  position and per-take placement — the first place the recorder asks for the arranger's data model
+  back. Mitigation: a take list with origins and fixed offsets, not tracks and clips; needing more
+  than that is the signal that the arranger profile's turn has come.

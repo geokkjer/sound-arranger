@@ -1,6 +1,6 @@
 # AGENTS.md
 
-sound-arranger (working title) — an audio platform built on a minimal core (clock · graph interpreter · session log · context plumbing) with every capability as a plugin; the product is an assembled profile. First profile: the clip-arranger ("sound-arranger") — record long live jams, then cut, paste, rearrange, and shape them into a finished piece. Offline processing is a separate deferred profile ("sound sculptor"). Rust audio engine + Tauri v2 + Vue 3. Working research lives in [RESEARCH.md](RESEARCH.md); decision records live in [.agents/notes/](.agents/notes/README.md).
+The platform is **`audio`** (the repo rename is still pending) — built on a minimal core (clock · graph interpreter · session log · context plumbing) with every capability as a plugin, so a product is an assembled **profile**. Three profiles: **recorder** (the current focus — send a clock to external gear, capture, align, master, export), **arranger** (the ACID clip arranger — record long live jams, then cut, paste, rearrange and shape them into a finished piece), and **sculptor** (audio transformation, deferred). Rust audio engine; the shells are `ratatui` (the TUI) and `iced` — Tauri retired 2026-09-22. Working research lives in [RESEARCH.md](RESEARCH.md); decision records live in [.agents/notes/](.agents/notes/README.md); the profile decision is [here](.agents/notes/proposed/architecture/2026-09-27-profiles-and-the-umbrella-name.md).
 
 ## Separation of concerns
 

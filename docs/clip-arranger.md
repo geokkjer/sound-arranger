@@ -4,12 +4,14 @@
 > trust the code and move this line forward.
 
 **What this is.** The engine ([`architecture-explainer.md`](architecture-explainer.md)) is a
-minimal, model-free core: clock · graph · log · context. This doc is the *product* side —
-what turns that core into a **sound-arranger**: the arrangement model, the ACID editing ops,
-the node that renders it, the media pool it reads from, and the host wiring that makes edits
-reach audio. If you've done the FIRST_SESSION tour, you've seen the synth chain
-(euclidean→scale→tone→mixer). This is the half that records, cuts, splices and rearranges
-*real* audio into a piece — the edit-as-composition half.
+minimal, model-free core: clock · graph · log · context. This doc is the *product* side of the
+**[arranger profile](../.agents/notes/proposed/architecture/2026-09-27-profiles-and-the-umbrella-name.md)**
+— what turns that core into an ACID-style clip arranger: the arrangement model, the ACID editing
+ops, the node that renders it, the media pool it reads from, and the host wiring that makes edits
+reach audio. (The platform's other profiles are the **recorder** — the current focus, owning clock
+out, capture, alignment, mix, master and export — and the deferred **sculptor**.) If you've done
+the FIRST_SESSION tour, you've seen the synth chain (euclidean→scale→tone→mixer). This is the half
+that cuts, splices and rearranges *real* audio into a piece — the edit-as-composition half.
 
 > Read the [overview note](../.agents/notes/implemented/feature/2026-08-24-p1-3-0-timeline-value.md)
 > for why the model is *value-first*; this doc is the working explainer.

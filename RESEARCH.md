@@ -460,33 +460,35 @@ For the "PaulStretch sound," the clean paths are CDP8's own `.pvx` pvoc tools (L
 
 ## 7. Workflow feature map
 
-Concrete features by inspiration. **Bold = Phase 1 (first profile).**
+Concrete features by inspiration. **Bold = shipped or scheduled.** Each group is labelled with the
+[profile](.agents/notes/proposed/architecture/2026-09-27-profiles-and-the-umbrella-name.md) that
+owns it: **recorder** is the current focus, **arranger** follows it, **sculptor** is deferred.
 
-**Capture — record (Phase 1)**
+**Capture — record (recorder)**
 - **Record long takes** (mono/stereo; multitrack later) straight into the **media pool**; non-destructive; waveform preview via peak pyramids.
 - **Markers while recording**; optional silence-based auto-split.
 
-**Arrange — edit-as-composition (Phase 1)**
+**Arrange — edit-as-composition (arranger)**
 - **Razor/splice at playhead; ripple delete; copy/paste/duplicate regions; crossfades.**
 - **Drag clips on the horizontal timeline; loop a clip region with adjustable loop crossfade.**
 - **Trim/crop (src_in/src_out); move/layer takes on tracks.**
 - Varispeed (linked pitch+speed) and independent time-stretch (`rubato`) — Acid-style "make it fit."
 - Reverse; per-clip fade in/out; comping (later).
 
-**Mix — soft mixer (Phase 1)**
+**Mix — soft mixer (recorder)**
 - **Track strips: gain, pan, mute, solo; master fader; level meters.**
 - Bounce/export the arrangement to WAV (`hound`).
 
-**Sound — Feldman, time & texture (Phase 2+)**
+**Sound — Feldman, time & texture (sculptor, deferred)**
 - Seconds-based timeline, long durations, fine gain (0.1 dB), very long fades.
-- Spectral/textural processing (CDP8 / own phase-vocoder) as "render to new source" actions — sound-sculptor profile, deferred.
+- Spectral/textural processing (CDP8 / own phase-vocoder) as "render to new source" actions.
 
-**Dub — console-as-instrument (Phase 2+)**
+**Dub — console-as-instrument (a usage pattern: two instances, arranger → recorder, Phase 2+)**
 - Aux sends → delay bus (tape delay + feedback + filter) and reverb bus.
 - **Live dub mixing** (mute/unmute sends, filter sweeps, fader rides) recorded as automation.
 - "Drop the track, keep the echo tail" as a structural gesture.
 
-**Master (Phase 3)**
+**Master (recorder)**
 - Master chain (EQ → compressor → limiter) → offline bounce; FLAC/MP3 via a sidecar (ffmpeg/sox).
 
 ---
@@ -558,7 +560,7 @@ Not part of the x86 prototype. Kept here as the target for the eventual ARM phas
 > The deliberate cuts and the measured limits are stated in
 > [`docs/capabilities.md`](docs/capabilities.md), not here.
 
-Architecture: a **minimal core** — clock, audio graph interpreter, session event log, context plumbing (the [minimal-core note](.agents/notes/proposed/architecture/2026-08-15-minimal-core-clock-graph-session-log.md)) — with every capability as a plugin; the product is an assembled profile. "sound-arranger" is the **clip-arranger profile** (ACID-style cut/paste; the tape techniques as inspiration). Direction locked 2026-08-15: **umbrella-first** — the platform is the goal, the phases below build it, and the clip-arranger profile is the first product ([umbrella-first note](.agents/notes/proposed/architecture/2026-08-15-umbrella-first-product-direction.md)).
+Architecture: a **minimal core** — clock, audio graph interpreter, session event log, context plumbing (the [minimal-core note](.agents/notes/proposed/architecture/2026-08-15-minimal-core-clock-graph-session-log.md)) — with every capability as a plugin; a product is an assembled profile. The platform is **`audio`**, assembling three profiles: **recorder** (the current focus — clock out, capture, align, mix, master, export), **arranger** (the ACID clip arranger; committed, sequenced after the recorder) and **sculptor** (audio transformation; deferred) — [profiles note](.agents/notes/proposed/architecture/2026-09-27-profiles-and-the-umbrella-name.md). Direction locked 2026-08-15: **umbrella-first** — the platform is the goal, the phases below build it ([umbrella-first note](.agents/notes/proposed/architecture/2026-08-15-umbrella-first-product-direction.md)).
 
 > **The sequence is a plan, not a gate.** These phases state an *intended order* and a shared
 > scope vocabulary; they are not authorisation gates. In particular **Phase 3 is a suggestion**:

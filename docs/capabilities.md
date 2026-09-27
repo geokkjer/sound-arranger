@@ -3,10 +3,12 @@
 > 🕒 Last verified against commit `971524b` (2026-09-24). If the code has moved on,
 > trust the code and move this line forward.
 
-What the sound-arranger alpha **is**: a terminal-first tool for recording long
-live jams and cutting them into a finished piece, with the session log as its
-document. What it is **not** is part of the statement, not an omission — this
-page exists so nobody has to discover a boundary by hitting it.
+What this alpha **is**: the **[arranger profile](../.agents/notes/proposed/architecture/2026-09-27-profiles-and-the-umbrella-name.md)**
+— a terminal-first tool for recording long live jams and cutting them into a finished piece, with
+the session log as its document. Recording appears here as the arranger's input; it becomes a
+product in its own right in the **recorder profile**, which is the focus from here. What it is
+**not** is part of the statement, not an omission — this page exists so nobody has to discover a
+boundary by hitting it.
 
 Scope is fixed by
 [the reviewed plan](../.agents/notes/proposed/architecture/2026-09-23-alpha-finish-line.md);
