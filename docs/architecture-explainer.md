@@ -1,6 +1,6 @@
 # sound-arranger: from architecture up
 
-> 🕒 Last verified against commit `100999a` (2026-09-24). If the code has moved on,
+> 🕒 Last verified against commit `52b7c09` (2026-09-27). If the code has moved on,
 > trust the code and move this line forward.
 
 > A plain-English (mostly) tour of the Rust code, for a developer with roughly six
@@ -644,17 +644,21 @@ the stack and it'd dangle.
 `crates/engine/src/plugins/mixer.rs` is the flagship plugin, and worth a close
 look because it exercises almost every idea in the project.
 
-- **Adaptable to the device** (P1.2): the `channels` count is a *mount parameter*
-  clamped to `1..=8`, sized from the input device's layout (the Notepad-12FX's 4
-  USB channels, the Scarlett 2i2's 2).
+- **Adaptable to the device** (P1.2): the `channels` count is a *mount parameter*,
+  sized from the input device's layout (the Notepad-12FX's 4 USB channels, the
+  Scarlett 2i2's 2) — and since [the mixer's width is a mount
+  parameter](../.agents/notes/implemented/architecture/2026-09-27-mixer-width-is-a-mount-parameter.md)
+  it is *any* width, not a value clamped below a constant: the port/param surface,
+  the node's state and its meters are all generated from the mount. The only bound
+  left is a named sanity guard (64) against gross typos.
 - **Owns the master bus**: mounting the mixer calls `api.graph.set_out(node)`,
   which ends Spike A.5's "last audio provider wins" limitation on who owns the
   output.
-- **Per-channel pan into a stereo master**: each of the `1..=8` *mono* input
-  channels gets gain / mute / solo / `pan` (`ch{k}.pan`, −1..1), summed into a
-  stereo master bus (`channels: 2`). A pan is exactly the equal-power
-  `cos`/`sin` law from the splice, applied in miniature. (Two-channel *sources*
-  are the next sub-step — the graph's audio ports are already channel-aware.)
+- **Per-channel pan into a stereo master**: each mounted *mono* input channel gets
+  gain / mute / solo / `pan` (`ch{k}.pan`, −1..1), summed into a stereo master bus
+  (`channels: 2`). A pan is exactly the equal-power `cos`/`sin` law from the splice,
+  applied in miniature. (Two-channel *sources* are the next sub-step — the graph's
+  audio ports are already channel-aware.)
 - **Provides a service**: it shoves an `Arc<MeterBank>` under the `mixer.meters`
   context key, which the host later reads for the UI — without the UI needing to
   know how the mixer works.
@@ -662,7 +666,9 @@ look because it exercises almost every idea in the project.
 The meters are the star of the Rust-al idioms:
 
 ```rust
-pub struct MeterBank(pub [AtomicU32; MIXER_CHANNELS_MAX + 1]);
+/// A bank with one atomic per channel plus the master — sized at mount, like
+/// everything else about the mixer's width.
+pub struct MeterBank(pub Vec<AtomicU32>);
 
 impl MeterBank {
     pub fn channel_peak(&self, k: usize) -> f32 {
