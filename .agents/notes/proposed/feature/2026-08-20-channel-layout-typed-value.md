@@ -2,6 +2,12 @@
 
 Status: proposed
 
+> **Extended 2026-09-27:** the *ceiling* this note works within is gone — capacity now scales with
+> the rig rather than a compile-time constant, and the layout it argues for becomes an **equipment
+> profile** field ([capacity note](../architecture/2026-09-27-capacity-scales-with-the-rig.md)).
+> The diagnosis below stands unchanged and is the reason that note exists; only its
+> "preserve `MIXER_CHANNELS_MAX`" acceptance criterion is superseded.
+
 ## Problem
 
 The mixer's channel model is a bare **count**: a `channels` mount param, `1..=MIXER_CHANNELS_MAX` (8), default 4, that "the profile sets from the input device's layout" ([`mixer.rs`](../../../../crates/engine/src/plugins/mixer.rs)) — e.g. the Notepad-12FX's 4 USB capture channels or the Scarlett 2i2's 2. A count cannot express the actual target layout: the Notepad-12FX's four channels are **2 mono + 1 stereo pair** — a mixed layout with roles, not "four equal channels." The mixer already shows the symptom: *"Patches to channels beyond the mounted `channels` count are accepted but ignored (documented)"* — a silent behavior, the opposite of the patch bay's fail-loud rule.
