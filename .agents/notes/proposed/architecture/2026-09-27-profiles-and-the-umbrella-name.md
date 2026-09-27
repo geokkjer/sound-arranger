@@ -131,8 +131,11 @@ sentiment, because "viable but not focus" decays into "never" without one.
    "the first profile" without qualification.
 3. A profile is selectable between `recorder` and `arranger` (`sculptor` absent while deferred):
    the recorder exposes no document ops and no timeline surface; the arranger exposes them.
-4. A recorded take's identity — id, device, channel count, rate, origin — survives save/load
-   **without re-opening a device**, and a saved session's log describes its own material.
+4. A recorded take's identity — id, frame count, dropped frames, channel count, origin — survives
+   save/load **without re-opening a device**, and a saved session's log describes its own material.
+   (Shipped: [takes are declared state](../../implemented/architecture/2026-09-27-takes-are-declared-state.md).
+   Device identity is the rig's, declared by `source add` per the capture note — not a property of
+   every take.)
 5. A session whose only material is a recorded take masters and exports, with the render length
    still **derived from the value** — `end_frame()`'s invariant — extended to see the session's
    material and not only its clips.

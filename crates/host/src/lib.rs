@@ -187,12 +187,34 @@ pub enum HostCommand {
     /// **Record a take** from the default input device into the session's pool:
     /// `{take_id}.ch{k}` sources land beside the other pool material, at the session
     /// rate (the device's clock is drift-compensated), ready to be placed on a track.
-    /// An **action**, not state: what the log records is the *clip* you make from the
-    /// take, not the recording session.
+    /// An **action**, not state: opening a device is a side effect, and a replay must
+    /// never touch hardware. What the log keeps is the finished [`HostCommand::Take`]
+    /// declaration, so a loaded session describes its own material.
     Record { take_id: String },
     /// Stop the take in progress and finalize it (headers, peaks). A no-op-looking
-    /// error when nothing is recording — never a silent half-take.
+    /// error when nothing is recording — never a silent half-take. Commits the
+    /// resulting [`HostCommand::Take`] to the session's state.
     RecordStop,
+    /// **A finished take**, as state — and *not* a capture. The pool sources the
+    /// recording wrote and the shape of what they hold, so a loaded session names its
+    /// material and a replay binds it **without opening a device**. What is in the WAV
+    /// is not this layer's business: reproducibility starts at the pool file, and any
+    /// session that loads that file renders the same bytes.
+    ///
+    /// The pool ids follow the `{take_id}.ch{k}` convention every clip already
+    /// references, so the declaration names the take and its shape rather than each
+    /// file; `at_frame` is where the capture started on the timeline and is
+    /// deliberately **not** an `@frame` edit time.
+    Take {
+        take_id: String,
+        /// Session frames written per channel.
+        frames: u64,
+        /// Source frames the capture dropped (the ring was full) — material fidelity
+        /// that the WAV cannot record, so the declaration does.
+        dropped: u64,
+        channels: usize,
+        at_frame: u64,
+    },
     /// **A gesture**: several arrangement ops that apply as one unit and undo as
     /// **one step**. Members must be arrangement ops sharing one `at_frame` (a
     /// gesture happens at one moment, which is what makes a replay's
@@ -409,6 +431,7 @@ impl HostCommand {
                 | HostCommand::Splice { .. }
                 | HostCommand::Group { .. }
                 | HostCommand::SetSourceTempo { .. }
+                | HostCommand::Take { .. }
         )
     }
 }
@@ -770,12 +793,16 @@ impl HostSession {
             source,
         )?;
         let sources = (0..channels).map(|k| format!("{take_id}.ch{k}")).collect();
+        // The origin is read here, once: the declaration must say where the capture
+        // started even though the capture itself is never replayed.
+        let at_frame = self.engine.clock.frame();
         self.last_take = None;
         self.recording = Some(Recording {
             handle: None,
             capture,
             take_id: take_id.to_string(),
             sources,
+            at_frame,
         });
         Ok(())
     }
@@ -818,6 +845,7 @@ impl HostSession {
             capture,
             take_id,
             sources,
+            at_frame,
         } = rec;
         // Stop feeding first, then drain and finalize what the device already delivered.
         drop(handle);
@@ -832,6 +860,7 @@ impl HostSession {
             channels: capture.channels(),
             sources,
             sample_rate: self.engine.clock.sample_rate,
+            at_frame,
         };
         self.last_take = Some(report.clone());
         match stop {
@@ -1405,6 +1434,39 @@ impl HostSession {
             HostCommand::RecordStop => {
                 let take = self.stop_recording()?;
                 self.status_take(&take);
+                // The capture was the side effect; the **declaration** is the state. It is
+                // committed through the same path every other state command uses, so the
+                // save and the journal name the take that just landed — while `RecordStop`
+                // itself stays an action the replay never re-runs (it would open a device).
+                self.commit_state(vec![HostCommand::Take {
+                    take_id: take.take_id.clone(),
+                    frames: take.frames,
+                    dropped: take.dropped,
+                    channels: take.channels,
+                    at_frame: take.at_frame,
+                }]);
+                Ok(())
+            }
+            // A take declaration, replayed or loaded: the audio is already pool material,
+            // so binding it touches no device and reads no file. The pool ids follow the
+            // `{take_id}.ch{k}` convention, which is why the declaration names the shape
+            // rather than each source.
+            HostCommand::Take {
+                take_id,
+                frames,
+                dropped,
+                channels,
+                at_frame,
+            } => {
+                self.status_take(&TakeReport {
+                    take_id: take_id.clone(),
+                    frames: *frames,
+                    dropped: *dropped,
+                    channels: *channels,
+                    sources: (0..*channels).map(|k| format!("{take_id}.ch{k}")).collect(),
+                    sample_rate: self.engine.clock.sample_rate,
+                    at_frame: *at_frame,
+                });
                 Ok(())
             }
             // Context, validated: a session's rate is set at construction.
@@ -2299,6 +2361,21 @@ impl HostSession {
     /// mixer mount, render up to the command's absolute frame, then `apply`.
     /// Shared by [`run_script`] and [`execute`] so the live path can never
     /// diverge from the one-shot path.
+    /// Commit one state entry to the session: the autosave journal, the history, and the
+    /// redo reset (a new state change makes any undone branch unreachable).
+    ///
+    /// Every state command reaches here from `process`. The other caller is the take
+    /// commit: a finished capture is declared by `record stop`, which is an *action*, so
+    /// the declaration is produced by an action rather than by a command of its own — and
+    /// it still has to reach the document the save and the journal are built from.
+    fn commit_state(&mut self, entry: Vec<HostCommand>) {
+        // Autosave: the journal is appended per committed gesture, so a crash costs at
+        // most the gesture in flight.
+        self.journal_append(&entry);
+        self.history.push(entry);
+        self.redo.clear();
+    }
+
     fn process(&mut self, cmd: &HostCommand) -> Result<(), String> {
         let mut pending_mixer_channels = None;
         if let HostCommand::Mount {
@@ -2356,11 +2433,7 @@ impl HostSession {
                     HostCommand::Group { commands } => commands.clone(),
                     other => vec![other.clone()],
                 };
-                // Autosave: the journal is appended per committed gesture, so a crash
-                // costs at most the gesture in flight.
-                self.journal_append(&entry);
-                self.history.push(entry);
-                self.redo.clear();
+                self.commit_state(entry);
             }
         }
         r
@@ -2384,6 +2457,9 @@ struct Recording {
     take_id: String,
     /// The pool source ids the take will produce (`take.ch0`, `take.ch1`, …).
     sources: Vec<String>,
+    /// Where the capture started on the session timeline (the transport frame when
+    /// `record` was issued) — the take's origin, which the declaration keeps.
+    at_frame: u64,
 }
 
 /// A finished take: what the shell needs to say what happened, and what the pool
@@ -2399,6 +2475,8 @@ pub struct TakeReport {
     /// The pool source ids to place on a track (`{take_id}.ch{k}`).
     pub sources: Vec<String>,
     pub sample_rate: u32,
+    /// The transport frame the capture started at (the take's origin).
+    pub at_frame: u64,
 }
 
 /// A take in progress, for a live indicator.
@@ -2521,6 +2599,16 @@ pub fn format_command(cmd: &HostCommand, session_dir: Option<&std::path::Path>) 
         } => format!("set_tempo {bpm} {beats_per_bar}{}", frame(at_frame)),
         HostCommand::Unmount { plugin, at_frame } => format!("unmount {plugin}{}", frame(at_frame)),
         HostCommand::Pool { dir } => format!("pool {}", pool_text(dir, session_dir)),
+        // `take <take_id> <frames> <dropped> <channels> <at_frame>` — the pool sources are
+        // the `{take_id}.ch{k}` convention, and `at_frame` is the take's origin rather
+        // than an edit time, so it is not `@`-suffixed.
+        HostCommand::Take {
+            take_id,
+            frames,
+            dropped,
+            channels,
+            at_frame,
+        } => format!("take {take_id} {frames} {dropped} {channels} {at_frame}"),
         HostCommand::SessionRate { hz } => format!("session_rate {hz}"),
         HostCommand::Arrange { op, at_frame } => {
             format!("arrange {}{}", format_arrange(op), frame(at_frame))
@@ -3014,6 +3102,29 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
                         take_id: take_id.to_string(),
                     });
                 }
+            }
+            "take" => {
+                exact(&words, 6, at, "take")?;
+                let take_id = word(&words, 1, at)?.to_string();
+                let frames = word(&words, 2, at)?
+                    .parse::<u64>()
+                    .map_err(|_| format!("line {at}: bad take length (want frames)"))?;
+                let dropped = word(&words, 3, at)?
+                    .parse::<u64>()
+                    .map_err(|_| format!("line {at}: bad take dropped count (want frames)"))?;
+                let channels = word(&words, 4, at)?
+                    .parse::<usize>()
+                    .map_err(|_| format!("line {at}: bad take channel count"))?;
+                let at_frame = word(&words, 5, at)?
+                    .parse::<u64>()
+                    .map_err(|_| format!("line {at}: bad take origin (want a frame)"))?;
+                commands.push(HostCommand::Take {
+                    take_id,
+                    frames,
+                    dropped,
+                    channels,
+                    at_frame,
+                });
             }
             "bounce" => {
                 exact(&words, 3, at, "bounce")?;
@@ -4438,6 +4549,13 @@ mod tests {
             ops.into_iter()
                 .map(|op| HostCommand::Arrange { op, at_frame: None }),
         );
+        commands.push(HostCommand::Take {
+            take_id: "jam".into(),
+            frames: 96_000,
+            dropped: 0,
+            channels: 2,
+            at_frame: 0,
+        });
         commands.push(HostCommand::Group {
             commands: vec![
                 HostCommand::Arrange {
@@ -6583,6 +6701,63 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A finished take is **state**: the capture is the side effect, and what the session
+    /// keeps is the declaration — so the document names its own material and never carries
+    /// the `record` line that would open a device on replay.
+    #[test]
+    fn a_finished_take_is_committed_to_the_session_state() {
+        let root = std::env::temp_dir().join(format!("host-take-commit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("work");
+        std::fs::create_dir_all(&pool).expect("root");
+
+        let mut s = HostSession::new();
+        s.execute(&HostCommand::Pool { dir: pool.clone() })
+            .expect("pool");
+        let ring = std::sync::Arc::new(media::Spsc::<f32>::new(64));
+        s.start_recording("jam", ring, 48_000, 2)
+            .expect("the take starts");
+        s.execute(&HostCommand::RecordStop).expect("the take stops");
+
+        let text = s.script_text(&root).expect("the session writes");
+        assert!(
+            text.contains("take jam "),
+            "the document names the take that landed: {text}"
+        );
+        assert!(
+            !text.contains("record jam"),
+            "the capture is an action and must never reach the document: {text}"
+        );
+        let back = parse_script(&text).expect("the session parses");
+        assert!(
+            back.iter().any(|c| matches!(
+                c,
+                HostCommand::Take { take_id, channels, .. } if take_id == "jam" && *channels == 2
+            )),
+            "the declaration round-trips: {text}"
+        );
+    }
+
+    /// The point of the declaration: a loaded session binds its take **without opening a
+    /// device** — what is in the WAV is not this layer's business.
+    #[test]
+    fn a_take_declaration_replays_without_a_device() {
+        let script = parse_script("host v1\nsession_rate 48000\ntake jam 96000 7 2 120\n")
+            .expect("a take line parses");
+        let s = run_script(&script).expect("the session replays");
+        let take = s.last_take().expect("the take is bound");
+        assert_eq!(take.take_id, "jam");
+        assert_eq!(take.frames, 96_000);
+        assert_eq!(take.dropped, 7);
+        assert_eq!(take.channels, 2);
+        assert_eq!(take.sources, vec!["jam.ch0", "jam.ch1"]);
+        assert_eq!(
+            take.sample_rate, 48_000,
+            "the session's rate, not a declared one"
+        );
+        assert_eq!(take.at_frame, 120, "the take's origin is kept");
     }
 
     /// Recording is one take at a time, needs somewhere to put it, and stopping
