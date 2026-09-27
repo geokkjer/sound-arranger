@@ -60,6 +60,19 @@ pub trait Plugin {
     fn inject(&self) -> &'static [&'static str];
     /// Declared patch-bay surface (the dropdown's data source).
     fn ports(&self) -> &'static [Port];
+    /// The surface this **mounted instance** actually offers, which may be narrower
+    /// than the registered catalog: the mixer mounts four channels' worth of the eight
+    /// port names it declares. Validation prefers this over the catalog, so a patch to
+    /// a channel the instance did not mount is **refused** rather than accepted and
+    /// silently ignored. Defaults to the declared surface, so a static plugin says
+    /// nothing.
+    fn mounted_ports(&self) -> Vec<Port> {
+        self.ports().to_vec()
+    }
+    /// The **mounted** parameter surface; see [`Plugin::mounted_ports`].
+    fn mounted_params(&self) -> Vec<ParamDef> {
+        self.params().to_vec()
+    }
     /// Declared runtime parameter surface (the logged `SetParam` namespace).
     /// `Engine::set_param` refuses names not declared here — fail-loud, never
     /// logged (Phase 1: the mixer's gain/mute/solo/fader).

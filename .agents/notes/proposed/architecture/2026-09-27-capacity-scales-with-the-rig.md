@@ -44,11 +44,11 @@ Additive placement assigns fresh lanes per pass; **strict overdub** reuses the s
 
 ## Acceptance criteria
 
-1. No compile-time channel ceiling: `MAX_AUDIO_INS` and `MIXER_CHANNELS_MAX` are gone, or kept only as a named sanity bound with a stated reason — never as the array dimension in the render path.
-2. The mixer's port and param surface is derived from the mounted layout, with no hand-written channel list; `SetParam` still refuses an undeclared name.
+1. No compile-time channel ceiling: `MAX_AUDIO_INS` and `MIXER_CHANNELS_MAX` are gone, or kept only as a named sanity bound with a stated reason — never as the array dimension in the render path. *(Half shipped: [the node's input width is its own](../../implemented/architecture/2026-09-27-node-input-width-is-the-nodes-own.md) removed the graph's ceiling and the array dimension; the mixer's own `MIXER_CHANNELS_MAX` and the per-channel clamps remain.)*
+2. The mixer's port and param surface is derived from the mounted layout, with no hand-written channel list; `SetParam` still refuses an undeclared name. *(Partial: [the mounted surface overrides the catalog](../../implemented/architecture/2026-09-27-mounted-surface-overrides-the-catalog.md) narrows validation and the node itself, but the list is still hand-written — pending dynamic names.)*
 3. The render path allocates nothing: per-node capacity is preallocated when the node is added, and the counting-allocator test still passes.
 4. An equipment profile declares a rig — sources, per-source roles, clock role, binding rule — and a session logs it and replays it byte-identically.
-5. A patch to an undeclared role is refused and never logged; a source that cannot report roles is `unattributed`, never guessed.
+5. A patch to an undeclared role is refused and never logged; a source that cannot report roles is `unattributed`, never guessed. *(The mounted-surface half is shipped: [a patch to an unmounted channel is refused](../../implemented/architecture/2026-09-27-mounted-surface-overrides-the-catalog.md); the role half waits on the layout.)*
 6. Additive placement of *N* passes × *M* channels mounts and renders for every *N* the profile declared — measured on a session that would have exceeded the old ceiling, not assumed.
 7. Device-specific layout data appears in the studio project and is linked here, never copied.
 

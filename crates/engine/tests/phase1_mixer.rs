@@ -578,9 +578,25 @@ fn a_node_may_declare_more_inputs_than_the_old_ceiling() {
     );
 }
 
-/// The mixer adapts to the input layout (P1.2): mounted with `channels = 2`,
-/// only the first two inputs are processed — a patch to ch2 is accepted but
-/// ignored.
+/// A patch to a channel the mixer did **not** mount is refused: the mounted surface is
+/// what validation reads, so the old "accepted but ignored" path is gone.
+#[test]
+fn a_patch_to_an_unmounted_channel_is_refused() {
+    let mut e = engine();
+    e.mount("tone", &[]).unwrap();
+    e.mount("mixer", &[("channels", 2.0)]).unwrap();
+    // The mounts apply during a render, and the mounted surface is what patches read.
+    let _ = e.render(64);
+    e.patch(("tone", "audio"), ("mixer", "ch1"))
+        .expect("a mounted channel accepts the patch");
+    let refused = e.patch(("tone", "audio"), ("mixer", "ch2"));
+    let err = refused.expect_err("an unmounted channel is refused");
+    assert!(err.contains("no port 'ch2'"), "got: {err}");
+}
+
+/// The mixer adapts to the input layout (P1.2): mounted with `channels = 2`, only the
+/// first two inputs are processed. Defense in depth — a mounted node declares only its
+/// own channels, so this is the node's own guard rather than a reachable product path.
 #[test]
 fn mixer_adapts_to_channel_count() {
     let mut g = Graph::new();

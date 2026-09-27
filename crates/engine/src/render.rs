@@ -116,8 +116,15 @@ pub struct Engine {
     factories: HashMap<&'static str, PluginFactory>,
     /// registered port surfaces (validated against the plugin at apply).
     port_table: HashMap<&'static str, &'static [Port]>,
+    /// The **mounted** port surface per plugin, captured from the instance at apply
+    /// time. It can be narrower than the catalog — the mixer mounts some of the
+    /// channels it declares — and validation prefers it, so a patch to an unmounted
+    /// channel fails loudly instead of being accepted and ignored downstream.
+    mounted_ports: HashMap<&'static str, Vec<Port>>,
     /// registered runtime parameter surfaces (validated by `set_param`).
     params_table: HashMap<&'static str, &'static [ParamDef]>,
+    /// The **mounted** parameter surface per plugin; see [`Self::mounted_ports`].
+    mounted_params: HashMap<&'static str, Vec<ParamDef>>,
     /// plugin name → its mounted primary node.
     node_of: HashMap<&'static str, NodeId>,
     disposers: HashMap<&'static str, Disposer>,
@@ -150,6 +157,8 @@ impl Engine {
             factories: HashMap::new(),
             port_table: HashMap::new(),
             params_table: HashMap::new(),
+            mounted_ports: HashMap::new(),
+            mounted_params: HashMap::new(),
             node_of: HashMap::new(),
             disposers: HashMap::new(),
             scheduled: std::collections::HashSet::new(),
@@ -246,6 +255,11 @@ impl Engine {
             .ok_or_else(|| format!("unknown plugin '{name}'"))?;
         let mut plugin = factory(params)?;
         let id = plugin.id();
+        // Capture the **mounted** surface before applying: it is the instance's answer
+        // to "what did you actually mount", and every later patch and parameter
+        // validation reads it in preference to the registered catalog.
+        self.mounted_ports.insert(name, plugin.mounted_ports());
+        self.mounted_params.insert(name, plugin.mounted_params());
         let (node, disposer) = {
             let Engine {
                 ctx,
@@ -317,15 +331,23 @@ impl Engine {
         if !(self.scheduled.contains(tp) || self.node_of.contains_key(tp)) {
             return Err(format!("plugin '{tp}' is neither scheduled nor mounted"));
         }
-        let from_port = self
-            .port_table
-            .get(fp)
-            .and_then(|ports| ports.iter().find(|p| p.name == from.1))
+        // The **mounted** surface wins: a plugin may mount fewer channels than it
+        // declares, and a patch to one it did not mount must fail here rather than be
+        // accepted and silently ignored downstream.
+        let surface = |p: &'static str| -> &[Port] {
+            self.mounted_ports
+                .get(p)
+                .map(Vec::as_slice)
+                .or_else(|| self.port_table.get(p).copied())
+                .unwrap_or(&[])
+        };
+        let from_port = surface(fp)
+            .iter()
+            .find(|p| p.name == from.1)
             .ok_or_else(|| format!("no port '{}' on plugin '{fp}'", from.1))?;
-        let to_port = self
-            .port_table
-            .get(tp)
-            .and_then(|ports| ports.iter().find(|p| p.name == to.1))
+        let to_port = surface(tp)
+            .iter()
+            .find(|p| p.name == to.1)
             .ok_or_else(|| format!("no port '{}' on plugin '{tp}'", to.1))?;
         if from_port.direction != crate::graph::Direction::Out
             || to_port.direction != crate::graph::Direction::In
@@ -416,6 +438,8 @@ impl Engine {
     /// Apply an unmount: run the disposer (reversible effects). Idempotent.
     fn apply_unmount(&mut self, name: &'static str) {
         self.scheduled.remove(name);
+        self.mounted_ports.remove(name);
+        self.mounted_params.remove(name);
         if let Some(disposer) = self.disposers.remove(name) {
             self.node_of.remove(name);
             let Engine {
@@ -477,17 +501,26 @@ impl Engine {
                 "plugin '{plugin}' is neither scheduled nor mounted"
             ));
         }
-        let declared = self.params_table.get(plugin).copied().unwrap_or(&[]);
-        let Some(def) = declared.iter().find(|d| d.name == param) else {
-            return Err(format!("plugin '{plugin}' has no parameter '{param}'"));
+        // Prefer the mounted surface: the mixer declares eight channels and may mount
+        // four, and a parameter the instance did not mount is not settable.
+        let (min, max) = {
+            let declared = self
+                .mounted_params
+                .get(plugin)
+                .map(Vec::as_slice)
+                .or_else(|| self.params_table.get(plugin).copied())
+                .unwrap_or(&[]);
+            let Some(def) = declared.iter().find(|d| d.name == param) else {
+                return Err(format!("plugin '{plugin}' has no parameter '{param}'"));
+            };
+            (def.min, def.max)
         };
         if !value.is_finite() {
             return Err(format!("parameter '{param}' must be finite, got {value}"));
         }
-        if value < def.min || value > def.max {
+        if value < min || value > max {
             return Err(format!(
-                "parameter '{param}' out of range [{}, {}]: {value}",
-                def.min, def.max
+                "parameter '{param}' out of range [{min}, {max}]: {value}"
             ));
         }
         let at_frame = self.clock.frame();

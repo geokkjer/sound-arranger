@@ -427,6 +427,18 @@ pub struct MixerPlugin {
     channels: usize,
 }
 
+/// The channel index a mixer **port** name carries (`ch3` → 3), or `None` for a port
+/// that is not a channel input (the master `audio` out).
+fn channel_of(name: &str) -> Option<usize> {
+    name.strip_prefix("ch")?.parse().ok()
+}
+
+/// The channel index a mixer **parameter** name carries (`ch3.gain` → 3), or `None`
+/// for a parameter that is not per-channel (`master.gain`).
+fn param_channel_of(name: &str) -> Option<usize> {
+    name.split_once('.').and_then(|(head, _)| channel_of(head))
+}
+
 impl Plugin for MixerPlugin {
     fn id(&self) -> &'static str {
         "mixer"
@@ -444,14 +456,39 @@ impl Plugin for MixerPlugin {
         MIXER_PARAMS
     }
 
+    /// Only the channels this instance mounted, plus the stereo master out. The
+    /// catalog declares the full `ch0..ch7` so the patch bay can offer them; the
+    /// instance answers for what it actually mounted, which is what validation uses —
+    /// so a patch to a channel beyond the mounted count is **refused**, and the old
+    /// "accepted but ignored" path is gone.
+    fn mounted_ports(&self) -> Vec<Port> {
+        MIXER_PORTS
+            .iter()
+            .copied()
+            .filter(|p| channel_of(p.name).is_none_or(|i| i < self.channels))
+            .collect()
+    }
+
+    fn mounted_params(&self) -> Vec<ParamDef> {
+        MIXER_PARAMS
+            .iter()
+            .copied()
+            .filter(|p| param_channel_of(p.name).is_none_or(|i| i < self.channels))
+            .collect()
+    }
+
     fn apply(&mut self, api: &mut PluginApi) -> Result<(NodeId, Disposer), String> {
         let meters = Arc::new(MeterBank::default());
+        // The node declares the surface this instance **mounted**, not the catalog's
+        // full `ch0..ch7`: a patch to a channel beyond the mounted count is then
+        // refused by the graph itself, so the old "accepted but ignored" path is
+        // unreachable rather than merely discouraged.
         let node = api.graph.add_node(
             NodeKind::Opaque(Box::new(MixerNode::with_channels(
                 self.channels,
                 meters.clone(),
             ))),
-            MIXER_PORTS.to_vec(),
+            self.mounted_ports(),
         );
         // The mixer owns the master bus: sources route into its channels, and
         // the master out is its output. Its meters are a context service.
