@@ -24,6 +24,7 @@ pub trait AudioNode: Send {
         block: RenderBlock,
     );
     fn set_param(&mut self, _name: &str, _value: f32) {}
+    fn has_tail(&self) -> bool { false }
 }
 ```
 
@@ -40,6 +41,9 @@ Reading it:
 - Parameter names like `_name` — the leading underscore silences "unused"
   warnings for a parameter a default body ignores. You'll see `_` prefixes all
   over idiomatic Rust; they mean "intentionally unused".
+- **`has_tail` also has a default body** (`false`): a node that buffers a tail
+  (a delay, a decaying voice) overrides it, and the engine's drain phase keeps
+  rendering while any mounted node reports one.
 
 An implementation looks like:
 
@@ -56,16 +60,17 @@ The graph stores every node in one list regardless of concrete type:
 
 ```rust
 pub enum NodeKind {
-    Declarative(/* ... */),
-    Opaque(Box<dyn AudioNode>),
+    Sine(Sine),                  // the declarative tier, concrete
+    Gain(Gain),
+    Opaque(Box<dyn AudioNode>),  // everything else, type-erased
 }
 ```
 
 `Box<dyn AudioNode>` ("a boxed *trait object*") holds *some* heap-allocated
 value whose type implements `AudioNode`. The concrete type is erased; calls go
 through a vtable, exactly like an interface reference in Java/C#. That's how
-`Sine`, `Gain`, `ToneGen`, the mixer, and media's playback nodes all sit in one
-`Vec<Node>` and get rendered uniformly by one loop.
+`ToneGen`, the mixer, and media's playback nodes sit in one `Vec<Node>` alongside
+the concrete `Sine`/`Gain` variants and get rendered uniformly by one loop.
 
 Cost/benefit: dynamic dispatch costs an indirect call per `render` — negligible
 at block rate — in exchange for not needing to know node types at compile time.
@@ -97,32 +102,52 @@ runtime overhead, but you can't mix types in one collection. Rule of thumb:
 pub trait Plugin {
     fn id(&self) -> &'static str;
     fn inject(&self) -> &'static [&'static str];   // required services
-    fn ports(&self) -> &'static [Port];             // patch-bay surface
-    fn params(&self) -> &'static [ParamDef] { &[] } // runtime knobs
+    fn ports(&self) -> &'static [Port];             // nominal catalog surface
+    fn mounted_ports(&self) -> Vec<Port> {          // what this instance mounted
+        self.ports().to_vec()
+    }
+    fn mounted_params(&self) -> Vec<ParamDef> {     // what this instance mounted
+        self.params().to_vec()
+    }
+    fn params(&self) -> &'static [ParamDef] { &[] } // nominal runtime knobs
     fn apply(&mut self, api: &mut PluginApi) -> Result<(NodeId, Disposer), String>;
 }
 ```
 
-This trait is the whole plugin architecture in six lines, and it demonstrates a
-pattern worth stealing: **methods return static slices of declarative data**
-(`&'static [Port]`, `&'static [ParamDef]`). A plugin doesn't just *behave*, it
-*describes itself* — its ports feed UI dropdowns, its param definitions feed
-validation (Lesson 2's range checks). Behavior and metadata come through the
-same door.
+This trait is the whole plugin architecture, and it demonstrates a pattern
+worth stealing: **a plugin declares itself as data**. `ports()`/`params()`
+return static slices — the *nominal catalog*, the dropdown's data source and
+the pre-mount fallback — while `mounted_ports()`/`mounted_params()` return
+owned `Vec`s and answer for the instance: the mixer registers `ch0..ch7`, but
+a two-channel mount offers only `ch0`/`ch1`. Patch and parameter validation
+resolve in three rungs — the applied instance, then the queued mount's
+factory (asked with its mount params), then the catalog (`render.rs`'s
+`ports_of`/`params_of`) — so a patch to a channel the instance did not mount
+is refused, not silently ignored. Behavior and metadata come through the same
+door.
 
-Note again the default method: `params()` defaults to an empty slice, so
-plugins without knobs (euclidean, scale) never mention params, while the mixer
-declares its full gain/mute/solo surface.
+Note again the default methods: `params()` defaults to an empty slice, so
+plugins without knobs (euclidean, scale) never mention params;
+`mounted_ports()`/`mounted_params()` default to the declared catalog, so a
+static plugin says nothing extra; while the mixer overrides them to declare
+its mounted gain/mute/solo/pan surface.
 
 ## 3.5 Where to see it all wired: the factories
 
-In `render.rs`, plugins register themselves under names:
+In the host, plugins register themselves under names (the engine exposes the
+registry, it does not fill it):
 
 ```rust
-engine.register("tone", Box::new(tone_factory));
+// host/src/lib.rs — build the registry once, then mount by name
+engine.register_factory(
+    "tone",
+    plugins::tone_factory,
+    plugins::tone::TONE_PORTS,
+    plugins::tone::TONE_PARAMS,
+);
 ```
 
-A factory is itself a trait object (`PluginFactory`) producing `Box<dyn Plugin>`
+A factory is a plain `fn` pointer (`PluginFactory`) producing `Box<dyn Plugin>`
 — layers of erasure, each narrow and purposeful. When you later read
 `host/src/lib.rs` and see `"mixer"` sent as text from a script, mapped to this
 registry, and ending in a virtual `apply()` call, you've seen the entire

@@ -30,7 +30,8 @@
 //!   handoff is Phase 1.
 //!
 //! External I/O seams (MIDI / OSC for SuperCollider and Tidal) are declared in
-//! [`plugins`] — traits now, implementations when demanded (patch-bay note §4).
+//! [`plugins`] — traits now, implementations when demanded (patch-bay note,
+//! external-I/O seams).
 
 pub mod clock;
 pub mod ctx;

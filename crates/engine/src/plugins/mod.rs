@@ -110,8 +110,8 @@ pub enum ExternalEvent {
     },
 }
 
-/// A source of external events for a block (seam declaration — patch-bay note
-/// §4; implementations arrive with Phase 2 integrations).
+/// A source of external events for a block (seam declaration — patch-bay note,
+/// external-I/O seams; implementations arrive with Phase 2 integrations).
 pub trait EventSource: Send {
     fn id(&self) -> &'static str;
     fn for_each_event(&self, block: Range<u64>, emit: &mut dyn FnMut(ExternalEvent));

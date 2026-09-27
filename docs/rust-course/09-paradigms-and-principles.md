@@ -235,12 +235,13 @@ and the tests are the culture made executable.
 
 *"Many small interfaces beat one fat one."*
 
-`AudioNode` is three methods with a default body. `PatternQuery` is one method.
+`AudioNode` is four methods, two with default bodies. `PatternQuery` is one method.
 `EventSource`/`EventSink` split input from output rather than making a
 bidirectional mega-trait. Consumers depend only on what they use: the render
-loop needs `render`; param UIs need only `params()`. Every default method
-(`set_param {}`, `params() -> &[]`) is ISP applied — optional capability kept
-off implementors who don't care.
+loop needs `render`; param UIs need only `mounted_params()`. Every default
+method (`set_param {}`, `has_tail() -> false`, `params() -> &[]`,
+`mounted_ports()`, `mounted_params()`) is ISP applied — optional capability
+kept off implementors who don't care.
 
 ### D — Dependency Inversion
 
@@ -257,7 +258,7 @@ Three distinct mechanisms, worth telling apart:
    less typed than constructor injection, but it works across mount-time
    boundaries where constructors can't reach.
 3. **Direction of dependency**: media depends on engine (never reverse);
-   host depends on both; the UI (future Tauri shell) implements the host's
+   host depends on both; the UI (an iced or ratatui shell) implements the host's
    contract rather than the core importing UI. Dependency arrows point toward
    the stable core — DIP at architecture scale.
 
@@ -276,17 +277,20 @@ version's limits are explicit.
 validate/log/schedule sequence repeats deliberately in every engine mutation
 (the *pattern* is factored conceptually; forcing it through a generic wrapper
 would obscure the per-event differences). DRY is about knowledge having one
-home — e.g., a plugin's port list declared once and reused by validation, the
-UI, and the parser — not about textual similarity.
+home — e.g., the mixer's channel surface is generated once from the mount's
+`channels` by `channel_ports(n)`/`channel_params(n)`, and the same generated
+surface is what the engine validates patches and parameters against — not
+about textual similarity.
 
 **YAGNI.** Everywhere, and load-bearing:
 
 ```rust
-// patch-bay note §4: "traits now, implementations when demanded"
+// patch-bay note, external-I/O seams: "traits now, implementations when demanded"
 pub trait MidiSource: EventSource {}   // seam declared, no impl yet
 ```
 
-Declared seams with zero implementations, `MAX_BLIPS` voice-stealing deferred,
+Declared seams with no production implementation (only a test double exercises
+`OscSource`), `MAX_BLIPS` voice-stealing deferred,
 automation curves postponed — the notes track these as conscious debts, not
 oversights. The counterweight is also recorded: "ceremony without payoff" is a
 named risk, watched by capping the machinery at two hosts. YAGNI done well

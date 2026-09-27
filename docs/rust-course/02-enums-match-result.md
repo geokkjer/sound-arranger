@@ -1,9 +1,9 @@
 # Lesson 2 — Enums, `match`, `Option`, and `Result`
 
-**Material:** [`crates/engine/src/log.rs`](../../crates/engine/src/log.rs) (88 lines),
+**Material:** [`crates/engine/src/log.rs`](../../crates/engine/src/log.rs) (86 lines),
 plus enum usage from `graph.rs`.
 
-The session log is 88 lines and is arguably the most important file in the
+The session log is 86 lines and is arguably the most important file in the
 project — "a composition *is* a log". It's also the perfect vehicle for Rust's
 enums, because an event log *is* a list of typed alternatives.
 
@@ -115,7 +115,7 @@ The engine's whole public API returns `Result<(), String>`:
 
 ```rust
 // render.rs
-pub fn set_param(&mut self, plugin: &str, param: &str, value: f32) -> Result<(), String>
+pub fn set_param(&mut self, plugin: &'static str, param: &'static str, value: f32) -> Result<(), String>
 ```
 
 The discipline here is worth copying into your own code: **validate now, fail
@@ -123,7 +123,7 @@ loud, never log a refusal.**
 
 ```rust
 if !value.is_finite() { return Err(...); }              // NaN/∞ banned
-if value < def.min || value > def.max { return Err(...); } // range check
+if value < min || value > max { return Err(...); } // range check // range check
 ```
 
 Error propagation uses the `?` operator: "if this is `Err`, return it from my

@@ -1,6 +1,6 @@
 # Learn Rust with sound-arranger
 
-> 🕒 Last verified against commit `97cc411` (2026-08-27). If the code has moved on,
+> 🕒 Last verified against commit `17a9d9a` (2026-09-27). If the code has moved on,
 > trust the code and move this line forward.
 
 A mini course that teaches Rust by reading and modifying *this* codebase. You
@@ -20,8 +20,9 @@ first — fifteen minutes, no prerequisites.
   let-chains, so use a recent toolchain: `rustup update`.
 - **A editor with rust-analyzer** (VS Code + the rust-analyzer extension is
   fine). Inlay hints for types are your best friend while learning.
-- That's it. No external crates beyond `cpal` in `media/`, which you can ignore
-  until Lesson 8.
+- That's it. No external crates beyond `cpal` and `serde` in `media/` (both
+  ignorable until Lesson 8); `engine`'s optional `fundsp` feature is off by
+  default.
 
 Verify your setup works:
 

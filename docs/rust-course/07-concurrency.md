@@ -1,6 +1,6 @@
 # Lesson 7 — Threads, atomics, and a lock-free ring
 
-**Material:** [`crates/media/src/ring.rs`](../../crates/media/src/ring.rs) (200 lines —
+**Material:** [`crates/media/src/ring.rs`](../../crates/media/src/ring.rs) (212 lines —
 the single best file in the repo to study closely).
 
 Everything before this lesson was single-threaded. Now: the recorder's disk
@@ -107,10 +107,16 @@ pub fn try_pop(&self) -> Option<T>        // None = empty
 
 Both take `&self` (!) yet mutate — legal only because of the atomics and the
 `UnsafeCell`. Both return instantly; blocking policy belongs to callers. Look
-at how the two callers differ in `media/src/stream.rs` and `record.rs`:
+at how the callers differ — `media/src/stream.rs` holds both sides of a clip
+read:
 
-- reader thread (may block): spins/sleeps when `try_push` returns false;
-- render path (must not block): pops once, counts an underrun if empty.
+- the reader thread (may block): sleeps 50 µs when `try_push` returns false
+  (`stream.rs:156`);
+- the render path (must not block): `pop_sample` pops once and counts an
+  underrun if the ring is empty before the clip is done (`stream.rs:272`).
+
+The recorder is the mirror image: `record.rs` pushes each captured frame and
+counts an *overrun* when the ring is full (`record.rs:144`).
 
 Same data structure, opposite policies — the separation is structural.
 

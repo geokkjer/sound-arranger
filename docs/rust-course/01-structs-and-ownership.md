@@ -1,10 +1,11 @@
 # Lesson 1 — Structs, methods, and ownership
 
-**Material:** [`crates/engine/src/clock.rs`](../../crates/engine/src/clock.rs) (250 lines)
+**Material:** [`crates/engine/src/clock.rs`](../../crates/engine/src/clock.rs) (270 lines)
 
 The clock is the best first file in the repo: it's pure std, small, and uses
-almost no "clever" Rust. It defines three things: a `TempoMap` (frames ↔ beats),
-a `Clock` (where are we now), and a `Scheduler<T>` (do this at exactly frame t).
+almost no "clever" Rust. It defines three things: a `TempoMap` (frames ↔ beats), a `Clock` (where are
+we now), and a `Scheduler<T>` (do this at exactly frame t) — plus the
+`PatternQuery` trait a generator pulls its trigger frames through.
 
 ## 1.1 Structs: data with named fields
 

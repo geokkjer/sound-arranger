@@ -11,8 +11,9 @@ vocabularies, error formatting, and pure-function parsers.
 
 ## 8.1 Crates and modules in this workspace
 
-The root `Cargo.toml` declares three members; each is a **crate** with its own
-`Cargo.toml`. Inside a crate, files are **modules**:
+The root `Cargo.toml` declares four members; each is a **crate** with its own
+`Cargo.toml` (the fourth, `crates/workflow`, holds the key-driven editing model
+the shells share). Inside a crate, files are **modules**:
 
 ```
 engine/src/lib.rs      ← crate root: `pub mod clock;` etc. (you saw it)
@@ -39,7 +40,7 @@ Lessons 2–3 noted that names throughout the engine are `&'static str`, which
 seems to forbid user input. Here's the reconciliation:
 
 ```rust
-pub const HOST_PLUGINS: &[&str] = &["euclidean", "scale", "tone", "mixer"];
+pub const HOST_PLUGINS: &[&str] = &["euclidean", "scale", "tone", "mixer", "master"];
 
 fn in_list(list: &'static [&str], s: &str, what: &str) -> Result<&'static str, String> {
     list.iter()
@@ -80,7 +81,8 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String>
 
 A parser shaped as a pure function — text in, commands out, no I/O, no side
 effects. That shape buys free testability (there are dedicated tests in
-`host/tests/`) and reuse: today the CLI feeds it stdin, tomorrow a Tauri shell
+`host/tests/`) and reuse: today the CLI feeds it stdin, tomorrow an iced or
+ratatui shell
 feeds it validated frontend commands. Inside, it's plain token processing:
 `line.split_whitespace()`, `.split_once('=')` for key=value pairs, then
 `in_list`-style interning per slot. No regex, no parser-combinator framework —
@@ -106,7 +108,7 @@ text ──parse_script──▶ Vec<HostCommand> ──run_script──▶ Host
                                         │
                              Engine::render (Lesson 6's no-alloc loop)
                                         │
-                        nodes: Sine/Gain/mixer/player (Lessons 3–4)
+                        nodes: Sine/Gain/mixer/master/PlaybackNode (Lessons 3–4)
 ```
 
 Every arrow is a concept you've studied. That's the course complete: you can
@@ -117,7 +119,7 @@ read any file in this repository and name the technique behind each line.
 ⭐ **1.** Run the host end-to-end with a script on stdin:
 
 ```sh
-cat <<'EOF' | cargo run -p host -
+cat <<'EOF' | cargo run -p host
 host v1
 mount euclidean steps=8 pulses=3
 mount scale

@@ -1,7 +1,7 @@
 # Lesson 4 — Closures and the disposer pattern
 
 **Material:** [`crates/engine/src/plugins/euclidean.rs`](../../crates/engine/src/plugins/euclidean.rs)
-(166 lines, and its `apply` is the whole lesson).
+(170 lines, and its `apply` is the whole lesson).
 
 Closures — functions that capture variables from their surroundings — are the
 feature this codebase leans on most for its architecture. The key idea of the
@@ -44,7 +44,7 @@ The compiler infers the weakest sufficient trait. Where do you see them? Two
 places in files you've read:
 
 ```rust
-// plugins/mod.rs — a callback we invoke repeatedly per block:
+// clock.rs — the PatternQuery seam; a callback we invoke repeatedly per block:
 fn for_each_trigger(&self, block: Range<u64>, tempo: &TempoMap,
                     emit: &mut dyn FnMut(u64));
 //                                        ^^^^^ FnMut: called N times,

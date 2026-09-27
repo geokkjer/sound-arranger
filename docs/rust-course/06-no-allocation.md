@@ -110,20 +110,25 @@ From the tests (see `spike_a.rs`): the test binary installs a global allocator
 that counts calls, renders blocks, and asserts the count didn't move:
 
 ```rust
-struct Counting;
+struct CountingAllocator;
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
-        unsafe { System.alloc(l) }
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if MEASURING.with(|m| m.get()) {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe { System.alloc(layout) }
     }
-    // ... dealloc forwards likewise
+    // ... dealloc/realloc forward likewise
 }
 
 #[global_allocator]
-static A: Counting = Counting;
+static GLOBAL_ALLOC: CountingAllocator = CountingAllocator;
 ```
+
+`MEASURING` is a thread-local flag set only around the measured `render_into`
+call, so the control-side allocations that prime a session are not counted.
 
 `#[global_allocator]` swaps the process-wide allocator; because Rust routes all
 heap traffic through it, "does my code allocate?" becomes a measurable integer,
