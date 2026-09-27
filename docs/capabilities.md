@@ -1,6 +1,6 @@
 # Capabilities and limitations — the alpha
 
-> 🕒 Last verified against commit `971524b` (2026-09-24). If the code has moved on,
+> 🕒 Last verified against commit `52b7c09` (2026-09-27). If the code has moved on,
 > trust the code and move this line forward.
 
 What this alpha **is**: the **[arranger profile](../.agents/notes/proposed/architecture/2026-09-27-profiles-and-the-umbrella-name.md)**
@@ -18,7 +18,7 @@ the per-slice decisions live in [the notes](../.agents/notes/README.md).
 
 | Capability | Where it lives | Evidence |
 |---|---|---|
-| **Record** a take from the input device into the pool (stereo, 24-bit material too) | `record <take_id>` / `:record` | `crates/host` tests, `crates/media/tests/hardware_input.rs` (`--ignored`) |
+| **Record** a take from the input device into the pool (stereo, 24-bit material too); the finished take is **declared state** (`take <id> <frames> <dropped> <channels> <at_frame>`), so the session replays without the device | `record <take_id>` / `:record` | `crates/host` tests (incl. `a_take_declaration_replays_without_a_device`), `crates/media/tests/hardware_input.rs` (`--ignored`) |
 | **Import** a WAV: any rate, mono or multi-channel (split per channel) | `--wave <file>`, `pool` | `crates/media/tests/pool.rs` |
 | **Arrange**: cut, copy, cut/copy-paste, append, move, trim, loop, chop, fade, gain | keys `x v y c p P d < > t H L J K g G f F` | the TUI's 55 tests, the host's arrangement tests |
 | **Tracks**: add, rename, delete (with clips), reorder (the mixer channel follows) | `a R D { }` | `tracks_add_rename_delete_and_reorder` |

@@ -325,10 +325,20 @@ pre-allocates **everything** and the render path only *writes into* it.
 
 Concretely, look at `Graph`'s fields: `audio_out: Vec<Vec<f32>>`,
 `control_out: Vec<f32>`, `triggers_out: Vec<EventBuf<...>>`, `audio_ins:
-Vec<Vec<Vec<f32>>>`, `delays: Vec<RingDelay>`. Every one of those is sized when a
-node is added (control side), not during render. The `render` method walks nodes
-gathering inputs, calls the node, applies PDC, and writes the output — purely by
-indexing into preallocated buffers.
+Vec<Vec<Vec<f32>>>`, `audio_in_channels: Vec<Vec<usize>>`, `delays:
+Vec<RingDelay>`. Every one of those is sized when a node is added (control side),
+not during render. The `render` method walks nodes gathering inputs, calls the
+node, applies PDC, and writes the output — purely by indexing into preallocated
+buffers.
+
+A node never sees those `Vec`s: it reads its inputs through `AudioInputs`, a
+`Copy` view over its own ports' buffers. `count()` says how many inputs it
+declared and `get(port)` returns one (empty past its own width), so the view is
+exactly as wide as the node's declaration. There is **no compile-time input
+ceiling** — a node mounted with many inputs simply has a wider view, and the
+buffers behind it were sized at `add_node`. The per-node channel counts
+(`audio_in_channels`) are precomputed there for the same reason as everything
+else: so sizing the view costs the render path nothing.
 
 How do they *know* it's allocation-free? A **counting-allocator test**: they
 install a global allocator that counts allocations, render a block, and assert the
@@ -466,18 +476,27 @@ if !value.is_finite() { return Err(...); }            // NaN/∞ are banned
 if value < def.min || value > def.max { return Err(...); }  // range check
 ```
 
-`def` comes from the plugin's *declared* param surface (`params()`), and anything
-not declared is refused. So a plugin's runtime knobs are a closed, documented,
-range-checked namespace — the log can trust them, and the UI can render them from
-the declaration rather than hard-coding.
+`def` comes from the surface the plugin **currently offers**, and anything not on
+it is refused. That surface is resolved in three rungs: the **mounted instance's**
+`mounted_params()`, else the **queued mount's factory** (asked with the params it
+will be mounted with — the same call `validate_mount` makes), else the registered
+catalog. The middle rung is why `mount mixer channels=20` followed by
+`set_param mixer ch19.gain 0.5` in one script works even though no instance exists
+yet. So a plugin's runtime knobs are a closed, documented, range-checked namespace
+— the log can trust them, and the UI can render them from the instance rather than
+hard-coding.
 
 > **Rustism — `&'static str` as a cheap registry key:**
 > Plugin names, port names, and param names are all `&'static str`. Because they're
 > statics (interned at compile time for literals), they're `Copy`, comparable, and
-> hashable with no allocation and no lifetime juggling. The flip side is they must
-> be *closed* — you can't register a runtime-generated name. That's exactly the
-> point: the `HOST_NAMES` registry in `crates/host` is a closed vocabulary the
-> text parser accepts and a future shell sends verbatim.
+> hashable with no allocation and no lifetime juggling. The flip side used to be
+> that such names had to be *closed* — a runtime-generated name was impossible.
+> It is possible now, and the mixer is why: its channel names come from the mount,
+> so it **interns** them (one allocation per name for the life of the process, not
+> per mount — a replay rebuild re-mounts). Interning is what keeps `&'static str`
+> honest as a key type while letting the surface itself be data. Where a closed
+> vocabulary is the point, it still holds: the `HOST_NAMES` registry in
+> `crates/host` is a fixed set the text parser accepts and a shell sends verbatim.
 
 ### 4.3 Rendering interleaves events with blocks
 
@@ -575,9 +594,15 @@ A plugin *declares* three things about itself:
 
 - **`inject()`** — the services it *requires* (a "coeffect specification"). The
   euclidean plugin declares `["clock"]`; the mixer declares `[]`.
-- **`ports()`** — its patch-bay surface, the data source for a "which output can I
-  connect?" dropdown.
-- **`params()`** — its runtime parameter namespace with ranges.
+- **`ports()`** — its patch-bay **catalog**: a static, nominal list, the data
+  source for a "which output can I connect?" dropdown. For a plugin whose width is
+  a mount parameter that list *cannot* be the truth, so the **instance** answers
+  instead — `mounted_ports()` returns the ports it actually mounted (`Vec<Port>`,
+  because the mixer generates `ch0..chN` plus the master out per mount). Validation
+  prefers the instance and falls back to the catalog for a mount that has not
+  applied yet.
+- **`params()`** — the same pair for its runtime parameter namespace with ranges
+  (`mounted_params()` describing what the instance mounted).
 
 And `apply()` returns a `(NodeId, Disposer)` — the node it mounted **plus a
 function that unmounts it**. That disposer is the whole "reversible effects"
