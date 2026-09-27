@@ -74,10 +74,19 @@ sibling:
 - **The recorder overdubs.** "Just hit record again" over playback is cheap and expected: the
   player path already exists for it (`Play`/`Splice` "remain for the recorder player path"), and
   an overdub is simply another aligned take.
-- **The recorder's first slices are the sibling changes, not the UI**: (1) recordings as logged
-  state; (2) an explicit render length independent of the timeline; (3) a render path that does
-  not wire the arranger; then (4) MIDI clock out; (5) an alignment/offset model. A record gesture
-  in the shell is a small, separate follow-on.
+- **Length stays derived from the value.** `Timeline::end_frame()` measures the export length from
+  the material on purpose — "measured from the value, not handed in, so a mix cannot be exported
+  short by a stale frame count" — and that invariant is worth more than a configurable number. So
+  the recorder adds **no** session length: a capture produces a **placement**, the placement
+  extends the timeline, and the existing derivation does the rest. An explicit length stays a
+  separate, optional affordance for rendering *past* the material (a decay tail, silence), which
+  is a limitation the capabilities page already names — not the mechanism.
+- **The recorder's first slices are the under-the-hood changes, not the UI**: (1) recordings as
+  logged state; (2) a capture produces a **placement** (a clip at its origin), so the
+  already-derived render length sees the take and the timeline extends itself — no handed-in
+  length; (3) MIDI clock out; (4) an alignment/offset model. A record gesture in the shell is a
+  small, separate follow-on, and a render path that does not wire the arranger becomes *optional*
+  — worth doing only if a timeline-free recorder build is ever actually wanted.
 
 ### What this phase does not prove (the arranger's corner, owned and written down)
 
@@ -124,13 +133,15 @@ sentiment, because "viable but not focus" decays into "never" without one.
    the recorder exposes no document ops and no timeline surface; the arranger exposes them.
 4. A recorded take's identity — id, device, channel count, rate, origin — survives save/load
    **without re-opening a device**, and a saved session's log describes its own material.
-5. A session with a take and **no clips** masters and exports, with the length taken from an
-   explicit session/take length rather than `Timeline::end_frame()`.
-6. `render`/`render_with_drain` work with the arranger plugin unmounted.
+5. A session whose only material is a recorded take masters and exports, with the render length
+   still **derived from the value** — `end_frame()`'s invariant — extended to see the session's
+   material and not only its clips.
+6. `render`/`render_with_drain` work with the arranger plugin unmounted. *(Optional: this is the
+   timeline-free-build goal, not a recorder requirement.)*
 7. MIDI clock out and an alignment/offset model exist and are measured on captured material, or
    are listed as the recorder's remaining gaps — never assumed done.
-8. Overdub works: recording again over playback yields another take, and the alignment model's
-   unit is the take, not a track-and-clip placement.
+8. Overdub works: recording again over playback yields another take, and every take has a
+   placement (origin + length) the render length can see.
 9. The two-instance pattern is exercised once end to end: an arranger instance's output declared
    as a recorder source by name, captured alongside the hardware sources with no summing.
 
@@ -149,7 +160,9 @@ sentiment, because "viable but not focus" decays into "never" without one.
   there is. Mitigation: decide here, execute at the tag.
 - **Recorder-first starves the arranger.** Mitigation: the written trigger above, and the
   acceptance criteria naming the arranger's corner explicitly.
-- **Overdub quietly re-imports the timeline.** "Record again over playback" needs a playback
-  position and per-take placement — the first place the recorder asks for the arranger's data model
-  back. Mitigation: a take list with origins and fixed offsets, not tracks and clips; needing more
-  than that is the signal that the arranger profile's turn has come.
+- **The timeline is the take registry, chosen deliberately.** Giving each take a placement re-uses
+  the arranger's model, so the recorder renders through the arranger node and takes and clips are
+  one representation in the document. Accepted: it buys the derived length, record → arrange
+  continuity, and zero new concepts — and it is why criterion 6 is optional rather than required.
+  The cost: overdub stacks takes as clips rather than as a distinct take list. If that ever grates,
+  it is the signal to split the representations, not a bug to patch.
