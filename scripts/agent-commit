@@ -5,18 +5,55 @@
 # path/branch/remote, not on the actor, and both the human and the agent commit in this
 # checkout. So the actor sets the identity, and this wrapper is that for agent commits:
 #
-#   author    = DeepSeek V4 Flash <deepseek-v4-flash@geokkjer.eu>
-#   committer = the human's configured identity (deliberately untouched)
+#   author    = <model> <model-slug@geokkjer.eu>   (--model / $DSH_AGENT_MODEL)
+#   committer = the human's configured identity    (deliberately untouched)
+#   trailer   = Assisted-by: <model> · <harness>   (--harness / $DSH_AGENT_HARNESS)
 #
-# `.githooks/commit-msg` appends the `Assisted-by:` trailer whenever this author is
-# active, so agent commits are always attributed. See the git-identity note:
-# .agents/notes/implemented/process/2026-09-12-git-identity-for-agent-commits.md
+# The model and the harness are switchable because more than one of each commits here,
+# and a hand-typed trailer cannot be trusted to name the model that actually ran. The
+# wrapper exports the trailer for `.githooks/commit-msg` to append verbatim, so a
+# commit's identity and its disclosure cannot drift apart, and it echoes the identity it
+# is about to claim, so a wrong label is visible at commit time rather than in the log.
 #
-# Usage: identical to `git commit` — e.g. `scripts/agent-commit -F -`, `scripts/agent-commit -m "…"`.
+# The email is derived, not configured: the model name lowercased with each run of
+# non-alphanumerics collapsed to one dash ("DeepSeek V4 Flash" -> deepseek-v4-flash), a
+# subaddress of the human's own domain so the identity stays non-human and greppable.
+#
+# Usage:
+#   scripts/agent-commit -m "…"
+#   scripts/agent-commit --model "Space Bunny" --harness "OpenCode" -m "…"
+#   DSH_AGENT_MODEL=… DSH_AGENT_HARNESS=… scripts/agent-commit -F -
+# Everything this wrapper does not recognise is passed to `git commit` verbatim.
 set -euo pipefail
 
-export GIT_AUTHOR_NAME="DeepSeek V4 Flash"
-export GIT_AUTHOR_EMAIL="deepseek-v4-flash@geokkjer.eu"
-# GIT_COMMITTER_* is intentionally not set: the committer stays the human.
+model="${DSH_AGENT_MODEL:-DeepSeek V4 Flash}"
+harness="${DSH_AGENT_HARNESS:-DeepSeek Harness}"
 
-exec git commit "$@"
+args=()
+while (($# > 0)); do
+  case "$1" in
+    --model) model="${2:?agent-commit: --model needs a value}"; shift 2 ;;
+    --model=*) model="${1#*=}"; shift ;;
+    --harness) harness="${2:?agent-commit: --harness needs a value}"; shift 2 ;;
+    --harness=*) harness="${1#*=}"; shift ;;
+    --) shift; args+=("$@"); break ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+
+[[ -n "${model//[[:space:]]/}" ]] || { echo "agent-commit: --model must not be blank" >&2; exit 2; }
+[[ -n "${harness//[[:space:]]/}" ]] || { echo "agent-commit: --harness must not be blank" >&2; exit 2; }
+
+slug="$(printf '%s' "$model" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
+[[ -n "$slug" ]] || { echo "agent-commit: cannot derive an identity slug from '$model'" >&2; exit 2; }
+
+export GIT_AUTHOR_NAME="$model"
+export GIT_AUTHOR_EMAIL="${slug}@geokkjer.eu"
+# GIT_COMMITTER_* is intentionally not set: the committer stays the human.
+# Exporting the trailer (rather than letting the hook re-derive it) is what keeps the
+# disclosure and the author identity from drifting apart.
+export DSH_AGENT_TRAILER="Assisted-by: ${model} · ${harness}"
+
+printf 'agent-commit: author = %s <%s>; trailer = %s\n' "$GIT_AUTHOR_NAME" "$GIT_AUTHOR_EMAIL" "$DSH_AGENT_TRAILER" >&2
+
+exec git commit ${args[@]+"${args[@]}"}
