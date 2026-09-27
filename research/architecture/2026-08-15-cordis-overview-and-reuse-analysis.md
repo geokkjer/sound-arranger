@@ -44,7 +44,7 @@ Our documented plan (composition-seams + minimal-core + musical-event + umbrella
 
 2. **Cordis's guarantees are control-plane; audio has no inverses.** Revertible effects assume environment state that can be restored. You cannot un-ring a reverb. Our teardown protocol (ramp / voice-steal / tail-flush), the atomic `Arc` graph swap, the timestamped SPSC parameter queues, PDC — none of these exist in Cordis, and they're the hard 80% of the product. The composition layer is the easy 20%.
 
-3. **Cordis is mid-migration and unstable.** v4 is `4.0.0-rc.7` with an explicit "may change without notice" warning; Koishi still runs v3 while the paper presents v4. The harness pays a visible price for reuse: it **vendors** eight packages with per-package upstream-commit pins, a scope rename (`cordis` → `@deepseek-ai/cordis`), a local-modification log, a `verify-vendored-links` hygiene gate, and an update procedure. That's real maintenance. Adopting churn before we know what we need violates the budget rule.
+3. **Cordis is mid-migration and unstable.** v4 is `4.0.0-rc.7` (upstream is now `rc.10`; the harness's *own* `@deepseek-ai/cordis` manifest carries a separate Harness release version, `4.0.4`, which is **not** the upstream version — see the 2026-09-27 update below) with an explicit "may change without notice" warning; Koishi still runs v3 while the paper presents v4. The harness pays a visible price for reuse: it **vendors** nine packages with per-package upstream-commit pins, a scope rename (`cordis` → `@deepseek-ai/cordis`), a local-modification log, a `verify-vendored-links` hygiene gate, and an update procedure. That's real maintenance. Adopting churn before we know what we need violates the budget rule.
 
 4. **The budget rule is binding.** Umbrella-first: "no composition machinery beyond what a phase-0 spike or a real second provider demands." Cordis *is* machinery — loader, reconciliation, HMR, realms, interception, service brokers. Its patterns cost nothing; its code costs ongoing sync.
 
@@ -61,3 +61,25 @@ Our documented plan (composition-seams + minimal-core + musical-event + umbrella
 - **Reuse the paradigm** (free): seams as interfaces, `inject`-style dependencies, reversible effects, declarative rows with layered patches — already in our notes.
 - **Borrow the code** (paid, with vendoring discipline) when a real seam demands it: the gate is written down.
 - **Keep the realtime contract ours** (the graph value, log, events, teardown) — that's the part Cordis can't give us and the part the product lives on.
+
+## Update 2026-09-27 — re-checked after a harness update: still an RC, and the design the vendored line gained
+
+Verified against the harness checkout at `477b4f4205` (after a `dsh_update` from `0d1f50007f`) and upstream [`cordiverse/cordis`](https://github.com/cordiverse/cordis).
+
+**Two version numbers, and conflating them misreads the situation.** `vendor/<pkg>/package.json` carries the *Harness release version* of the re-published `@deepseek-ai` package — Cordis reads `4.0.4` there, which looks like a stable 4.0 release. The **upstream** version lives only in `vendor/README.md`'s manifest table: `cordis 4.0.0-rc.7` at `56b3d4f`, and it did **not** move across the update (the `release(vendor)` commits touch only the manifests' version fields — nine files, one line each).
+
+So §4.3 stands, and got sharper: upstream is now **`4.0.0-rc.10`** — the harness pin is three RCs behind a framework that is still a release candidate. A third-party repo exists purely to backport upstream Cordis fixes the vendored line misses ([dsh-cordis-backport](https://github.com/173787247/dsh-cordis-backport)); the vendoring cost §4.3 priced is now being paid by someone else too.
+
+**What the line gained is design, not code volume** — Cordis core changed by four files (+13/−6) in that window. Three ideas worth carrying into our own row/patch model:
+
+1. **Volatile config references** (`vendor/cosmokit/src/volatile.ts`, new). A schema field can be declared volatile; the plugin then holds a *stable reference* to an immutable snapshot the runtime updates in place (`get()` returns a frozen deep copy, functions and cycles are rejected, and ESM/CJS copies recognise each other through a `Symbol.for` protocol). Changing the value does **not** reconfigure the plugin.
+2. **Schema-aware config diff** (`vendor/loader/src/config/diff.ts`, new). The loader compares raw configs through schema metadata: volatile fields compare equal, absent objects fall back to schema defaults, and expressions and unknown fields keep strict raw equality. This is what lets a reconciler read a change as "same row, new value" instead of "remount".
+3. **Lazy config resolution** (ported from [cordiverse/cordis#41](https://github.com/cordiverse/cordis/pull/41)). Raw fiber config is retained and resolved only once declared injections are active, and only at the entry root — child plugins keep caller-owned config identity.
+
+**Why this reaches us although we import none of it** (Cordis appears in this repo only in prose — research, notes, and one aside in the architecture explainer — and in no manifest or source file). Ideas 1+2 are the generic form of a problem we have in the realtime domain: *a parameter change must not tear down the thing it parameterizes*. Cordis's answer — keep identity stable, make the value a snapshot, and teach the **diff** to ignore what must not trigger a remount — is the same split our log already makes, where a logged `SetParam` carries the value while the node keeps its identity, and only an identity change pays the teardown protocol (ramp / voice-steal / tail-flush). Worth naming that distinction in the [composition-seams note](../../.agents/notes/proposed/architecture/2026-08-15-composition-seams-plugin-architecture.md) before any reconciliation machinery gets built.
+
+The maintenance evidence grew with it: the vendored line's local-modification log now runs to **20 entries** — deep `fiber.ts` lifecycle hardening, durable Include writes, Node loader-shape detection. The harness does not consume Cordis as-is; it carries it. §4.4's budget rule reads the same, only more so.
+
+*Corrections this re-check made to the document above: §4.3 said the harness vendors "eight packages" — the manifest lists nine; and the `4.0.4` in the package manifests is the Harness release version, not upstream.*
+
+*Update authored with DeepSeek-V4.1-Flash · DeepSeek Harness, 2026-09-27.*
