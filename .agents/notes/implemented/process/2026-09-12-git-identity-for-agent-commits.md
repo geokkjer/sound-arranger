@@ -23,18 +23,20 @@ checkout. The actor must therefore set the identity.
   is told to commit as and leaves `GIT_COMMITTER_*` untouched, so a commit records **author =
   model, committer = the human's configured identity**. `git log` and `git blame` now name the
   model; the human stays visible as the committer.
-- **The model and harness are switch arguments, not constants.** `--model` / `--harness` (or
+- **The model is a required argument, and the harness is a switch.** `--model` / `--harness` (or
   `$DSH_AGENT_MODEL` / `$DSH_AGENT_HARNESS`) name whichever model and harness actually ran; the
   email is derived from the model — lowercased, each run of non-alphanumerics collapsed to one
   dash (`DeepSeek V4 Flash` → `deepseek-v4-flash`) — so a new model needs no code change, only the
-  right label. The wrapper echoes the identity it is about to claim on stderr, so a wrong label is
-  visible at commit time rather than discovered in the log afterwards.
+  right label. The model has **no default** (see the retirement paragraph in the addendum): the
+  wrapper refuses to commit without one, and echoes the identity it is about to claim on stderr,
+  so a wrong label is visible at commit time rather than discovered in the log afterwards.
 - **The trailer is generated, not remembered.** The wrapper exports
   `DSH_AGENT_TRAILER="Assisted-by: <model> · <harness>"` and `.githooks/commit-msg` appends it
   verbatim when the message carries no `Assisted-by:` trailer yet, so a commit's identity and its
-  disclosure cannot drift apart. The legacy hardcoded DeepSeek author still gets the legacy
-  trailer. Human commits are untouched, and a model identity set by hand with no trailer is warned
-  about on stderr rather than blocked.
+  disclosure cannot drift apart. Human commits are untouched; a model identity set by hand with no
+  trailer is warned about on stderr rather than blocked; and an author carrying a **retired**
+  identity is left unattributed and warned about, because an absent attribution is honest where a
+  false one is not.
 - **The email is a subaddress of the human's own domain** (`<model-slug>@geokkjer.eu`), so an agent
   identity is clearly non-human, greppable, and needs no external account.
 - **Documents keep the `Authored with …` footer** ([convention](2026-08-27-agent-attribution-convention.md));
@@ -90,6 +92,15 @@ worse than none, because it turns an unknown into a plausible fact. **Deliberate
 human remains the committer, identities still derive from the human's domain, the trailer stays
 generated, and no history is rewritten.
 
+**The default retired the same day.** `DeepSeek V4 Flash` — the identity this note was written for,
+and the wrapper's only default — is retired. The default went with it: `--model` or
+`$DSH_AGENT_MODEL` is now required, because a default can only guess which model is running, and
+this note exists because that guess was wrong once. A commit that still carries the retired author
+name is left **unattributed** and warned about, rather than stamped with a trailer naming a model
+that no longer exists: an absent attribution is honest, a false one is not. Historical commits keep
+their labels, and a reader should now treat any `DeepSeek-v4-flash` / `DeepSeek V4 Flash`
+attribution as **anonymous** — a name no model can legitimately claim any more.
+
 ## Consequences
 
 - `git log`, `git blame` and `git shortlog -e` attribute agent work to the model; the human remains
@@ -102,7 +113,8 @@ generated, and no history is rewritten.
 - The identity string and trailer name are a versioned snapshot: re-evaluate them when the model
   or harness changes (the co-work routing note's re-evaluation duty applies). Since the 2026-09-27
   addendum the snapshot is per-invocation rather than baked in, so this duty is discharged by
-  passing the right `--model`/`--harness` rather than by editing the wrapper.
+  passing the right `--model`/`--harness` rather than by editing the wrapper — and the retirement
+  of its default the same day is that duty being exercised for real.
 - The trailer's spelling now follows the model string as given, so the default reads
   `Assisted-by: DeepSeek V4 Flash · DeepSeek Harness` where commits before 2026-09-27 carry
   `DeepSeek-v4-flash · DeepSeek Harness`. A grep for attribution should match both spellings.

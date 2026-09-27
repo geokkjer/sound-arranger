@@ -5,28 +5,29 @@
 # path/branch/remote, not on the actor, and both the human and the agent commit in this
 # checkout. So the actor sets the identity, and this wrapper is that for agent commits:
 #
-#   author    = <model> <model-slug@geokkjer.eu>   (--model / $DSH_AGENT_MODEL)
+#   author    = <model> <model-slug@geokkjer.eu>   (--model / $DSH_AGENT_MODEL, REQUIRED)
 #   committer = the human's configured identity    (deliberately untouched)
 #   trailer   = Assisted-by: <model> · <harness>   (--harness / $DSH_AGENT_HARNESS)
 #
-# The model and the harness are switchable because more than one of each commits here,
-# and a hand-typed trailer cannot be trusted to name the model that actually ran. The
-# wrapper exports the trailer for `.githooks/commit-msg` to append verbatim, so a
-# commit's identity and its disclosure cannot drift apart, and it echoes the identity it
-# is about to claim, so a wrong label is visible at commit time rather than in the log.
+# The model is required, not defaulted. A default can only guess which model is running,
+# and this wrapper exists because that guess was wrong once. `DeepSeek V4 Flash` — the old
+# default — is retired, so emitting it would attribute new work to a model that no longer
+# exists: a false claim is worse than a missing one. The harness still defaults to this
+# repository's own, and the wrapper echoes both so a wrong label is visible at commit time
+# rather than discovered in the log afterwards.
 #
 # The email is derived, not configured: the model name lowercased with each run of
 # non-alphanumerics collapsed to one dash ("DeepSeek V4 Flash" -> deepseek-v4-flash), a
 # subaddress of the human's own domain so the identity stays non-human and greppable.
 #
 # Usage:
-#   scripts/agent-commit -m "…"
+#   scripts/agent-commit --model "DeepSeek-V4.1-Flash" -m "…"
 #   scripts/agent-commit --model "Space Bunny" --harness "OpenCode" -m "…"
-#   DSH_AGENT_MODEL=… DSH_AGENT_HARNESS=… scripts/agent-commit -F -
+#   export DSH_AGENT_MODEL=… DSH_AGENT_HARNESS=…; scripts/agent-commit -F -
 # Everything this wrapper does not recognise is passed to `git commit` verbatim.
 set -euo pipefail
 
-model="${DSH_AGENT_MODEL:-DeepSeek V4 Flash}"
+model="${DSH_AGENT_MODEL:-}"
 harness="${DSH_AGENT_HARNESS:-DeepSeek Harness}"
 
 args=()
@@ -41,7 +42,15 @@ while (($# > 0)); do
   esac
 done
 
-[[ -n "${model//[[:space:]]/}" ]] || { echo "agent-commit: --model must not be blank" >&2; exit 2; }
+if [[ -z "${model//[[:space:]]/}" ]]; then
+  cat >&2 <<'EOF'
+agent-commit: name the model that actually ran, with --model "<name>" or $DSH_AGENT_MODEL.
+  There is no default: the old one (DeepSeek V4 Flash) is retired, and a trailer naming a
+  model that no longer exists is a false claim, not a missing one.
+EOF
+  exit 2
+fi
+
 [[ -n "${harness//[[:space:]]/}" ]] || { echo "agent-commit: --harness must not be blank" >&2; exit 2; }
 
 slug="$(printf '%s' "$model" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
