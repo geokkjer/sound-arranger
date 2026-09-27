@@ -7,7 +7,7 @@ Status: implemented
 A session could record a take but had no way to say **what it was recording from**. The recorder
 needs a declared rig — which sources exist, how wide each is, and what each does about the clock —
 because capture, alignment and the coming clock-out all need addresses to work with. The
-[capture-topology note](../proposed/architecture/2026-09-25-capture-topology-aligned-stems.md) had
+[capture-topology note](../../proposed/architecture/2026-09-25-capture-topology-aligned-stems.md) had
 already fixed the *shape* of a source (identity, channels, clock role, binding rule) and the *form*
 (`source add` is a logged `host v1` command); what did not exist was the type, the command and the
 log/replay contract.
