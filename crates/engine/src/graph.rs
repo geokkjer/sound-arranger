@@ -200,13 +200,50 @@ pub struct RenderBlock<'a> {
     pub mode: RenderMode,
 }
 
-/// Maximum audio inputs a node may declare (the mixer's channels, Phase 1).
-pub const MAX_AUDIO_INS: usize = 8;
+/// The audio inputs a node may read this block, in port order — a view onto the
+/// graph's per-port fan-in buffers.
+///
+/// There is deliberately **no** compile-time maximum: a node's input width is
+/// whatever it declared, so a node mounted with many inputs simply has a wider view
+/// (the buffers are preallocated at `add_node`, so the render path still allocates
+/// nothing).
+#[derive(Clone, Copy)]
+pub struct AudioInputs<'a> {
+    ports: &'a [Vec<f32>],
+    channels: &'a [usize],
+    frames: usize,
+}
+
+impl<'a> AudioInputs<'a> {
+    /// No audio inputs at all — a source node, or a render test's stub.
+    pub const fn none() -> Self {
+        AudioInputs {
+            ports: &[],
+            channels: &[],
+            frames: 0,
+        }
+    }
+
+    /// How many audio-In ports this node declared.
+    pub fn count(&self) -> usize {
+        self.ports.len()
+    }
+
+    /// The `port`-th audio input, or `&[]` when the node declared fewer ports. Its
+    /// length is `port.channels() * frames` — interleaved when the port declares
+    /// more than one channel.
+    pub fn get(&self, port: usize) -> &'a [f32] {
+        match (self.ports.get(port), self.channels.get(port)) {
+            (Some(buf), Some(&ch)) => &buf[..ch * self.frames],
+            _ => &[],
+        }
+    }
+}
 
 /// What a node may read this block: its inputs, merged from connected
 /// producers by the interpreter. Audio inputs are per *port* (a mixer's
-/// channels are separate inputs, `audio_ins[..audio_in_count]`); control,
-/// trigger, and note stay single-port per node in Phase 1.
+/// channels are separate inputs); control, trigger, and note stay single-port per
+/// node in Phase 1.
 pub struct NodeIO<'a> {
     /// The first audio input (convenience for single-input nodes; `&[]` when the
     /// node declares none). Its length is `channels * frames` — mono for a port that
@@ -214,7 +251,7 @@ pub struct NodeIO<'a> {
     pub audio_in: &'a [f32],
     /// Per audio-In port, in port order; meaningful up to `audio_in_count`. Each
     /// slice is `port.channels() * frames` long (interleaved when above 1).
-    pub audio_ins: [&'a [f32]; MAX_AUDIO_INS],
+    pub audio_ins: AudioInputs<'a>,
     pub audio_in_count: usize,
     /// the node's audio output channel count (1 mono, 2 stereo) — the length
     /// of the `out_audio` slice a node receives is `channels * frames`. A node
@@ -719,6 +756,10 @@ pub struct Graph {
     audio_ins: Vec<Vec<Vec<f32>>>,
     /// per-node: indices of its audio-In ports (into the node's ports vec).
     audio_in_ports: Vec<Vec<usize>>,
+    /// per-node: the channel count of each audio-In port, in the same order —
+    /// precomputed at `add_node` so the render path can size a view without
+    /// touching the node's ports.
+    audio_in_channels: Vec<Vec<usize>>,
     /// per-node cumulative audio latency + PDC delay lines.
     cum: Vec<u32>,
     delays: Vec<RingDelay>,
@@ -742,6 +783,7 @@ impl Graph {
             notes_in: Vec::new(),
             audio_ins: Vec::new(),
             audio_in_ports: Vec::new(),
+            audio_in_channels: Vec::new(),
             cum: Vec::new(),
             delays: Vec::new(),
             next_id: 0,
@@ -800,16 +842,15 @@ impl Graph {
         // Phase-1 shape (kimi review findings 2 + 8): many audio Ins (the
         // mixer's channels), at most one audio Out — enforced loudly.
         assert!(
-            audio_in_ports.len() <= MAX_AUDIO_INS,
-            "node declares {} audio inputs (max {MAX_AUDIO_INS})",
-            audio_in_ports.len()
-        );
-        assert!(
             audio_out_ports <= 1,
             "node declares {audio_out_ports} audio outputs (max 1 in Phase 1)"
         );
         let out_ch = Self::node_out_channels(&ports);
         let ins = Self::audio_in_buffers(&ports, &audio_in_ports);
+        let audio_in_channels: Vec<usize> = audio_in_ports
+            .iter()
+            .map(|&pi| ports[pi].channels())
+            .collect();
         self.nodes.push(Node { id, kind, ports });
         self.audio_out.push(vec![0.0; out_ch * BLOCK]);
         self.audio_out_ch.push(out_ch);
@@ -820,6 +861,7 @@ impl Graph {
         self.notes_in.push(EventBuf::new());
         self.audio_ins.push(ins);
         self.audio_in_ports.push(audio_in_ports);
+        self.audio_in_channels.push(audio_in_channels);
         self.cum.push(0);
         self.delays
             .push(RingDelay::with_capacity(MAX_PDC * MAX_PDC_CHANNELS));
@@ -933,16 +975,15 @@ impl Graph {
             .filter(|p| p.direction == Direction::Out && p.kind == SignalKind::Audio)
             .count();
         assert!(
-            audio_in_ports.len() <= MAX_AUDIO_INS,
-            "node declares {} audio inputs (max {MAX_AUDIO_INS})",
-            audio_in_ports.len()
-        );
-        assert!(
             audio_out_ports <= 1,
             "node declares {audio_out_ports} audio outputs (max 1 in Phase 1)"
         );
         let out_ch = Self::node_out_channels(&ports);
         let ins = Self::audio_in_buffers(&ports, &audio_in_ports);
+        let audio_in_channels: Vec<usize> = audio_in_ports
+            .iter()
+            .map(|&pi| ports[pi].channels())
+            .collect();
         let id = NodeId(self.next_id);
         self.next_id += 1;
         self.nodes.insert(idx, Node { id, kind, ports });
@@ -955,6 +996,7 @@ impl Graph {
         self.notes_in.insert(idx, EventBuf::new());
         self.audio_ins.insert(idx, ins);
         self.audio_in_ports.insert(idx, audio_in_ports);
+        self.audio_in_channels.insert(idx, audio_in_channels);
         self.cum.insert(idx, 0);
         self.delays
             .insert(idx, RingDelay::with_capacity(MAX_PDC * MAX_PDC_CHANNELS));
@@ -998,6 +1040,7 @@ impl Graph {
         self.notes_in.remove(idx);
         self.audio_ins.remove(idx);
         self.audio_in_ports.remove(idx);
+        self.audio_in_channels.remove(idx);
         self.cum.remove(idx);
         self.delays.remove(idx);
         Some(self.nodes.remove(idx))
@@ -1179,17 +1222,16 @@ impl Graph {
                 }
             }
 
-            let mut io_ins = [&[][..]; MAX_AUDIO_INS];
-            let count = self.audio_in_ports[i].len().min(MAX_AUDIO_INS);
-            for (k, _) in self.audio_in_ports[i].iter().enumerate().take(count) {
-                let n = self.in_channels(i, k) * frames;
-                io_ins[k] = &self.audio_ins[i][k][..n];
-            }
+            let ins = AudioInputs {
+                ports: &self.audio_ins[i],
+                channels: &self.audio_in_channels[i],
+                frames,
+            };
             let out_ch = self.audio_out_ch[i];
             let io = NodeIO {
-                audio_in: io_ins[0],
-                audio_ins: io_ins,
-                audio_in_count: count,
+                audio_in: ins.get(0),
+                audio_ins: ins,
+                audio_in_count: ins.count(),
                 audio_out_channels: out_ch,
                 control_in: self.control_scratch,
                 triggers_in: self.triggers_in[i].as_slice(),
@@ -1499,7 +1541,7 @@ mod tests {
         ) {
             out.fill(0.0);
             for k in 0..io.audio_in_count {
-                for (o, i) in out.iter_mut().zip(io.audio_ins[k]) {
+                for (o, i) in out.iter_mut().zip(io.audio_ins.get(k)) {
                     *o += *i;
                 }
             }

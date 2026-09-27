@@ -567,7 +567,7 @@ mod tests {
             }
             let io = NodeIO {
                 audio_in: &interleaved,
-                audio_ins: [&[], &[], &[], &[], &[], &[], &[], &[]],
+                audio_ins: crate::AudioInputs::none(),
                 audio_in_count: 1,
                 audio_out_channels: 2,
                 control_in: 0.0,
@@ -774,7 +774,7 @@ mod tests {
         }
         let io = NodeIO {
             audio_in: &interleaved,
-            audio_ins: [&[], &[], &[], &[], &[], &[], &[], &[]],
+            audio_ins: crate::AudioInputs::none(),
             audio_in_count: 1,
             audio_out_channels: 2,
             control_in: 0.0,

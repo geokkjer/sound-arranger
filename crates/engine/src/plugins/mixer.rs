@@ -386,12 +386,13 @@ impl AudioNode for MixerNode {
         for (i, sample) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
             let mut sl = 0.0f32;
             let mut sr = 0.0f32;
-            for (ch, channel_in) in io.audio_ins[..n].iter().enumerate() {
+            for (ch, peak) in peaks[..n].iter_mut().enumerate() {
+                let channel_in = io.audio_ins.get(ch);
                 let v = channel_in.get(i).copied().unwrap_or(0.0);
                 // Channel meter: post-gain, pre-mute/solo — a muted channel
                 // still shows its level. Mute is absolute (wins over solo).
                 let g = v * self.gains[ch];
-                peaks[ch] = peaks[ch].max(g.abs());
+                *peak = peak.max(g.abs());
                 let audible = !self.mutes[ch] && (!any_solo || self.solos[ch]);
                 if audible {
                     // Equal-power pan: `-1` hard left, `0` center (√2/2 each),

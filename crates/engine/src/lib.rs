@@ -43,7 +43,7 @@ pub mod value;
 pub use clock::{Clock, Scheduler, TempoMap};
 pub use ctx::Context;
 pub use graph::{
-    AudioNode, BLOCK, CAP_EVENTS, Direction, EuclideanGen, EventBuf, Gain, Graph, MAX_AUDIO_INS,
+    AudioInputs, AudioNode, BLOCK, CAP_EVENTS, Direction, EuclideanGen, EventBuf, Gain, Graph,
     MERGE_CAP, Node, NodeIO, NodeId, NodeKind, NoteEvent, Port, RenderBlock, RenderMode, ScaleGen,
     SignalKind, Sine, ToneGen, Trigger,
 };

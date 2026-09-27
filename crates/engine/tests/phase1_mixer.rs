@@ -511,13 +511,39 @@ fn mixer_meters_are_a_context_service() {
     );
 }
 
-/// The graph refuses more than MAX_AUDIO_INS audio inputs loudly (kimi
-/// finding 2).
+/// A probe: records how many audio inputs the render handed it.
+struct WidthProbe(Arc<AtomicUsize>);
+
+impl AudioNode for WidthProbe {
+    fn latency(&self) -> u32 {
+        0
+    }
+
+    fn render(
+        &mut self,
+        io: &NodeIO,
+        out: &mut [f32],
+        _control: &mut f32,
+        _triggers: &mut EventBuf<Trigger, CAP_EVENTS>,
+        _notes: &mut EventBuf<NoteEvent, CAP_EVENTS>,
+        _block: RenderBlock,
+    ) {
+        self.0.store(io.audio_in_count, Ordering::Relaxed);
+        out.fill(0.0);
+    }
+}
+
+/// A node's input width is **its own**. The graph used to refuse more than
+/// `MAX_AUDIO_INS` (8) audio inputs, and that constant was the array dimension in
+/// the node-facing `NodeIO` — a structural ceiling, not a validation bound. Now the
+/// width is whatever the node declared and the view is sized from it.
 #[test]
-#[should_panic(expected = "max")]
-fn more_than_max_audio_ins_refused() {
+fn a_node_may_declare_more_inputs_than_the_old_ceiling() {
+    const WIDE: usize = 12;
+    let tempo = TempoMap::new(SR, 120.0, 4);
     let mut g = Graph::new();
-    let mut ports: Vec<Port> = (0..engine::MAX_AUDIO_INS + 1)
+    let seen = Arc::new(AtomicUsize::new(0));
+    let mut ports: Vec<Port> = (0..WIDE)
         .map(|i| Port {
             name: Box::leak(format!("ch{i}").into_boxed_str()),
             direction: Direction::In,
@@ -531,7 +557,25 @@ fn more_than_max_audio_ins_refused() {
         kind: SignalKind::Audio,
         channels: 1,
     });
-    let _ = g.add_node(NodeKind::Opaque(Box::new(MixerNode::new())), ports);
+    g.add_node(
+        NodeKind::Opaque(Box::new(WidthProbe(Arc::clone(&seen)))),
+        ports,
+    );
+    let mut out = vec![0.0f32; BLOCK];
+    g.render(
+        &mut out,
+        RenderBlock {
+            frame: 0,
+            sample_rate: SR,
+            tempo: &tempo,
+            mode: RenderMode::Timeline,
+        },
+    );
+    assert_eq!(
+        seen.load(Ordering::Relaxed),
+        WIDE,
+        "every declared audio input reaches the node"
+    );
 }
 
 /// The mixer adapts to the input layout (P1.2): mounted with `channels = 2`,

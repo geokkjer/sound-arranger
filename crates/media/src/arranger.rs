@@ -332,7 +332,7 @@ mod tests {
         node.render(
             &engine::NodeIO {
                 audio_in: &[],
-                audio_ins: [&[], &[], &[], &[], &[], &[], &[], &[]],
+                audio_ins: engine::AudioInputs::none(),
                 audio_in_count: 0,
                 audio_out_channels: 1,
                 control_in: 0.0,
@@ -368,7 +368,7 @@ mod tests {
         node.render(
             &engine::NodeIO {
                 audio_in: &[],
-                audio_ins: [&[], &[], &[], &[], &[], &[], &[], &[]],
+                audio_ins: engine::AudioInputs::none(),
                 audio_in_count: 0,
                 audio_out_channels: 1,
                 control_in: 0.0,
@@ -438,7 +438,7 @@ mod tests {
         node.render(
             &engine::NodeIO {
                 audio_in: &[],
-                audio_ins: [&[], &[], &[], &[], &[], &[], &[], &[]],
+                audio_ins: engine::AudioInputs::none(),
                 audio_in_count: 0,
                 audio_out_channels: 1,
                 control_in: 0.0,
@@ -544,7 +544,7 @@ mod tests {
         for (bi, chunk) in out.chunks_mut(engine::BLOCK).enumerate() {
             let io = NodeIO {
                 audio_in: &[],
-                audio_ins: [&[][..]; engine::MAX_AUDIO_INS],
+                audio_ins: engine::AudioInputs::none(),
                 audio_in_count: 0,
                 audio_out_channels: 1,
                 control_in: 0.0,
