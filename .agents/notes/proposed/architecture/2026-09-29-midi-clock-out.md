@@ -2,6 +2,10 @@
 
 Status: proposed
 
+> **Partly shipped (2026-09-29):** the engine half — the currency, the `clock_out` plugin, the tick
+> math and the purity test — is [implemented here](../../implemented/architecture/2026-09-29-midi-clock-out-in-the-engine.md).
+> The host wiring, a real `media` sink and the `clock=follower` binding are slice B and still open.
+
 ## Problem
 
 The recorder profile rests on external gear following the session's clock (or the session following

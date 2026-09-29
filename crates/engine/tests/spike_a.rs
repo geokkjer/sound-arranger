@@ -835,6 +835,16 @@ static GLOBAL_ALLOC: CountingAllocator = CountingAllocator;
 fn render_path_does_not_allocate() {
     let mut e = engine();
     mount_chain(&mut e);
+    // The clock generator is portless and sinkless here — its per-block
+    // scratch is preallocated, so steady-state clocking must also allocate
+    // nothing (midi-clock-out note, acceptance 5).
+    e.register_factory(
+        "clock_out",
+        plugins::clock_out_factory,
+        plugins::clock_out::CLOCK_OUT_PORTS,
+        &[],
+    );
+    e.mount("clock_out", &[]).unwrap();
     e.schedule_unmount("euclidean", 100_000);
     // Prime: applying the mounts/patches allocates on the control side
     // (factories, boxes, service table). The measured region must be free.

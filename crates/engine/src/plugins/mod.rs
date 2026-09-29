@@ -4,6 +4,7 @@
 //! — reversible effects, in miniature. The patch bay turns trigger/note/audio
 //! streams into first-class, typed, patchable outputs.
 
+pub mod clock_out;
 pub mod euclidean;
 #[cfg(feature = "fundsp")]
 pub mod fundsp_synth;
@@ -19,6 +20,10 @@ use crate::ctx::Context;
 use crate::graph::{NodeId, Port};
 use crate::render::SchedEvent;
 
+pub use clock_out::{
+    CLOCK_OUT_PORTS, ClockOutNode, ClockOutPlugin, MIDI_OUT_KEY, SharedMidiSink,
+    SharedTransportLog, TRANSPORT_KEY, Transport, TransportLog, clock_out_factory,
+};
 pub use euclidean::{Euclidean, Rhythm, euclid, euclidean_factory};
 pub use master::{
     MASTER_CEILING_DB, MASTER_LOOKAHEAD_MS, MASTER_PARAMS, MASTER_PORTS, MasterMeters, MasterNode,
@@ -107,6 +112,23 @@ pub enum ExternalEvent {
     },
     Control {
         value: f32,
+    },
+    /// MIDI clock tick (24 PPQN) — the realtime clock a follower follows.
+    Clock {
+        offset: u32,
+    },
+    /// MIDI transport Start (play from the current position).
+    Start {
+        offset: u32,
+    },
+    /// MIDI transport Stop.
+    Stop {
+        offset: u32,
+    },
+    /// MIDI transport Continue (play from the current position without
+    /// rewinding — the pause-resume case).
+    Continue {
+        offset: u32,
     },
 }
 
