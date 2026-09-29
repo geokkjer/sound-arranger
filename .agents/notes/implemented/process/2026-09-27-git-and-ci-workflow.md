@@ -1,6 +1,6 @@
 # Agent Note: The git and CI workflow — slices on branches, gates in CI, worktrees for agents
 
-Status: proposed
+Status: implemented
 
 ## Problem
 
@@ -20,7 +20,7 @@ None of this is about process for its own sake. It is about the two failure mode
 already met: a second machine (the session opened with "I did some work on my laptop, can you
 pull"), and more than one writer at a time. Both get worse, not better, as the alpha approaches.
 
-## Proposal
+## Decision
 
 Five stages, each useful on its own, each reversible. Stages 1 and 2 are the ones that pay
 immediately; nothing here waits for the alpha.
@@ -122,30 +122,34 @@ in AGENTS.md so the difference is not folklore.
 - **Move the hook's checks into a `just`/`make` task and drop the hook.** Rejected: the hook is the
   only check that runs without being remembered, and it costs nothing to keep as a fast subset.
 
-## Acceptance criteria
+## Consequences
+
+What is live as of this note:
 
 1. CI runs formatting, clippy (`-D warnings`), the workspace tests and the notes verifier on every
-   pull request and on every push to `main`; the two shell spikes are covered by their own jobs;
-   `crates/shell` is not built. — **Met** (`.github/workflows/ci.yml`, green on
-   `ci/gates-and-worktrees`). The trigger split matters: `push: ['**']` *plus* `pull_request` runs
-   every PR commit twice, doubling the minutes and leaving two checks with one name.
-2. `main` requires those jobs, refuses force-push and deletion. — **Pending, and the only human
-   step**: a GitHub setting. The PR *does* report the checks (a pull-request run uses the head's
-   workflow), so they can be required immediately rather than after a first merge.
-3. A slice lands as a branch plus a PR whose body carries its note; the merge preserves per-commit
-   authorship and `Assisted-by` trailers (verified once, on a real branch, not assumed). — **This
-   branch is the test**; its record is below.
-4. `git worktree` is the documented convention for concurrent agent sessions, and the main checkout
-   is clean on `main` between sessions. — **Met in practice**: this work happened in a worktree
-   (`../sa-ci`) while the main checkout stayed clean on `main`, and AGENTS.md carries the orders.
-5. The alpha is a tag plus a release note, never a release branch. — Not yet exercised.
-6. CI runtime stays under roughly five minutes warm, so it is a gate and not a queue. — **Met, and
-   measured twice**: cold, `rust` 1m14s / `notes` 8s / `tui` 1m23s / `iced` **7m11s**; warm, `rust`
-   1m11s / `notes` 6s / `tui` 42s / `iced` 1m2s. A warm run is about a minute of wall time (the jobs
-   run in parallel); the first run after a cache miss is the expensive one, and the iced spike only
-   needs its own trigger if cold caches become common.
+   pull request and on every push to `main`, plus a job per shell spike — `spikes/*` are separate
+   workspaces a root test run does not cover. `crates/shell` is deliberately not built.
+2. **Enforcement is advisory, and that is a plan limitation rather than a choice.** Branch protection
+   and repository rulesets both answer `403 Upgrade to GitHub Pro or make this repository public` on a
+   private repo, so nothing *blocks* a force-push or a red merge. What stands in for it is CI
+   reporting on every PR plus the conventions in AGENTS.md — weaker than a rule the platform enforces,
+   and recorded here rather than implied. The paths to real enforcement are a public repo or Pro.
+3. A slice lands as a branch plus a PR whose body carries its note, and the merge does **not** squash.
+   Verified on this very change: the rebase-merge preserved per-commit authorship (the model) and
+   every `Assisted-by` trailer, with the human as committer.
+4. Worktrees are the convention for concurrent sessions: this work happened in `../sa-ci` while the
+   main checkout stayed clean on `main`, and AGENTS.md carries the orders.
+5. Releases wait for the alpha — a tag plus a release note, never a release branch. Not yet exercised.
+6. Runtime, measured twice: cold, `rust` 1m14s / `notes` 8s / `tui` 1m23s / `iced` 7m11s; warm,
+   `rust` 1m11s / `notes` 6s / `tui` 42s / `iced` 1m2s. A warm run is about a minute of wall time; the
+   first run after a cache miss is the expensive one.
 
-### What the first run found — the argument for this note, made by the tool itself
+The merge exposed one more thing worth a line: locally `scripts/agent-commit` sets the human
+committer to `geir@geokkjer.eu`, while GitHub's rebase-merge sets the account's
+`geokkjer@gmail.com`. A `.mailmap` folds the two together for every authorship-reading tool,
+without rewriting a commit.
+
+### What the first run found (the evidence, from the tool itself)
 
 1. **A real regression, invisible locally.** The tui-shell spike failed 36 of 54 tests on an
    index-out-of-bounds: `Snapshot.channels` became a `Vec` earlier in this session (the mixer-width
