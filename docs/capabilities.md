@@ -1,6 +1,6 @@
 # Capabilities and limitations — the alpha
 
-> 🕒 Last verified against commit `52b7c09` (2026-09-27). If the code has moved on,
+> 🕒 Last verified against commit `6f80f5f` (2026-09-27). If the code has moved on,
 > trust the code and move this line forward.
 
 What this alpha **is**: the **[arranger profile](../.agents/notes/proposed/architecture/2026-09-27-profiles-and-the-umbrella-name.md)**
@@ -90,10 +90,13 @@ the user will not find.
 
 ## Flaky and unfinished (the honest list)
 
-- `a_take_records_into_the_pool_and_plays` has failed intermittently
-  ("capture stopped with a partial frame (1/2 samples) dropped") in full-suite
-  runs and passes in isolation. Seen by three reviewer gates; it needs its own
-  look — a flaky test erodes trust in the rest.
+- ~~`a_take_records_into_the_pool_and_plays` failed intermittently ("capture
+  stopped with a partial frame (1/2 samples) dropped").~~ **Fixed 2026-09-29**: the
+  cause was an error path, not a race — a capture stopping on a partial interleaved
+  frame errored and discarded the tail. The tail is now padded with silence and kept
+  ([note](../.agents/notes/implemented/bug-fix/2026-09-29-a-partial-frame-is-kept-not-dropped.md)),
+  so the timing dependence is gone: fifteen consecutive runs, no failures, and a
+  deterministic regression test covers it.
 - The iced shell's `shared_actions_work_or_report_their_gap` failed once in ~40
   full-suite runs: it read the live snapshot immediately after pressing space and
   raced the actor's publish. The test now waits for the state (fixed); the
