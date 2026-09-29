@@ -120,6 +120,12 @@ for (const lifecycle of LIFECYCLES) {
         const linkPath = target.startsWith('/')
           ? resolve(repoRoot, `.${target}`)
           : resolve(dirname(resolve(classDir, file)), target)
+        // A path that leaves the repository is a **cross-project reference** — the
+        // studio notes and sibling projects AGENTS.md tells us to link instead of
+        // copying. It resolves on the machine that has those checkouts and can never
+        // resolve in a clone, so it is out of scope for a gate that must mean the
+        // same thing everywhere.
+        if (!linkPath.startsWith(repoRoot + '/')) continue
         if (!existsSync(linkPath)) fail(rel, `broken link: ${link[1]}`)
       }
     }
