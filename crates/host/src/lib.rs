@@ -1307,7 +1307,12 @@ impl HostSession {
             return Ok(report);
         }
 
-        let commands = parse_script(&format!("host v1\n{}\n", lines.join("\n")))?;
+        // **The journal is replayed entry by entry**, and an entry the `host v1` form
+        // cannot parse is **dropped and reported** like a refused one. Parsing the whole
+        // tail as one text made a single unspellable line (a hand-edited journal, a
+        // write from another host) a `load` that fails — the session on top of it lost
+        // as well, which is the one failure an autosave must never cause.
+        //
         // **The journal is a document too, so it is applied as one** — the same walk
         // `from_script` and `rebuild` use. A journal is written by the live path, where
         // a re-mount is legal because the name was released when the unmount *applied*;
@@ -1318,16 +1323,28 @@ impl HostSession {
         // A refused entry is still dropped and reported, never fatal, and the walk is
         // left unconditionally so one bad entry cannot leave the session walking.
         self.engine.enter_walk();
-        for cmd in &commands {
-            // A journal entry the session refuses (a stale journal from a crash in the
-            // save's window, or a pool that moved) is **dropped and reported**, never
-            // fatal.
-            match self.execute(cmd) {
-                Ok(()) => report.applied += 1,
+        for entry in journal_entries(&lines) {
+            let commands = match parse_script(&format!("host v1\n{entry}")) {
+                Ok(commands) => commands,
                 Err(e) => {
                     report.refused += 1;
                     if report.refused_reason.is_none() {
                         report.refused_reason = Some(e);
+                    }
+                    continue;
+                }
+            };
+            for cmd in &commands {
+                // A journal entry the session refuses (a stale journal from a crash in
+                // the save's window, or a pool that moved) is **dropped and reported**,
+                // never fatal.
+                match self.execute(cmd) {
+                    Ok(()) => report.applied += 1,
+                    Err(e) => {
+                        report.refused += 1;
+                        if report.refused_reason.is_none() {
+                            report.refused_reason = Some(e);
+                        }
                     }
                 }
             }
@@ -1348,6 +1365,20 @@ impl HostSession {
         // command with no text form cannot be in the history (a save would have
         // refused it), so a failure here means nothing to write.
         if write_entry(&mut text, entry, None).is_err() || text.is_empty() {
+            return;
+        }
+        // **The journal is read back by `parse_script`, so it is checked the way `save`
+        // checks its script** — otherwise the autosave is the one way an operand the
+        // word-based form cannot carry (a `play` path with whitespace or a `#`) reaches
+        // a session directory, and it takes the *whole* session unopenable with it, not
+        // just that edit. So the entry is not written, and the refusal is reported: the
+        // edit stands in the live session and a save would refuse it too.
+        if !entry_round_trips(entry, &text) {
+            self.journal_error = Some(format!(
+                "journal: an edit has no host v1 text form, so it is not autosaved (a save \
+                 would refuse it as well) and this session cannot be reopened: {}",
+                text.trim()
+            ));
             return;
         }
         let path = dir.join(JOURNAL_FILE);
@@ -1559,6 +1590,15 @@ impl HostSession {
                         "source_tempo must be finite and positive, got {bpm}"
                     ));
                 }
+                // The id is written as a bare word (`source_tempo <id> <bpm>`), so it
+                // takes the same discipline as a declared source's name: a session that
+                // cannot spell its ids cannot be reopened.
+                if !media::valid_name(source) {
+                    return Err(format!(
+                        "'{source}' is not usable as a source name (one token, no '#', not an \
+                         @frame or snap= modifier)"
+                    ));
+                }
                 if !self.source_tempos.contains_key(source) && self.source_tempos.len() >= 1_000 {
                     return Err("too many source tempos recorded (max 1000)".into());
                 }
@@ -1640,8 +1680,14 @@ impl HostSession {
                          not a merge"
                     ));
                 }
-                if matcher.is_empty() {
-                    return Err("a source matcher must not be empty".into());
+                // The matcher is written as a bare operand (`match=…`) and the
+                // tokenizer is whitespace-based, so it must be one token the parser
+                // reads back: a space or a `#` in it is a session that will not open.
+                if !media::valid_name(matcher) {
+                    return Err(format!(
+                        "the matcher '{matcher}' is not usable in the host v1 log (one token, \
+                         no whitespace, no '#')"
+                    ));
                 }
                 if !(1..=media::capture::CAPTURE_CHANNELS_SANITY).contains(channels) {
                     let sanity = media::capture::CAPTURE_CHANNELS_SANITY;
@@ -2883,8 +2929,9 @@ pub struct JournalRecovery {
     /// rather than refusing to open the session.
     pub torn_lines: usize,
     /// Journal commands the session **refused** (a stale journal from a crash inside the
-    /// save's window, or a path that moved). Dropped and reported, not fatal: refusing
-    /// to open a session because of an autosave line is the worse failure.
+    /// save's window, or a path that moved), plus entries the `host v1` form cannot
+    /// parse at all. Dropped and reported, not fatal: refusing to open a session because
+    /// of an autosave line is the worse failure.
     pub refused: usize,
     /// The first refusal, for a shell to show.
     pub refused_reason: Option<String>,
@@ -2916,6 +2963,53 @@ fn write_entry(
         out.push_str("group end\n");
     }
     Ok(())
+}
+
+/// Split journal lines into **entries**: a bare command is one line, a gesture runs
+/// from its `group begin` to its `group end`. The journal is a sequence of complete
+/// entries and recovery is per entry, so each is parsed on its own — one unspellable
+/// line must not take the edits after it with it.
+fn journal_entries(lines: &[&str]) -> Vec<String> {
+    let mut entries: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.trim() == "group begin" {
+            // A gesture runs to its `group end`; an unterminated one (which
+            // `apply_journal` truncates before calling) runs to the end of the tail, so
+            // the parser reports it rather than this function guessing where it ended.
+            let last = lines[i + 1..]
+                .iter()
+                .position(|l| l.trim() == "group end")
+                .map_or(lines.len() - 1, |k| i + 1 + k);
+            entries.push(lines[i..=last].join("\n"));
+            i = last + 1;
+        } else if line.trim().is_empty() {
+            i += 1; // a blank line between entries is a crash artefact, not an entry
+        } else {
+            // A bare command is one entry — and so is a `group end` with no
+            // `group begin`, as the unparseable entry it is.
+            entries.push((*line).to_string());
+            i += 1;
+        }
+    }
+    entries
+}
+
+/// Whether the rendered `text` of one history **entry** reads back as that entry: the
+/// same round trip `save` checks over a whole script, for a single gesture.
+/// `parse_script` must accept the line(s) *and* return the commands they came from — a
+/// line the tokenizer mangles (a `play` path with whitespace) is not the same command,
+/// and a journal that carries it cannot be reopened.
+fn entry_round_trips(entry: &[HostCommand], text: &str) -> bool {
+    let expected: Vec<HostCommand> = if entry.len() == 1 {
+        entry.to_vec()
+    } else {
+        vec![HostCommand::Group {
+            commands: entry.to_vec(),
+        }]
+    };
+    parse_script(&format!("host v1\n{text}")).is_ok_and(|parsed| parsed == expected)
 }
 
 /// Re-point every `pool` command in the history at `pool` (recursing into gestures).
@@ -4419,6 +4513,54 @@ mod tests {
 
         // A refused declaration is never logged: nothing landed in the session.
         assert_eq!(s.sources().len(), 1, "only the first declaration landed");
+    }
+
+    /// The operands the log spells as **bare words** must be one token: the matcher of
+    /// a declared source, and the source a tempo is recorded for. A space in either (or
+    /// a `#`, which starts a comment) produces a line `parse_script` cannot read back, so
+    /// the session that holds it cannot be reopened — so the command is refused at the
+    /// door, like the name beside it.
+    #[test]
+    fn a_source_and_a_matcher_the_text_form_cannot_spell_are_refused() {
+        let mut s = HostSession::new();
+        let declare = |matcher: &str| HostCommand::SourceAdd {
+            name: "s1".into(),
+            kind: "alsa",
+            matcher: matcher.into(),
+            channels: 2,
+            clock: rig::ClockRole::Follower,
+        };
+
+        // A matcher with a space is one token too many in `match=…`.
+        let spaced = s.execute(&declare("hw:USB 1"));
+        assert!(spaced.is_err(), "a matcher with a space is refused");
+        // A `#` is a comment to the parser.
+        let hashed = s.execute(&declare("hw:#0"));
+        assert!(hashed.is_err(), "a matcher with a '#' is refused");
+        assert!(s.execute(&declare("")).is_err(), "and so is an empty one");
+        assert!(
+            s.sources().is_empty(),
+            "no refused declaration is logged: {}",
+            spaced.expect_err("the error")
+        );
+
+        // `source_tempo <id> <bpm>` spells the id as a word, so it takes the same
+        // discipline as the declaration's name.
+        let spaced_source = s.execute(&HostCommand::SetSourceTempo {
+            source: "jam ch0".into(),
+            bpm: 90.0,
+        });
+        assert!(
+            spaced_source.is_err(),
+            "a source id with a space is refused"
+        );
+        assert!(s.source_tempos().is_empty(), "and no tempo is recorded");
+        s.execute(&HostCommand::SetSourceTempo {
+            source: "jam.ch0".into(),
+            bpm: 90.0,
+        })
+        .expect("a spellable source id still records");
+        assert_eq!(s.source_tempos().get("jam.ch0"), Some(&90.0));
     }
 
     #[test]
@@ -7691,6 +7833,140 @@ mod tests {
             "nothing was written: {}",
             refused.expect_err("the error")
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The save's self-check has to have a twin on the autosave.** `save` refuses a
+    /// history the text form cannot spell, but the journal was written unchecked — and
+    /// a line `parse_script` rejects makes the **whole session** unopenable, not just
+    /// that edit. So a `play` whose path the word-based form cannot carry is applied but
+    /// *not* journalled, the failure is reported, and the journal keeps the edits it can
+    /// spell.
+    #[test]
+    fn a_journal_line_the_text_form_cannot_spell_is_not_written() {
+        let root = std::env::temp_dir().join(format!("host-journal-lossy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("my pool"); // the space is in the *play* path
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = session_with_pool("journal-lossy", &pool);
+        let dir = root.join("song.d");
+        s.save(&dir).expect("save the baseline");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("journal.txt")).expect("journal"),
+            "",
+            "a save resets the journal to its baseline"
+        );
+
+        // The host plays a path with a space in it (any path `FilePlayer` opens)…
+        s.execute(&HostCommand::Play {
+            clip: media::ClipRef {
+                path: pool.join("s1.wav"),
+                start: 0,
+                len: 0,
+            },
+            channel: 0,
+            at_frame: None,
+        })
+        .expect("the live path plays it");
+        // …and the autosave says so, naming the line it would not write. (A later
+        // successful write clears the error, so it is read here, not at the end.)
+        let error = s
+            .journal_error()
+            .expect("the autosave reports what it could not write")
+            .to_string();
+        assert!(
+            error.contains("host v1") && error.contains("play"),
+            "and it names the format and the line: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("journal.txt")).expect("journal"),
+            "",
+            "and the unspellable edit is not written"
+        );
+
+        // An edit the text form *can* spell still is, so the journal is not merely empty.
+        s.execute(&gesture(vec![media::ArrangeOp::Trim {
+            track: "t0".into(),
+            clip: "c0".into(),
+            edge: media::Edge::Start,
+            by_frames: 1_200,
+        }]))
+        .expect("a spellable edit");
+
+        let journal = std::fs::read_to_string(dir.join("journal.txt")).expect("journal");
+        assert!(
+            !journal.contains("play"),
+            "the unspellable play is not in the journal:\n{journal}"
+        );
+        assert!(
+            journal.contains("arrange trim t0 c0 start 1200"),
+            "but the spellable edit is: {journal}"
+        );
+
+        // The point of the guard: the session still opens, and it opens with the edit
+        // that *was* spellable.
+        let mut loaded = HostSession::new();
+        loaded
+            .load_session(&dir)
+            .expect("an unspellable edit must not make the session unopenable");
+        let recovery = loaded.last_recovery().cloned().expect("a report");
+        assert_eq!(recovery.applied, 1, "the spellable edit replayed");
+        assert_eq!(recovery.refused, 0, "nothing in the journal was refused");
+        assert_eq!(
+            clip_of(&loaded).src_len,
+            3_600,
+            "and the trim is in the reopened session"
+        );
+        assert!(s.save(&dir).is_err(), "a save still refuses the history");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A journal line **nobody can parse** is dropped and reported, never fatal. The
+    /// write side refuses to produce one (the case above), so this is what a
+    /// hand-edited journal, or one from an older host, looks like — and the rule is the
+    /// one `apply_journal` already states for a *refused* entry: an autosave line must
+    /// not cost the user the session it sits in. The good line beside it still lands.
+    #[test]
+    fn an_unparseable_journal_line_is_dropped_not_fatal() {
+        let root =
+            std::env::temp_dir().join(format!("host-journal-garbage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = session_with_pool("journal-garbage", &pool);
+        let dir = root.join("song.d");
+        s.save(&dir).expect("save the baseline");
+
+        // A play line with a space in its path is four words against a three-word form.
+        // The gesture after it is well formed and must survive.
+        std::fs::write(
+            dir.join("journal.txt"),
+            "play /tmp/a b.wav ch0\ngroup begin\narrange set_clip_gain t0 c0 0.25\ngroup end\n",
+        )
+        .expect("a hand-written journal");
+
+        let mut loaded = HostSession::new();
+        loaded
+            .load_session(&dir)
+            .expect("an unparseable journal line must not stop the load");
+        let recovery = loaded.last_recovery().cloned().expect("a report");
+        assert_eq!(recovery.applied, 1, "the gesture beside it applied");
+        assert_eq!(recovery.refused, 1, "the unparseable entry is reported");
+        let reason = recovery
+            .refused_reason
+            .clone()
+            .expect("and the refusal says why");
+        assert!(
+            reason.contains("play") || reason.contains("operand"),
+            "the reason names the line: {reason}"
+        );
+        assert_eq!(clip_of(&loaded).gain, 0.25, "the gesture is in the session");
 
         let _ = std::fs::remove_dir_all(&root);
     }
