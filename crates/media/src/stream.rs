@@ -551,6 +551,7 @@ mod tests {
                 audio_ins: engine::AudioInputs::none(),
                 audio_in_count: 0,
                 audio_out_channels: 1,
+                frames: engine::BLOCK,
                 control_in: 0.0,
                 triggers_in: &[],
                 notes_in: &[],

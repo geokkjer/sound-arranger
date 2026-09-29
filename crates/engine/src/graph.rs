@@ -257,6 +257,10 @@ pub struct NodeIO<'a> {
     /// of the `out_audio` slice a node receives is `channels * frames`. A node
     /// must write its audio for `channels` interleaved channels.
     pub audio_out_channels: usize,
+    /// Frames in this block. A node with no audio ports receives an empty
+    /// `out_audio` (there is no slice to measure), so portless nodes — a clock
+    /// generator, a meter — read the block's width from here.
+    pub frames: usize,
     pub control_in: f32,
     pub triggers_in: &'a [Trigger],
     pub notes_in: &'a [NoteEvent],
@@ -1233,6 +1237,7 @@ impl Graph {
                 audio_ins: ins,
                 audio_in_count: ins.count(),
                 audio_out_channels: out_ch,
+                frames,
                 control_in: self.control_scratch,
                 triggers_in: self.triggers_in[i].as_slice(),
                 notes_in: self.notes_in[i].as_slice(),
