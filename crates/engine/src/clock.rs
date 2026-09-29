@@ -90,6 +90,13 @@ impl TempoMap {
     }
 
     /// Absolute frame at a fractional beat position (inverse of [`beat_at`]).
+    ///
+    /// A beat the map cannot reach — only a tempo so slow that even the final
+    /// open-ended segment spans less than one tick — saturates at `u64::MAX`
+    /// rather than falling back to a *real* frame: the honest answer is "past
+    /// the end of time", and a caller that walks frames (the clock-out node
+    /// looking for its next tick) terminates on it instead of spinning on a
+    /// constant.
     pub fn frame_at(&self, beat: f64) -> u64 {
         let mut remaining = beat;
         for (i, seg) in self.segments.iter().enumerate() {
@@ -105,11 +112,10 @@ impl TempoMap {
             }
             remaining -= seg_beats;
         }
-        // Unreachable: the final open-ended segment covers any finite beat.
-        self.segments
-            .last()
-            .expect("tempo map never empty")
-            .start_frame
+        // The loop falls through only when no segment spans the beat: at a
+        // tempo slow enough that `seg_beats` is below one tick, every beat past
+        // the first is unreachable. Saturate — a walk over frames stays finite.
+        u64::MAX
     }
 }
 
@@ -251,6 +257,30 @@ mod tests {
         assert_eq!(map.frame_at(4.0), 96_000);
         // a beat after the change: 1 more beat at 60bpm = 48_000 samples.
         assert_eq!(map.frame_at(5.0), 144_000);
+    }
+
+    /// A beat no segment can reach saturates instead of answering with a real
+    /// frame. At a tempo slow enough that the open-ended segment spans less than
+    /// one tick, the old fallback returned the map's last start frame — `0` —
+    /// so `frame_at` was constant, and a caller walking tick frames (the
+    /// clock-out node) spun forever looking for a tick that never advanced.
+    #[test]
+    fn frame_at_saturates_on_a_tempo_too_slow_to_reach_the_beat() {
+        let map = TempoMap::new(48_000, 1e-15, 4);
+        assert_eq!(map.frame_at(0.0), 0);
+        // One tick (1/24 beat) already needs more frames than u64 can hold.
+        assert_eq!(map.frame_at(1.0 / 24.0), u64::MAX);
+        // The walk a tick scheduler performs therefore terminates, and says so
+        // rather than sitting on a constant.
+        let mut n = 0u64;
+        while map.frame_at(n as f64 / 24.0) < 48_000 {
+            n += 1;
+            assert!(
+                n < 8,
+                "frame_at did not advance: tick {n} is still in range"
+            );
+        }
+        assert_eq!(n, 1);
     }
 
     #[test]

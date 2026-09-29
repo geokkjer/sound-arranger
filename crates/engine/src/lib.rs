@@ -56,6 +56,7 @@ pub use plugins::{
     Rhythm, Scale, TONE_PARAMS, Tone, Transport, TransportLog, euclid, mixer_factory,
 };
 pub use render::{
-    DrainOutcome, DrainPolicy, Engine, MAX_DRAIN_FRAMES, OpHandler, PluginFactory, SchedEvent,
+    DrainOutcome, DrainPolicy, Engine, MAX_DRAIN_FRAMES, MIN_TEMPO_BPM, OpHandler, PluginFactory,
+    SchedEvent,
 };
 pub use value::{OpMsg, Value};

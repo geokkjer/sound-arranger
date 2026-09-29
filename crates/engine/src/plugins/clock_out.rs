@@ -125,8 +125,19 @@ impl TransportLog {
 /// an absurd one could: when a block would exceed the bound, the node emits
 /// what fits and counts the rest. Dropping clock ticks is bad — but allocating
 /// on the render path is worse, so the bound must be **visible**: the overflow
-/// counter is a loud failure, not silent growth.
+/// counter is a loud failure, not silent growth. The bound is on the **walk**,
+/// not only on the scratch: a tempo whose ticks all round onto one frame would
+/// otherwise keep the loop running after the scratch stopped growing.
 const CLOCK_OUT_CAP: usize = 64;
+
+/// The hard bound on the noise-correction walk in
+/// [`ClockOutNode::first_tick_at_or_after`]. The correction exists to undo f64
+/// rounding, so it is one or two ticks at any tempo where a tick is worth a
+/// frame; a generous bound never changes the answer. It exists because a tempo
+/// whose ticks are *closer together than frames* cannot converge — there the
+/// beat-domain candidate and the frame domain disagree by an unbounded number
+/// of ticks — and a walk that cannot converge must still return.
+const TICK_WALK_CAP: u64 = 1 << 16;
 
 /// The clock-out node: computes the MIDI clock ticks and transport events due
 /// in each block and sends them through the host's sink. It produces no audio,
@@ -202,16 +213,53 @@ impl ClockOutNode {
     /// First tick index whose frame is `>= frame`, corrected through
     /// `frame_at` so f64 noise in `beat_at` cannot shift a tick off its exact
     /// frame: the candidate from the beat domain is walked onto the true
-    /// answer, which the frame domain defines.
+    /// answer, which the frame domain defines. The walk is bounded by
+    /// [`TICK_WALK_CAP`] — a correction is short, and a walk that cannot
+    /// converge (a tempo whose ticks are closer together than frames) must
+    /// still return, because this runs on the render path.
     fn first_tick_at_or_after(map: &TempoMap, frame: u64) -> u64 {
-        let mut n = (map.beat_at(frame) * TICKS_PER_BEAT as f64).floor() as u64;
-        while Self::tick_frame(map, n) < frame {
+        let n0 = (map.beat_at(frame) * TICKS_PER_BEAT as f64).floor() as u64;
+        let mut n = n0;
+        while n - n0 < TICK_WALK_CAP && Self::tick_frame(map, n) < frame {
             n += 1;
         }
         while n > 0 && Self::tick_frame(map, n - 1) >= frame {
             n -= 1;
         }
         n
+    }
+
+    /// How many ticks from `from` on fall before `block_end` — the count the
+    /// capped walk stopped short of. `frame_at` is monotone in the tick index,
+    /// so a binary search answers it in a fixed number of lookups: the block
+    /// pays for the count instead of the unbounded walk the count replaces, and
+    /// the overflow counter keeps meaning *exactly* how many ticks the walk
+    /// skipped. `tick_frame(map, from) < block_end` must hold.
+    fn due_ticks_from(map: &TempoMap, from: u64, block_end: u64) -> u64 {
+        // Bracket by doubling from `from` (already known due). The doubling
+        // cannot run away: the last step pins `hi` at `u64::MAX` and hands the
+        // narrowing to the binary search, which then converges on the highest
+        // index it can reach — an unreachable "no such tick" only ever
+        // overstates a count that is already absurd.
+        let mut lo = from;
+        let mut hi = from.saturating_add(1);
+        while Self::tick_frame(map, hi) < block_end {
+            lo = hi;
+            if hi >= u64::MAX / 2 {
+                hi = u64::MAX;
+                break;
+            }
+            hi *= 2;
+        }
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if Self::tick_frame(map, mid) < block_end {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo.saturating_sub(from).saturating_add(1)
     }
 }
 
@@ -262,13 +310,27 @@ impl crate::graph::AudioNode for ClockOutNode {
         // frame comes from the tempo map's `frame_at`, not from a rate carried
         // between blocks.
         let mut n = Self::first_tick_at_or_after(block.tempo, block.frame);
+        let n0 = n;
         loop {
             let frame = Self::tick_frame(block.tempo, n);
             if frame >= block_end {
                 break;
             }
+            if n - n0 >= CLOCK_OUT_CAP as u64 {
+                // The cap the module declares: the rest of the block's ticks are
+                // *counted*, not walked. Exact, so `overflows` still means "how
+                // many ticks this block dropped", and bounded, so no tempo can
+                // hold the render thread in this loop.
+                self.overflows.fetch_add(
+                    Self::due_ticks_from(block.tempo, n, block_end),
+                    Ordering::Relaxed,
+                );
+                break;
+            }
+            // Saturating: a tick the bounded correction could not walk onto the
+            // block's frame lands at the block's start rather than underflowing.
             self.push(ExternalEvent::Clock {
-                offset: (frame - block.frame) as u32,
+                offset: frame.saturating_sub(block.frame) as u32,
             });
             n += 1;
         }
@@ -554,6 +616,34 @@ mod tests {
         assert_eq!(emitted + node.overflows(), due);
         assert_eq!(emitted, CLOCK_OUT_CAP as u64);
         assert!(node.overflows() > 0);
+    }
+
+    /// The cap bounds the **walk**, not only the scratch, so no tempo can hold
+    /// the render thread in the tick loop. A tempo too slow for any tick to
+    /// land in the block used to pin every tick at frame 0 (and one too fast
+    /// rounds them all onto frame 0); either way the loop never reached the
+    /// block end, `render` never returned, and the actor thread wedged with the
+    /// shell frozen. Both must return, and the fast one must be loud.
+    #[test]
+    fn an_absurd_tempo_does_not_hold_the_render_loop() {
+        // Too slow: tick 0 is at frame 0, and no later tick is in reach.
+        let map = TempoMap::new(48_000, 1e-15, 4);
+        let (mut node, recorded) = node_with_sink();
+        render_range(&mut node, &map, 0, 512, 512);
+        assert_eq!(FakeSink::clock_frames(&recorded), vec![0]);
+        assert_eq!(node.overflows(), 0);
+
+        // Too fast: every tick rounds onto frame 0, so the cap stops the walk
+        // and the block's remaining ticks are counted.
+        let map = TempoMap::new(48_000, 1e300, 4);
+        let (mut node, recorded) = node_with_sink();
+        render_range(&mut node, &map, 0, 512, 512);
+        assert_eq!(
+            FakeSink::clock_frames(&recorded).len(),
+            CLOCK_OUT_CAP,
+            "the block emitted exactly the cap"
+        );
+        assert!(node.overflows() > 0, "and the rest was counted, not walked");
     }
 
     /// An **empty** slot sends nothing: the host's detach across a rebuild

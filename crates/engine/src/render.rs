@@ -106,6 +106,14 @@ pub struct DrainOutcome {
 /// reported, not hidden).
 pub const MAX_DRAIN_FRAMES: usize = 48_000 * 60;
 
+/// The slowest tempo [`Engine::set_tempo`] accepts. Below it a quarter note
+/// takes longer than the whole `u64` frame range can hold (a beat of 1e-3 bpm
+/// is ~1000 s), so the tempo map cannot place a tick inside any block and MIDI
+/// clock has nothing to say: refusing it is the honest answer, and the render
+/// path's own bounds — [`crate::clock::TempoMap::frame_at`] saturating, the
+/// clock-out node's capped walk — hold for a log that carries one anyway.
+pub const MIN_TEMPO_BPM: f64 = 1e-3;
+
 /// The assembled minimal core.
 pub struct Engine {
     pub clock: Clock,
@@ -493,11 +501,18 @@ impl Engine {
     }
 
     /// A tempo change at the current frame (sample-accurate: applied by the
-    /// render loop at that frame). Fail-loud: a non-finite or non-positive
-    /// tempo is refused and never logged (kimi review finding 10).
+    /// render loop at that frame). Fail-loud: a non-finite, non-positive, or
+    /// sub-floor tempo is refused and never logged (kimi review finding 10;
+    /// the floor is [`MIN_TEMPO_BPM`]).
     pub fn set_tempo(&mut self, bpm: f64, beats_per_bar: u32) -> Result<(), String> {
         if !bpm.is_finite() || bpm <= 0.0 {
             return Err(format!("tempo must be finite and positive, got {bpm}"));
+        }
+        if bpm < MIN_TEMPO_BPM {
+            return Err(format!(
+                "tempo must be at least {MIN_TEMPO_BPM} bpm \
+                 (a quarter note longer than the timeline itself), got {bpm}"
+            ));
         }
         let at_frame = self.clock.frame();
         self.log.push(Event::SetTempo {

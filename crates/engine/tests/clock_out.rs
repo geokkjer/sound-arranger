@@ -81,3 +81,27 @@ fn mounts_and_renders_with_neither_service() {
     assert!(e.node_of("clock_out").is_some());
     assert_eq!(rendered.len(), BLOCK, "the tone's mono bus renders");
 }
+
+/// A tempo the clock cannot render is refused **at the API**, with a message
+/// that says why, and the session keeps the tempo it had. A sub-floor tempo used
+/// to be accepted (`is_finite() && bpm > 0.0` was the whole check) and wedged
+/// the render thread on the next `play`: the tempo map could not place a tick
+/// inside any block, so `clock_out`'s tick loop never ended.
+#[test]
+fn a_tempo_below_the_floor_is_refused_and_the_session_still_renders() {
+    let mut e = engine_with_clock_out(false);
+    let refused = e.set_tempo(1e-15, 4).unwrap_err();
+    assert!(
+        refused.contains(&MIN_TEMPO_BPM.to_string()),
+        "the error names the floor: {refused}"
+    );
+    // A refused change is never logged, so the render is the 120 bpm session.
+    let rendered = e.render(BLOCK);
+    assert_eq!(rendered.len(), BLOCK, "the session still renders");
+    assert_eq!(e.clock.tempo_map.tempo_at(0), 120.0, "and kept its tempo");
+    // The slowest accepted tempo is accepted, and renders: the floor bounds the
+    // nonsense, it does not narrow the usable range.
+    e.set_tempo(MIN_TEMPO_BPM, 4)
+        .expect("the floor itself is a tempo");
+    assert_eq!(e.render(BLOCK).len(), BLOCK);
+}
