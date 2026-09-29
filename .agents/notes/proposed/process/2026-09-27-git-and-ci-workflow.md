@@ -139,11 +139,11 @@ in AGENTS.md so the difference is not folklore.
    is clean on `main` between sessions. — **Met in practice**: this work happened in a worktree
    (`../sa-ci`) while the main checkout stayed clean on `main`, and AGENTS.md carries the orders.
 5. The alpha is a tag plus a release note, never a release branch. — Not yet exercised.
-6. CI runtime stays under roughly five minutes warm, so it is a gate and not a queue. — **Refined by
-   measurement, cold cache**: `rust` 1m14s, `agent notes` 8s, `spike tui-shell` 1m23s,
-   `spike iced-shell` **7m11s**. The iced spike *is* the runtime, so the honest form is "the default
-   gate is about 90 seconds; the iced spike is minutes and moves behind a path filter or a nightly
-   trigger if it starts to cost attention".
+6. CI runtime stays under roughly five minutes warm, so it is a gate and not a queue. — **Met, and
+   measured twice**: cold, `rust` 1m14s / `notes` 8s / `tui` 1m23s / `iced` **7m11s**; warm, `rust`
+   1m11s / `notes` 6s / `tui` 42s / `iced` 1m2s. A warm run is about a minute of wall time (the jobs
+   run in parallel); the first run after a cache miss is the expensive one, and the iced spike only
+   needs its own trigger if cold caches become common.
 
 ### What the first run found — the argument for this note, made by the tool itself
 
