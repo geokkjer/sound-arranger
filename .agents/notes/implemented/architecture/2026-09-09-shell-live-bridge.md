@@ -19,10 +19,13 @@ The bridge (`crates/shell/src-tauri`) is now a thin adapter over [`host::live::H
   an `Arc<Mutex<Snapshot>>`, and the join handle), so `.manage(HostHandle::spawn())` compiles — unlike
   `State<Mutex<HostSession>>` (`HostSession` is `!Send`; the live-runtime note owns that).
 - **`run_host_script` = reset-and-apply into the live session** (`load_script`): parse the text →
-  `HostHandle::load` (the actor installs a *fresh* session, applies the commands, and returns a
-  `HostOutcome`) → map the outcome + the current snapshot to the serializable `ScriptOutcome`.
-  Reset-and-apply keeps re-running a script **idempotent** (no double-mount), preserving the old
-  stateless semantics while the session stays resident for transport.
+  `HostHandle::load` (the actor builds a *fresh* session, adopts it only once it built whole, and
+  returns the `HostOutcome`) → map the outcome + the current snapshot to the serializable
+  `ScriptOutcome`. Reset-and-apply keeps re-running a script **idempotent** (no double-mount),
+  preserving the old stateless semantics while the session stays resident for transport. A
+  **refused** script changes nothing: the `Err` is returned and the session that was already there
+  keeps playing ([the note that fixed it](../bug-fix/2026-09-29-a-refused-live-load-keeps-the-session.md)),
+  the same rule `load_session` follows.
 - **Transport is first-class, not script text**: `transport_play` / `transport_stop` /
   `transport_seek(frame)` execute the corresponding `HostCommand`; `transport_state` polls the shared
   snapshot and returns `TransportState` (position + meters + the pump's `last_error`). The live,
@@ -43,6 +46,11 @@ Tests: a tone+bounce script loads with clean diagnostics and a channel count; a 
 - **`run_host_script` appends to the live session (no reset)** — re-running a script would re-mount
   the mixer and fail ("already mounted"), and the previous state would leak into the new run.
   Rejected: reset-and-apply is idempotent.
+- **Reset-and-apply, and install the empty session when the script is refused** — a rejected
+  alternative, kept here because the failure is what the idempotence was for: the shell gets its
+  error *and* loses the arrangement, the pool binding, the undo history and the transport. Rejected:
+  building the candidate and adopting it only on `Ok` is idempotent in both directions, and matches
+  `load_session`.
 - **Expose transport only as script text (`transport play` lines)** — the frontend would drive
   playback by re-running a script, and a poll would need a script run per tick. Rejected: the text
   schema is for loading a session; transport is a live control surface.
@@ -65,3 +73,5 @@ Tests: a tone+bounce script loads with clean diagnostics and a channel count; a 
 ## Attribution
 
 Authored with DeepSeek-v4-flash · DeepSeek Harness, 2026-09-09.
+
+Authored with Space Bunny · OpenCode, 2026-09-29.
