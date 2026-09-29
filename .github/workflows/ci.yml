@@ -35,19 +35,24 @@ concurrency:
   group: ${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  # Read-only: a compromised action should not be able to write to the repository.
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   rust:
     name: rust (fmt, clippy, test)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest # floats on purpose; the CI moves to a Forgejo/Woodpecker host next
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: system deps (ALSA — cpal's backend)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev
+      # Floats within v2 on purpose: a cache action has no reason to be pinned to a patch.
       - uses: Swatinem/rust-cache@v2
       - run: rustc --version && cargo --version
       - run: cargo fmt --all --check
@@ -56,18 +61,18 @@ jobs:
 
   notes:
     name: agent notes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest # floats on purpose; the CI moves to a Forgejo/Woodpecker host next
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: '22'
+          node-version: '24'
       # Structure, and that every cross-reference resolves.
       - run: node scripts/verify-agent-notes.mjs
 
   spikes:
     name: spike ${{ matrix.spike }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest # floats on purpose; the CI moves to a Forgejo/Woodpecker host next
     strategy:
       # A failure in one shell spike is information about that spike, not a reason
       # to hide the other one's result.
@@ -79,11 +84,12 @@ jobs:
           - spike: iced-shell
             apt: pkg-config libasound2-dev libxkbcommon-dev libwayland-dev libx11-dev libxkbcommon-x11-dev
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: system deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ${{ matrix.apt }}
+      # Floats within v2 on purpose: a cache action has no reason to be pinned to a patch.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: spikes/${{ matrix.spike }}
