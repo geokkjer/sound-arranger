@@ -1308,6 +1308,16 @@ impl HostSession {
         }
 
         let commands = parse_script(&format!("host v1\n{}\n", lines.join("\n")))?;
+        // **The journal is a document too, so it is applied as one** — the same walk
+        // `from_script` and `rebuild` use. A journal is written by the live path, where
+        // a re-mount is legal because the name was released when the unmount *applied*;
+        // replaying those lines back to back renders nothing between them, so unwalked
+        // the re-mount was refused and **the edit was dropped** (reported as `refused`,
+        // so the session opened without it — a silent loss of the user's work).
+        //
+        // A refused entry is still dropped and reported, never fatal, and the walk is
+        // left unconditionally so one bad entry cannot leave the session walking.
+        self.engine.enter_walk();
         for cmd in &commands {
             // A journal entry the session refuses (a stale journal from a crash in the
             // save's window, or a pool that moved) is **dropped and reported**, never
@@ -1322,6 +1332,7 @@ impl HostSession {
                 }
             }
         }
+        self.engine.leave_walk();
         Ok(report)
     }
 
@@ -2324,14 +2335,32 @@ impl HostSession {
             return Err("session_rate must be non-zero".into());
         }
         let mut session = HostSession::new_at(rate);
-        for cmd in commands {
-            // `execute`, not `process`: a script built by `process` alone would have
-            // the *state* but an empty history — so a session opened from a file could
-            // not be undone, and saving it again would write only what happened after
-            // the load. (`execute` appends to the journal only when a session
-            // directory is set, and a session being built or loaded has none.)
-            session.execute(cmd)?;
-        }
+        // **The script is a document, so it is applied as a document walk**
+        // ([`Engine::enter_walk`]) — the same mechanism `rebuild` uses, not a second
+        // one. An unplaced command renders nothing, so the apply queue never drains
+        // between the script's lines: a `mount … unmount … mount` the live path
+        // accepted and recorded (and a `save` therefore wrote) was refused here as a
+        // second instance, which made such a session **unopenable** — the platform
+        // wrote files it could not read back.
+        //
+        // Scoped with **no `?` between the enter and the leave**, so a refused command
+        // cannot leave a half-built session walking (and the caller keeps its own
+        // session either way: `load_session` only adopts a session that built whole).
+        session.engine.enter_walk();
+        let applied = (|| -> Result<(), String> {
+            for cmd in commands {
+                // `execute`, not `process`: a script built by `process` alone would
+                // have the *state* but an empty history — so a session opened from a
+                // file could not be undone, and saving it again would write only what
+                // happened after the load. (`execute` appends to the journal only when
+                // a session directory is set, and a session being built or loaded has
+                // none.)
+                session.execute(cmd)?;
+            }
+            Ok(())
+        })();
+        session.engine.leave_walk();
+        applied?;
         Ok(session)
     }
 
@@ -2623,12 +2652,22 @@ impl HostSession {
                         at_frame,
                     } = cmd
                     {
-                        let at = at_frame.unwrap_or(0);
-                        // Place the clock at the command's own frame (no render) and let the
-                        // engine log and **schedule** it there; the run-in render delivers the
-                        // event at its frame, which pushes the segment — exactly the sequence a
-                        // full replay performs, so the map ends up identical (pushing here as
-                        // well would double every segment).
+                        // **The clock only ever moves forward here**, exactly as it does
+                        // on the live path: `process` renders up to a command's placement
+                        // when it is in the future, and when it is in the *past* it leaves
+                        // the clock where it is, so `set_tempo` stamps the change at the
+                        // current frame rather than at the stale one. Seeking to the
+                        // stated frame unconditionally walked the clock **backwards** over
+                        // such a command, and every `at_now` command after it was then
+                        // stamped *before* the ones before it — a document the walk
+                        // refuses as frame-inverted, on a history the live path wrote and
+                        // accepted. `max` is that rule, in one expression.
+                        let at = at_frame.unwrap_or(0).max(rebuilt.engine.clock.frame());
+                        // Place the clock at that frame (no render) and let the
+                        // engine log and **schedule** it there; the run-in render delivers
+                        // the event at its frame, which pushes the segment — exactly the
+                        // sequence a full replay performs, so the map ends up identical
+                        // (pushing here as well would double every segment).
                         rebuilt.engine.seek(at);
                         rebuilt.engine.set_tempo(*bpm, *beats_per_bar)?;
                         continue;
@@ -6265,6 +6304,344 @@ mod tests {
         plain
             .execute(&HostCommand::TransportSeek { frame: 240_000 })
             .expect("and still seeks");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The loader is a document walk too, or a saved re-mount cannot be reopened.**
+    ///
+    /// The commit above fixed every *re-apply* path — `rebuild`, `rebuild_prefix` — by
+    /// entering a document walk, so the one-instance rule is the history's question
+    /// while the state is re-issued. The **load** path was left out: `from_script`
+    /// issues each command with `execute`, unwalked. The saved text of the unplaced
+    /// triple is `mount clock_out` / `unmount clock_out` / `mount clock_out` with no
+    /// placement on any of them, and the bounce that released the name between the
+    /// first two is an *action*, so it is not in the text — a load re-issues three
+    /// unplaced commands with nothing rendering between them, and the second mount was
+    /// refused: `Err("plugin 'clock_out' is already mounted")`. The session could be
+    /// written but never opened, which is the same user-facing defect the walk exists
+    /// to kill, still reachable through `load_session`.
+    ///
+    /// The round-trip check inside `save` (the parsed text must equal the history) does
+    /// not catch it: the text is faithful, it is the *application* of the text that
+    /// failed. So this test goes all the way round — build, save, reopen — rather than
+    /// comparing commands.
+    #[test]
+    fn a_saved_session_that_re_mounts_a_plugin_reopens() {
+        let root = std::env::temp_dir().join(format!("host-remount-load-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 240_000, 48_000);
+
+        // The unplaced triple, built the way a UI sends it: a command with no
+        // placement renders nothing, so the name is released only by the bounce
+        // between the unmount and the re-mount. The live path accepts it, which is
+        // what puts it in the history a save writes.
+        let mut s = HostSession::new();
+        s.execute(&HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 2.0)],
+            at_frame: Some(0),
+        })
+        .expect("mixer");
+        s.execute(&HostCommand::Pool { dir: pool.clone() })
+            .expect("pool");
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::AddTrack { track: "t0".into() },
+            at_frame: None,
+        })
+        .expect("track");
+        s.execute(&HostCommand::Arrange {
+            op: add_clip("c0", 0),
+            at_frame: None,
+        })
+        .expect("clip");
+        s.execute(&HostCommand::Mount {
+            plugin: "clock_out",
+            params: vec![],
+            at_frame: None,
+        })
+        .expect("mount");
+        s.execute(&HostCommand::Unmount {
+            plugin: "clock_out",
+            at_frame: None,
+        })
+        .expect("unmount");
+        bounce(&mut s, 4_800, &root.join("mid.wav")); // a render applies the unmount
+        s.execute(&HostCommand::Mount {
+            plugin: "clock_out",
+            params: vec![],
+            at_frame: None,
+        })
+        .expect("re-mount — the name was released");
+
+        let dir = root.join("re-mounted.d");
+        s.save(&dir).expect("a session that re-mounts is savable");
+        let text = std::fs::read_to_string(dir.join("session.txt")).expect("the script");
+        let mounts = text
+            .lines()
+            .filter(|l| l.starts_with("mount clock_out"))
+            .count();
+        assert_eq!(
+            mounts, 2,
+            "both mounts are in the session's own text form:\n{text}"
+        );
+        assert!(
+            text.lines().any(|l| l.starts_with("unmount clock_out")),
+            "…with the unmount between them:\n{text}"
+        );
+
+        // **The load.** This is the round trip the commit's own test did not make: the
+        // session is rebuilt from the *file*, not compared as commands.
+        let mut loaded = HostSession::new();
+        loaded
+            .load_session(&dir)
+            .expect("a saved session that re-mounts a plugin must reopen");
+        assert_eq!(
+            loaded.arrangement().expect("tl"),
+            s.arrangement().expect("tl"),
+            "the arrangement round-trips"
+        );
+
+        // And the reopened session is a session, not a value: it exports, renders,
+        // seeks, and saves again (so a second load has to work as well).
+        loaded
+            .export(&root.join("reopened.wav"), ExportFormat::F32)
+            .expect("the reopened session exports");
+        let audio = bounce(&mut loaded, 4_800, &root.join("reopened-clip.wav"));
+        assert!(
+            audio.iter().any(|x| x.abs() > 0.01),
+            "the reopened session renders its clip"
+        );
+        loaded
+            .execute(&HostCommand::TransportSeek { frame: 240_000 })
+            .expect("and still seeks");
+        let again = root.join("re-mounted-again.d");
+        loaded.save(&again).expect("save again");
+        let mut twice = HostSession::new();
+        twice
+            .load_session(&again)
+            .expect("a re-saved re-mounting session reopens too");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The journal is a document walk too, or a re-mounting edit is dropped on load.**
+    ///
+    /// The journal is appended by the *live* path, where `mount p` / `unmount p` /
+    /// `mount p` is accepted because the name was released when the unmount applied.
+    /// `apply_journal` replays those lines back to back on a session that has rendered
+    /// nothing, so unwalked the re-mount was refused — and a refused journal entry is
+    /// **dropped and reported**, which means the load succeeded while silently losing
+    /// the user's last edit. The walk makes the journal's own lifecycle the answer,
+    /// exactly as it does for the script.
+    ///
+    /// The test drives the real thing: a session directory whose `journal.txt` holds an
+    /// unplaced re-mount triple, torn the way a crash mid-gesture tears one.
+    #[test]
+    fn a_journal_that_re_mounts_a_plugin_is_applied_not_dropped() {
+        let root =
+            std::env::temp_dir().join(format!("host-journal-remount-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 240_000, 48_000);
+
+        let mut s = HostSession::new();
+        s.execute(&HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 2.0)],
+            at_frame: Some(0),
+        })
+        .expect("mixer");
+        s.execute(&HostCommand::Pool { dir: pool.clone() })
+            .expect("pool");
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::AddTrack { track: "t0".into() },
+            at_frame: None,
+        })
+        .expect("track");
+        s.execute(&HostCommand::Arrange {
+            op: add_clip("c0", 0),
+            at_frame: None,
+        })
+        .expect("clip");
+        let dir = root.join("journalled.d");
+        s.save(&dir).expect("save the baseline");
+
+        // The autosave since that save: a re-mount of `clock_out`, written the way the
+        // live path writes it (unplaced, with a render between the unmount and the
+        // re-mount — the render is an action, so it is not in the journal). The journal
+        // holds entries only; `apply_journal` supplies the `host v1` header.
+        std::fs::write(
+            dir.join("journal.txt"),
+            b"mount clock_out\nunmount clock_out\nmount clock_out\n",
+        )
+        .expect("write the journal");
+
+        let mut loaded = HostSession::new();
+        loaded.load_session(&dir).expect("load");
+        let recovery = loaded.last_recovery().expect("a recovery report");
+        assert_eq!(
+            recovery.applied, 3,
+            "every journal command applied: {recovery:?}"
+        );
+        assert_eq!(
+            recovery.refused, 0,
+            "the re-mount is not a refusal any more: {recovery:?}"
+        );
+        assert!(
+            recovery.refused_reason.is_none(),
+            "…with no reason to report: {recovery:?}"
+        );
+
+        // The applied triple really is in the loaded session's history, so a further
+        // save carries it (this is what was being lost).
+        let again = root.join("journalled-again.d");
+        loaded.save(&again).expect("save the recovered session");
+        let text = std::fs::read_to_string(again.join("session.txt")).expect("the script");
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.starts_with("mount clock_out"))
+                .count(),
+            2,
+            "both mounts survived the load:\n{text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A warm seek over a tempo placed in the past does not walk the clock back.**
+    ///
+    /// `rebuild_prefix` places the clock at each `SetTempo`'s *stated* frame, because a
+    /// tempo segment has to sit at its own frame in the map even when the run-in starts
+    /// later. It did that unconditionally, so a tempo command whose placement is already
+    /// behind the clock moved the clock **backwards** — and every `at_now` command after
+    /// it was then stamped *before* the commands before it. On a history that also
+    /// re-mounts a plugin the result is `Mount@0 … Unmount@120000 … Mount@48000`: a
+    /// frame-inverted document, which the walk refuses (`plugin 'clock_out' goes back to
+    /// frame 48000 after frame 120000`) on a session the live path wrote and accepted.
+    ///
+    /// The rule is the live path's: `process` renders up to a placement only when it is
+    /// in the future, and `set_tempo` stamps at the current frame otherwise — so the
+    /// clock moves forward and only forward. `max` says that in one expression, and this
+    /// is the test that keeps it said.
+    #[test]
+    fn a_warm_seek_over_a_past_tempo_placement_still_works() {
+        let root = std::env::temp_dir().join(format!("host-past-tempo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 480_000, 48_000);
+
+        let mut s = HostSession::new();
+        s.execute(&HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 2.0)],
+            at_frame: Some(0),
+        })
+        .expect("mixer");
+        s.execute(&HostCommand::Pool { dir: pool.clone() })
+            .expect("pool");
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::AddTrack { track: "t0".into() },
+            at_frame: None,
+        })
+        .expect("track");
+        // A clip long enough to still be playing at the seek target, so "the rebuilt
+        // session renders" is an observation about the rebuilt graph.
+        let mut clip = add_clip("c0", 0);
+        if let media::ArrangeOp::AddClip { clip, .. } = &mut clip {
+            clip.src_len = 480_000;
+        }
+        s.execute(&HostCommand::Arrange {
+            op: clip,
+            at_frame: None,
+        })
+        .expect("clip");
+        s.execute(&HostCommand::Mount {
+            plugin: "clock_out",
+            params: vec![],
+            at_frame: Some(0),
+        })
+        .expect("mount");
+        s.execute(&HostCommand::SetTempo {
+            bpm: 90.0,
+            beats_per_bar: 4,
+            at_frame: Some(120_000),
+        })
+        .expect("tempo at 2.5 s");
+        s.execute(&HostCommand::Unmount {
+            plugin: "clock_out",
+            at_frame: Some(120_000),
+        })
+        .expect("unmount");
+        // **The past placement.** Issued while the clock is already past 48 000, so the
+        // live path stamps it at the current frame — and the history carries the stale
+        // one, which is what `rebuild_prefix` used to seek to.
+        s.execute(&HostCommand::SetTempo {
+            bpm: 140.0,
+            beats_per_bar: 4,
+            at_frame: Some(48_000),
+        })
+        .expect("a tempo whose placement is already behind the clock");
+        s.execute(&HostCommand::Mount {
+            plugin: "clock_out",
+            params: vec![],
+            at_frame: Some(300_000),
+        })
+        .expect("re-mount");
+        let live = s.engine.log.clone();
+        let live_bpm = s.position().bpm;
+
+        // A warm seek (the `rebuild_prefix` path) over that history.
+        s.execute(&HostCommand::TransportSeek { frame: 360_000 })
+            .expect("a warm seek over a past tempo placement");
+        let (frame, warmed) = s.last_seek().expect("a seek ran");
+        assert_eq!(frame, 360_000);
+        assert!(warmed, "this is the prefix path this test is for");
+        assert_eq!(
+            s.position().bpm,
+            live_bpm,
+            "the tempo map is the session's, not the stale placement's"
+        );
+        let audio = bounce(&mut s, 8_000, &root.join("after.wav"));
+        assert!(
+            audio.iter().any(|x| x.abs() > 0.01),
+            "the rebuilt session still renders"
+        );
+
+        // The invariant the walk now enforces, checked against the log the live path
+        // actually wrote: the lifecycle frames for one name are non-decreasing. The
+        // seek above succeeded precisely because `rebuild_prefix` preserved it — the
+        // stale 48 000 placement is not in the *log* (the live path stamped it at the
+        // current frame), it was only in the command the rebuild read.
+        let frames: Vec<u64> = live
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                engine::Event::Mount {
+                    plugin: "clock_out",
+                    at_frame,
+                    ..
+                } => Some(*at_frame),
+                engine::Event::ScheduleUnmount {
+                    plugin: "clock_out",
+                    at_frame,
+                } => Some(*at_frame),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            frames,
+            vec![0, 120_000, 300_000],
+            "the live path's lifecycle frames for clock_out are in order"
+        );
+        assert!(
+            frames.windows(2).all(|w| w[0] <= w[1]),
+            "…which is what the walk's frame rule requires: {frames:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

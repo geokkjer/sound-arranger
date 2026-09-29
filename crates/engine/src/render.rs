@@ -126,55 +126,85 @@ pub const MAX_DRAIN_FRAMES: usize = 48_000 * 60;
 /// walk) hold for a log that carries one anyway.
 pub const MIN_TEMPO_BPM: f64 = 1e-3;
 
-/// **Which plugin names are live** — mounted, or queued to mount — as far as some
-/// document says.
+/// What one **document** has said about a plugin's name — the one-instance-per-name
+/// bookkeeping, and *who owns it* is the whole question.
 ///
-/// This is the one-instance-per-name bookkeeping, and *who owns it* is the whole
-/// question. A **live command** answers it from the engine's scheduling state
-/// (`disposers` + `scheduled`), because a render applies what it queues and so the
-/// state is current. A **document walk** — [`Self::enter_walk`]: the recorded state
-/// of a session, re-issued onto an engine — cannot: nothing renders during the walk,
-/// so the apply queue never drains and a name whose unmount the document schedules
-/// would still read as mounted. The lifecycle belongs to the document while it is
-/// being applied, exactly as it belongs to the engine between renders.
+/// A **live command** asks the engine's scheduling state (`disposers` + `scheduled`),
+/// because a render applies what it queues and so that state is current. A
+/// **document walk** — [`Engine::enter_walk`], the recorded state of a session
+/// re-issued onto an engine — cannot: nothing renders during the walk, so the apply
+/// queue never drains and a name whose unmount the document schedules would still
+/// read as mounted. The lifecycle belongs to the document while it is being applied,
+/// exactly as it belongs to the engine between renders.
 ///
-/// A walk is seeded from what the engine already holds ([`Self::of`]), so it never
-/// loses the target's own state: a walk that mounts a name the engine already has
-/// applied is refused like any other second instance.
+/// **A walk records the names the document has spoken for, and nothing else.** A name
+/// it has not mentioned is still the engine's business
+/// ([`Engine::holds_instance_of`]), so the walk is a view of the document rather than
+/// a snapshot of the target taken at entry — a snapshot goes stale the moment the
+/// target's own state moves, and a stale view is how a walk loses state it was
+/// supposed to protect. Two consequences, both load-bearing:
+///
+/// - a document that unmounts a name the target holds **replaces** that instance.
+///   That is the point: the document says the plugin goes away and comes back, and
+///   the frame rule below is what guarantees the teardown applies first.
+/// - a document that mounts a name the target holds, without unmounting it first, is
+///   refused like any other second instance — the target's own state answers for a
+///   name the document has not spoken for.
+///
+/// The frame each event carries is the frame the scheduler will apply it at, and a
+/// document's lifecycle for one name must be in **frame** order: `Mount p@a,
+/// Unmount p@b, Mount p@c` is only re-mountable if `a ≤ b ≤ c`. Frame-inverted
+/// otherwise (the scheduler sorts by frame, so the second mount would apply *before*
+/// the unmount: two `apply_mount`s for one name, the first node orphaned and its
+/// disposer dropped unrun). [`Engine::frame_inverted`] is that refusal — loud, at the
+/// walk, so replay, load and rebuild all inherit it.
 struct Live {
-    names: HashSet<&'static str>,
+    spoken: HashMap<&'static str, Instance>,
+}
+
+/// One name's document-side lifecycle: in force, and the frame of the last thing the
+/// document said about it.
+#[derive(Clone)]
+struct Instance {
+    /// Is the name in force? An unmount sets this false, a mount true.
+    live: bool,
+    /// The frame of this document's most recent lifecycle event for the name.
+    at_frame: u64,
 }
 
 impl Live {
-    /// The names this engine holds live **right now**: applied, or queued to apply.
-    fn of(engine: &Engine) -> Self {
-        Live {
-            names: engine
-                .disposers
-                .keys()
-                .chain(engine.scheduled.iter())
-                .copied()
-                .collect(),
-        }
+    /// The **document's** answer for `name`, or `None` when the document has not
+    /// spoken for it — in which case the name is the engine's business, not the
+    /// document's (see [`Engine::holds_instance_of`]).
+    fn in_force(&self, name: &str) -> Option<bool> {
+        self.spoken.get(name).map(|instance| instance.live)
     }
 
-    /// Whether one instance of `name` is already in force.
-    fn holds(&self, name: &str) -> bool {
-        self.names.contains(name)
-    }
-
-    /// A mount takes the name. The caller has already refused a second instance
-    /// ([`Engine::validate_mount`]), so this never has to answer.
-    fn mount(&mut self, name: &'static str) {
-        self.names.insert(name);
+    /// A mount takes the name at `at_frame`. The caller has already refused a second
+    /// instance ([`Engine::validate_mount`]), so the only thing left to answer is
+    /// whether the document is going *backwards* in time.
+    fn mount(&mut self, name: &'static str, at_frame: u64) -> Result<(), String> {
+        self.record(name, at_frame, true)
     }
 
     /// An unmount gives the name back — the document says the plugin goes away, so a
     /// later mount of the same name in the same document is a **re-mount**, not a
     /// second instance. This mirrors `apply_unmount`, which is where the live path
-    /// releases the name.
-    fn unmount(&mut self, name: &str) {
-        self.names.remove(name);
+    /// releases the name. It records even for a name the document never mounted: the
+    /// *target* may hold that name, and the document is the one saying it goes away.
+    fn unmount(&mut self, name: &'static str, at_frame: u64) -> Result<(), String> {
+        self.record(name, at_frame, false)
+    }
+
+    /// The one write path: refuse a document that goes back in time, else record.
+    fn record(&mut self, name: &'static str, at_frame: u64, live: bool) -> Result<(), String> {
+        if let Some(prev) = self.spoken.get(name)
+            && prev.at_frame > at_frame
+        {
+            return Err(Engine::frame_inverted(name, prev.at_frame, at_frame));
+        }
+        self.spoken.insert(name, Instance { live, at_frame });
+        Ok(())
     }
 }
 
@@ -209,7 +239,7 @@ pub struct Engine {
     scheduled: HashSet<&'static str>,
     /// The **document walks** in force, innermost last (see [`Self::enter_walk`]).
     /// Non-empty exactly while a caller re-issues a recorded document — a session
-    /// log, the host's command history — onto this engine.
+    /// log, a host's command history, a session script — onto this engine.
     walks: Vec<Live>,
     /// registered plugin-message handlers, keyed by op (closed-core dispatch).
     op_handlers: HashMap<&'static str, OpHandler>,
@@ -266,26 +296,56 @@ impl Engine {
     }
 
     /// Enter a **document walk**: from here until [`Self::leave_walk`], the
-    /// one-instance-per-name rule is answered by the walk's own `Live` set rather
-    /// than by the engine's scheduling state.
+    /// one-instance-per-name rule for every name **the document has spoken for** is
+    /// answered by the document's own lifecycle rather than by the engine's
+    /// scheduling state.
     ///
     /// A walk is for re-issuing a *recorded* document onto this engine — a session
-    /// log ([`Self::replay_from`]) or a host's command history. Nothing renders
-    /// during one, so the apply queue never drains, and the engine's own view would
-    /// refuse a `mount … unmount … mount` sequence the live path accepts (it releases
-    /// the name when the unmount *applies*). The document is the authority while it
-    /// is being applied.
+    /// log ([`Self::replay_from`]), a host's command history, a session script. Nothing
+    /// renders during one, so the apply queue never drains, and the engine's own view
+    /// would refuse a `mount … unmount … mount` sequence the live path accepts (it
+    /// releases the name when the unmount *applies*). The document is the authority
+    /// over the names it speaks for, exactly as the engine is between renders.
     ///
-    /// Walks stack: the new one starts from the walk it is nested in, or from what
-    /// the engine holds, so no name in force is ever forgotten. **Pair every
-    /// `enter_walk` with a `leave_walk`** — a `?` between them would leave the
-    /// engine answering from a half-applied document.
+    /// **What a walk guarantees** (all of it enforced, all of it here):
+    ///
+    /// - every mount, unmount and re-mount of a name the document issued is
+    ///   accounted for, so `mount … unmount … mount` is a re-mount;
+    /// - a document that mounts a name the engine already holds, without unmounting
+    ///   it first, is refused — the walk does not speak for a name the document never
+    ///   mentioned, so the engine's own state answers and a second instance cannot be
+    ///   applied over a live one;
+    /// - a document whose lifecycle frames for one name are not in order is refused
+    ///   with [`Self::frame_inverted`], so a walk can never leave an orphaned node or
+    ///   a dropped disposer behind.
+    ///
+    /// **What a caller must guarantee.** A walk is not a sandbox: the engine cannot
+    /// tell *which* caller issued a command inside one, so entering a walk is the
+    /// assertion that **everything issued until [`Self::leave_walk`] is one document**.
+    /// Two ways to break that, both the caller's to avoid:
+    ///
+    /// - issuing state of your own while the walk is in force. It joins the
+    ///   document's lifecycle; if it contradicts what the document says, the frame
+    ///   rule refuses the whole walk — which is the safe outcome, but the message
+    ///   names a document the caller did not write.
+    /// - **placing the clock backwards** ([`Self::seek`]) inside a walk, so a later
+    ///   event is stamped before an earlier one. The walk refuses the document that
+    ///   results; the caller that caused it is the one to hear about it.
+    ///
+    /// Walks stack, and a nested walk starts from the document state it is nested in.
+    /// **Pair every `enter_walk` with a `leave_walk`**, and put no `?` between them: a
+    /// path that returns early leaves the engine answering from a half-applied
+    /// document. (There is no guard type for this — a guard would have to borrow the
+    /// engine, which is the very thing being mutated inside the walk — so it is a
+    /// discipline, and every in-tree caller scopes it deliberately.)
     pub fn enter_walk(&mut self) {
         let live = match self.walks.last() {
             Some(outer) => Live {
-                names: outer.names.clone(),
+                spoken: outer.spoken.clone(),
             },
-            None => Live::of(self),
+            None => Live {
+                spoken: HashMap::new(),
+            },
         };
         self.walks.push(live);
     }
@@ -303,11 +363,13 @@ impl Engine {
         params: &[(&'static str, f32)],
     ) -> Result<(), String> {
         self.validate_mount(name, params)?;
-        if let Some(live) = self.walks.last_mut() {
-            // The document takes the name; its own unmount gives it back.
-            live.mount(name);
-        }
         let at_frame = self.clock.frame();
+        if let Some(live) = self.walks.last_mut() {
+            // The document takes the name at the frame the scheduler will apply it
+            // at; its own unmount gives it back. The frame order is checked here, so
+            // a document that goes back in time is refused rather than walked.
+            live.mount(name, at_frame)?;
+        }
         self.log.push(Event::Mount {
             plugin: name,
             params: params.to_vec(),
@@ -339,14 +401,19 @@ impl Engine {
     }
 
     /// "Is one instance of `name` already in force?" — the one-instance-per-name
-    /// question, asked of whoever owns the lifecycle: a **document walk** answers
-    /// from the document ([`Self::enter_walk`]), the live path from the engine's
-    /// scheduling state (applied, or queued to apply).
+    /// question, asked of whoever owns the lifecycle. In a **document walk** the
+    /// document owns the names it has spoken for (an unmount releases the name, so a
+    /// later mount is a re-mount); for every other name the live path's own view
+    /// answers — applied, or queued to apply. A walk never answers for a name the
+    /// document has not mentioned, which is what keeps a walk from *losing* the
+    /// target's state as well as from contradicting it.
     fn holds_instance_of(&self, name: &str) -> bool {
-        match self.walks.last() {
-            Some(live) => live.holds(name),
-            None => self.disposers.contains_key(name) || self.scheduled.contains(name),
+        if let Some(live) = self.walks.last()
+            && let Some(in_force) = live.in_force(name)
+        {
+            return in_force;
         }
+        self.disposers.contains_key(name) || self.scheduled.contains(name)
     }
 
     /// The lifecycle-free half of [`Self::validate_mount`]. [`Self::replay_from`]
@@ -386,6 +453,24 @@ impl Engine {
     /// engine, from a document walk and from a replay alike.
     fn already_mounted(name: &str) -> String {
         format!("plugin '{name}' is already mounted (one instance per name in spike A.5)")
+    }
+
+    /// The refusal a **frame-inverted document** speaks in, from every walk alike.
+    ///
+    /// The apply queue is frame-ordered, the log is not: `Mount p@a, Unmount p@b,
+    /// Mount p@c` with `c ≤ b` or `b < a` delivers the second mount *before* the
+    /// unmount that frees the name, so `apply_mount` runs twice for one name — the
+    /// first instance's node stays in the graph and its disposer is dropped with its
+    /// entry. The walk is the one place that sees the whole document, so it refuses
+    /// here rather than repairing the log behind the caller's back: a loud `Err`
+    /// names the document, where a self-healing apply would silently render
+    /// something else than the log says.
+    fn frame_inverted(name: &str, previous: u64, next: u64) -> String {
+        format!(
+            "plugin '{name}' goes back to frame {next} after frame {previous} — a document's \
+             mounts and unmounts must be in frame order (the scheduler applies in frame order, so \
+             an inverted triple mounts '{name}' twice and orphans the first instance)"
+        )
     }
 
     /// The refusal a **replay onto a non-fresh engine** speaks in. `replay_from`'s
@@ -566,14 +651,21 @@ impl Engine {
 
     /// Schedule an unmount at an absolute frame — the scheduling queue driving
     /// lifecycle, sample-accurately.
-    pub fn schedule_unmount(&mut self, name: &'static str, at_frame: u64) {
+    ///
+    /// Fallible for one reason: in a **document walk** the unmount is half of a
+    /// lifecycle, and a document whose unmount lands *before* the mount it ends
+    /// cannot be read back (it would apply two instances — see
+    /// [`Self::frame_inverted`]). Off the walk it cannot fail: the live path has no
+    /// document to contradict, which is why `schedule_unmount` was infallible until
+    /// the walk needed it to speak.
+    pub fn schedule_unmount(&mut self, name: &'static str, at_frame: u64) -> Result<(), String> {
         if let Some(live) = self.walks.last_mut() {
             // In a **document walk** the name is free from here: the document says
             // the plugin goes away, so a later mount in the same document is a
             // re-mount. On the live path the release still happens at apply
             // (`apply_unmount`), which is why the same-tick `mount → unmount →
             // mount` window stays refused there.
-            live.unmount(name);
+            live.unmount(name, at_frame)?;
         }
         self.log.push(Event::ScheduleUnmount {
             plugin: name,
@@ -581,6 +673,7 @@ impl Engine {
         });
         self.scheduler
             .schedule(at_frame, SchedEvent::Unmount { plugin: name });
+        Ok(())
     }
 
     /// Unmount at the current frame. Fail-loud: an unknown plugin is refused
@@ -591,8 +684,7 @@ impl Engine {
             return Err(format!("plugin '{name}' is neither scheduled nor mounted"));
         }
         let at_frame = self.clock.frame();
-        self.schedule_unmount(name, at_frame);
-        Ok(())
+        self.schedule_unmount(name, at_frame)
     }
 
     /// The ports a plugin offers **now**, in preference order: the applied instance's
@@ -834,12 +926,19 @@ impl Engine {
     /// and drop its disposer, leaving its node in the graph forever.
     ///
     /// The one-instance-per-name rule itself is a fact about the **log's** lifecycle,
-    /// so it is tracked here in a `Live` set rather than read off `self.scheduled`:
+    /// so it is tracked here as a document walk rather than read off `self.scheduled`:
     /// a replay applies nothing (nothing renders yet), so a name whose unmount the
     /// log schedules stays in `scheduled` for the whole walk — and the
     /// `mount … unmount … mount` shape the live engine produces (it releases the
     /// name when the unmount *applies*) would be refused as a second instance. The
     /// engine writes such logs; it must be able to read them.
+    ///
+    /// The walk also **refuses a frame-inverted log**
+    /// ([`Self::frame_inverted`]): a log whose mount/unmount frames for one name are
+    /// not in order would apply that name twice and orphan an instance, so it is a
+    /// loud `Err` naming the frames rather than a silent leak. A refused replay
+    /// leaves the target with the events it had already scheduled and nothing
+    /// applied — the contract is a fresh engine, which the caller then discards.
     pub fn replay_from(&mut self, log: &SessionLog) -> Result<(), String> {
         // The fresh-engine precondition, spoken by the engine rather than assumed: an
         // applied plugin *or* a queued one (nothing has rendered, so both are
@@ -873,6 +972,12 @@ impl Engine {
                         return Err(Self::already_mounted(plugin));
                     }
                     self.validate_mount_declaration(plugin, params)?;
+                    // Before anything is scheduled or logged: the frame the
+                    // scheduler will apply this mount at, checked against the
+                    // document's own order, so a refused event leaves no trace.
+                    if let Some(live) = self.walks.last_mut() {
+                        live.mount(plugin, *at_frame)?;
+                    }
                     self.scheduler.schedule(
                         *at_frame,
                         SchedEvent::Mount {
@@ -887,16 +992,13 @@ impl Engine {
                     // `scheduled_params`), not against the nominal catalog.
                     self.scheduled.insert(plugin);
                     self.scheduled_params.insert(plugin, params.clone());
-                    if let Some(live) = self.walks.last_mut() {
-                        live.mount(plugin);
-                    }
                 }
                 Event::ScheduleUnmount { plugin, at_frame } => {
+                    if let Some(live) = self.walks.last_mut() {
+                        live.unmount(plugin, *at_frame)?;
+                    }
                     self.scheduler
                         .schedule(*at_frame, SchedEvent::Unmount { plugin });
-                    if let Some(live) = self.walks.last_mut() {
-                        live.unmount(plugin);
-                    }
                 }
                 Event::Patch {
                     from_plugin,
@@ -1149,6 +1251,19 @@ impl Engine {
     /// replay would have ([`Clock::seek_to`] explains the contract); a node whose reads
     /// are a pure function of the block frame needs nothing. The host's
     /// `SEEK_WARMUP_FRAMES` is that run-in, and its tests prove the equality.
+    ///
+    /// **A footgun, stated because it is a footgun:** moving the clock *backwards*
+    /// across a scheduled lifecycle event lets a later event be stamped before an
+    /// earlier one — `mount p; render; schedule_unmount p @f1; render; seek(0);
+    /// mount p` writes `Mount p@0, Unmount p@f1, Mount p@0`, and the scheduler (which
+    /// is frame-ordered) then applies two `Mount`s for one name and orphans the first
+    /// instance. A document walk **refuses** such a log when it is read back
+    /// ([`Self::frame_inverted`]) — loudly, which is the right outcome, but the caller
+    /// that placed the clock backwards is the one to hear about it. Every in-tree
+    /// caller places the clock forward on a session whose queue it is about to
+    /// rebuild; a caller that seeks an already-running engine backwards owns the
+    /// lifecycle it breaks. (`Clock` is a public field, so this is a stated obligation
+    /// rather than an enforced one — there is nothing to enforce it *with*.)
     pub fn seek(&mut self, frame: u64) {
         self.clock.seek_to(frame);
     }

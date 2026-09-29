@@ -190,7 +190,8 @@ fn patch_type_mismatch_refused() {
 fn patching_is_logged_and_replayable() {
     let mut e1 = engine();
     mount_chain(&mut e1);
-    e1.schedule_unmount("euclidean", 1_200_000);
+    e1.schedule_unmount("euclidean", 1_200_000)
+        .expect("scheduled unmount");
     e1.set_tempo(96.0, 4).unwrap();
     let a = e1.render(2 * 48_000);
     let log = e1.log.clone();
@@ -214,7 +215,8 @@ fn replay_is_exact_for_mid_session_tempo_change() {
     mount_chain(&mut e1);
     let first = l(&e1.render(2 * 48_000));
     e1.set_tempo(240.0, 4).unwrap();
-    e1.schedule_unmount("euclidean", 3 * 48_000);
+    e1.schedule_unmount("euclidean", 3 * 48_000)
+        .expect("scheduled unmount");
     let second = l(&e1.render(2 * 48_000));
     let log = e1.log.clone();
 
@@ -297,9 +299,10 @@ fn unmount_is_sample_accurate() {
     // Unmount the whole chain: stopping the *generator* would leave the tone's
     // running blip tail to ring out (the audio teardown protocol — ramp /
     // flush — is deferred; Spike B). Removing the chain is exact.
-    e.schedule_unmount("euclidean", at);
-    e.schedule_unmount("scale", at);
-    e.schedule_unmount("tone", at);
+    e.schedule_unmount("euclidean", at)
+        .expect("scheduled unmount");
+    e.schedule_unmount("scale", at).expect("scheduled unmount");
+    e.schedule_unmount("tone", at).expect("scheduled unmount");
     let out = l(&e.render((at + 64) as usize));
 
     assert!(
@@ -322,9 +325,10 @@ fn unmount_removes_contribution() {
     let mut e = engine();
     mount_chain(&mut e);
     let bar = 2 * 48_000;
-    e.schedule_unmount("euclidean", bar);
-    e.schedule_unmount("scale", bar);
-    e.schedule_unmount("tone", bar);
+    e.schedule_unmount("euclidean", bar)
+        .expect("scheduled unmount");
+    e.schedule_unmount("scale", bar).expect("scheduled unmount");
+    e.schedule_unmount("tone", bar).expect("scheduled unmount");
     let out = l(&e.render(bar as usize + 4096));
     assert!(out[..bar as usize].iter().any(|s| *s != 0.0));
     assert!(out[bar as usize..].iter().all(|s| *s == 0.0));
@@ -451,6 +455,152 @@ fn replay_onto_an_engine_that_already_has_plugins_is_refused() {
     // And the fresh case still replays — the precondition is the only new refusal.
     let mut fresh = engine();
     fresh.replay_from(&log).expect("a fresh engine replays");
+}
+
+/// **A frame-inverted document is refused, not applied.** The walk tracked the
+/// lifecycle in *log* order while the apply queue drains in *frame* order, so a log
+/// reading `Mount p@0, Unmount p@96_000, Mount p@0` was admitted: at apply both mounts
+/// pop before the unmount, `apply_mount` runs twice for one name, and the first
+/// instance's node stays in the graph while its disposer is dropped unrun.
+///
+/// The engine itself writes that log whenever a caller places the clock back before
+/// a scheduled lifecycle frame (`Engine::seek`), so this is the real shape, not a
+/// hand-built one. The rule is refusal — a loud `Err` naming the plugin and the two
+/// frames — because the alternative (a self-healing apply that disposes the instance
+/// it finds) would render something the log does not say and hide the log-order
+/// error. No panic either way: a refusal is a `Result`, on every build.
+#[test]
+fn replay_refuses_a_log_whose_mounts_are_not_in_frame_order() {
+    let mut e = engine();
+    e.mount("tone", &[]).unwrap();
+    let _ = e.render(1); // the first instance applies
+    e.schedule_unmount("tone", 96_000)
+        .expect("scheduled unmount");
+    let _ = e.render(96_000); // …past 96_000, so the unmount is due
+    let _ = e.render(1); // an event on a block's end frame applies in the next call
+    e.seek(0); // …and the clock goes back *before* it
+    e.mount("tone", &[])
+        .expect("a re-mount, stamped at frame 0");
+    let log = e.log.clone();
+
+    // The log really is the inverted triple, so the refusal below is about the
+    // engine's rule and not about an accident in the fixture.
+    let frames: Vec<u64> = log
+        .events()
+        .iter()
+        .filter_map(|ev| match ev {
+            Event::Mount {
+                plugin: "tone",
+                at_frame,
+                ..
+            } => Some(*at_frame),
+            Event::ScheduleUnmount {
+                plugin: "tone",
+                at_frame,
+            } => Some(*at_frame),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        frames,
+        vec![0, 96_000, 0],
+        "the live path wrote Mount@0, Unmount@96_000, Mount@0"
+    );
+
+    let mut fresh = engine();
+    let err = fresh
+        .replay_from(&log)
+        .expect_err("a frame-inverted document must be refused");
+    assert!(
+        err.contains("'tone'") && err.contains("frame order"),
+        "the refusal names the plugin and the rule: {err}"
+    );
+    // The refused event left no trace: the two events the replay had already
+    // accepted are all that is scheduled, nothing was applied, and the engine
+    // renders its own silence rather than an orphaned instance.
+    assert_eq!(
+        fresh.log.events().len(),
+        2,
+        "a refused event is never logged: {:?}",
+        fresh.log.events()
+    );
+    assert!(
+        fresh.graph.nodes().is_empty(),
+        "nothing was applied: {} node(s)",
+        fresh.graph.nodes().len()
+    );
+    assert!(
+        fresh.render(4_096).iter().all(|s| *s == 0.0),
+        "the refused replay left the engine rendering its own (empty) session"
+    );
+
+    // The **frame-ordered** triple is still accepted — the rule is order, not a ban
+    // on re-mounts. `replay_accepts_a_log_that_re_mounts_a_plugin` is the audio
+    // proof; this is the boundary.
+    let mut ordered = engine();
+    ordered.mount("tone", &[]).unwrap();
+    ordered
+        .schedule_unmount("tone", 48_000)
+        .expect("scheduled unmount");
+    let _ = ordered.render(48_001); // the unmount is due…
+    // …and with no mixer mounted the tone owns the bus, so its unmount is a width
+    // change and parks to the next control-side flush. The name is released when
+    // the unmount *applies*, so the flush is what frees it.
+    ordered.flush_scheduled();
+    ordered
+        .mount("tone", &[])
+        .expect("a re-mount after the unmount's frame");
+    let mut target = engine();
+    target
+        .replay_from(&ordered.log.clone())
+        .expect("a frame-ordered re-mount replays");
+    let _ = target.render(4_096);
+    assert_eq!(
+        target.graph.nodes().len(),
+        1,
+        "one instance, one node — the ordered triple is a re-mount, not a second mount"
+    );
+}
+
+/// **A walk speaks only for the names the document spoke for.** The doc claimed a
+/// walk "never loses the target's own state" while seeding itself from a snapshot
+/// taken at entry — a snapshot that goes stale the moment the target's own state
+/// moves, so the property was neither true nor checkable. The walk is now a *view of
+/// the document*: for a name it has not mentioned, the target's own state answers.
+///
+/// That half is what keeps a walk from overwriting a live instance, and it is pinned
+/// here so the doc cannot rot. The other half — a walk may not mount onto a target
+/// from outside the document — is a caller obligation (the engine has no way to see
+/// it), and `Engine::seek`'s doc says so.
+#[test]
+fn a_walk_answers_for_the_documents_names_only() {
+    let mut target = engine();
+    mount_chain(&mut target);
+    let _ = target.render(48_000); // the chain is applied
+
+    target.enter_walk();
+    // A document that mounts a name the target holds is refused: the walk does not
+    // speak for `tone`, so the target's applied instance does.
+    let err = target
+        .mount("tone", &[])
+        .expect_err("a walk must not mount over an instance the target holds");
+    assert!(err.contains("already mounted"), "{err}");
+
+    // A document that unmounts it *first* is a replacement, not a second instance —
+    // the frame rule puts the teardown before the re-mount (both at the current
+    // frame here, and equal frames apply in the order they were scheduled).
+    target.unmount("tone").expect("the document unmounts it");
+    target
+        .mount("tone", &[])
+        .expect("a replacement is a re-mount, not a second instance");
+    target.leave_walk();
+
+    // Leaving the walk hands the question back to the engine: the name the document
+    // left mounted is now the engine's own, so a live mount is refused again.
+    let err = target
+        .mount("tone", &[])
+        .expect_err("off the walk the engine answers for itself");
+    assert!(err.contains("already mounted"), "{err}");
 }
 
 /// Spatial composability, static half: a consumer plugin declares `rhythm`,
@@ -946,7 +1096,8 @@ fn render_path_does_not_allocate() {
         &[],
     );
     e.mount("clock_out", &[]).unwrap();
-    e.schedule_unmount("euclidean", 100_000);
+    e.schedule_unmount("euclidean", 100_000)
+        .expect("scheduled unmount");
     // Prime: applying the mounts/patches allocates on the control side
     // (factories, boxes, service table). The measured region must be free.
     let _prime = e.render(512);
