@@ -67,6 +67,10 @@ jitter figure is asserted.
   export clone sends nothing; a session with no sink mounts, renders and replays byte-identically; the
   ticks land at the tempo map's frames with the transport mapped `Start`/`Continue`/`Stop`; and the
   overflow counter reaches the snapshot.
+- The shell spikes are separate workspaces with their **own committed `Cargo.lock`s**, so a new
+  transitive dependency has to be added to each as well. CI caught precisely that — `--locked`
+  refusing to update them — while the root workspace passed, which is the class of breakage a
+  root-only test run cannot see and the reason those jobs exist.
 - **Nothing here has touched a real MIDI device.** The `#[ignore]`d
   `midi_out_real_port_sends_a_few_ticks` is the first thing to run when gear is available, and it is
   the only evidence that would make the wire conversion and the writer thread more than compiled code.
