@@ -607,6 +607,10 @@ impl App {
             can_undo: true,
             ..Snapshot::default()
         };
+        // The host publishes one meter per mounted mixer channel, so the snapshot's
+        // channel vector is as long as the mount (empty before a mixer exists) — the
+        // fixture sizes it before indexing, the way a live mount would.
+        snap.channels = vec![0.0; 4];
         snap.channels[0] = 0.88;
         snap.channels[1] = 0.12;
         snap.channels[3] = 0.94;

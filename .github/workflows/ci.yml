@@ -74,7 +74,7 @@ jobs:
           - spike: tui-shell
             apt: pkg-config libasound2-dev
           - spike: iced-shell
-            apt: pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxkbcommon-x11-dev
+            apt: pkg-config libasound2-dev libxkbcommon-dev libwayland-dev libx11-dev libxkbcommon-x11-dev
     steps:
       - uses: actions/checkout@v4
       - name: system deps
