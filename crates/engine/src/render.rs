@@ -17,7 +17,13 @@
 //!   reaches the render stack is parked for the control side (`flush_scheduled`
 //!   drains it), never discarded; the live run and a replay of the same log
 //!   therefore cannot diverge on skipped work (see the control→render handoff
-//!   decision note, 2026-08-27).
+//!   decision note, 2026-08-27);
+//! - **a failed apply changes nothing, and is reported in every build** — a
+//!   plugin's `apply` is fallible and the one step [`Engine::validate_mount`]
+//!   cannot dry-run, so [`Engine::apply_mount`] is a transaction: on `Err` the
+//!   engine's own bookkeeping is never written, the graph is put back, and the
+//!   refusal is **recorded** ([`Engine::apply_faults`], bounded) rather than
+//!   asserted, so a host can see it and mark the session degraded.
 
 use std::collections::{HashMap, HashSet};
 
@@ -105,6 +111,37 @@ pub struct DrainOutcome {
 /// ring indefinitely, so the cap makes drain terminating (and hitting it is
 /// reported, not hidden).
 pub const MAX_DRAIN_FRAMES: usize = 48_000 * 60;
+
+/// The default bound on [`Engine::apply_faults`]: how many apply-time refusals
+/// the engine keeps before it counts the rest.
+///
+/// A bound rather than a silent cap, like [`MAX_DRAIN_FRAMES`] and
+/// [`DrainOutcome::capped`]: the refusals past the bound are *counted* in
+/// [`Engine::apply_faults_dropped`], so a session that refuses a thousand mounts
+/// shows a thousand refusals without holding a thousand strings. 64 is far more
+/// than a session should ever accumulate — one is already a fault — and small
+/// enough that keeping them costs nothing.
+pub const MAX_APPLY_FAULTS: usize = 64;
+
+/// A scheduled mount the engine could not apply: the log says this plugin mounts
+/// at this frame, and the plugin's `apply` refused.
+///
+/// **A fault, not a diagnostic.** Two things that ought to agree — the log and
+/// the plugin — do not, so the engine records it in *every* build (the previous
+/// report was a `debug_assert!`, which release compiles away) and the session is
+/// degraded. The log event is **not** withdrawn: the log is the document, so a
+/// refusal is reported beside it rather than erased from it, and a replay of the
+/// same log refuses at the same frame and records the same fault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyFault {
+    /// The plugin name the log asked to mount.
+    pub plugin: &'static str,
+    /// The frame the **log** stamped the mount with — not the frame the refusal
+    /// was noticed at, which a late flush or a warm-up seek can move.
+    pub at_frame: u64,
+    /// The plugin's own refusal, verbatim, so the message names what to change.
+    pub reason: String,
+}
 
 /// The slowest tempo [`Engine::set_tempo`] accepts: 1e-3 bpm, where a quarter
 /// note lasts 60 000 s — 16.7 hours. Nothing musical is that slow (a whole note
@@ -245,8 +282,20 @@ pub struct Engine {
     op_handlers: HashMap<&'static str, OpHandler>,
     /// Arrangement ops that reached the render stack (a host that rendered
     /// without flushing) — parked for the control side; `flush_scheduled`
-    /// applies them FIFO before the due queue. Nothing logged is dropped.
-    parked: Vec<SchedEvent>,
+    /// applies them FIFO before the due queue. Nothing logged is dropped. The
+    /// frame each one was scheduled at rides with it, because a parked mount
+    /// applies at the *next* flush and its fault must still name the frame the log
+    /// stamped, not the frame the flush happened on.
+    parked: Vec<(u64, SchedEvent)>,
+    /// Scheduled mounts a plugin's `apply` refused, oldest first (see
+    /// [`Self::apply_faults`]). Bounded by [`MAX_APPLY_FAULTS`]; the rest are
+    /// counted in `apply_faults_dropped`. Never cleared: a fault is a standing
+    /// fact about the session, not work to be done later (the opposite of
+    /// `parked`), and it is written from the apply path — the misuse path, which
+    /// is allowed to allocate.
+    apply_faults: Vec<ApplyFault>,
+    /// How many refusals the bound in [`MAX_APPLY_FAULTS`] could not hold.
+    apply_faults_dropped: usize,
 }
 
 impl Engine {
@@ -277,6 +326,8 @@ impl Engine {
             walks: Vec::new(),
             op_handlers: HashMap::new(),
             parked: Vec::new(),
+            apply_faults: Vec::new(),
+            apply_faults_dropped: 0,
         }
     }
 
@@ -486,6 +537,33 @@ impl Engine {
         )
     }
 
+    /// Apply a mount: build the instance, let it register, and **commit** — or,
+    /// on a refusal, leave the engine exactly as it was.
+    ///
+    /// `apply` is fallible and this is the one step [`Self::validate_mount`]
+    /// cannot dry-run (it calls `inject()`, never `apply`), so a mount that the
+    /// log accepted can still be refused here. The euclidean plugin's `apply` is
+    /// the first that can: its `steps` bound is re-checked at apply because its
+    /// fields are public and an instance can be hand-assembled without the
+    /// factory's door. When that happens the engine must not be left holding a
+    /// name it never mounted — `scheduled` kept, the name refused as a second
+    /// instance for the rest of the session, and `replay_from` refusing the log.
+    ///
+    /// So it is a **transaction**. Nothing the mount *adds* is written until the
+    /// apply has succeeded: the mounted surfaces are captured first (they are the
+    /// instance's answer to "what did you actually mount", which a refused
+    /// instance has no answer to), and the node, its disposer and those surfaces
+    /// are committed together below. On `Err` the engine keeps only what it had —
+    /// the reservation `mount` took is released, so the name reads as free again
+    /// rather than wedged for the rest of the session — and
+    /// [`Self::undo_a_refused_apply`] puts the **graph** back too, since an
+    /// `apply` that added a node and *then* refused would otherwise orphan it with
+    /// no disposer able to remove it (the euclidean's refusal precedes its
+    /// `add_node`, so this is the belt to that suspenders).
+    ///
+    /// A *successful* apply whose name is already mounted still overwrites the
+    /// first instance's `node_of`/`disposers` — a log that says so is refused by
+    /// the walk ([`Self::frame_inverted`]) before it can be applied.
     fn apply_mount(
         &mut self,
         name: &'static str,
@@ -497,12 +575,16 @@ impl Engine {
             .ok_or_else(|| format!("unknown plugin '{name}'"))?;
         let mut plugin = factory(params)?;
         let id = plugin.id();
-        // Capture the **mounted** surface before applying: it is the instance's answer
-        // to "what did you actually mount", and every later patch and parameter
-        // validation reads it in preference to the registered catalog.
-        self.mounted_ports.insert(name, plugin.mounted_ports());
-        self.mounted_params.insert(name, plugin.mounted_params());
-        let (node, disposer) = {
+        // Captured, **not** recorded: an instance that refuses has mounted nothing,
+        // so its surface must not answer a patch or a parameter change.
+        let mounted_ports = plugin.mounted_ports();
+        let mounted_params = plugin.mounted_params();
+        // The graph as it was, for the same reason. `NodeId`s come from a
+        // monotonic counter, so "what this apply added" is exactly "the ids at or
+        // above the watermark" — wherever `insert_before` put them.
+        let watermark = self.graph.next_id();
+        let bus = self.graph.out_node;
+        let applied = {
             let Engine {
                 ctx,
                 scheduler,
@@ -516,13 +598,58 @@ impl Engine {
                 graph,
                 clock,
             };
-            plugin.apply(&mut api)?
+            plugin.apply(&mut api)
         };
+        let (node, disposer) = match applied {
+            Ok(mounted) => mounted,
+            Err(refusal) => {
+                // The reservation goes back with the graph. This is the wedge: a
+                // name left in `scheduled` reads as mounted to every later
+                // `validate_mount`, so the session could never mount it again and
+                // `replay_from` refused the log that carries it.
+                self.scheduled.remove(name);
+                self.scheduled_params.remove(name);
+                self.undo_a_refused_apply(watermark, bus);
+                return Err(refusal);
+            }
+        };
+        // Commit. Every write the mount makes is below this line.
+        self.mounted_ports.insert(name, mounted_ports);
+        self.mounted_params.insert(name, mounted_params);
         self.scheduled.remove(name);
         self.scheduled_params.remove(name);
         self.node_of.insert(id, node);
         self.disposers.insert(id, disposer);
         Ok(())
+    }
+
+    /// Put the **graph** back the way a refused `apply` found it: every node the
+    /// failed apply added is removed, and the master-bus claim goes back to
+    /// whoever held it (`remove_node` only clears the claim, it does not hand it
+    /// on). The engine's own maps need no counterpart — `apply_mount` writes none
+    /// of them until the apply has succeeded.
+    ///
+    /// **Additions and the claim, not everything**: a plugin that *removed* a node,
+    /// or provided a context service, before it refused has already broken the
+    /// contract below, and neither is restorable from here — the graph would need
+    /// its whole node list rebuilt, and `Context` holds `Box<dyn Any>`. Both are
+    /// [`Plugin::apply`]'s half of the deal: **an `Err` means nothing changed**,
+    /// stated there the way [`OpHandler`] states its own.
+    fn undo_a_refused_apply(&mut self, watermark: u64, bus: Option<NodeId>) {
+        let added: Vec<NodeId> = self
+            .graph
+            .nodes()
+            .iter()
+            .map(|n| n.id)
+            .filter(|id| id.0 >= watermark)
+            .collect();
+        for id in added {
+            self.graph.remove_node(id);
+        }
+        self.graph.out_node = match bus {
+            Some(id) if self.graph.nodes().iter().any(|n| n.id == id) => Some(id),
+            _ => None,
+        };
     }
 
     /// Patch two plugins' ports at the current frame. Validated synchronously
@@ -721,13 +848,19 @@ impl Engine {
         self.params_table.get(name).copied().unwrap_or(&[]).to_vec()
     }
 
-    /// Apply an unmount: run the disposer (reversible effects). Idempotent.
+    /// Apply an unmount: run the disposer (reversible effects). Idempotent, and
+    /// **total**: the name leaves every lifecycle map whether or not a disposer
+    /// was found, so the maps describe what is mounted and never what was. A
+    /// disposer-less entry cannot be built by the apply path any more (a mount
+    /// that fails records neither `node_of` nor `disposers`), so the clears are
+    /// unconditional rather than a courtesy of the disposer being present.
     fn apply_unmount(&mut self, name: &'static str) {
         self.scheduled.remove(name);
+        self.scheduled_params.remove(name);
         self.mounted_ports.remove(name);
         self.mounted_params.remove(name);
+        self.node_of.remove(name);
         if let Some(disposer) = self.disposers.remove(name) {
-            self.node_of.remove(name);
             let Engine {
                 ctx,
                 scheduler,
@@ -1079,7 +1212,12 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_event(&mut self, event: SchedEvent) {
+    /// Apply one scheduled event. `at_frame` is the frame the **log** stamped the
+    /// event with, carried in from the call site rather than read off the clock:
+    /// the queue is frame-ordered, but an event can be delivered late (a warm-up
+    /// seek, a flush after the fact), and a fault report has to name the frame the
+    /// document says, not the frame the engine noticed.
+    fn apply_event(&mut self, event: SchedEvent, at_frame: u64) {
         match event {
             SchedEvent::Unmount { plugin } => self.apply_unmount(plugin),
             SchedEvent::Mount { plugin, params } => {
@@ -1088,16 +1226,23 @@ impl Engine {
                 // *no-op in release* (debug_assert! never evaluates its
                 // argument), so no scheduled mount was ever applied there and
                 // the engine rendered silence on every mounted path — a
-                // release-only bug. Now always applied. Like the sibling arms,
-                // an `apply` failure is a log-order error (the mount was
-                // validated against a registered plugin at schedule time) that
-                // is debug-asserted and skipped in release, where replay
-                // reproduces the same state. `apply` is the one step
-                // `validate_mount` can't dry-run (it calls `inject()`, not
-                // `apply`), so "a scheduled mount must apply" is enforced by
-                // tests, not the type system.
-                if let Err(e) = self.apply_mount(plugin, &params) {
-                    debug_assert!(false, "scheduled mount must apply (log was validated): {e}");
+                // release-only bug (the 2026-08-30 note).
+                //
+                // A refusal is **recorded, not asserted**: `apply` is fallible by
+                // design (the euclidean plugin's `apply` re-checks its `steps`
+                // bound, because its fields are public and an instance can be
+                // hand-assembled without the factory's door), so "the log and the
+                // plugin disagree" is a fault a user must be able to see — and a
+                // `debug_assert!` is invisible in release, the build that ships.
+                // `apply_mount` has already undone what the refused apply touched,
+                // so the session is not wedged: the name is free again and the
+                // next mount of it succeeds.
+                if let Err(reason) = self.apply_mount(plugin, &params) {
+                    self.record_apply_fault(ApplyFault {
+                        plugin,
+                        at_frame,
+                        reason,
+                    });
                 }
             }
             SchedEvent::Patch {
@@ -1170,6 +1315,51 @@ impl Engine {
     /// is the mixer — the bus only points at the mixer while the mixer is mounted.
     pub fn node_of(&self, plugin: &'static str) -> Option<NodeId> {
         self.node_of.get(plugin).copied()
+    }
+
+    /// Record a scheduled mount a plugin's `apply` refused. Bounded by
+    /// [`MAX_APPLY_FAULTS`]: past it the fault is **counted** rather than kept
+    /// ([`Self::apply_faults_dropped`]), the same "the bound is reported, not
+    /// hidden" discipline as [`DrainOutcome::capped`] and the euclidean's
+    /// `euclidean.drops`.
+    fn record_apply_fault(&mut self, fault: ApplyFault) {
+        if self.apply_faults.len() < MAX_APPLY_FAULTS {
+            self.apply_faults.push(fault);
+        } else {
+            self.apply_faults_dropped += 1;
+        }
+    }
+
+    /// Every apply the engine could not perform, oldest first — a mount the log
+    /// asked for and the plugin refused, with the frame the log stamped and the
+    /// plugin's own reason.
+    ///
+    /// **Never drained, and never cleared.** A fault is a standing fact about the
+    /// session — the audio is not what the log says — so a shell that polls this
+    /// cannot consume the evidence by looking at it (the opposite of
+    /// [`Self::flush_scheduled`], which drains `parked` because a parked op is work
+    /// still to be done). Bounded by [`MAX_APPLY_FAULTS`]; what did not fit is
+    /// [`Self::apply_faults_dropped`].
+    pub fn apply_faults(&self) -> &[ApplyFault] {
+        &self.apply_faults
+    }
+
+    /// How many refusals the bound in [`MAX_APPLY_FAULTS`] could not hold. Zero on
+    /// any healthy session; non-zero means the fault list is a *sample*, so a host
+    /// must say "N refused applies" rather than "these are all of them".
+    pub fn apply_faults_dropped(&self) -> usize {
+        self.apply_faults_dropped
+    }
+
+    /// Whether the session is **degraded**: something the log scheduled could not
+    /// be applied, so the audio is not what the document says. A shell shows this
+    /// rather than rendering a playhead over a session that is missing a plugin.
+    ///
+    /// Sticky for the life of the engine, like the fault list itself: a re-render
+    /// cannot undo a mount that never happened, and a poll that drained the flag
+    /// would let a shell clear it by looking.
+    pub fn is_degraded(&self) -> bool {
+        !self.apply_faults.is_empty() || self.apply_faults_dropped > 0
     }
 
     /// Plugin names providing an `Out` port of the given kind — the dropdown
@@ -1410,15 +1600,15 @@ impl Engine {
     /// stack (the reference host materializes scheduled mounts before wiring
     /// cords; kimi review finding 5: no discarded block).
     pub fn flush_scheduled(&mut self) {
-        for event in std::mem::take(&mut self.parked) {
-            self.apply_event(event);
+        for (at_frame, event) in std::mem::take(&mut self.parked) {
+            self.apply_event(event, at_frame);
         }
         while let Some(frame) = self.scheduler.peek_frame() {
             if frame > self.clock.frame() {
                 break;
             }
             let event = self.scheduler.pop().expect("peeked");
-            self.apply_event(event);
+            self.apply_event(event, frame);
         }
     }
 
@@ -1448,48 +1638,45 @@ impl Engine {
             if next == f1 {
                 break;
             }
-            loop {
-                let frame = self.scheduler.peek_frame();
-                match frame {
-                    Some(f) if f <= next => {
-                        let event = self.scheduler.pop().expect("peeked");
-                        if matches!(&event, SchedEvent::Arrangement { .. }) {
-                            // Arrangement ops apply on the CONTROL side
-                            // (flush_scheduled), never on the render stack: a
-                            // media handler reconciles readers (threads, file
-                            // I/O), which must not run on the audio thread.
-                            // A host that reaches one here failed to flush
-                            // before rendering — PARK the op (never drop it):
-                            // it stays pending for the next flush_scheduled,
-                            // so nothing logged is ever lost and live/replay
-                            // cannot diverge (previously this path dropped
-                            // the op in release while replay would still
-                            // apply it). The debug assert keeps the contract
-                            // violation loud in development.
-                            self.parked.push(event);
-                            debug_assert!(
-                                false,
-                                "an arrangement op reached the render stack; flush_scheduled before rendering"
-                            );
-                            continue;
-                        }
-                        if self.changes_master_width(&event) {
-                            // A master-*width* change (the mixer mounts/unmounts
-                            // and thus the bus owner's channel count changes)
-                            // cannot apply mid-call: the output buffer was sized
-                            // for the width at the call's start, so a mid-call
-                            // change would silently split the frame count
-                            // (replay would advance the clock wrong). PARK it —
-                            // it takes effect at the next flush (render-call
-                            // boundary), keeping the width constant per call and
-                            // render a pure function of (log, call boundaries).
-                            self.parked.push(event);
-                            continue;
-                        }
-                        self.apply_event(event);
-                    }
-                    _ => break,
+            while let Some(f) = self.scheduler.peek_frame() {
+                if f > next {
+                    break;
                 }
+                let event = self.scheduler.pop().expect("peeked");
+                if matches!(&event, SchedEvent::Arrangement { .. }) {
+                    // Arrangement ops apply on the CONTROL side
+                    // (flush_scheduled), never on the render stack: a
+                    // media handler reconciles readers (threads, file
+                    // I/O), which must not run on the audio thread.
+                    // A host that reaches one here failed to flush
+                    // before rendering — PARK the op (never drop it):
+                    // it stays pending for the next flush_scheduled,
+                    // so nothing logged is ever lost and live/replay
+                    // cannot diverge (previously this path dropped
+                    // the op in release while replay would still
+                    // apply it). The debug assert keeps the contract
+                    // violation loud in development.
+                    self.parked.push((f, event));
+                    debug_assert!(
+                        false,
+                        "an arrangement op reached the render stack; flush_scheduled before rendering"
+                    );
+                    continue;
+                }
+                if self.changes_master_width(&event) {
+                    // A master-*width* change (the mixer mounts/unmounts
+                    // and thus the bus owner's channel count changes)
+                    // cannot apply mid-call: the output buffer was sized
+                    // for the width at the call's start, so a mid-call
+                    // change would silently split the frame count
+                    // (replay would advance the clock wrong). PARK it —
+                    // it takes effect at the next flush (render-call
+                    // boundary), keeping the width constant per call and
+                    // render a pure function of (log, call boundaries).
+                    self.parked.push((f, event));
+                    continue;
+                }
+                self.apply_event(event, f);
             }
         }
         debug_assert_eq!(written, out.len());

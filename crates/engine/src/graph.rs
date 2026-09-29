@@ -1062,6 +1062,19 @@ impl Graph {
         id
     }
 
+    /// The id the next [`add_node`](Self::add_node) or
+    /// [`insert_before`](Self::insert_before) will hand out.
+    ///
+    /// Ids come from a monotonic counter and are never reused, so a caller that
+    /// snapshots this can afterwards name **exactly** the nodes a later
+    /// `add_node`/`insert_before` added — wherever in the graph they landed, which
+    /// a node *count* cannot do (`insert_before` shifts every later node up). That
+    /// is how the engine rolls the graph back when a plugin's `apply` registers a
+    /// node and then refuses (`Engine::apply_mount`).
+    pub fn next_id(&self) -> u64 {
+        self.next_id
+    }
+
     pub fn set_out(&mut self, id: NodeId) {
         self.out_node = Some(id);
     }

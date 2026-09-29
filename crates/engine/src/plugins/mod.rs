@@ -86,6 +86,22 @@ pub trait Plugin {
     fn params(&self) -> &'static [ParamDef] {
         &[]
     }
+    /// Register the instance's node and everything else the mount contributes,
+    /// returning the node and the disposer that undoes all of it.
+    ///
+    /// **Contract: an `Err` means nothing changed** — validate before you mutate.
+    /// The engine makes its apply path a transaction (the bookkeeping is written
+    /// only after this returns `Ok`, and the graph is put back on a refusal, see
+    /// `Engine::apply_mount`), but it cannot put back a **context service** a
+    /// failed `apply` provided: `Context` holds `Box<dyn Any>`, so a value a
+    /// `provide` replaced cannot be restored. This is the same atomicity
+    /// [`OpHandler`](crate::render::OpHandler) carries, and for the same reason:
+    /// a handler that half-applied would leave state no reader could reconcile.
+    ///
+    /// `apply` runs on the render stack, so it must not panic either — the
+    /// euclidean plugin's `steps` bound is re-checked here for exactly that reason
+    /// (its fields are public, so an instance can be hand-assembled without the
+    /// factory's door).
     fn apply(&mut self, api: &mut PluginApi) -> Result<(NodeId, Disposer), String>;
 }
 
