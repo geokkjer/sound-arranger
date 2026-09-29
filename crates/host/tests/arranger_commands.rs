@@ -584,6 +584,80 @@ fn text_format_arrange_ops_parse() {
     assert!(host::parse_script("host v1\narrange loop_region t0 c0 4294967296\n").is_err());
 }
 
+/// **A fade pair whose sum overflows `u64` is refused, from the wire in.** The
+/// text format takes both fade operands as raw `u64` with no bound and no
+/// `frame_operand` to snap, so `arrange set_clip_fade t0 c0 18446744073709551615
+/// 1` parses and reaches the value model. `u64::MAX + 1` wraps to 0, which used
+/// to pass the length check — a release build logged the op and rendered the clip
+/// at gain 0 for every sample (silent while the log claimed otherwise), and a
+/// debug build panicked inside the editor's timeline lock, poisoning every later
+/// `arrangement()`. The script must be refused loudly, and the session must
+/// still be readable afterwards.
+#[test]
+fn a_fade_pair_whose_sum_overflows_u64_is_refused_by_a_script() {
+    let pool = tmp_dir("fadeoverflow");
+    write_source(&pool, "s1", 8000);
+    let overflowing = format!(
+        "host v1\n\
+         mount mixer channels=2 @0\n\
+         pool {}\n\
+         arrange add_track t0 @0\n\
+         arrange add_clip t0 c0 s1 0 4000 0 0 0 1.0 @0\n\
+         arrange set_clip_fade t0 c0 18446744073709551615 1 @0\n",
+        pool.display()
+    );
+    // The parse itself succeeds: the wire schema carries the operands, and the
+    // refusal is the value model's (a parse error would blame the wrong layer).
+    let cmds = host::parse_script(&overflowing).expect("the operands are plain u64");
+    assert_eq!(cmds.len(), 5);
+    let err = host::run_script(&cmds).expect_err("a wrapped fade sum must be refused");
+    assert!(
+        err.contains("fades"),
+        "the refusal names the fade rule, got: {err}"
+    );
+
+    // `add_clip` carries the same pair (words 7/8) and is refused the same way.
+    let add_overflowing = format!(
+        "host v1\n\
+         mount mixer channels=2 @0\n\
+         pool {}\n\
+         arrange add_track t0 @0\n\
+         arrange add_clip t0 c0 s1 0 4000 0 18446744073709551615 1 1.0 @0\n",
+        pool.display()
+    );
+    let err = host::run_script(&host::parse_script(&add_overflowing).expect("parses"))
+        .expect_err("an add_clip whose fades overflow must be refused");
+    assert!(
+        err.contains("fades"),
+        "the refusal names the fade rule, got: {err}"
+    );
+
+    // A legal pair over the same clip is still accepted, so the guard is the
+    // fade rule and not a blanket refusal of large operands.
+    let legal = format!(
+        "host v1\n\
+         mount mixer channels=2 @0\n\
+         pool {}\n\
+         arrange add_track t0 @0\n\
+         arrange add_clip t0 c0 s1 0 4000 0 0 0 1.0 @0\n\
+         arrange set_clip_fade t0 c0 4000 0 @0\n",
+        pool.display()
+    );
+    let sess = host::run_script(&host::parse_script(&legal).expect("parses"))
+        .expect("a fade pair within the clip length applies");
+    assert_eq!(
+        sess.arrangement()
+            .expect("a legal fade must snapshot")
+            .tracks[0]
+            .clips[0]
+            .fade_in,
+        4000,
+        "the legal fade pair is in the value"
+    );
+
+    let _ = std::fs::remove_dir_all(&pool);
+}
+
 #[test]
 fn arrangement_bounces_audio_and_replays_byte_identically() {
     let pool = tmp_dir("audio");

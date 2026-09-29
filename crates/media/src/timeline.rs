@@ -346,7 +346,14 @@ pub fn validate_clip(c: &Clip) -> Result<(), String> {
         // the empty string without ambiguity.
         return Err(format!("clip '{}' has an unusable name '{name}'", c.id));
     }
-    if c.fade_in + c.fade_out > c.src_len {
+    // `checked_add`, not `+`: a pair whose sum overflows (`u64::MAX + 1` wraps to
+    // 0) would *pass* the length check and enter the value as a clip the renderer
+    // reads at gain 0 for every sample — a silent clip that claims to be audible.
+    // A sum that cannot be represented is refused like any other over-long fade.
+    if c.fade_in
+        .checked_add(c.fade_out)
+        .is_none_or(|s| s > c.src_len)
+    {
         return Err(format!("clip '{}' fades exceed the clip length", c.id));
     }
     Ok(())
@@ -756,7 +763,12 @@ impl Timeline {
                 let (ti, ci) = self
                     .locate(track, clip)
                     .ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
-                if fade_in + fade_out > self.tracks[ti].clips[ci].src_len {
+                // `checked_add` for the same reason as `validate_clip`: a wrapped sum
+                // would pass the length check and mute the clip instead of refusing it.
+                if fade_in
+                    .checked_add(*fade_out)
+                    .is_none_or(|s| s > self.tracks[ti].clips[ci].src_len)
+                {
                     return Err("fades exceed the clip length".into());
                 }
                 self.tracks[ti].clips[ci].fade_in = *fade_in;
@@ -1931,6 +1943,59 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    /// **A fade pair whose sum overflows `u64` is refused, not wrapped.** Both fade
+    /// operands are raw `u64` on the `host v1` text path (`arrange set_clip_fade t0
+    /// c0 18446744073709551615 1`), so the sum can leave the range: it wraps to 0,
+    /// `0 > src_len` is false, and the pair passes the length check. In a debug
+    /// build the `+` itself panics *under the editor's timeline lock*; in a release
+    /// build the clip is accepted and rendered at gain 0 for every sample — silent
+    /// while the log, panel and gain all claim it is audible.
+    #[test]
+    fn a_fade_pair_whose_sum_overflows_is_refused_not_wrapped() {
+        let t = two_tracks();
+        let fading = |fade_in, fade_out| ArrangeOp::SetClipFade {
+            track: "t0".into(),
+            clip: "c0".into(),
+            fade_in,
+            fade_out,
+        };
+        let t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 0, 100),
+            })
+            .unwrap();
+
+        // `AddClip` runs the same rule through `validate_clip`; a wrapped sum must
+        // not admit a clip the value model would refuse.
+        let mut c = clip("c0", 0, 100);
+        c.fade_in = u64::MAX;
+        c.fade_out = 1;
+        assert!(
+            t.apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: c
+            })
+            .is_err(),
+            "an overflowing fade pair must not enter the value through AddClip"
+        );
+
+        // `SetClipFade`: the overflowing pair is refused...
+        assert!(
+            t.apply(&fading(u64::MAX, 1)).is_err(),
+            "fade_in u64::MAX + fade_out 1 wraps to 0 — refuse, never admit"
+        );
+        // ...and so is the pair that only *reaches* the top of the range, which the
+        // wrapped comparison would also have waved through.
+        assert!(
+            t.apply(&fading(u64::MAX, 0)).is_err(),
+            "a fade pair above the clip length is refused however it was spelled"
+        );
+        // The boundary that is legal stays legal: `fade_in + fade_out == src_len`
+        // is exactly what the model allows.
+        assert!(t.apply(&fading(60, 40)).is_ok());
     }
 
     #[test]

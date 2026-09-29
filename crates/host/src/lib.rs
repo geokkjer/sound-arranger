@@ -4025,10 +4025,6 @@ pub fn summarize(session: &HostSession) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Only used by the debug-gated poisoning test; gate the import so release
-    // clippy (-D warnings) doesn't flag them as unused.
-    #[cfg(debug_assertions)]
-    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     /// No `Arrange` command has run, so there is no editor: `arrangement()` is
     /// `Ok(default)` — the legitimate "nothing built yet" case, never an error.
@@ -4044,20 +4040,21 @@ mod tests {
         );
     }
 
-    /// An editor whose `snapshot()` errors must surface as `Err` — never a
-    /// silent empty `Timeline` (the fail-loud rule this accessor exists for).
+    /// A fade pair whose **sum** overflows `u64` is refused, and refusing it does
+    /// not damage the session. Both fade operands reach the host as raw `u64`
+    /// (`arrange set_clip_fade t0 c0 18446744073709551615 1`), so the sum leaves
+    /// the range and wraps to 0 — which used to pass the length check: a debug
+    /// build panicked on the overflow *inside `ClipEditor::apply`'s lock*, and
+    /// the poisoned mutex made every later `arrangement()` an `Err`; a release
+    /// build admitted the op, logged it, and rendered the clip at gain 0 for
+    /// every sample.
     ///
-    /// The error is induced the way it realistically occurs: a panic while the
-    /// editor holds its timeline lock. `SetClipFade` with `fade_in + fade_out`
-    /// overflowing `u64` trips the debug overflow check inside the op apply,
-    /// *under the lock* — the poisoned mutex is exactly what `snapshot()` maps
-    /// to `Err`. The panic is contained with `catch_unwind` so the session (and
-    /// its now-poisoned editor) survives to be read. Gated on
-    /// `debug_assertions` because the mechanism is an overflow check (release
-    /// builds have no reachable poison path through the public API).
+    /// Both halves are pinned here: the op is an `Err` naming the fade rule (not
+    /// a panic, not a silent success), and the editor is still readable and
+    /// writable afterwards — the clip keeps its fades and a legal `SetClipFade`
+    /// still applies, which is what "refused, never corrupted" means.
     #[test]
-    #[cfg(debug_assertions)]
-    fn arrangement_propagates_an_errored_snapshot_instead_of_an_empty_value() {
+    fn an_overflowing_fade_pair_is_refused_and_the_editor_stays_usable() {
         let mut session = HostSession::new();
         session
             .ensure_editor()
@@ -4067,8 +4064,8 @@ mod tests {
             .as_mut()
             .expect("ensure_editor built the editor");
 
-        // A valid track + clip so the overflowing SetClipFade reaches the
-        // overflow add (an absent clip would refuse before it).
+        // A valid track + clip so the overflowing SetClipFade reaches the fade
+        // check (an absent clip would refuse before it).
         let mut engine = Engine::new(48_000, 120.0, 4);
         editor.register(&mut engine).expect("register op handlers");
         editor
@@ -4099,9 +4096,10 @@ mod tests {
             )
             .expect("add clip");
 
-        // Poison: the overflow panics while the editor holds the timeline lock.
-        let poisoned = catch_unwind(AssertUnwindSafe(|| {
-            let _ = editor.apply(
+        // u64::MAX + 1 wraps to 0, so `0 > src_len` is false — the pair must be
+        // refused by name, never admitted and never a panic under the lock.
+        let err = editor
+            .apply(
                 &mut engine,
                 &media::ArrangeOp::SetClipFade {
                     track: "t0".into(),
@@ -4109,22 +4107,36 @@ mod tests {
                     fade_in: u64::MAX,
                     fade_out: 1,
                 },
-            );
-        }))
-        .is_err();
+            )
+            .expect_err("a wrapped fade sum must be refused, not accepted");
         assert!(
-            poisoned,
-            "the overflowing SetClipFade must panic (overflow check) to poison the lock"
+            err.contains("fades"),
+            "the refusal names the fade rule, got: {err}"
         );
+        // A legal pair over the same clip still applies, so the editor is writable.
+        editor
+            .apply(
+                &mut engine,
+                &media::ArrangeOp::SetClipFade {
+                    track: "t0".into(),
+                    clip: "c0".into(),
+                    fade_in: 64,
+                    fade_out: 128,
+                },
+            )
+            .expect("a legal SetClipFade still applies after the refusal");
 
-        // The session survived the contained panic; its snapshot now errors and
-        // arrangement() must propagate that Err — never Ok(empty).
-        let err = session
+        // The refusal left the session readable: a poisoned timeline would make
+        // this `Err`, and the legal pair above is the only fade in the value.
+        let c = &session
             .arrangement()
-            .expect_err("a poisoned editor must Err, not return an empty Timeline");
-        assert!(
-            err.contains("poison"),
-            "the error is the snapshot poison, got: {err}"
+            .expect("a refused op must not poison the timeline")
+            .tracks[0]
+            .clips[0];
+        assert_eq!(
+            (c.fade_in, c.fade_out),
+            (64, 128),
+            "the value carries the legal pair, never the refused one"
         );
     }
 

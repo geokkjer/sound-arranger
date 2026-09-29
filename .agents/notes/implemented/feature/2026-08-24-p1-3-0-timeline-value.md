@@ -38,7 +38,9 @@ mutation on `Err`).
 Invariants enforced by every mutating op (fail-loud, never logged on refusal):
 `src_len > 0`, `src_len <= i64::MAX` (so signed trim arithmetic never wraps), `gain`
 finite, `loop_len != Some(0)`, `at_frame + src_len` not overflowing, and
-`fade_in + fade_out <= src_len`.
+`fade_in + fade_out <= src_len`. The two sums are **checked, not wrapped**: both fades are
+raw `u64` on the `host v1` text path, so a pair can leave the range — see the
+[fade-sum fix](../bug-fix/2026-09-29-fade-sums-are-checked-not-wrapped.md).
 
 Opaque loop phase handled explicitly: **`RazorSplit` and `Trim(Start)` refuse a looped
 clip** — the loop phase at the cut is not representable in this model, and "drop the
