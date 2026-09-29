@@ -352,6 +352,50 @@ fn remount_reproduces_identical_signal() {
     assert_eq!(first, again, "re-mount must reproduce the exact signal");
 }
 
+/// A log the engine itself writes replays. The `remount_reproduces_identical_signal`
+/// shape — `Mount p … ScheduleUnmount p … Mount p` — is what the live engine produces
+/// (the name is released when the unmount *applies*), so refusing it would mean the
+/// engine writes logs it cannot read back: the session fails to load at all, before
+/// any audio is rendered.
+///
+/// Regression: `replay_from` validated each `Mount` against the *engine's* scheduling
+/// state, which a replay never drains, so the second mount of a name was refused as a
+/// second instance. Rendered here in the same call boundaries as the live run, because
+/// the mixer unmount/remount changes the master width and such an event parks to a
+/// render-call boundary.
+#[test]
+fn replay_accepts_a_log_that_re_mounts_a_plugin() {
+    let mut e = engine();
+    mount_chain(&mut e);
+    let mut live = e.render(2 * 48_000);
+    e.unmount("euclidean").unwrap();
+    e.unmount("scale").unwrap();
+    e.unmount("tone").unwrap();
+    e.unmount("mixer").unwrap();
+    live.extend(e.render(2 * 48_000)); // the unmounted window: no bus owner, so mono
+    mount_chain(&mut e);
+    live.extend(e.render(2 * 48_000));
+    let log = e.log.clone();
+
+    let mut replayed = engine();
+    replayed
+        .replay_from(&log)
+        .expect("a log that re-mounts a plugin must replay");
+    let mut out = replayed.render(2 * 48_000);
+    out.extend(replayed.render(2 * 48_000));
+    out.extend(replayed.render(2 * 48_000));
+
+    assert_eq!(
+        out.len(),
+        live.len(),
+        "the replay must land the same widths"
+    );
+    assert_eq!(
+        out, live,
+        "the replayed remount must render byte-identically"
+    );
+}
+
 /// Spatial composability, static half: a consumer plugin declares `rhythm`,
 /// resolves it at mount (fail-loud when the provider is absent).
 #[test]

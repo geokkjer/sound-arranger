@@ -19,7 +19,7 @@
 //!   therefore cannot diverge on skipped work (see the control→render handoff
 //!   decision note, 2026-08-27).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::clock::{Clock, Scheduler};
 use crate::graph::{BLOCK, Graph, NodeId, Port, RenderBlock, RenderMode, SignalKind};
@@ -142,7 +142,7 @@ pub struct Engine {
     node_of: HashMap<&'static str, NodeId>,
     disposers: HashMap<&'static str, Disposer>,
     /// plugins whose mount is queued but not yet applied.
-    scheduled: std::collections::HashSet<&'static str>,
+    scheduled: HashSet<&'static str>,
     /// registered plugin-message handlers, keyed by op (closed-core dispatch).
     op_handlers: HashMap<&'static str, OpHandler>,
     /// Arrangement ops that reached the render stack (a host that rendered
@@ -175,7 +175,7 @@ impl Engine {
             scheduled_params: HashMap::new(),
             node_of: HashMap::new(),
             disposers: HashMap::new(),
-            scheduled: std::collections::HashSet::new(),
+            scheduled: HashSet::new(),
             op_handlers: HashMap::new(),
             parked: Vec::new(),
         }
@@ -230,10 +230,19 @@ impl Engine {
         params: &[(&'static str, f32)],
     ) -> Result<(), String> {
         if self.disposers.contains_key(name) || self.scheduled.contains(name) {
-            return Err(format!(
-                "plugin '{name}' is already mounted (one instance per name in spike A.5)"
-            ));
+            return Err(Self::already_mounted(name));
         }
+        self.validate_mount_declaration(name, params)
+    }
+
+    /// The lifecycle-free half of [`Self::validate_mount`]. [`Self::replay_from`]
+    /// calls this directly, because there "one instance per name" is a question
+    /// about the **log's** lifecycle, not about this engine's scheduling state.
+    fn validate_mount_declaration(
+        &self,
+        name: &'static str,
+        params: &[(&'static str, f32)],
+    ) -> Result<(), String> {
         // Mount params get a finiteness check (GLM-5.3 #9): `set_param` has one,
         // but a `mount ... NaN` would otherwise reach the plugin's apply silently.
         for (pname, v) in params {
@@ -257,6 +266,12 @@ impl Engine {
             "registered ports must match the plugin"
         );
         Ok(())
+    }
+
+    /// The refusal the "one instance per name" rule speaks in, from the live
+    /// engine and from a replay alike.
+    fn already_mounted(name: &str) -> String {
+        format!("plugin '{name}' is already mounted (one instance per name in spike A.5)")
     }
 
     fn apply_mount(
@@ -679,6 +694,14 @@ impl Engine {
     /// scheduled at its recorded frame and applied by the render loop — nothing
     /// is applied eagerly, so the timeline reproduces exactly.
     pub fn replay_from(&mut self, log: &SessionLog) -> Result<(), String> {
+        // The one-instance-per-name rule is a fact about the **log's** lifecycle,
+        // so it is tracked from the log here, not read off `self.scheduled`: a
+        // replay applies nothing (nothing renders yet), so a name whose unmount
+        // the log schedules stays in `scheduled` for the whole walk — and the
+        // `mount … unmount … mount` shape the live engine produces (it releases
+        // the name when the unmount *applies*) would be refused as a second
+        // instance. The engine writes such logs; it must be able to read them.
+        let mut live: HashSet<&str> = HashSet::new();
         for event in log.events() {
             match event {
                 Event::Mount {
@@ -686,7 +709,10 @@ impl Engine {
                     params,
                     at_frame,
                 } => {
-                    self.validate_mount(plugin, params)?;
+                    if live.contains(plugin) {
+                        return Err(Self::already_mounted(plugin));
+                    }
+                    self.validate_mount_declaration(plugin, params)?;
                     self.scheduler.schedule(
                         *at_frame,
                         SchedEvent::Mount {
@@ -695,10 +721,12 @@ impl Engine {
                         },
                     );
                     self.scheduled.insert(plugin);
+                    live.insert(plugin);
                 }
                 Event::ScheduleUnmount { plugin, at_frame } => {
                     self.scheduler
                         .schedule(*at_frame, SchedEvent::Unmount { plugin });
+                    live.remove(plugin);
                 }
                 Event::Patch {
                     from_plugin,
