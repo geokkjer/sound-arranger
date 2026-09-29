@@ -44,8 +44,16 @@ struct Header {
 }
 
 impl Header {
+    /// Bytes one sample occupies, from the bit depth the header declares. Never
+    /// inferred from an "is this float?" test: 24-bit PCM is *three* bytes a
+    /// sample, and describing a recovered 24-bit take at two truncated it to
+    /// two thirds while returning the frame count the file no longer held.
+    fn bytes_per_sample(&self) -> u16 {
+        self.bits / 8
+    }
+
     fn block_align(&self) -> u64 {
-        self.channels as u64 * (self.bits / 8) as u64
+        self.channels as u64 * self.bytes_per_sample() as u64
     }
 }
 
@@ -405,8 +413,11 @@ impl WavWriter {
         // Patch a *frame-aligned* size: a torn tail from a crash mid-flush is
         // truncated away so the recovered file is formally well-formed
         // (kimi review finding 7). Refuse a take that would overflow the u32
-        // size field rather than writing a corrupt small header (>4 GiB).
-        let data_bytes = data_bytes(frames, h.channels, h.bits == 32)?;
+        // size field rather than writing a corrupt small header (>4 GiB). The
+        // sample width is the header's own (`bits / 8`) — the same term
+        // `block_align` uses — so a 24-bit take is described at three bytes a
+        // sample and survives recovery whole.
+        let data_bytes = data_bytes(frames, h.channels, h.bytes_per_sample())?;
         let mut f = File::options()
             .write(true)
             .open(path)
@@ -485,7 +496,8 @@ fn patch_sizes(
     channels: u16,
     float: bool,
 ) -> Result<(), String> {
-    let data_bytes = data_bytes(frames, channels, float)?;
+    let bytes_per_sample: u16 = if float { 4 } else { 2 };
+    let data_bytes = data_bytes(frames, channels, bytes_per_sample)?;
     let data_bytes = data_bytes as u32;
     w.seek(SeekFrom::Start(RIFF_SIZE_POS))
         .map_err(|e| e.to_string())?;
@@ -498,15 +510,16 @@ fn patch_sizes(
     Ok(())
 }
 
-/// The RIFF data-chunk size, or `Err` if it would exceed the u32 field — a take
+/// The RIFF data-chunk size for a take of `frames` at a sample width of
+/// `bytes_per_sample` (a *width*, not a format flag — a 24-bit take is three
+/// bytes a sample), or `Err` if it would exceed the u32 field — a take
 /// that big must not silently truncate to a corrupt small header (the pool
 /// records long live jams; ~6.2 h mono float @48 kHz crosses 4 GiB). RF64 is the
 /// longer-term answer; for now a >4 GiB take fails loud.
-fn data_bytes(frames: u64, channels: u16, float: bool) -> Result<u64, String> {
-    let bytes_per_sample: u64 = if float { 4 } else { 2 };
+fn data_bytes(frames: u64, channels: u16, bytes_per_sample: u16) -> Result<u64, String> {
     let data_bytes = frames
         .checked_mul(channels as u64)
-        .and_then(|b| b.checked_mul(bytes_per_sample))
+        .and_then(|b| b.checked_mul(bytes_per_sample as u64))
         .ok_or("take length overflows the WAV size arithmetic")?;
     // The RIFF size field is `36 + data_bytes (+ 1 pad byte if data_bytes is odd,
     // since WAV chunks are word-aligned)` — both must fit u32. `-37` (not `-36`)
@@ -772,17 +785,18 @@ mod float_tests {
     /// truncate to a corrupt small header (>4 GiB — the pool records long jams).
     #[test]
     fn data_bytes_guard_refuses_oversized_take() {
-        // mono float: data_bytes = frames * 4. The RIFF field is `36 + data_bytes
-        // (+1 pad if odd)`; the guard is `> u32::MAX - 37` (conservative, covers
-        // the odd-data pad even though our writers always produce even data_bytes).
+        // mono float: data_bytes = frames * 4, i.e. 4 bytes per sample. The RIFF
+        // field is `36 + data_bytes (+1 pad if odd)`; the guard is
+        // `> u32::MAX - 37` (conservative, covers the odd-data pad even though our
+        // writers always produce even data_bytes).
         let ok_frames = (u32::MAX as u64 - 37) / 4; // data_bytes just under the bound
         assert!(
-            data_bytes(ok_frames, 1, true).is_ok(),
+            data_bytes(ok_frames, 1, 4).is_ok(),
             "just under the boundary is ok"
         );
         let err_frames = ok_frames + 1; // data_bytes just over
         assert!(
-            data_bytes(err_frames, 1, true).is_err(),
+            data_bytes(err_frames, 1, 4).is_err(),
             "just over the boundary must refuse"
         );
     }
@@ -854,6 +868,67 @@ mod float_tests {
         file.extend_from_slice(&0u32.to_le_bytes());
         std::fs::write(&bad, file).expect("write bad");
         assert!(WavReader::open(&bad).is_err(), "32-bit PCM is refused");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A crashed **24-bit** take recovers to its full length: `recover` describes
+    /// the file at the width the header declares (three bytes a sample), not at a
+    /// float-or-16-bit guess. The first draft passed `h.bits == 32` as a "float"
+    /// flag, so a 24-bit take was described at 2 bytes a sample — `set_len` kept
+    /// two thirds of the audio, `recover` still returned the *pre*-truncation
+    /// frame count (so `Pool::recover` reported frames the file no longer held),
+    /// and `is_finalized` then hid the loss forever.
+    #[test]
+    fn a_twenty_four_bit_take_recovers_to_its_full_length() {
+        let dir = std::env::temp_dir().join(format!("wav24-recover-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("t24-crash.wav");
+        let samples: [f32; 6] = [0.0, 0.5, -0.5, 1.0, -1.0, 0.25];
+        write_pcm24(&path, 48_000, 1, &samples);
+
+        // The header a crashed take is left with: the placeholder size `write_header`
+        // writes before any audio, so `is_finalized` is false and the pool's crash
+        // pass calls `recover`.
+        let mut bytes = std::fs::read(&path).expect("read the fixture");
+        bytes[40..44].copy_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&path, &bytes).expect("write the crashed fixture");
+        assert!(
+            !WavWriter::is_finalized(&path).unwrap(),
+            "the fixture must look like a crashed take"
+        );
+        let audio = bytes[44..].to_vec();
+        assert_eq!(audio.len(), samples.len() * 3, "3 bytes a 24-bit sample");
+
+        let n = samples.len() as u64;
+        assert_eq!(
+            WavWriter::recover(&path).unwrap(),
+            n,
+            "the recovered count is the file's own frames"
+        );
+
+        // The take survived whole: the audio bytes are untouched, and the header now
+        // declares them at their real width.
+        let bytes = std::fs::read(&path).expect("read the recovered file");
+        assert_eq!(&bytes[44..], &audio[..], "no audio byte was truncated away");
+        assert_eq!(
+            u32::from_le_bytes(bytes[40..44].try_into().unwrap()),
+            (n * 3) as u32,
+            "the data size is 3 bytes a sample, not 2"
+        );
+        assert!(WavWriter::is_finalized(&path).unwrap());
+
+        // …and the reader agrees with the report: every frame, at its own value.
+        let mut r = WavReader::open(&path).unwrap();
+        assert_eq!(r.total_frames(), n);
+        let mut back = vec![0.0f32; n as usize];
+        assert_eq!(r.read_into(&mut back), n as usize);
+        for (got, want) in back.iter().zip(samples) {
+            assert!(
+                (got - want).abs() < 1e-5,
+                "recovered 24-bit sample {got} != {want}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
