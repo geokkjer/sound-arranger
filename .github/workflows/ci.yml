@@ -1,0 +1,92 @@
+# CI: the authority the pre-commit hook cannot be.
+#
+# The hook is local config (`core.hooksPath` does not travel with a clone), so it
+# is a courtesy to the next reader; this is the gate. The commands are deliberately
+# the *same* ones the hook runs, plus the tests, so the two cannot drift into
+# disagreeing about what "green" means.
+#
+# Choices worth knowing:
+#   - Linux only. The audio path is ALSA/cpal, the studio is Linux, and the
+#     hardware tests are `--ignored` (no device in CI).
+#   - The toolchain comes from `rust-toolchain.toml` via the runner's rustup, so CI
+#     uses what a fresh clone uses rather than a version chosen here.
+#   - `--locked`, because every Cargo.lock is tracked: CI proves the lock resolves,
+#     not that some newer compatible version also would.
+#   - `crates/shell` is never built: it is retired and frozen out of the build
+#     (`crates/shell/RETIRED.md`). CI must not resurrect it.
+#   - The two shells are separate workspaces (`spikes/*/Cargo.toml`), so a root
+#     `cargo test` does not cover them. They get their own jobs, and their own
+#     system libraries.
+
+name: ci
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  # Manual runs, for when a branch needs re-checking without a new commit.
+  workflow_dispatch:
+
+concurrency:
+  # One run per ref: a new push supersedes the old run rather than queueing behind it.
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: rust (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: system deps (ALSA — cpal's backend)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: rustc --version && cargo --version
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  notes:
+    name: agent notes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # Structure, and that every cross-reference resolves.
+      - run: node scripts/verify-agent-notes.mjs
+
+  spikes:
+    name: spike ${{ matrix.spike }}
+    runs-on: ubuntu-latest
+    strategy:
+      # A failure in one shell spike is information about that spike, not a reason
+      # to hide the other one's result.
+      fail-fast: false
+      matrix:
+        include:
+          - spike: tui-shell
+            apt: pkg-config libasound2-dev
+          - spike: iced-shell
+            apt: pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxkbcommon-x11-dev
+    steps:
+      - uses: actions/checkout@v4
+      - name: system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.apt }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: spikes/${{ matrix.spike }}
+      - run: cargo fmt --all --check
+        working-directory: spikes/${{ matrix.spike }}
+      - run: cargo clippy --all-targets --locked -- -D warnings
+        working-directory: spikes/${{ matrix.spike }}
+      - run: cargo test --locked
+        working-directory: spikes/${{ matrix.spike }}
