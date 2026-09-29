@@ -5,6 +5,9 @@
 //! triggers into a scale and a tone generator (or MIDI out, or anything else).
 //! It also provides the `rhythm` service for consumers that want the pattern.
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+
 use super::{Disposer, DisposerCtx, Plugin, PluginApi};
 use crate::graph::{Direction, EuclideanGen, NodeId, NodeKind, Port, SignalKind};
 
@@ -15,6 +18,13 @@ pub const EUCLIDEAN_PORTS: &[Port] = &[Port {
     kind: SignalKind::Trigger,
     channels: 1,
 }];
+
+/// The context key the plugin **publishes** its drop counter under — the same
+/// context-service pattern the clock-out plugin uses for `clock_out.overflows`,
+/// so a host (and through it a shell's snapshot) can read the live count of
+/// grid steps a block could not evaluate. Provided on apply, withdrawn by the
+/// disposer. See [`EuclideanGen::drops`] for what the count means.
+pub const EUCLIDEAN_DROPS_KEY: &str = "euclidean.drops";
 
 /// Maximally-even pulse placement: a pulse at `floor(i * steps / pulses)`,
 /// rotated by `rotation` steps. A valid Euclidean rhythm generator (the
@@ -75,12 +85,17 @@ impl Plugin for Euclidean {
         // The 'clock' dependency is a core service: satisfied by the engine
         // (see `Engine::core_services`), read via the block's tempo map.
         let pattern = euclid(self.steps, self.pulses, self.rotation);
+        // The drop counter is published, not kept private: the host snapshot
+        // reads it back under the key (the clock-out plugin's `overflows`
+        // pattern), so a truncated step walk is visible rather than silent.
+        let drops = Arc::new(AtomicU64::new(0));
         let node = api.graph.add_node(
-            NodeKind::Opaque(Box::new(EuclideanGen {
-                steps: self.steps,
-                pulses_per_beat: self.pulses_per_beat.max(1),
-                pattern: pattern.clone(),
-            })),
+            NodeKind::Opaque(Box::new(EuclideanGen::with_drop_counter(
+                self.steps,
+                self.pulses_per_beat.max(1),
+                pattern.clone(),
+                drops.clone(),
+            ))),
             EUCLIDEAN_PORTS.to_vec(),
         );
         api.ctx.provide(
@@ -91,11 +106,13 @@ impl Plugin for Euclidean {
                 pattern,
             },
         );
+        api.ctx.provide(EUCLIDEAN_DROPS_KEY, drops);
         Ok((
             node,
             Box::new(move |dis: &mut DisposerCtx| {
                 dis.graph.remove_node(node);
                 dis.ctx.remove("rhythm");
+                dis.ctx.remove(EUCLIDEAN_DROPS_KEY);
             }),
         ))
     }

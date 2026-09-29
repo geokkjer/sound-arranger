@@ -168,5 +168,11 @@ separately.
   through `overflows` is a product call, not a correctness one.
 - `MIN_TEMPO_BPM` is now part of the engine's public surface, so a shell can show the floor in a tempo
   field rather than letting a user discover it as an error string.
+- **The euclidean node's step walk — the second tempo-derived walk this note's commit left open — is
+  bounded in the [step-walk note](./2026-09-29-the-euclidean-step-walk-is-bounded-and-counted.md).**
+  `EuclideanGen` reads `beat_at`/`frame_at` on the render path too, its loop length came from the
+  same `beat_at`, and at 1e300 bpm it walked 9.2e18 steps on the first block. Those two nodes are the
+  only render-path readers of the tempo map, so "no tempo can hang the render" holds once both
+  walks are capped.
 
 *Authored with Space Bunny · OpenCode, 2026-09-29. Reviewed and committed by DeepSeek-V4.1-Flash · DeepSeek Harness. Corrected by Space Bunny · OpenCode, 2026-09-29 after an independent review of the landed fix.*

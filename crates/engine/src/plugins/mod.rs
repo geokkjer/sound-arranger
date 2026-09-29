@@ -24,7 +24,9 @@ pub use clock_out::{
     CLOCK_OUT_OVERFLOWS_KEY, CLOCK_OUT_PORTS, ClockOutNode, ClockOutPlugin, MIDI_OUT_KEY,
     SharedMidiSink, SharedTransportLog, TRANSPORT_KEY, Transport, TransportLog, clock_out_factory,
 };
-pub use euclidean::{Euclidean, Rhythm, euclid, euclidean_factory};
+pub use euclidean::{
+    EUCLIDEAN_DROPS_KEY, EUCLIDEAN_PORTS, Euclidean, Rhythm, euclid, euclidean_factory,
+};
 pub use master::{
     MASTER_CEILING_DB, MASTER_LOOKAHEAD_MS, MASTER_PARAMS, MASTER_PORTS, MasterMeters, MasterNode,
     MasterPlugin, master_factory,

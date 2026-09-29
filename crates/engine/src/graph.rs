@@ -20,6 +20,8 @@
 //! fixed-capacity (enforced by a counting-allocator test).
 
 use std::f64::consts::TAU;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::clock::TempoMap;
 
@@ -451,13 +453,85 @@ impl AudioNode for Gain {
     }
 }
 
+/// The hard bound on **grid steps** one [`EuclideanGen`] block walks — the
+/// euclidean node's counterpart to the clock-out node's `CLOCK_OUT_CAP`, and for
+/// the same reason. The block's grid is a *pure function of the tempo*: the step
+/// index of the block's last frame comes from `beat_at`, and at an absurd tempo
+/// the `f64 → i64` cast of that index saturates at `i64::MAX`, so the walk
+/// `[s0, s1)` is ~9.2e18 steps long **on the first block at frame 0**. That is a
+/// permanent render-thread hang, not a panic, and no bound on the event buffer
+/// prevents it: the cost is the iteration, and the body `continue`s on the
+/// pattern check long before it would push.
+///
+/// Eight steps per frame is where the grid becomes finer than the block's own
+/// resolution — `frame_at` rounds to whole frames, so from there on several
+/// steps share every frame and their offsets are indistinguishable. At the
+/// default four pulses per beat and a 512-frame block that is ~1.2e5 bpm
+/// (a sixteenth note every 0.125 ms), and a quarter of it at sixteen pulses per
+/// beat. Everything below that is walked whole, so the audible output is
+/// unchanged for every tempo a person could mean; what is left is **counted**,
+/// not walked ([`EuclideanGen::drops`]).
+pub const EUCLIDEAN_STEP_CAP: u64 = BLOCK as u64 * 8;
+
 /// Opaque tier: the euclidean generator as a node. Pure function of the block
 /// and the tempo map: emits `out("triggers")` sample-accurately. No voice —
 /// patch the triggers into whatever you like.
+///
+/// `pattern` is indexed by `step % steps.max(1)`, so the two are built together
+/// and [`EuclideanGen::new`] asserts the length; a node hand-assembled with a
+/// shorter pattern would index out of bounds **on the render thread**, which is
+/// why the fields that make a node are set through a constructor.
 pub struct EuclideanGen {
     pub steps: u32,
     pub pulses_per_beat: u32,
     pub pattern: Vec<bool>,
+    /// Grid steps a block did not evaluate because its walk hit
+    /// [`EUCLIDEAN_STEP_CAP`] (or because the trigger buffer was already full,
+    /// which no further push could have used). Behind a shared atomic so the
+    /// plugin can **publish** the live count while the render path only ever
+    /// increments — a counter is not worth a lock in a block. The `euclidean`
+    /// plugin publishes it under
+    /// [`EUCLIDEAN_DROPS_KEY`](crate::plugins::euclidean::EUCLIDEAN_DROPS_KEY).
+    drops: Arc<AtomicU64>,
+}
+
+impl EuclideanGen {
+    /// Build a node with its own drop counter, for a caller that mounts it
+    /// directly. Reads the count back with [`Self::drops`].
+    pub fn new(steps: u32, pulses_per_beat: u32, pattern: Vec<bool>) -> Self {
+        Self::with_drop_counter(steps, pulses_per_beat, pattern, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// Build a node against an **existing** counter — the plugin's form, which
+    /// publishes the same `Arc` into the context so a reader outside the graph
+    /// sees the live count.
+    pub fn with_drop_counter(
+        steps: u32,
+        pulses_per_beat: u32,
+        pattern: Vec<bool>,
+        drops: Arc<AtomicU64>,
+    ) -> Self {
+        assert_eq!(
+            pattern.len() as u64,
+            steps.max(1) as u64,
+            "the euclidean pattern is indexed by `step % steps` — it must be exactly \
+             `steps.max(1)` long",
+        );
+        EuclideanGen {
+            steps,
+            pulses_per_beat,
+            pattern,
+            drops,
+        }
+    }
+
+    /// Grid steps this node did not evaluate, over every block it has rendered.
+    /// Zero at any tempo a person could mean; nonzero means the block's grid was
+    /// denser than [`EUCLIDEAN_STEP_CAP`] and part of it went unwalked — a loud
+    /// bound, never a silent truncation.
+    pub fn drops(&self) -> u64 {
+        self.drops.load(Ordering::Relaxed)
+    }
 }
 
 impl AudioNode for EuclideanGen {
@@ -483,18 +557,49 @@ impl AudioNode for EuclideanGen {
         let b1 = block.tempo.beat_at(block.frame + len.saturating_sub(1)) + step_beats;
         let s0 = (b0 / step_beats).floor() as i64;
         let s1 = (b1 / step_beats).ceil() as i64;
-        for step in s0..s1 {
-            if step < 0 {
-                continue;
+        // The block's **whole** grid, in closed form: how many steps a walk of
+        // `[s0, s1)` would visit, known without visiting any of them. The
+        // `f64 → i64` casts above saturate (they do not wrap), so at an absurd
+        // tempo this is honestly "as many as there are" rather than a negative
+        // or a wrapped one — which is what makes the count of what the walk
+        // *skipped* exact below.
+        let grid = s1.saturating_sub(s0).max(0) as u64;
+        let stride = self.steps.max(1) as u64;
+        let mut step = s0;
+        let mut walked = 0u64;
+        while step < s1 {
+            if step >= 0 {
+                let index = step as u64;
+                if self.pattern[(index % stride) as usize] {
+                    let frame = block.tempo.frame_at(index as f64 * step_beats);
+                    if frame >= block.frame && frame < block.frame + len {
+                        out_triggers.push((frame - block.frame) as u32);
+                    }
+                }
             }
-            let step = step as u64;
-            if !self.pattern[(step % self.steps.max(1) as u64) as usize] {
-                continue;
+            walked += 1;
+            // Bounded both ways, and both are sound. The cap is the one that
+            // matters: `grid` is the tempo's, and no tempo may hold the render
+            // thread in this loop. The full buffer is the cheaper stop — a push
+            // into it would be refused, so the emitted triggers are identical
+            // either way, and stopping there keeps this node from ever being the
+            // source of a silently refused push.
+            if walked >= EUCLIDEAN_STEP_CAP || out_triggers.is_full() {
+                break;
             }
-            let frame = block.tempo.frame_at(step as f64 * step_beats);
-            if frame >= block.frame && frame < block.frame + len {
-                out_triggers.push((frame - block.frame) as u32);
-            }
+            // Saturating rather than `+ 1`: `s1` is itself a saturating cast, so
+            // the loop condition is what stops the walk, and an unchecked
+            // increment past `i64::MAX` must not be how that happens.
+            step = step.saturating_add(1);
+        }
+        // What the walk did not take, counted exactly — `drops` means "grid steps
+        // this block did not evaluate", not "steps that would have sounded" (a
+        // pattern position that is false emits nothing by design). A block whose
+        // grid fits the cap adds nothing, so the count stays zero at any sane
+        // tempo.
+        let skipped = grid.saturating_sub(walked);
+        if skipped > 0 {
+            self.drops.fetch_add(skipped, Ordering::Relaxed);
         }
     }
 }
@@ -1812,5 +1917,86 @@ mod tests {
             err.contains("channel mismatch") && err.contains("2ch") && err.contains("1ch"),
             "the refusal names both counts: {err}"
         );
+    }
+
+    /// Render one block through a graph holding one euclidean node, and hand back
+    /// the drop counter the node shares. The node is a trigger-only source, so the
+    /// graph has no bus owner and the block renders as silence — the walk is the
+    /// whole subject.
+    fn euclid_walk_block(
+        map: &TempoMap,
+        frame: u64,
+        pattern: Vec<bool>,
+        steps: u32,
+    ) -> Arc<AtomicU64> {
+        let drops = Arc::new(AtomicU64::new(0));
+        let mut g = Graph::new();
+        g.add_node(
+            NodeKind::Opaque(Box::new(EuclideanGen::with_drop_counter(
+                steps,
+                4,
+                pattern,
+                drops.clone(),
+            ))),
+            vec![],
+        );
+        let mut out = [0.0f32; BLOCK];
+        g.render(
+            &mut out,
+            RenderBlock {
+                frame,
+                sample_rate: 48_000,
+                tempo: map,
+                mode: RenderMode::Timeline,
+            },
+        );
+        drops
+    }
+
+    /// The euclidean walk was the length of the block's **grid**, and the grid is
+    /// a pure function of the tempo: at 1e300 bpm the block's last beat is
+    /// 1.77e296, its cast to a step index saturates at `i64::MAX`, and the walk
+    /// from step 0 was 9.2e18 steps — on the very first block, at frame 0. The
+    /// body `continue`s on the pattern check long before it would emit, so
+    /// `frame_at`'s saturation could not save it: the cost was the iteration and
+    /// `render` never returned. The walk is now capped and the rest of the grid
+    /// is *counted*, exactly.
+    #[test]
+    fn an_absurd_tempo_does_not_wedge_the_step_walk() {
+        // A pattern with no pulse in it, so the walk's only possible stop is the
+        // cap: the counts below are about the walk and about nothing else.
+        let map = TempoMap::new(48_000, 1e300, 4);
+        let drops = euclid_walk_block(&map, 0, vec![false; 8], 8);
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            i64::MAX as u64 - EUCLIDEAN_STEP_CAP,
+            "the block walked exactly the cap and counted the other 9.2e18"
+        );
+
+        // A grid that fits the cap is walked whole and counts nothing, so the bound
+        // changes no audible output at any tempo a person could mean: 120 bpm with
+        // four pulses per beat is 4 steps per block.
+        let map = TempoMap::new(48_000, 120.0, 4);
+        let drops = euclid_walk_block(&map, 0, vec![false; 8], 8);
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            0,
+            "a sane grid drops nothing"
+        );
+    }
+
+    /// The same defect one order of magnitude below the saturation: a grid of
+    /// 1e9 bpm holds 709 724 steps in one 512-frame block, and uncapped the
+    /// block walked every one of them. The walk stops at the cap and the rest of
+    /// the grid is counted **exactly** — `walked + counted == the block's whole
+    /// grid` — with the trigger buffer out of the picture (a pattern with no
+    /// pulse in it, so nothing could fill the buffer and stop the walk early).
+    #[test]
+    fn a_dense_grid_does_not_run_away_in_one_block() {
+        let map = TempoMap::new(48_000, 1.0e9, 4);
+        let drops = euclid_walk_block(&map, 0, vec![false; 8], 8);
+        // 511 frames at 1e9 bpm is 177 430.556 beats, +1/4 beat, /1/4 beat per step
+        // → 709 724 steps in the block's grid.
+        assert_eq!(drops.load(Ordering::Relaxed), 709_724 - EUCLIDEAN_STEP_CAP);
     }
 }

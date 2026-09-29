@@ -44,16 +44,16 @@ pub mod value;
 pub use clock::{Clock, Scheduler, TempoMap};
 pub use ctx::Context;
 pub use graph::{
-    AudioInputs, AudioNode, BLOCK, CAP_EVENTS, Direction, EuclideanGen, EventBuf, Gain, Graph,
-    MERGE_CAP, Node, NodeIO, NodeId, NodeKind, NoteEvent, Port, RenderBlock, RenderMode, ScaleGen,
-    SignalKind, Sine, ToneGen, Trigger,
+    AudioInputs, AudioNode, BLOCK, CAP_EVENTS, Direction, EUCLIDEAN_STEP_CAP, EuclideanGen,
+    EventBuf, Gain, Graph, MERGE_CAP, Node, NodeIO, NodeId, NodeKind, NoteEvent, Port, RenderBlock,
+    RenderMode, ScaleGen, SignalKind, Sine, ToneGen, Trigger,
 };
 pub use log::{Event, SessionLog};
 pub use plugins::{
-    ClockOutNode, ClockOutPlugin, Disposer, DisposerCtx, Euclidean, EventSink, EventSource,
-    ExternalEvent, MIXER_CHANNELS, MIXER_CHANNELS_SANITY, MIXER_PARAMS, MIXER_PORTS, MeterBank,
-    MidiSink, MidiSource, MixerNode, MixerPlugin, OscSink, OscSource, ParamDef, Plugin, PluginApi,
-    Rhythm, Scale, TONE_PARAMS, Tone, Transport, TransportLog, euclid, mixer_factory,
+    ClockOutNode, ClockOutPlugin, Disposer, DisposerCtx, EUCLIDEAN_DROPS_KEY, Euclidean, EventSink,
+    EventSource, ExternalEvent, MIXER_CHANNELS, MIXER_CHANNELS_SANITY, MIXER_PARAMS, MIXER_PORTS,
+    MeterBank, MidiSink, MidiSource, MixerNode, MixerPlugin, OscSink, OscSource, ParamDef, Plugin,
+    PluginApi, Rhythm, Scale, TONE_PARAMS, Tone, Transport, TransportLog, euclid, mixer_factory,
 };
 pub use render::{
     DrainOutcome, DrainPolicy, Engine, MAX_DRAIN_FRAMES, MIN_TEMPO_BPM, OpHandler, PluginFactory,
