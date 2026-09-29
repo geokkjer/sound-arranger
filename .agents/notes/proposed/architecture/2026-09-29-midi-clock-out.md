@@ -93,10 +93,13 @@ Three properties make this more than writing bytes to a port:
   be the kind of claim this project keeps refusing to make.
 - **A blocking device write** is the main realtime hazard, which is why the queue is in the design
   rather than discovered later. Its depth is a bound that has to fail loudly, not grow.
-- **Seek and rebuild semantics are unresolved.** A seek rebuilds the session, so gear that is
-  mid-pattern would jump. The options — `Stop` … `Continue` around a rebuild, re-`Start` at the
-  target, or refusing clock-out while seeking — need deciding before implementation; the safe default
-  is to send nothing across a rebuild and re-sync on the next `play`.
+- **Seek and rebuild semantics: decided, conservatively (2026-09-29).** A seek rebuilds the session,
+  so gear mid-pattern would jump. The decision is that **nothing is sent across a rebuild**, and the
+  next `play` re-syncs (`Start`, or `Continue` after a pause) at that frame. Rejected:
+  `Stop` … `Continue` around the rebuild (more correct in principle, and it assumes the gear tolerates
+  the pair), and refusing clock-out while seeking (a refusal the player cannot act on). This is
+  expected to be revisited once real gear is on the wire — bugs here will show themselves in use,
+  which is the honest reason to start with the option that cannot corrupt anything.
 - **No binding yet.** The first slice takes an explicit port; the rig's `matcher` cannot resolve to
   one until the registry slice lands.
 - **Gear-specific behaviour** (what a particular device expects on the wire) belongs to the studio
