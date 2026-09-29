@@ -154,6 +154,12 @@ interleaved frame ("1/2 samples"). That is the whole argument in one incident �
 cannot be "always green" while a known-flaky test sits inside it, so fixing that flake
 is a prerequisite for this invariant rather than a nice-to-have.
 
+Two smaller things are policy rather than configuration detail. Action majors are kept **current** — the CI
+was three majors behind on `checkout` and `setup-node`, which is all the node-20 deprecation warning was
+actually reporting — and this note deliberately does **not** quote the versions, because a version in prose
+rots exactly like a count. The workflow also asks for `contents: read` and nothing more, so a compromised
+action cannot write to the repository.
+
 The merge exposed one more thing worth a line: locally `scripts/agent-commit` sets the human
 committer to `geir@geokkjer.eu`, while GitHub's rebase-merge sets the account's
 `geokkjer@gmail.com`. A `.mailmap` folds the two together for every authorship-reading tool,
