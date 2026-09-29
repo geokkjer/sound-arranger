@@ -29,9 +29,12 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use engine::*;
+use media::midi::MidiOut;
 use media::{
     ClipRef, DEFAULT_RING_CAPACITY, FilePlayer, Interner, Mailbox, PlaybackNode, SpliceCmd,
 };
+
+use engine::plugins::SharedMidiSink;
 
 pub mod live;
 pub mod media_ops;
@@ -49,8 +52,10 @@ use media_ops::{BounceRecord, MediaSession, PlayerIntent, SpliceIntent};
 pub const HOST_API_VERSION: u32 = 1;
 
 /// The host registry: plugins, then ports, then parameters — validated per
-/// slot by the parser (a port name is not a plugin name).
-pub const HOST_PLUGINS: &[&str] = &["euclidean", "scale", "tone", "mixer", "master"];
+/// slot by the parser (a port name is not a plugin name). `clock_out` declares
+/// no ports or params; it is mounted for its side effect through the host's
+/// sink (the midi-clock-out note, slice B).
+pub const HOST_PLUGINS: &[&str] = &["euclidean", "scale", "tone", "mixer", "master", "clock_out"];
 
 /// The largest stretch ratio operand (`num` or `den`) the host will render. A tempo
 /// match lives well inside this (a 10:1 ratio is already absurd); beyond it the ratio is
@@ -477,10 +482,46 @@ pub struct Position {
     pub playing: bool,
 }
 
+/// The MIDI clock-out status a shell reads (see
+/// [`HostSession::midi_status`]): the port being driven and the plugin's
+/// overflow counter.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MidiOutStatus {
+    /// The port name the sink was opened from; `None` when the process asked
+    /// for no MIDI output.
+    pub port: Option<String>,
+    /// Events the `clock_out` plugin dropped because a block exceeded its
+    /// per-block bound — a mount this sane never sees a nonzero count.
+    pub overflows: u64,
+}
+
 /// The assembled profile: the engine, the registered factories, the media
 /// wiring (player nodes into the mixer), and the master bounce path.
 pub struct HostSession {
     engine: Engine,
+    /// The transport tap the host feeds at the frames `Play`/`Stop` take
+    /// effect. Provided under `"transport"` **always** — it is pure
+    /// bookkeeping (a queue of frames), no device — so a session mounts
+    /// `clock_out` identically with and without gear attached. Fed from the
+    /// **apply** path, so a replayed command re-feeds the tap identically; the
+    /// sink's absence is what makes a replay silent, never a special case
+    /// here.
+    transport: Arc<TransportLog>,
+    /// The MIDI output sink **slot** — always present, containing the device
+    /// when the process asked for one (`--midi-out`/`DSH_MIDI_OUT`, see
+    /// [`midi_out_from_process`]) and empty when it did not. Provided under
+    /// `"midi.out"` either way, so a session's `clock_out` node can be
+    /// **re-filled later without re-mounting**. **Configuration, not session
+    /// state**: which device is attached is a fact about the machine the
+    /// process runs on, so it is never a logged command and never replayed —
+    /// a rebuilt session shares the *same slot object* (the node inside sees
+    /// the re-fill), and around any rebuild the host empties the slot, renders
+    /// the reconstruction, and restores the device: nothing is sent across a
+    /// rebuild (the seek-and-rebuild decision).
+    midi_slot: SharedMidiSink,
+    /// The port name the sink was opened from, reported on the snapshot so a
+    /// shell can show whether gear is being driven.
+    midi_port: Option<String>,
     /// pending (player node, mixer channel) cords, wired once the mixer's
     /// node exists (flush_scheduled materializes it — no discarded audio).
     pending_cords: Vec<(NodeId, usize)>,
@@ -577,6 +618,22 @@ impl HostSession {
     /// **context**: it is fixed here, because the clock, every frame in the log and
     /// the device negotiation all derive from it.
     pub fn new_at(rate: u32) -> Self {
+        let (midi_port, midi_out) = midi_out_from_process();
+        Self::new_at_with(rate, midi_out, midi_port)
+    }
+
+    /// Create a session with an explicit MIDI output sink **slot** — the seam
+    /// tests mount a **fake** through, using the same `"midi.out"` context key
+    /// the real sink uses. A `Some` slot is adopted **as the session's slot
+    /// object** (shared, not copied — a rebuild passes this session's slot so
+    /// its nodes see a re-fill), `None` mounts a fresh empty one. `midi_port`
+    /// is the report-only name (the snapshot shows what is being driven);
+    /// pass `None`/`None` for a silent session.
+    pub fn new_at_with(
+        rate: u32,
+        midi_out: Option<SharedMidiSink>,
+        midi_port: Option<String>,
+    ) -> Self {
         let mut engine = Engine::new(rate, 120.0, 4);
         engine.register_factory(
             "euclidean",
@@ -610,11 +667,34 @@ impl HostSession {
             plugins::master::MASTER_PORTS,
             plugins::master::MASTER_PARAMS,
         );
+        // The clock-out plugin: no ports, no params — its effect runs through
+        // the context services below (the midi-clock-out note, slice B).
+        engine.register_factory(
+            "clock_out",
+            plugins::clock_out_factory,
+            plugins::clock_out::CLOCK_OUT_PORTS,
+            &[],
+        );
+        // The transport tap is provided **always**: it is bookkeeping, not a
+        // device, and a session must mount identically with and without gear.
+        let transport = Arc::new(TransportLog::new());
+        engine
+            .ctx
+            .provide(plugins::TRANSPORT_KEY, transport.clone());
+        // The sink **slot** is provided **always**: an empty slot is the
+        // legitimate "no device (yet)" state the plugin mounts under, and the
+        // process-lifetime slot object lets the host detach and refill around
+        // a rebuild without re-mounting the plugin.
+        let midi_slot = midi_out.unwrap_or_else(|| Arc::new(Mutex::new(None)));
+        engine.ctx.provide(plugins::MIDI_OUT_KEY, midi_slot.clone());
         let media: Arc<Mutex<MediaSession>> = Arc::new(Mutex::new(MediaSession::default()));
         media_ops::register_handlers(&mut engine, media.clone())
             .expect("media op handlers register once on a fresh engine");
         HostSession {
             engine,
+            transport,
+            midi_slot,
+            midi_port,
             media,
             media_intern: Interner::new(),
             pending_cords: Vec::new(),
@@ -1327,10 +1407,29 @@ impl HostSession {
                 r
             }
             HostCommand::TransportPlay => {
+                // Feed the transport tap from the **apply** path, at the frame
+                // the command takes effect (the clock's current position, where
+                // the next render starts) — a replayed command re-feeds the tap
+                // identically, and the sink's absence is what makes a replay
+                // silent. `Start` when play begins from the start of the
+                // timeline, `Continue` when it resumes from a non-zero
+                // position: on the wire, MIDI `Start` tells a follower to
+                // return to its song start, so a play from frame 0 is the only
+                // one whose position that agrees with; every other play
+                // resumes from where we are, which is what `Continue` means.
+                let frame = self.engine.clock.frame();
+                let transport = if frame == 0 {
+                    engine::Transport::Start
+                } else {
+                    engine::Transport::Continue
+                };
+                self.transport.push(frame, transport);
                 self.playing = true;
                 Ok(())
             }
             HostCommand::TransportStop => {
+                let frame = self.engine.clock.frame();
+                self.transport.push(frame, engine::Transport::Stop);
                 self.playing = false;
                 Ok(())
             }
@@ -1901,6 +2000,22 @@ impl HostSession {
     /// mix whose peak exceeds full scale is **refused with nothing written** — "never a
     /// clipped file" is a property of the command, not of the user's care.
     pub fn export(&mut self, path: &std::path::Path, format: ExportFormat) -> Result<(), String> {
+        // **An export must never drive gear** — it is side-effect free by
+        // contract. The slot is emptied across the clone's rebuild *and* its
+        // offline render, then the device goes back (even when the export
+        // fails), so the live session keeps driving gear afterwards.
+        let device = self.detach_midi();
+        let result = self.export_detached(path, format);
+        self.restore_midi(device);
+        result
+    }
+
+    /// `export` with the sink slot already detached — see the wrapper above.
+    fn export_detached(
+        &mut self,
+        path: &std::path::Path,
+        format: ExportFormat,
+    ) -> Result<(), String> {
         // The clone: current state, clock at 0, and no rendering while the state is
         // applied (`at_now`), so this is cheap even for a long session.
         let mut fresh = self.rebuild(None)?;
@@ -2043,6 +2158,25 @@ impl HostSession {
             .cloned()
     }
 
+    /// The MIDI clock-out status: the port being driven (configuration, not
+    /// state — `None` when the process asked for no device) and the
+    /// `clock_out` plugin's overflow counter, read back through the plugin's
+    /// `"clock_out.overflows"` context service (the mixer's `mixer.meters`
+    /// pattern). The counter is **always** surfaced — ticks are generated
+    /// whether or not a sink is present, so a dropped tick is loud even
+    /// gearless.
+    pub fn midi_status(&self) -> MidiOutStatus {
+        MidiOutStatus {
+            port: self.midi_port.clone(),
+            overflows: self
+                .engine
+                .ctx
+                .get::<Arc<std::sync::atomic::AtomicU64>>(plugins::CLOCK_OUT_OVERFLOWS_KEY)
+                .map(|c| c.load(Ordering::Relaxed))
+                .unwrap_or(0),
+        }
+    }
+
     /// The mastering stage's meters, when a `master` plugin is mounted — the
     /// compressor + limiter's output peaks and gain reduction.
     pub fn master_meters(&self) -> Option<std::sync::Arc<engine::plugins::MasterMeters>> {
@@ -2104,6 +2238,48 @@ impl HostSession {
 impl Default for HostSession {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The MIDI output this process asked for, if any: `--midi-out <port>` on the
+/// command line (the host binary's flag, documented in `src/main.rs`) or
+/// `DSH_MIDI_OUT=<substring>` in the environment. The operand is a
+/// case-insensitive **substring** of a port name (`media::midi::MidiOut::open`
+/// fails loudly listing what matched otherwise).
+///
+/// This is **configuration, not session state**: which device is attached is a
+/// fact about the machine the process runs on, so it is read once per session
+/// construction here and never logged — a replayed session carries the
+/// `mount clock_out` declaration but never the device. A port that cannot be
+/// opened is reported on stderr and the session runs **silent**: refusing to
+/// start over a missing device would make the session hardware-dependent,
+/// which the purity rule exists to prevent.
+fn midi_out_from_process() -> (Option<String>, Option<SharedMidiSink>) {
+    let mut args = std::env::args().skip(1);
+    let mut requested: Option<String> = None;
+    while let Some(arg) = args.next() {
+        if arg == "--midi-out" {
+            requested = args.next();
+        } else if let Some(port) = arg.strip_prefix("--midi-out=") {
+            requested = Some(port.to_string());
+        }
+    }
+    let requested = requested.or_else(|| std::env::var("DSH_MIDI_OUT").ok());
+    let Some(port) = requested else {
+        return (None, None);
+    };
+    match MidiOut::open(&port) {
+        Ok(out) => (
+            Some(port),
+            Some(Arc::new(Mutex::new(Some(
+                Box::new(out) as Box<dyn MidiSink>
+            )))),
+        ),
+        Err(e) => {
+            eprintln!("host: the requested MIDI output '{port}' could not be opened: {e}");
+            eprintln!("host: continuing without a MIDI output (clock-out stays silent)");
+            (None, None)
+        }
     }
 }
 
@@ -2201,8 +2377,19 @@ impl HostSession {
     /// gate showed as an export clipping where the audible session did not.
     ///
     /// Pure with respect to `self`: the caller decides what to adopt and what to carry.
+    ///
+    /// The rebuilt session **shares this session's slot object** (and the port
+    /// name), so the gear keeps being driven after a seek — but the rebuild's
+    /// renders happen with the slot **emptied by the caller**: nothing is sent
+    /// across a rebuild (the seek-and-rebuild decision), and the export clone
+    /// — which renders after `rebuild` returns — keeps the slot empty through
+    /// its own render too.
     fn rebuild(&self, upto: Option<u64>) -> Result<HostSession, String> {
-        let mut rebuilt = HostSession::new_at(self.engine.clock.sample_rate);
+        let mut rebuilt = HostSession::new_at_with(
+            self.engine.clock.sample_rate,
+            Some(self.midi_slot.clone()),
+            self.midi_port.clone(),
+        );
         for entry in &self.history {
             match upto {
                 Some(frame) => {
@@ -2288,17 +2475,47 @@ impl HostSession {
         // nothing (their read is a pure function of the block frame), so the run-in only
         // has to cover the bus effects' memory. `warm` reports which path ran.
         let warm = self.can_warm_seek(frame);
-        let mut rebuilt = if warm {
-            let mut session = self.rebuild_prefix(frame - SEEK_WARMUP_FRAMES)?;
-            session.engine.seek(frame - SEEK_WARMUP_FRAMES);
-            session.render_to(frame)?;
-            session
-        } else {
-            self.rebuild(Some(frame))?
-        };
+        // **Nothing is sent across a rebuild** (the seek-and-rebuild decision):
+        // the device leaves the slot for the duration of the reconstruction's
+        // renders — rebuild, warm-up run-in, and render-to-target alike — and
+        // goes back before `carry_over`, so the adopted session (which shares
+        // the same slot object) drives gear again on its next render.
+        let device = self.detach_midi();
+        let rebuilt = (|| -> Result<HostSession, String> {
+            Ok(if warm {
+                let mut session = self.rebuild_prefix(frame - SEEK_WARMUP_FRAMES)?;
+                session.engine.seek(frame - SEEK_WARMUP_FRAMES);
+                session.render_to(frame)?;
+                session
+            } else {
+                self.rebuild(Some(frame))?
+            })
+        })();
+        self.restore_midi(device);
+        let mut rebuilt = rebuilt?;
         rebuilt.carry_over(self, warm, frame, is_seek);
         *self = rebuilt;
         Ok(())
+    }
+
+    /// Take the device out of the process-lifetime sink **slot** — the detach
+    /// side of "empty the slot, render the rebuild, restore the device". The
+    /// lock is held only for the `take`; while the slot is empty, every
+    /// `clock_out` node sharing it renders its schedule and sends nothing.
+    fn detach_midi(&self) -> Option<Box<dyn MidiSink>> {
+        self.midi_slot
+            .lock()
+            .expect("the midi.out sink slot is not poisoned")
+            .take()
+    }
+
+    /// Put the device back into the sink slot (the refill side of
+    /// [`Self::detach_midi`]). The lock is held only for the assignment.
+    fn restore_midi(&self, device: Option<Box<dyn MidiSink>>) {
+        *self
+            .midi_slot
+            .lock()
+            .expect("the midi.out sink slot is not poisoned") = device;
     }
 
     /// Adopt a rebuilt session: the fields a replay must carry across (the playing state,
@@ -2307,6 +2524,11 @@ impl HostSession {
     fn carry_over(&mut self, from: &mut HostSession, warm: bool, frame: u64, is_seek: bool) {
         self.last_take = from.last_take.take();
         self.playing = from.playing;
+        // The MIDI sink slot is configuration carried across (the same arc —
+        // in practice the rebuilt session already shares it, so its node keeps
+        // seeing the host's refills), with the port name that reports it.
+        self.midi_slot = from.midi_slot.clone();
+        self.midi_port = from.midi_port.clone();
         self.redo = from.redo.clone();
         self.session_dir = from.session_dir.clone();
         self.journal_error = from.journal_error.clone();
@@ -2332,7 +2554,12 @@ impl HostSession {
         if self.recording.is_some() {
             let _ = self.stop_recording();
         }
-        let mut rebuilt = self.rebuild(Some(frame))?;
+        // Same detach/refill as `replay_to_kind`: the full replay's renders
+        // must not reach the gear either.
+        let device = self.detach_midi();
+        let rebuilt = self.rebuild(Some(frame));
+        self.restore_midi(device);
+        let mut rebuilt = rebuilt?;
         rebuilt.carry_over(self, false, frame, true);
         *self = rebuilt;
         Ok(())
@@ -2344,7 +2571,14 @@ impl HostSession {
     /// starting state; `can_warm_seek` has already proved that nothing placed after the
     /// run-in's start is in the history, so "at once" is exactly "in force".
     fn rebuild_prefix(&self, _start: u64) -> Result<HostSession, String> {
-        let mut rebuilt = HostSession::new_at(self.engine.clock.sample_rate);
+        // The slot object carries across (the gear is driven again after the
+        // jump, once the caller's refill lands) — the same decision the seek
+        // reconstruction in `rebuild` makes.
+        let mut rebuilt = HostSession::new_at_with(
+            self.engine.clock.sample_rate,
+            Some(self.midi_slot.clone()),
+            self.midi_port.clone(),
+        );
         // **Tempo is the exception to `at_now`.** It is frame-placed *value* state (the
         // tempo map is a function of the frame), so a change at 60 s must sit at 60 s in
         // the map even when the run-in starts later — otherwise the audio would be right
@@ -7170,5 +7404,320 @@ mod tests {
             "the strict forms must still parse: {:?}",
             parse_script(script).err()
         );
+    }
+}
+
+// ------------------------------------------------- clock-out wiring (slice B)
+
+#[cfg(test)]
+mod clock_out_wiring {
+    use super::*;
+    use engine::plugins::SharedMidiSink;
+    use std::sync::Mutex;
+
+    /// The recordings one `FakeSink` appends to and its test reads.
+    type Sends = Arc<Mutex<Vec<(u64, Vec<ExternalEvent>)>>>;
+
+    /// A fake `MidiSink` recording `(frame, events)` per send — no device. It
+    /// arrives through the same `"midi.out"` context key the real device sink
+    /// uses: that is the seam, and why the test needs no hardware.
+    struct FakeSink {
+        sends: Sends,
+    }
+
+    /// A shared fake sink (already inside the session's **slot** shape) plus
+    /// the handle the assertions read.
+    fn fake_sink() -> (SharedMidiSink, Sends) {
+        let sends: Sends = Arc::new(Mutex::new(Vec::new()));
+        let sink: SharedMidiSink = Arc::new(Mutex::new(Some(Box::new(FakeSink {
+            sends: sends.clone(),
+        }))));
+        (sink, sends)
+    }
+
+    impl engine::EventSink for FakeSink {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        fn send(&mut self, events: &[ExternalEvent], frame: u64) {
+            self.sends.lock().unwrap().push((frame, events.to_vec()));
+        }
+    }
+
+    impl engine::MidiSink for FakeSink {}
+
+    /// The absolute frames of every `Clock` event, in send order.
+    fn clock_frames(sends: &Sends) -> Vec<u64> {
+        let sends = sends.lock().unwrap();
+        let mut out = Vec::new();
+        for &(block_frame, ref events) in sends.iter() {
+            for ev in events {
+                if let ExternalEvent::Clock { offset } = ev {
+                    out.push(block_frame + *offset as u64);
+                }
+            }
+        }
+        out
+    }
+
+    /// Every transport event with its absolute frame, in send order.
+    fn transport_events(sends: &Sends) -> Vec<(u64, &'static str)> {
+        let sends = sends.lock().unwrap();
+        let mut out = Vec::new();
+        for &(block_frame, ref events) in sends.iter() {
+            for ev in events {
+                let (kind, offset) = match ev {
+                    ExternalEvent::Start { offset } => ("Start", *offset),
+                    ExternalEvent::Stop { offset } => ("Stop", *offset),
+                    ExternalEvent::Continue { offset } => ("Continue", *offset),
+                    _ => continue,
+                };
+                out.push((block_frame + offset as u64, kind));
+            }
+        }
+        out
+    }
+
+    fn mount_clock_out(session: &mut HostSession) {
+        session
+            .execute(&HostCommand::Mount {
+                plugin: "clock_out",
+                params: Vec::new(),
+                at_frame: Some(0),
+            })
+            .expect("clock_out mounts");
+    }
+
+    /// A one-clip arrangement's op on track `t0` (the export test's material);
+    /// local copies of the `tests` module's helpers, which this module does not
+    /// share scope with.
+    fn add_clip(id: &str, at: u64) -> media::ArrangeOp {
+        media::ArrangeOp::AddClip {
+            track: "t0".into(),
+            clip: media::Clip {
+                reversed: false,
+                id: id.into(),
+                name: None,
+                source: "s1".into(),
+                src_start: 0,
+                src_len: 4_800,
+                at_frame: at,
+                fade_in: 0,
+                fade_out: 0,
+                gain: 1.0,
+                loop_len: None,
+            },
+        }
+    }
+
+    fn write_tone(dir: &std::path::Path, id: &str, frames: usize, rate: u32) {
+        let path = dir.join(format!("{id}.wav"));
+        let mut w = media::WavWriter::create(&path, rate, 1).expect("wav writer");
+        let samples: Vec<f32> = (0..frames).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        w.write(&samples).expect("write tone");
+        w.finalize().expect("finalize tone");
+    }
+
+    /// One second of playback at 120 bpm 48 kHz sends 48 ticks at frames
+    /// 0, 1000, … 47000 — the tempo map's own answer, to the sample — and a
+    /// play from frame 0 reaches the wire as a `Start`, a resume from a
+    /// non-zero position as a `Continue`, a stop as a `Stop`, each at the
+    /// frame the command took effect.
+    #[test]
+    fn clock_out_sends_ticks_at_the_tempo_maps_frames_and_maps_transport() {
+        let (sink, sends) = fake_sink();
+        let mut session = HostSession::new_at_with(48_000, Some(sink), Some("fake".into()));
+        mount_clock_out(&mut session);
+        session.execute(&HostCommand::TransportPlay).expect("play");
+        session.render(48_000).expect("render one second");
+        let expected: Vec<u64> = (0..48u64).map(|i| i * 1000).collect();
+        assert_eq!(clock_frames(&sends), expected);
+        assert_eq!(transport_events(&sends), vec![(0, "Start")]);
+
+        // Stop at frame 48 000, then play again without rendering in between:
+        // a resume from a non-zero position is a Continue. Both commands take
+        // effect at the same frame, so both flush at offset 0 of the next
+        // block, in log order.
+        session.execute(&HostCommand::TransportStop).expect("stop");
+        session
+            .execute(&HostCommand::TransportPlay)
+            .expect("resume");
+        session.render(48_000).expect("render the second second");
+        assert_eq!(
+            transport_events(&sends),
+            vec![(0, "Start"), (48_000, "Stop"), (48_000, "Continue"),]
+        );
+        let second_half = &clock_frames(&sends)[48..];
+        let expected: Vec<u64> = (48..96u64).map(|i| i * 1000).collect();
+        assert_eq!(second_half, &expected[..]);
+    }
+
+    /// A session with **no** sink mounts, renders, and replays byte-identically
+    /// — and the identical script *with* a sink renders the same audio: whether
+    /// gear is attached cannot change the mix (the purity rule), it only drives
+    /// the seam.
+    #[test]
+    fn a_session_without_a_sink_mounts_renders_and_replays_byte_identically() {
+        let script = |session: &mut HostSession| {
+            mount_clock_out(session);
+            session.execute(&HostCommand::TransportPlay).expect("play");
+        };
+        let mut silent = HostSession::new_at_with(48_000, None, None);
+        script(&mut silent);
+        let first = silent.render(48_000).expect("render");
+
+        // A replay (a seek rebuilds and re-renders from the state history)
+        // reproduces the same bytes — silently, because there is no sink.
+        silent
+            .execute(&HostCommand::TransportSeek { frame: 0 })
+            .expect("replay");
+        let replayed = silent.render(48_000).expect("render after replay");
+        assert_eq!(first, replayed, "the replay is byte-identical");
+
+        let (sink, sends) = fake_sink();
+        let mut driven = HostSession::new_at_with(48_000, Some(sink), Some("fake".into()));
+        script(&mut driven);
+        let driven_audio = driven.render(48_000).expect("render with a sink");
+        assert_eq!(first, driven_audio, "the sink cannot change the audio");
+        assert!(
+            !clock_frames(&sends).is_empty(),
+            "the driven session actually sent"
+        );
+    }
+
+    /// The overflow counter reaches the host status through the plugin's
+    /// `"clock_out.overflows"` context service — the accessor the snapshot's
+    /// publish pass uses. 1e6 bpm is the cheap deterministic overflow (one tick
+    /// every ~0.12 frames puts thousands due inside one 512-frame block, far
+    /// past the plugin's 64-event cap); the point asserted is the counter, not
+    /// the tempo.
+    #[test]
+    fn the_overflow_counter_reaches_the_host_status() {
+        let (sink, _sends) = fake_sink();
+        let mut session = HostSession::new_at_with(48_000, Some(sink), Some("fake".into()));
+        session
+            .execute(&HostCommand::SetTempo {
+                bpm: 1.0e6,
+                beats_per_bar: 4,
+                at_frame: None,
+            })
+            .expect("the tempo applies");
+        mount_clock_out(&mut session);
+        session.render(512).expect("render one block");
+        let status = session.midi_status();
+        assert_eq!(status.port.as_deref(), Some("fake"), "the port is reported");
+        assert!(
+            status.overflows > 0,
+            "the block exceeded the cap: {status:?}"
+        );
+
+        // No clock_out mounted: zero, never an error — the counter's absence is
+        // the legitimate "plugin not mounted" state.
+        assert_eq!(HostSession::new().midi_status().overflows, 0);
+    }
+
+    /// **The test the detach/refill fix exists for**: a seek rebuilds the
+    /// session and renders it, and the reconstruction must drive no gear —
+    /// nothing is sent across a rebuild (the seek-and-rebuild decision) —
+    /// while the live session sends ticks again on its very next render.
+    #[test]
+    fn a_seek_sends_nothing_while_it_rebuilds_and_resumes_afterwards() {
+        let (sink, sends) = fake_sink();
+        let mut session = HostSession::new_at_with(48_000, Some(sink), Some("fake".into()));
+        mount_clock_out(&mut session);
+        session.execute(&HostCommand::TransportPlay).expect("play");
+        session.render(48_000).expect("render one second");
+        let frames_before = clock_frames(&sends);
+        assert!(!frames_before.is_empty(), "the live session drove the gear");
+
+        // Seek to 24 000 (< the warm-up bound, so this is the full rebuild:
+        // replay the history and render the timeline to the target) — with the
+        // slot detached, none of that reconstruction render may reach the sink.
+        session
+            .execute(&HostCommand::TransportSeek { frame: 24_000 })
+            .expect("seek");
+        assert_eq!(
+            clock_frames(&sends),
+            frames_before,
+            "the rebuild render sent nothing"
+        );
+        assert_eq!(
+            transport_events(&sends),
+            vec![(0, "Start")],
+            "no transport command crossed the rebuild either"
+        );
+
+        // The device is back in the shared slot: the live render records
+        // ticks again, all at or past the seek target.
+        session.render(48_000).expect("render after the seek");
+        let all = clock_frames(&sends);
+        let resumed = &all[frames_before.len()..];
+        assert!(
+            !resumed.is_empty() && resumed.iter().all(|&f| f >= 24_000),
+            "ticks again after the seek, from the target onward: {resumed:?}"
+        );
+    }
+
+    /// The export clone renders offline: it must send nothing, while the sink
+    /// slot is detached — and the live session sends again afterwards.
+    #[test]
+    fn an_export_clone_sends_nothing() {
+        let root = std::env::temp_dir().join(format!("host-export-midi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let (sink, sends) = fake_sink();
+        let mut session = HostSession::new_at_with(48_000, Some(sink), Some("fake".into()));
+        session
+            .execute(&HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(0),
+            })
+            .expect("mixer");
+        mount_clock_out(&mut session);
+        session
+            .execute(&HostCommand::Pool { dir: pool })
+            .expect("pool");
+        session
+            .execute(&HostCommand::Arrange {
+                op: media::ArrangeOp::AddTrack { track: "t0".into() },
+                at_frame: None,
+            })
+            .expect("track");
+        session
+            .execute(&HostCommand::Arrange {
+                op: add_clip("c0", 0),
+                at_frame: None,
+            })
+            .expect("clip");
+        // Render once so the clock_out node is mounted and has driven the gear
+        // (mounts apply on the next render, so nothing has been sent yet).
+        session.render(48_000).expect("render one second");
+        let frames_before = clock_frames(&sends);
+        assert!(!frames_before.is_empty(), "the live session drove the gear");
+
+        session
+            .execute(&HostCommand::Export {
+                path: root.join("mix.wav"),
+                format: ExportFormat::F32,
+            })
+            .expect("export");
+        assert_eq!(
+            clock_frames(&sends),
+            frames_before,
+            "the export clone sent nothing"
+        );
+
+        // The slot is refilled after the export: gear is driven again.
+        session.render(48_000).expect("render after the export");
+        assert!(
+            clock_frames(&sends).len() > frames_before.len(),
+            "ticks again after the export"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -9,12 +9,16 @@
 //! rebuilds the session, so nothing is sent across a rebuild; the next `play`
 //! re-syncs (the conservative decision the note takes).
 //!
-//! Device ownership stays with the host: the node holds whatever sink the host
-//! provided under the [`MIDI_OUT_KEY`] context key, and **both services are
-//! optional** — a session mounts on a machine with no device, sends nothing,
-//! and renders byte-identically (the takes-slice purity rule: the declaration
-//! is state, the sending is a device-bound side effect, never replayed).
+//! Device ownership stays with the host: the node holds the sink **slot** the
+//! host provided under the [`MIDI_OUT_KEY`] context key (or its own empty one
+//! when the key is absent), and **both services are optional** — a session
+//! mounts on a machine with no device, sends nothing, and renders
+//! byte-identically (the takes-slice purity rule: the declaration is state,
+//! the sending is a device-bound side effect, never replayed). The host can
+//! empty the slot across a rebuild and refill it after, so a seek sends
+//! nothing while it reconstructs and gear is driven again on the next render.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::{Disposer, ExternalEvent, MidiSink, ParamDef, Plugin, PluginApi};
@@ -36,15 +40,23 @@ pub const TICKS_PER_BEAT: u64 = 24;
 /// still mounts.
 pub const MIDI_OUT_KEY: &str = "midi.out";
 
-/// The context key the host provides the transport log under
+/// The context key the transport log the host feeds arrives under
 /// ([`SharedTransportLog`]). Optional for the same reason.
 pub const TRANSPORT_KEY: &str = "transport";
 
-/// The shared-sink shape the host provides: a mutex around the sink so the
-/// control side can swap or inspect it while the render path sends. The real
-/// device sink will make `send` a fast queue push, and with a single sender
-/// the lock is uncontended.
-pub type SharedMidiSink = Arc<Mutex<Box<dyn MidiSink>>>;
+/// The context key the plugin **publishes** its overflow counter under — the
+/// host (and through it, a shell's snapshot) reads it back with the same
+/// context-service pattern the mixer's `mixer.meters` uses. Provided on apply,
+/// withdrawn by the disposer.
+pub const CLOCK_OUT_OVERFLOWS_KEY: &str = "clock_out.overflows";
+
+/// The shared-sink **slot** the host provides: a mutex around an *optional*
+/// device, so the host can empty it (across any rebuild — the seek-and-rebuild
+/// decision: nothing is sent while a session is reconstructed) and refill it
+/// afterwards, with the re-fill visible to a node that already holds the slot.
+/// The real device sink will make `send` a fast queue push, and with a single
+/// sender the lock is uncontended.
+pub type SharedMidiSink = Arc<Mutex<Option<Box<dyn MidiSink>>>>;
 
 /// The shared transport log the host feeds ([`TransportLog`]).
 pub type SharedTransportLog = Arc<TransportLog>;
@@ -120,9 +132,12 @@ const CLOCK_OUT_CAP: usize = 64;
 /// in each block and sends them through the host's sink. It produces no audio,
 /// declares no ports, and tracks no state between blocks.
 pub struct ClockOutNode {
-    /// The host's sink, if any. `None` is a first-class state — a session
-    /// without the device — not an error.
-    sink: Option<SharedMidiSink>,
+    /// The host's sink slot, always present: when the host provided a slot
+    /// under [`MIDI_OUT_KEY`] the node shares it, and when it did not the
+    /// node holds its **own empty slot** — either way the render path sends
+    /// only when the slot currently contains a device, and the host can
+    /// empty and refill a shared slot without re-mounting the plugin.
+    sink: SharedMidiSink,
     transport: Option<SharedTransportLog>,
     /// Per-block event scratch, allocated once at construction and `clear`ed
     /// each block: the render path never grows it (see [`CLOCK_OUT_CAP`]).
@@ -130,28 +145,44 @@ pub struct ClockOutNode {
     /// Transport drained from the log this block — also preallocated, for the
     /// same reason.
     transport_scratch: Vec<(u64, Transport)>,
-    /// Events that did not fit the scratch: a loud bound, read by tests and,
-    /// later, the host's health surface.
-    overflows: u64,
+    /// Events that did not fit the scratch: a loud bound, kept behind a shared
+    /// atomic so the plugin can **publish** it under [`CLOCK_OUT_OVERFLOWS_KEY`]
+    /// while the render path only ever increments — a counter is not worth a
+    /// lock in the block.
+    overflows: Arc<AtomicU64>,
 }
 
 impl ClockOutNode {
     /// Construct with the services the plugin found in the context at apply
     /// time — either may be `None`.
     pub fn new(sink: Option<SharedMidiSink>, transport: Option<SharedTransportLog>) -> Self {
+        Self::with_overflow_counter(sink, transport, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// Construct with an **existing** overflow counter — the apply path's form,
+    /// which publishes the same `Arc` into the context so a reader outside the
+    /// graph sees the live count.
+    pub fn with_overflow_counter(
+        sink: Option<SharedMidiSink>,
+        transport: Option<SharedTransportLog>,
+        overflows: Arc<AtomicU64>,
+    ) -> Self {
+        // No host-provided slot under `midi.out` is a first-class state — the
+        // node mounts its own, permanently empty, so a session without the
+        // device sends nothing and renders byte-identically.
         ClockOutNode {
-            sink,
+            sink: sink.unwrap_or_else(|| Arc::new(Mutex::new(None))),
             transport,
             scratch: Vec::with_capacity(CLOCK_OUT_CAP),
             transport_scratch: Vec::with_capacity(CLOCK_OUT_CAP),
-            overflows: 0,
+            overflows,
         }
     }
 
     /// How many events were dropped because a block exceeded
     /// [`CLOCK_OUT_CAP`] — a mount this sane never sees a nonzero count.
     pub fn overflows(&self) -> u64 {
-        self.overflows
+        self.overflows.load(Ordering::Relaxed)
     }
 
     /// Push into the scratch, or count the overflow — never grow.
@@ -159,7 +190,7 @@ impl ClockOutNode {
         if self.scratch.len() < self.scratch.capacity() {
             self.scratch.push(event);
         } else {
-            self.overflows += 1;
+            self.overflows.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -245,11 +276,17 @@ impl crate::graph::AudioNode for ClockOutNode {
         // One send per block; the offsets carry the exact sub-block positions.
         // The lock is held only for the call, and with a single sender it is
         // uncontended — the real device sink will make this a fast queue push.
+        // An **empty** slot sends nothing: the host detaches the device across
+        // a rebuild, and the node renders its schedule regardless — only the
+        // send is device-bound.
         if !self.scratch.is_empty()
-            && let Some(sink) = &self.sink
+            && let Some(device) = self
+                .sink
+                .lock()
+                .expect("the midi.out sink is not poisoned")
+                .as_mut()
         {
-            let mut sink = sink.lock().expect("the midi.out sink is not poisoned");
-            sink.send(&self.scratch, block.frame);
+            device.send(&self.scratch, block.frame);
         }
     }
 }
@@ -287,14 +324,20 @@ impl Plugin for ClockOutPlugin {
     fn apply(&mut self, api: &mut PluginApi) -> Result<(NodeId, Disposer), String> {
         let sink = api.ctx.get::<SharedMidiSink>(MIDI_OUT_KEY).cloned();
         let transport = api.ctx.get::<SharedTransportLog>(TRANSPORT_KEY).cloned();
-        let node = api.graph.add_node(
-            NodeKind::Opaque(Box::new(ClockOutNode::new(sink, transport))),
-            Vec::new(),
-        );
+        // The overflow counter is published, not kept private: the host's
+        // snapshot reads it back under the key (the mixer's `mixer.meters`
+        // pattern), so a dropped tick is visible rather than silent.
+        let overflows = Arc::new(AtomicU64::new(0));
+        let node = ClockOutNode::with_overflow_counter(sink, transport, overflows.clone());
+        api.ctx.provide(CLOCK_OUT_OVERFLOWS_KEY, overflows);
+        let node_id = api
+            .graph
+            .add_node(NodeKind::Opaque(Box::new(node)), Vec::new());
         Ok((
-            node,
+            node_id,
             Box::new(move |dis: &mut super::DisposerCtx| {
-                dis.graph.remove_node(node);
+                dis.ctx.remove(CLOCK_OUT_OVERFLOWS_KEY);
+                dis.graph.remove_node(node_id);
             }),
         ))
     }
@@ -379,11 +422,12 @@ mod tests {
 
     impl MidiSink for FakeSink {}
 
-    /// A node with a fake sink, plus the recording handle the assertions read.
+    /// A node with a fake sink in its slot, plus the recording handle the
+    /// assertions read.
     fn node_with_sink() -> (ClockOutNode, Sends) {
         let (sink, recorded) = FakeSink::new();
-        let shared: SharedMidiSink = Arc::new(Mutex::new(Box::new(sink)));
-        (ClockOutNode::new(Some(shared), None), recorded)
+        let slot: SharedMidiSink = Arc::new(Mutex::new(Some(Box::new(sink))));
+        (ClockOutNode::new(Some(slot), None), recorded)
     }
 
     /// Render `[from, to)` in `block`-frame chunks through the node directly.
@@ -464,8 +508,8 @@ mod tests {
         let map = TempoMap::new(48_000, 120.0, 4);
         let log = Arc::new(TransportLog::new());
         let (sink, recorded) = FakeSink::new();
-        let shared: SharedMidiSink = Arc::new(Mutex::new(Box::new(sink)));
-        let mut node = ClockOutNode::new(Some(shared), Some(log.clone()));
+        let slot: SharedMidiSink = Arc::new(Mutex::new(Some(Box::new(sink))));
+        let mut node = ClockOutNode::new(Some(slot), Some(log.clone()));
         log.push(1_000, Transport::Start);
         log.push(3_000, Transport::Stop);
         log.push(5_500, Transport::Continue);
@@ -510,5 +554,22 @@ mod tests {
         assert_eq!(emitted + node.overflows(), due);
         assert_eq!(emitted, CLOCK_OUT_CAP as u64);
         assert!(node.overflows() > 0);
+    }
+
+    /// An **empty** slot sends nothing: the host's detach across a rebuild
+    /// leaves the node holding an empty slot, and the render path treats that
+    /// as "no device" — silently, never an error.
+    #[test]
+    fn an_empty_slot_sends_nothing() {
+        let map = TempoMap::new(48_000, 120.0, 4);
+        let (mut node, recorded) = node_with_sink();
+        // The host's detach: the device leaves the slot, the node keeps it.
+        *node.sink.lock().expect("not poisoned") = None;
+        render_range(&mut node, &map, 0, 48_000, crate::graph::BLOCK as u64);
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "the detached node sent nothing"
+        );
+        assert_eq!(node.overflows(), 0);
     }
 }

@@ -60,6 +60,11 @@ pub struct Snapshot {
     /// The audio output's state: `None` when the host runs silent (no device was
     /// requested), otherwise the negotiated rate/layout and the played counters.
     pub audio: Option<AudioStatus>,
+    /// The MIDI clock-out status, next to the meters: the port being driven
+    /// (`None` when the process asked for no device) and the `clock_out`
+    /// plugin's overflow counter (read back through its
+    /// `"clock_out.overflows"` context service).
+    pub midi: crate::MidiOutStatus,
     /// Whether an arrangement edit can be undone / redone (the shell's buttons).
     pub can_undo: bool,
     pub can_redo: bool,
@@ -133,6 +138,7 @@ impl Default for Snapshot {
             mastering: None,
             last_export: None,
             audio: None,
+            midi: Default::default(),
             can_undo: false,
             can_redo: false,
             last_error: None,
@@ -587,6 +593,10 @@ fn publish(session: &HostSession, shared: &Mutex<Snapshot>, audio: &AudioState) 
         peak_r: m.peak_r(),
         reduction_db: m.reduction_db(),
     });
+    // The MIDI status rides the same publish pass as the meters: the port and
+    // the overflow counter are cheap reads (an option clone and an atomic
+    // load), and a shell draws both next to the meters.
+    s.midi = session.midi_status();
     s.audio = match audio {
         AudioState::Off => None,
         AudioState::Failed(e) => Some(AudioStatus {
@@ -701,6 +711,42 @@ mod tests {
         let second = host.load(&script).expect("re-load starts a fresh session");
         assert_eq!(second.mixer_channels, Some(2));
         assert!(second.summary.contains("underruns: 0"));
+        host.shutdown();
+    }
+
+    /// The MIDI clock-out status is published next to the meters: no port and
+    /// zero overflows on a host that mounted `clock_out` but asked for no
+    /// device. (The counter's nonzero path is covered host-side by
+    /// `the_overflow_counter_reaches_the_host_status` — overflowing inside the
+    /// live actor would take an absurd tempo, and the field's plumbing is what
+    /// this asserts.)
+    #[test]
+    fn the_snapshot_publishes_the_midi_status() {
+        let host = HostHandle::spawn();
+        host.execute(HostCommand::Mount {
+            plugin: "clock_out",
+            params: vec![],
+            at_frame: Some(0),
+        })
+        .expect("mount clock_out");
+        host.execute(HostCommand::TransportPlay).expect("play");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let s = host.snapshot();
+            if s.frame > 0 {
+                assert_eq!(
+                    s.midi,
+                    crate::MidiOutStatus::default(),
+                    "no port asked for, no overflows at a sane tempo"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the clock never advanced within 2 s"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         host.shutdown();
     }
 
