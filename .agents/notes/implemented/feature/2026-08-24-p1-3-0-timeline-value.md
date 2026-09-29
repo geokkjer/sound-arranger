@@ -37,10 +37,20 @@ mutation on `Err`).
 
 Invariants enforced by every mutating op (fail-loud, never logged on refusal):
 `src_len > 0`, `src_len <= i64::MAX` (so signed trim arithmetic never wraps), `gain`
-finite, `loop_len != Some(0)`, `at_frame + src_len` not overflowing, and
-`fade_in + fade_out <= src_len`. The two sums are **checked, not wrapped**: both fades are
-raw `u64` on the `host v1` text path, so a pair can leave the range — see the
-[fade-sum fix](../bug-fix/2026-09-29-fade-sums-are-checked-not-wrapped.md).
+finite, `loop_len != Some(0)`, `at_frame + src_len` not overflowing,
+`src_start + src_len` not overflowing, and `fade_in + fade_out <= src_len`. The three
+sums are **checked, not wrapped**: the fades and `src_start` are raw `u64` on the
+`host v1` text path, so a pair or a window can leave the range — see the
+[fade-sum fix](../bug-fix/2026-09-29-fade-sums-are-checked-not-wrapped.md) and the
+[geometry-op fix](../bug-fix/2026-09-29-geometry-ops-leave-a-renderable-clip.md).
+
+**An op that rewrites a clip's geometry leaves the clip satisfying all of them.**
+`RazorSplit` and `ChopClip` shrink `src_len` without re-checking the fade sum, so they
+cap the fades they can no longer fit (the rule `Stretch` has always followed, and the one
+the shell's trim-to-content gesture uses) and validate what they produce. This is not
+cosmetic: `ArrangerNode::new` validates every clip on a track and refuses the *whole
+track* over one, so an op the log accepted but the renderer refused would make the
+session unplayable. `LoopRegion` is the growth arm and validates for the same reason.
 
 Opaque loop phase handled explicitly: **`RazorSplit` and `Trim(Start)` refuse a looped
 clip** — the loop phase at the cut is not representable in this model, and "drop the
@@ -69,13 +79,17 @@ fail-loud rather than a silent audio change.
   equality. This is the byte-identical-replay foundation for the arrangement.
 - `Clip::end()` assumes the span was validated on admission; `AddClip` validates the
   embedded `Clip` (a hand-built clip that would overflow/NaN/zero-length is refused on
-  the way in), so later ops (`RazorSplit`, `MoveClip`) can trust `at_frame + src_len`.
+  the way in), so later ops (`RazorSplit`, `MoveClip`) can trust `at_frame + src_len` —
+  and, since the [geometry-op fix](../bug-fix/2026-09-29-geometry-ops-leave-a-renderable-clip.md),
+  `src_start + src_len` too. `source_frame_at` adds to `src_start` and is therefore
+  panic-free for any clip that passed admission.
 - `RazorSplit`, `MoveClip`, `MoveClipToTrack`, and `Trim(Start)` all re-sort their track
   (stable, deterministic), so a track's `clips` stays sorted even when a neighbor starts
   *inside* the split clip's span (the kimi slice-1 sortedness bug).
 - `LoopRegion` uses `checked_mul` *before* any assignment (the kimi slice-1
-  panic/partial-mutation fix); the "refused op is never logged" contract holds because no
-  op mutates before its last possible failure point.
+  panic/partial-mutation fix) and validates the grown clip, since the growth is what can
+  push a span or a source window out of range; the "refused op is never logged" contract
+  holds because no op mutates before its last possible failure point.
 - 9 timeline tests pass (sortedness across split/move/trim, loop refusal, validation
   gate, determinism/replay). Workspace: 34 media unit tests, clippy clean.
 - **Deferred**: the engine log integration (`Event::Arrangement` + dispatch + `at_frame`)

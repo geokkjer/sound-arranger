@@ -658,6 +658,73 @@ fn a_fade_pair_whose_sum_overflows_u64_is_refused_by_a_script() {
     let _ = std::fs::remove_dir_all(&pool);
 }
 
+/// **The two-keypress sequence that used to make a track unplayable, end to end.**
+/// `f` at the clip's end sets a *full-length* fade-in (the shell caps it at
+/// `src_len - fade_out`, and the pair is legal: `4000 + 0 <= 4000`); `x` then
+/// razor-splits at an earlier frame. The split zeroed the seam fades but kept the
+/// inherited ones on halves a fraction of the original length, so it held a clip the
+/// model refuses — and `ArrangerNode::new` refuses the **whole track** over one clip,
+/// so the *bounce* failed and nothing on the track played. The split caps the fades
+/// to the halves they land on, so the sequence renders.
+#[test]
+fn a_razor_split_of_a_full_length_fade_still_bounces_audio() {
+    let pool = tmp_dir("spliffade");
+    write_ramp(&pool, "s1", 8000, 257);
+    let out_dir = tmp_dir("spliffadeout");
+    let out = out_dir.join("a.wav");
+
+    let script_text = format!(
+        "host v1\nmount mixer channels=2 @0\npool {}\narrange add_track t0 @0\narrange add_clip t0 c0 s1 0 4000 0 0 0 1.0 @0\narrange set_clip_fade t0 c0 4000 0 @0\narrange razor_split t0 c0 cL cR 1200 @0\nbounce 4000 {}\n",
+        pool.display(),
+        out.display()
+    );
+    let cmds = host::parse_script(&script_text).expect("script parses");
+    // The bounce is the assertion that matters: `bounce` renders through
+    // `wire_arranger`, which builds an `ArrangerNode` per track and returns the
+    // refusal as an `Err`. On the unfixed value this line failed with
+    // "arranger: clip 'cL' fades exceed the clip length".
+    let sess = run_script(&cmds).expect("a split of a fading clip must still bounce");
+
+    let timeline = sess.arrangement().expect("the arrangement must snapshot");
+    let ids: Vec<_> = timeline.tracks[0]
+        .clips
+        .iter()
+        .map(|c| c.id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["cL", "cR"], "the split produced two halves");
+    for c in &timeline.tracks[0].clips {
+        media::timeline::validate_clip(c)
+            .unwrap_or_else(|e| panic!("clip '{}' is invalid: {e}", c.id));
+    }
+    assert_eq!(
+        timeline.tracks[0].clips[0].fade_in, 1200,
+        "the fade-in is capped to the left half, not the whole clip"
+    );
+
+    let mut r = media::WavReader::open(&out).unwrap();
+    let mut audio = vec![0.0f32; r.total_frames() as usize];
+    let n = r.read_into(&mut audio);
+    assert!(
+        audio[..n].iter().any(|s| s.abs() > 1e-4),
+        "the split halves render audio"
+    );
+    // The capped fade is *audible*, not merely present: the left half ramps from
+    // silence at its first frame to full level over the 1200 frames it now spans.
+    assert!(
+        audio[0].abs() < 1e-3,
+        "the first frame of the split half is still inside its fade-in, got {}",
+        audio[0]
+    );
+    assert!(
+        audio[1000].abs() > 0.05,
+        "and the fade opens within the half, got {}",
+        audio[1000]
+    );
+
+    let _ = std::fs::remove_dir_all(&pool);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
 #[test]
 fn arrangement_bounces_audio_and_replays_byte_identically() {
     let pool = tmp_dir("audio");

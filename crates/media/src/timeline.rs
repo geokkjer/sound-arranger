@@ -21,7 +21,13 @@
 //!
 //! Invariants enforced by every mutating op (fail-loud, never partial):
 //! `src_len > 0`, `gain` finite, `loop_len != Some(0)`, `at_frame + src_len` not
-//! overflowing, and `src_len <= i64::MAX` (so signed trim arithmetic never wraps).
+//! overflowing, `src_start + src_len` not overflowing (the source window is an
+//! address, and every op that rewrites a clip's geometry adds to it), and
+//! `src_len <= i64::MAX` (so signed trim arithmetic never wraps). An op that
+//! *changes* a clip's geometry (razor-split, chop, trim, stretch, loop) leaves the
+//! clip satisfying all of them — a shrink caps the fades it can no longer fit, the
+//! way `Stretch` always has — so no op the log accepts can hold a clip
+//! [`validate_clip`] refuses, which is what would make the whole track unplayable.
 //! A refused op returns `Err` and — per the engine contract — is never logged.
 
 use serde::{Deserialize, Serialize};
@@ -337,6 +343,14 @@ pub fn validate_clip(c: &Clip) -> Result<(), String> {
     if c.at_frame.checked_add(c.src_len).is_none() {
         return Err(format!("clip '{}' span overflows the timeline", c.id));
     }
+    // The **source window** `[src_start, src_start + src_len)` is bounded for the same
+    // reason as the timeline span: razor-split and chop add to `src_start`, and a sum
+    // that leaves the range is a debug panic inside the editor's lock and a *wrapped*
+    // source offset in release — the clip reads from somewhere the user never asked
+    // for, with no diagnostic.
+    if c.src_start.checked_add(c.src_len).is_none() {
+        return Err(format!("clip '{}' source window overflows", c.id));
+    }
     if let Some(name) = &c.name
         && !valid_name(name)
     {
@@ -593,21 +607,37 @@ impl Timeline {
                 left.id = new_left.clone();
                 left.src_len = split_in;
                 left.fade_out = 0; // the split seam is hard (a crossfade is a later SetClipFade)
+                // A fade that was legal for the **whole** clip can outlast the half it
+                // lands on, and this op already rewrites the fades (the seam above), so
+                // cap them to the halves they must fit — the same rule `Stretch` follows
+                // when it repoints a clip at shorter material. Leaving them would admit a
+                // clip `validate_clip` refuses, and `ArrangerNode::new` refuses the whole
+                // *track* over one clip: a legal split that makes the session unplayable.
+                left.fade_in = left.fade_in.min(left.src_len);
                 let mut right = c.clone();
                 right.id = new_right.clone();
                 right.at_frame = *at_frame;
                 right.src_len = c.src_len - split_in;
                 right.fade_in = 0;
+                right.fade_out = right.fade_out.min(right.src_len);
                 if c.reversed {
                     // The clip's *first* frames are the region's **top**, so the left
                     // half takes the top and the right half the bottom — the mirror of
                     // the forward split (`clip_tests` pins both).
-                    left.src_start = c.src_start + right.src_len;
+                    left.src_start = c
+                        .src_start
+                        .checked_add(right.src_len)
+                        .ok_or("razor-split would move the left half past the source end")?;
                     right.src_start = c.src_start;
                 } else {
                     left.src_start = c.src_start;
-                    right.src_start = c.src_start + split_in;
+                    right.src_start = c
+                        .src_start
+                        .checked_add(split_in)
+                        .ok_or("razor-split would move the right half past the source end")?;
                 }
+                validate_clip(&left).map_err(|e| format!("razor-split left half: {e}"))?;
+                validate_clip(&right).map_err(|e| format!("razor-split right half: {e}"))?;
                 // drop the original clip, then sorted-insert both halves
                 self.tracks[ti].clips.remove(ci);
                 self.tracks[ti].clips.push(left);
@@ -796,6 +826,12 @@ impl Timeline {
                     .ok_or("loop region length overflows")?;
                 c.loop_len = Some(region);
                 c.src_len = src_len;
+                // `checked_mul` keeps the *length* representable; growing it can still
+                // push the clip's timeline span or its source window out of range (a
+                // clip placed near the end of the frame range, looped many times). Same
+                // rule as every other geometry op: an op the log accepts must not leave
+                // a clip the renderer refuses, because that wedges the whole track.
+                validate_clip(c).map_err(|e| format!("loop region: {e}"))?;
                 Ok(())
             }
             ArrangeOp::ChopClip {
@@ -832,7 +868,9 @@ impl Timeline {
                 // Forward, the pieces walk up from `src_start`; reversed, they walk
                 // **down** from the region's top (the first piece in time is the top).
                 let mut src_at = if c.reversed {
-                    c.src_start + c.src_len
+                    c.src_start
+                        .checked_add(c.src_len)
+                        .ok_or("chop would move a piece past the source end")?
                 } else {
                     c.src_start
                 };
@@ -847,6 +885,9 @@ impl Timeline {
                     // Preserve the clip's outer fades on the first/last piece (as
                     // RazorSplit does) so a chop doesn't silently remove audible
                     // crossfades; interior seams are hard (a SetClipFade follows).
+                    // A piece is shorter than the clip the fade was legal for, so it is
+                    // capped to the piece — an uncapped fade would make a piece the
+                    // model refuses, and the renderer refuses the whole track over it.
                     if c.reversed {
                         src_at -= slen;
                     }
@@ -859,8 +900,12 @@ impl Timeline {
                         src_start: src_at,
                         src_len: slen,
                         at_frame: at,
-                        fade_in: if i == 0 { c.fade_in } else { 0 },
-                        fade_out: if i + 1 == times_f { c.fade_out } else { 0 },
+                        fade_in: if i == 0 { c.fade_in.min(slen) } else { 0 },
+                        fade_out: if i + 1 == times_f {
+                            c.fade_out.min(slen)
+                        } else {
+                            0
+                        },
                         gain: c.gain,
                         loop_len: None,
                         reversed: c.reversed,
@@ -869,6 +914,13 @@ impl Timeline {
                         src_at += slen;
                     }
                     at += slen;
+                }
+                // The pieces tile the original clip's span and source window, so this
+                // cannot fail for a clip the model already accepted — it states that, so
+                // a future change to the piece construction cannot quietly reintroduce a
+                // logged clip the renderer refuses.
+                for p in &pieces {
+                    validate_clip(p).map_err(|e| format!("chop piece '{}': {e}", p.id))?;
                 }
                 self.tracks[ti].clips.remove(ci);
                 self.tracks[ti].clips.extend(pieces);
@@ -945,6 +997,17 @@ mod tests {
             .apply(&ArrangeOp::AddTrack { track: "t1".into() })
             .unwrap();
         t
+    }
+
+    /// Every clip in the value satisfies the model's invariants. This is the property
+    /// that makes an accepted op safe to *render*: `ArrangerNode::new` validates every
+    /// clip on a track and refuses the whole track over one of them, so a single clip an
+    /// op left invalid makes the session unplayable (and every later edit fail with it).
+    fn assert_all_clips_valid(t: &Timeline) {
+        for c in t.tracks.iter().flat_map(|tr| tr.clips.iter()) {
+            let verdict = validate_clip(c);
+            assert!(verdict.is_ok(), "clip '{}' is invalid: {verdict:?}", c.id);
+        }
     }
 
     #[test]
@@ -1894,6 +1957,26 @@ mod tests {
         assert_eq!(c.source_frame_at(999), 999);
         assert_eq!(c.source_frame_at(1000), 0);
         assert_eq!(c.source_frame_at(2500), 500);
+
+        // Growing `src_len` can push the clip's timeline span out of range, and that is
+        // refused rather than admitted: an op the log accepts must not leave a clip the
+        // renderer refuses, or the whole track stops building readers.
+        let mut t = two_tracks();
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", u64::MAX - 100, 100),
+            })
+            .unwrap();
+        assert!(
+            t.apply(&ArrangeOp::LoopRegion {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 2,
+            })
+            .is_err(),
+            "a loop that would push the clip's span out of range is refused"
+        );
     }
 
     #[test]
@@ -1996,6 +2079,182 @@ mod tests {
         // The boundary that is legal stays legal: `fade_in + fade_out == src_len`
         // is exactly what the model allows.
         assert!(t.apply(&fading(60, 40)).is_ok());
+    }
+
+    /// **A razor-split of a clip with a long fade leaves two clips the model accepts.**
+    /// The fade rule is a sum against `src_len`, and razor-split is an op that *shrinks*
+    /// `src_len` — it zeroed the two seam fades but kept the inherited ones on the halves
+    /// that did not have the seam. A full-length fade-in is one keypress away in the shell
+    /// (`f` with the playhead at the clip's end caps at `src_len - fade_out`), so
+    /// `f`-then-`x` produced a half with `fade_in = src_len_of_the_whole` on a clip a
+    /// fraction of that long. `ArrangerNode::new` validates every clip on a track and
+    /// refuses the *whole* track over one, so the split — legal, accepted and logged —
+    /// made the session unplayable, and the half could not even be trimmed back.
+    #[test]
+    fn a_razor_split_of_a_long_fade_leaves_two_valid_halves() {
+        let mut t = two_tracks();
+        // A full-length fade-in is legal (48000 + 0 == src_len) and one keypress away.
+        let mut c = clip("c0", 0, 48_000);
+        c.fade_in = 47_999;
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: c,
+            })
+            .unwrap();
+
+        let split = t
+            .apply(&ArrangeOp::RazorSplit {
+                track: "t0".into(),
+                clip: "c0".into(),
+                new_left: "L".into(),
+                new_right: "R".into(),
+                at_frame: 12_000,
+            })
+            .expect("a split of a fading clip is not refused");
+        assert_all_clips_valid(&split);
+
+        let l = split.clip("L").expect("left half").1;
+        let r = split.clip("R").expect("right half").1;
+        assert_eq!(l.src_len, 12_000, "the left half is the short one");
+        // Capped to the half, not kept whole: 47_999 does not fit 12_000 frames.
+        assert_eq!(l.fade_in, 12_000, "the fade is capped to the half");
+        assert_eq!(l.fade_out, 0, "the split seam stays hard");
+        assert_eq!((r.fade_in, r.fade_out), (0, 0), "the seam is hard");
+        assert_eq!(r.src_len, 36_000);
+
+        // The mirror: a fade-*out* longer than the right half is capped there.
+        let mut t = two_tracks();
+        let mut c = clip("c0", 0, 48_000);
+        c.fade_out = 47_000;
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: c,
+            })
+            .unwrap();
+        let split = t
+            .apply(&ArrangeOp::RazorSplit {
+                track: "t0".into(),
+                clip: "c0".into(),
+                new_left: "L".into(),
+                new_right: "R".into(),
+                at_frame: 12_000,
+            })
+            .expect("a split of a fading-out clip is not refused");
+        assert_all_clips_valid(&split);
+        assert_eq!(
+            split.clip("R").expect("right half").1.fade_out,
+            36_000,
+            "the fade-out is capped to the right half"
+        );
+    }
+
+    /// **A chop of a clip with a long fade leaves pieces the model accepts.** Same hole
+    /// as the split, per piece: the first piece inherited `fade_in` and the last
+    /// `fade_out` from the whole clip, and each piece is only `src_len / times` frames.
+    #[test]
+    fn a_chop_of_a_long_fade_leaves_pieces_the_model_accepts() {
+        let mut t = two_tracks();
+        let mut c = clip("c0", 0, 100);
+        c.fade_in = 50;
+        c.fade_out = 50; // exactly the clip's length: legal, and each piece is 10 frames
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: c,
+            })
+            .unwrap();
+
+        let chopped = t
+            .apply(&ArrangeOp::ChopClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 10,
+                prefix: "s".into(),
+            })
+            .expect("a chop of a fading clip is not refused");
+        assert_all_clips_valid(&chopped);
+        let pieces = &chopped.tracks[0].clips;
+        assert_eq!(pieces.len(), 10);
+        assert_eq!(
+            (pieces[0].fade_in, pieces[0].fade_out),
+            (10, 0),
+            "the leading fade is capped to the first piece"
+        );
+        assert_eq!(
+            (pieces[9].fade_in, pieces[9].fade_out),
+            (0, 10),
+            "the trailing fade is capped to the last piece"
+        );
+        assert!(
+            pieces[1..pieces.len() - 1]
+                .iter()
+                .all(|p| (p.fade_in, p.fade_out) == (0, 0)),
+            "the interior seams stay hard"
+        );
+    }
+
+    /// **A split and a chop are refused rather than wrapping when they would push the
+    /// source window past the frame range.** `src_start` is an unbounded `u64` on the
+    /// `add_clip` path, and a reversed split/chop *adds* to it: `u64::MAX - 3999 + 4000`
+    /// wraps in debug (a panic inside the editor's lock) and silently to a wrong offset
+    /// in release — the piece reads from somewhere the user never asked for. The clip is
+    /// refused at `AddClip` now that the window is bounded, and the arithmetic in both
+    /// arms is `checked_add` so a hand-built clip (a deserialized snapshot) is refused
+    /// there too rather than wrapped.
+    #[test]
+    fn a_source_window_past_the_frame_range_is_refused_not_wrapped() {
+        let t = two_tracks();
+        let mut c = clip("c0", 0, 4_000);
+        c.src_start = u64::MAX - 4_000; // the window ends on the last frame: legal
+        let t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: c,
+            })
+            .expect("the last representable window is legal");
+        let mut c = clip("c1", 0, 4_000);
+        c.src_start = u64::MAX - 3_999; // one frame further: the end leaves the range
+        let t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: c,
+            })
+            .expect_err("a source window that cannot be represented is refused");
+        assert!(
+            t.contains("source window"),
+            "the refusal names the source window, got: {t}"
+        );
+
+        // The arms refuse too, when a clip reaches them without passing `AddClip` (a
+        // value deserialized from a snapshot is a legal `&self` to `apply`).
+        let mut hand = two_tracks();
+        let mut c = clip("c0", 0, 4_000);
+        c.src_start = u64::MAX - 10; // the window cannot be represented
+        c.reversed = true; // the reversed arms add to `src_start`
+        hand.tracks[0].clips.push(c);
+        assert!(
+            hand.apply(&ArrangeOp::RazorSplit {
+                track: "t0".into(),
+                clip: "c0".into(),
+                new_left: "L".into(),
+                new_right: "R".into(),
+                at_frame: 100,
+            })
+            .is_err(),
+            "a reversed split that would wrap the source offset is refused"
+        );
+        assert!(
+            hand.apply(&ArrangeOp::ChopClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 4,
+                prefix: "p".into(),
+            })
+            .is_err(),
+            "a reversed chop that would wrap the source offset is refused"
+        );
     }
 
     #[test]
