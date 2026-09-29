@@ -2,6 +2,8 @@
 
 Status: proposed
 
+> **Overridden in part (2026-09-27):** [the profiles decision](2026-09-27-profiles-and-the-umbrella-name.md) makes the **recorder** the focus and names the platform `audio`. This list is the **arranger's** finish line, not the project's — the recorder has its own, and its two defining pieces (MIDI clock out, alignment of takes) are the unbuilt ones.
+
 ## Problem
 
 The owner wants to push the project from pre-alpha to a state where arranging is **confident**:
