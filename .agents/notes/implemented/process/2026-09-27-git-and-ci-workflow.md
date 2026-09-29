@@ -129,11 +129,12 @@ What is live as of this note:
 1. CI runs formatting, clippy (`-D warnings`), the workspace tests and the notes verifier on every
    pull request and on every push to `main`, plus a job per shell spike — `spikes/*` are separate
    workspaces a root test run does not cover. `crates/shell` is deliberately not built.
-2. **Enforcement is advisory, and that is a plan limitation rather than a choice.** Branch protection
-   and repository rulesets both answer `403 Upgrade to GitHub Pro or make this repository public` on a
-   private repo, so nothing *blocks* a force-push or a red merge. What stands in for it is CI
-   reporting on every PR plus the conventions in AGENTS.md — weaker than a rule the platform enforces,
-   and recorded here rather than implied. The paths to real enforcement are a public repo or Pro.
+2. **`main` is protected.** The repo went public on 2026-09-29, which lifted the plan block that had
+   made this criterion unmeetable (protection and rulesets both answered `403 Upgrade to GitHub Pro or
+   make this repository public` on a private repo): the four checks are required, force-pushes and
+   deletions are refused, and **no pull request is required** — deliberately, so a docs or typo fix can
+   still go straight to `main` when CI is green. Admins stay exempt, which is what keeps that
+   exception workable for the only account that pushes.
 3. A slice lands as a branch plus a PR whose body carries its note, and the merge does **not** squash.
    Verified on this very change: the rebase-merge preserved per-commit authorship (the model) and
    every `Assisted-by` trailer, with the human as committer.
