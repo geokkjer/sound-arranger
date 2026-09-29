@@ -1596,6 +1596,16 @@ impl HostSession {
                 channels,
                 at_frame,
             } => {
+                // The declaration names its own pool sources, so `channels` **sizes** the
+                // vector built below: a line carrying a width no capture could have
+                // recorded must be refused, never sized. The bound is the capture sanity
+                // bound — the same rule `SourceAdd` and `media::Capture::start` apply.
+                if !(1..=media::capture::CAPTURE_CHANNELS_SANITY).contains(channels) {
+                    let sanity = media::capture::CAPTURE_CHANNELS_SANITY;
+                    return Err(format!(
+                        "take '{take_id}' channels must be 1..={sanity}, got {channels}"
+                    ));
+                }
                 self.status_take(&TakeReport {
                     take_id: take_id.clone(),
                     frames: *frames,
@@ -7869,6 +7879,44 @@ mod tests {
             "the session's rate, not a declared one"
         );
         assert_eq!(take.at_frame, 120, "the take's origin is kept");
+    }
+
+    /// A declaration is **wire input** that names its own pool sources: the take's channel
+    /// count sizes `{take_id}.ch{k}`, so a malformed one would size that vector from the
+    /// script line — thirty bytes aborting the process. The bound is the capture sanity
+    /// bound, the same rule every other channel count on this path obeys.
+    #[test]
+    fn a_take_declaration_refuses_a_channel_count_it_could_not_have_recorded() {
+        let sanity = media::capture::CAPTURE_CHANNELS_SANITY;
+
+        // The wire form: a well-formed line whose channel count no capture could produce.
+        let script = parse_script(&format!("host v1\ntake jam 96000 0 {} 0\n", sanity + 1))
+            .expect("the line's shape is well formed");
+        let refused = run_script(&script).expect_err("an unboundable width is refused");
+        assert!(refused.contains("channels"), "and it says why: {refused}");
+
+        // The same bound in memory, where a replayed declaration comes from and where
+        // `usize::MAX` is a capacity overflow rather than a merely enormous allocation.
+        let mut s = HostSession::new();
+        assert!(
+            s.execute(&HostCommand::Take {
+                take_id: "jam".into(),
+                frames: 0,
+                dropped: 0,
+                channels: usize::MAX,
+                at_frame: 0,
+            })
+            .is_err(),
+            "a width no capture could have recorded is refused"
+        );
+        assert!(s.last_take().is_none(), "and nothing landed in the session");
+
+        // The bound is inclusive, and it is the *sanity* bound rather than a new ceiling:
+        // a take recorded at the sanity width still replays.
+        let widest =
+            parse_script(&format!("host v1\ntake jam 96000 0 {sanity} 0\n")).expect("it parses");
+        let s = run_script(&widest).expect("the widest legal take binds");
+        assert_eq!(s.last_take().expect("the take is bound").channels, sanity);
     }
 
     /// Recording is one take at a time, needs somewhere to put it, and stopping
