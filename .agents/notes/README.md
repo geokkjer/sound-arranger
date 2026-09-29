@@ -19,7 +19,7 @@ The tree itself is the inventory — there is no index file. Search or browse in
 
 Write or update a note in the same commit as any non-trivial change: new behavior, a structural change, a contract or format change, a tooling/process change, or any decision you might reasonably revisit. Purely mechanical or local edits are exempt.
 
-Update the note that already owns the decision; do not duplicate it. Never edit a note into a *different* decision — write a new note and cross-link (relative markdown links, so they survive moves). `RESEARCH.md` holds working research; a note holds the decision. When research locks a choice, graduate it into a note; research can link to the note instead of restating it.
+Update the note that already owns the decision; do not duplicate it. Never edit a note into a *different* decision — write a new note and cross-link (relative markdown links, so they survive moves). **When two notes disagree, the later decision governs**: the theory of the program is being refined, not excavated, so precedence is temporal and superseding means a cross-link back from the new note to the one it overrides. `RESEARCH.md` holds working research; a note holds the decision. When research locks a choice, graduate it into a note; research can link to the note instead of restating it.
 
 ## File format
 
@@ -43,6 +43,6 @@ Moving a note between lifecycles means updating the `Status:` line and re-satisf
 
 ## Verification
 
-`node scripts/verify-agent-notes.mjs` checks the whole tree: closed lifecycle/class sets, filename grammar, the header block, required sections, and the mandatory alternatives section. It runs automatically from the `pre-commit` hook (`.githooks/`, wired via `core.hooksPath`); you can also run it by hand.
+`node scripts/verify-agent-notes.mjs` checks the whole tree: closed lifecycle/class sets, filename grammar, the header block, required sections, the mandatory alternatives section, and that every cross-reference resolves. It runs automatically from the `pre-commit` hook (`.githooks/`, wired via `core.hooksPath`); you can also run it by hand.
 
 `archived/` is a frozen history by convention: once a note moves there it is never edited. The pre-commit hook refuses any change under `.agents/notes/archived/`.

@@ -1,239 +1,163 @@
-# sound-arranger (working title)
+# audio — an audio platform where everything is a plugin
 
-> 🕒 Last verified against commit `971524b` (2026-09-24). If the code has
-> moved on, trust the code and move this line forward.
+> 🕒 Last verified against commit `4a3706f` (2026-09-29). If the code has moved on,
+> trust the code and move this line forward.
 
-An **audio platform where everything is a plugin**: a minimal core — clock · audio graph
-interpreter · session event log · context plumbing — with every capability as a plugin, and
-the product an **assembled profile**. Rust (engine core + media engine + host) and Rust shells over
-the Host API — the same versioned text format the CLI drives. The shells are **iced** (GUI, with
-`iced_audio` widgets) and **ratatui** (TUI), both in-process over the same host actor; the
-**Tauri v2 + Vue 3 shell is retired** ([note](.agents/notes/implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md),
-[`crates/shell/RETIRED.md`](crates/shell/RETIRED.md)) — **the TUI is primary**, iced is the second
-shell with one shared workflow. The interaction direction under evaluation: **modal editing — visual mode for clips —
-with the `host v1` command language as the `:` prompt**, i.e. for audio what vim/helix/emacs is for
-text ([note](.agents/notes/proposed/architecture/2026-09-21-modal-editing-model.md)).
+*(The repository is still named `sound-arranger`; the rename to **`audio`** is decided but not done —
+[the profiles and umbrella-name note](.agents/notes/proposed/architecture/2026-09-27-profiles-and-the-umbrella-name.md).)*
 
-## Scope (focused core)
+A minimal core — **clock · audio-graph interpreter · session event log · context plumbing** — with
+every capability as a **plugin**, so a product is an **assembled profile**. The session log is the
+document: every edit is a line of `host v1` text, which is why a session replays byte-identically, a
+seek is a rebuild, and the shells speak the same language the CLI does.
 
-**The core is one thing: a *liquid* audio editor / sampler / arranger / mixer.** Record long
-**generative runs** — a eurorack patch or algorithmic source unfolding evolving patterns over
-drones or stretched audio — then cut, splice, rearrange and mix them into a finished piece:
-clips-as-objects, with a tape/edit-as-composition heritage (musique concrète, dub, ACID). This
-is the monorepo for that core **and
-its integrations**
-(`plugins/`): external programs and devices we sync and record, not plugin binaries —
-see the [no-sidecars note](.agents/notes/proposed/architecture/2026-09-21-external-programs-not-sidecars.md).
+Three profiles are planned. One works today.
 
-Deliberately **out of scope** for this repo (kept as separate projects, indexed by the
-`~/Projects/music` view): the personal composition-theory corpus, the jam/recording rig, and
-the Tidal live-coding tool (`tidal-lsp`) — those are not on the clip-arranger path.
-
-> **Working title.** The repo name names the *first profile*, not the platform; a rename
-> ("audio" / "sound") is an open question — see RESEARCH.md §14.
-
-**Status: pre-alpha, with a finish line.** The alpha scope, its order and what is deliberately cut are
-in the [alpha finish-line note](.agents/notes/proposed/architecture/2026-09-23-alpha-finish-line.md),
-reviewed by the co-work passes ([verbatim](research/architecture/2026-09-23-alpha-scope-co-work-reviews.md)).
-Its most important finding: the substrate is further along than the capability list implies — but
-**recording is not wired into the host** (`HostCommand::Record` is a stub), so the record → arrange loop
-has no first half yet, and the session has no save/open.
-
-The audio core works and is tested. **Recording works** and the pool reads 16/24-bit PCM and float WAVs, splitting a multi-channel import into one source per channel: `record <take_id>` captures the input device
-into the pool at the session rate and `record stop` finalizes it ([note](.agents/notes/implemented/feature/2026-09-23-recording-into-the-host.md)).
-What exists today: the minimal core,
-the media engine (disk streaming, recording, splicing, multi-channel capture, pool rate
-conformance), the soft mixer (gain/pan/mute/solo + stereo master), **the clip editor (P1.3 — value,
-ACID ops, arranger node, media pool with crash recovery, the engine's closed-core message
-dispatch, the logged-command codec, host wiring, and a text-format that drives it from the CLI)**,
-a **headless reference host** that proves the UI-as-plugin contract end-to-end, and **two shell
-spikes over it** — iced (transport, meters, a real `iced_audio` fader console) and ratatui (a
-timeline with braille envelopes, clip edits through the host's own `arrange` language, modal
-selection, a console whose faders read back from the log). The Tauri + Vue shell that carried the
-four views, zoom/pan, clip editing and undo/redo is **retired and frozen** — it is the porting
-reference, not the app.
-
-What doesn't exist yet: effects (no `fundsp` effect plugins), MIDI/OSC implementations (declared
-seams only), CLAP hosting, live-edit audio re-wiring, a genuine stereo *clip* (the master is
-stereo, stereo **material** is split into one mono pool source per channel and panned, but one
-clip is still one mono source), and **full UI wiring** — several surfaces are real
-components with placeholder bodies (the Detail View's three contexts are tabs whose bodies are
-sketched pending selection wiring; record is still chrome). The direction is locked
-([umbrella-first note](.agents/notes/proposed/architecture/2026-08-15-umbrella-first-product-direction.md)):
-
-- **Profile #1 — the clip arranger ("sound-arranger"):** record long **generative runs**, then
-  cut, splice, rearrange and mix them into a finished piece. ACID-style clips-as-objects with a
-  tape/edit-as-composition heritage (musique concrète, dub, ACID) as inspiration, and a
-  generative/modular "performer" (a eurorack patch or algorithm) rather than a human jam.
-  Chosen first because it stresses the substrate end-to-end: recording, editing, mixing, the
-  realtime path.
-- **Deferred, own profile — "sound sculptor":** offline/non-realtime processing (CDP8,
-  PaulStretch, Csound offline, phase-vocoder) as `OfflineProcess` plugins. **This is a *scope*
-  deferral, not a gate**: the trait is already defined, and building CDP8 as a *spoke* requires
-  no profile change at all. Which profile surfaces it is decided when that work starts — see
-  [the phase note](.agents/notes/proposed/process/2026-09-10-phase-sequence-is-a-plan-not-a-gate.md).
-
-## Where the code is
-
-| Crate | What it is | Status |
+| Profile | What it is | State |
 |---|---|---|
-| `crates/engine` | The minimal core: clock (tempo map + sample-accurate scheduler), patch-bay graph interpreter (typed ports, PDC), session event log, context plumbing — plus plugins: euclidean, scale, tone, **soft mixer** (gain/pan/mute/solo, stereo master fader, meters) and **master** (a stereo-linked compressor + a 5 ms lookahead brickwall limiter on the bus, with peak and gain-reduction meters; `mount master` after the mixer, `patch mixer.audio master.audio`, then `set_param master threshold …`). Audio ports are **channel-aware**: a cord carries one channel count, the mixer's master is stereo, and a mismatch is refused rather than silently downmixed. Offline renders are **latency-aligned** (`render_with_drain_aligned` trims the graph's transit), so a lookahead effect does not push the bounce's head into silence. Std-only. It also carries the **closed-core plugin-message dispatch** (`Event::Arrangement` + `arrange_logged`): profile-level ops are logged as commands the core understands without knowing them. | works, tested |
-| `crates/media` | The media engine (core-privileged, not a plugin): disk streaming, splice-during-playback, recording writer with crash recovery, **device-clock drift compensation wired into the capture**, multi-channel capture → **float-WAV media pool with live peak pyramids**, pool **enumeration + crash recovery** (finalize un-finalized takes, rebuild `.peaks`) **+ rate conformance** (`import`/`conform`: a source of any rate is resampled once to the session rate, original preserved — see the [session-rate note](.agents/notes/implemented/architecture/2026-09-22-session-rate-and-source-conversion.md)), a **band-limited resampler** (128-tap Kaiser polyphase), the **clip editor's value + ACID ops + `ArrangerNode`** (renders a track from the value), and the **`ArrangeOp ↔ engine-command` codec**. | works, tested |
-| `crates/workflow` | **The shell workflow, defined once**: the modal, key-driven editing model both shells implement — modes, a toolkit-neutral `Key`, the `Action` vocabulary, the **snap-grid state** (which musical division an edit lands on; UI state, never logged), and the **keymap table that generates the `?` help**. It is UI-toolkit-free (its dependencies are `host`, whose `v1` vocabulary it is a keyboard face of, and `media`, whose grid math it names), and a test proves every action that claims to be a log op is an op the host's parser accepts — so a binding cannot drift from the log. See the [modal model](.agents/notes/proposed/architecture/2026-09-21-modal-editing-model.md) and the [shells note](.agents/notes/implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md). | works, tested |
-| `crates/host` | The **Host API contract** (commands = logged events, events, values — including `params`, the session's parameters folded from the log) + the **headless reference host**: `run_script` assembles the profile and bounces byte-identically — now including the **clip-arrangement commands** (`pool`/`arrange`) in the versioned **text format**, so the CLI smoke binary drives the clip editor end-to-end. It is also a **persistent live session** (`execute()` for incremental edits, `arrangement()` for a serializable snapshot a shell reads) with **gestures** (several arrangement ops in one `group begin` … `group end`, applied all-or-nothing and **one undo step**), **sessions as directories** (`save <dir>` writes the log as a `host v1` script plus its pool; the journal autosaves every gesture; `load <dir>` replays both) and **seeking at scale** (a backward seek into a long piece is a **warm-up**: the clock is placed one second before the target and only that run-in is rendered — readers derive every read from the block frame and the bus effects settle inside a second — with the audio proved byte-equal to a full replay and measured at 10.6 s → 0.10 s for a 30-minute four-track arrangement), **recording** (`record <take_id>` takes the input device into the pool at the session rate, `record stop` finalizes it) and **export** (`export <path> [f32|s16]`: the whole arrangement from frame 0, measured length, f32 by default, s16 through a fixed-seed TPDF dither, peak/RMS reported, and a refusal rather than a clipped file) — [gestures](.agents/notes/implemented/architecture/2026-09-23-compound-gestures-one-undo-step.md), [sessions](.agents/notes/implemented/architecture/2026-09-23-session-directory-save-and-journal.md), [recording](.agents/notes/implemented/feature/2026-09-23-recording-into-the-host.md). The UI-as-plugin seam — the iced and ratatui shells implement the same contract (the retired Tauri shell did too); swapping shells swaps only the transport adapter. | works, tested |
-| `crates/shell` | **RETIRED (2026-09-22)** — the Tauri v2 + Vue 3 shell: the four views as components (`Surface`, `TimelineCanvas`, `SourcePool`, `MixerPanel`, `DetailView`), `bridge` (the Host API over Tauri), `transport`, `editor` (undo/redo replayed from the log) and the timeline viewport/editing maths with unit tests. Frozen and **excluded from the workspace** (no Tauri/npm in the default build); kept as the porting reference for the Rust shells. See [`crates/shell/RETIRED.md`](crates/shell/RETIRED.md). | retired / frozen |
-| `spikes/iced-shell` | The **iced shell** (its own workspace, excluded from the core build): window, transport, channel/master meters following the audio, and **a real mixer** — `iced_audio 0.17` `VSlider` faders on a dB range, one per channel plus the master, positions read from the host's **parameter fold** (screenshot in its README). Drives the *same* `host::live::HostHandle` in-process: no IPC, no serde wire, no webview. Headless `--probe` asserts live meter signal; 2 tests pin the strip mapping and the dB range. iced 0.14 + `iced_audio` 0.17. | **second shell** (one workflow with the TUI; the GUI-only extras come later) |
-| `spikes/tui-shell` | The **ratatui evaluation spike** (its own workspace): the terminal counterpart of the iced spike — transport, channel/master meters, position readout — over the same in-process `HostHandle`, plus an **arrangement view** (`--script <host script>` draws the engine's own clips and tracks: braille min/max envelopes per clip, per-track colour, boundaries, fades, ruler, zoom/scroll, playhead, **visual-mode selection**) with **edits dispatched through the host's own `arrange` text format** (`x` split, `d` delete, `n`/`N` clip motion, `u`/`Ctrl+r` undo/redo by log replay), a **right-hand console** whose faders are **read back from the log** (`params`), and **panel focus** (`Tab`). `--wave <file.wav>` imports the file into a session pool at the session rate, so a loaded 44.1 kHz file is **audible at the right pitch**. Mouse, per-command UI latency, a **scrollable `?` keymap**, deterministic `--dump`. **Move/trim by key**: `<`/`>` trim to the playhead, `t` trims to the selection, `H`/`L` nudge a grid step, `J`/`K` change track. **Snap grid**: `b` cycles off → bar → beat → 1/2 → 1/4, the ruler becomes numbered **bar/beat lines**, `[`/`]` step the playhead a grid line, and the frame an edit lands on is quantized through the session's tempo map before the command is built (a script snaps identically with `snap=<frames>`). **Clipboard**: `y`/`c` copy or cut the selection to a shell value (never logged), `p` pastes at the playhead and `P` appends after the track's last clip — one `group` of `add_clip`s with minted ids and 64-frame micro-fades on new boundaries, so a paste is one undo step. **Tracks**: `a` adds, `R` renames through the command line, `D` deletes a track with its clips as one gesture, `{`/`}` reorder — and because a track's position is its mixer channel, the console follows the order. **Pool panel**: the pool's sources are a panel under the timeline (entry/rate/length, crashed takes marked); `Enter` places the selected source on the active track at the playhead, creating the track when the session has none. **Utility gestures**: `V` reverses a clip (a clip property with a mirrored reader — split/trim/chop mirror their source arithmetic), `U` normalizes from the peak pyramid, `i` inverts polarity, `E` silences, `T` trims to the audible content. **Tempo match**: `: source_tempo <id> <bpm>` logs the tempo a take was performed at, and `W` **warps** the clip under the playhead to the session's tempo there — an offline WSOLA render into a new pool source (named `{source}.stretch.{src_start}_{src_len}.{num}_{den}` from the region actually read and the ratio — the region is in the name, so two clips of one take never overwrite each other, and the same warp twice reuses one file) followed by one logged `arrange stretch`, so the material is new but the clip stays a straight region read, pitch is preserved, and `u` restores the old reference. **Markers + names**: `'` names a marker at the playhead (the ruler draws `▼` and its name), `;`/`"` jump between markers exactly, `C` names the clip under the playhead (its label is drawn on the lane) — all logged `arrange` lines, one undo each, and invisible to the audio. **Export**: `X` opens the command line prefilled with `export <dir>/mix.wav f32` (add `s16` for the dithered 16-bit file); the status reports peak/RMS, or the refusal if it would clip. | **primary shell** (the workflow reference) |
-| `plugins/` | **External-integration home** (placeholder, direction changed 2026-09-21): **no sidecar binaries and no plugin *host*** — capabilities that already exist as standalone programs (TidalCycles, VCV Rack, CDP8, sox, ffmpeg) are driven as *processes* and recorded into the pool, and hardware is synced and captured the same way. *Narrowed 2026-09-22:* exporting **our own instruments** as CLAP plugins is re-opened as a deferred option ([note](.agents/notes/proposed/architecture/2026-09-22-clap-export-via-nice-plug.md)). See [plugins/README.md](plugins/README.md) and the [no-sidecars note](.agents/notes/proposed/architecture/2026-09-21-external-programs-not-sidecars.md). | placeholder |
+| **recorder** | send a clock to external gear, capture it, align the takes, master, export | **the focus** — capture and takes work; clock-out and alignment are not built |
+| **arranger** | record long live jams, then cut them into a finished piece (ACID-style clips) | works end to end |
+| **sculptor** | offline, non-realtime transformation (CDP8, PaulStretch, phase vocoder) | deferred |
 
-**The core workspace's Rust suites pass** (engine · media · host · workflow — 25 test binaries, 235
-tests; the frontend tests retired with the shell, and both spike workspaces are outside the count:
-`spikes/tui-shell` carries 29 view/input tests and `spikes/iced-shell` 5). The core's invariants
-(byte-identical replay, no-allocation render, sample-accurate lifecycle) are tested, and the streaming soak + real hardware
-capture run as `#[ignore]`d tests.
-
-**Honest gaps** (deliberate, pre-alpha): the master is **stereo** (the mixer pans mono channels
-into L/R and the bounce is 2-channel) and stereo *material* is kept whole — a multi-channel file is
-split at import into `{id}.ch0`/`{id}.ch1` and placed on panned tracks — but a genuine stereo
-*source/clip* (one source, two channels, the per-port channel-count seam) is still forthcoming;
-control-side mutations apply on the render call stack (the real control→render handoff is
-seeded by `flush_scheduled`, not finished); the recorder's `play`/`splice` media commands are
-now **logged events** (the [media-commands note](.agents/notes/implemented/architecture/2026-09-12-media-commands-logged.md));
-`record` stays unwired; **live-edit-while-playing reader reuse**
-(edits after a bounce are rebuilt and readers are re-positioned at the transport frame, so they
-reach audio and removed tracks no longer ghost — but each rebuild re-warms readers, and the
-shared-state `ArrangerNode` reuse is still deferred); the
-the **drain/EOF phase** for tailed effects shipped (a bounce renders stateful nodes'
-`has_tail()` tails and flushes in-flight PDC, with a `capped` fail-loud bound) — realtime
-transport stop does not drain yet, and the drain is not a logged event;
-MIDI/OSC are declared seams, not implementations; **no effects**; and in the UI, **selection is
-not wired** — the Detail View's three contexts are tabs with placeholder bodies, and record
-remains chrome.
+**Status: pre-alpha** (`v0.1.0-pre-alpha.1`). What the code does — and, more usefully, what it
+deliberately does not — is [docs/capabilities.md](docs/capabilities.md), which keeps a
+"known flaky and unfinished" list instead of a feature page.
 
 ## Try it
 
 ```sh
-cargo test --workspace        # everything that doesn't need hardware
-cargo clippy --workspace --all-targets
-
-# hardware-dependent tests (this machine: a Scarlett 2i2):
-cargo test -p media -- --ignored
-cargo test -p media --release -- --ignored soak   # 25-minute stream+record+splice+bounce
+cargo test --workspace            # everything that needs no hardware
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p media -- --ignored  # hardware capture (needs a real input device)
 ```
 
-The headless smoke binary speaks the same versioned command script the Tauri shell bridge runs
-(the contract a UI sends — the log is the command list). It drives the clip arrangement too:
+A session **is** a script — the log is the command list:
 
 ```sh
-# a simple tone from the synth chain:
-printf 'host v1\nmount mixer channels=4 @0\nbounce 512 /tmp/out.wav\n' | cargo run -p host
+# the generators through the mixer, bounced to a file:
+printf 'host v1\nmount euclidean steps=8 pulses=5 @0\nmount scale root=0 @0\nmount tone @0\nmount mixer channels=2 @0\npatch euclidean.triggers scale.trigger @0\npatch scale.note tone.note @0\npatch tone.audio mixer.ch0 @0\nbounce 96000 /tmp/out.wav\n' | cargo run -p host
 
-# a clip arrangement from a pool source (the clip editor):
-#   pool <dir>: adopting it resamples any foreign-rate source to the session rate
-#   (`s1.wav` must exist); then arrange clips on tracks and bounce.
-printf 'host v1\nmount mixer channels=2 @0\npool /data/takes\narrange add_track t0 @0\narrange add_clip t0 c0 s1 0 48000 0 0 0 1.0 @0\nbounce 48000 /tmp/out.wav\n' | cargo run -p host
-
-# Export the whole arrangement (f32 by default, `s16` for a dithered 16-bit file):
-# the length is measured, peak/RMS are reported, and a mix that would clip is refused.
-printf 'host v1\nmount mixer channels=2 @0\npool /data/takes\narrange add_track t0 @0\narrange add_clip t0 c0 s1 0 48000 0 0 0 1.0 @0\nexport /tmp/mix.wav s16\n' | cargo run -p host
+# the same language records, arranges and exports:
+#   pool <dir>     adopt a directory of float-WAV sources (foreign rates are conformed once)
+#   record <take>  capture the input device into the pool at the session rate
+#   export <path>  the whole arrangement, f32 by default or dithered s16, never a clipped file
 ```
+
+The shells are their own workspaces, so iced, wgpu and the terminal backend never enter the core
+build. Both drive the same in-process host:
+
+```sh
+cd spikes/tui-shell  && cargo run     # the terminal shell — press ? for the keymap, q to quit
+cd spikes/iced-shell && cargo run     # the iced shell (needs a display and an audio device)
+```
+
+Twenty minutes in the terminal workflow: [docs/tui-first-session.md](docs/tui-first-session.md).
+Fifteen minutes of `host v1` with no UI at all: [docs/FIRST_SESSION.md](docs/FIRST_SESSION.md).
+
+## What works, and what does not
+
+**Works.** Recording a take from the input device into a float-WAV pool, with device-clock drift
+compensation wired into the capture; import at any rate (conformed once to the session rate, the
+original preserved); the clip editor — cut, copy, paste, move, trim, loop, chop, fade, gain, tracks,
+snap grid with a bar/beat ruler, markers and clip names; the soft mixer (gain/pan/mute/solo, stereo
+master) and a mastering chain (compressor plus lookahead brickwall limiter) on the bus; export to f32
+or dithered s16 that refuses to write a clipped file; sessions as directories with a crash-safe
+per-gesture journal; undo/redo where one gesture is one entry; byte-identical replay, save/load and
+export; and a jump into a 30-minute arrangement in about 0.1 s.
+
+**Not yet.** The recorder's two defining capabilities — **MIDI clock out** and **alignment of takes**
+— are stubs, so the record → align loop has no first half yet; there is no record *gesture* in the
+shells (a take is started from the `:` command line); no effects (`fundsp` is an optional seam, off by
+default); MIDI and OSC are declared seams with no implementation; no stereo *clip* (the master is
+stereo, stereo material is split into one mono pool source per channel and panned); one sample rate
+per session; and a cold backward seek into a long piece wants a checkpoint. Reasons, not just
+absences: [docs/capabilities.md](docs/capabilities.md).
+
+## Where the code is
+
+| Crate | What it is |
+|---|---|
+| `crates/engine` | The minimal core: tempo map and sample-accurate scheduler, the typed-port patch-bay graph interpreter with plugin delay compensation, the session event log, context plumbing — plus the built-in plugins (euclidean, scale, tone, soft mixer, mastering `master`). Std-only, allocation-free on the render path. |
+| `crates/media` | The media engine (core-privileged, not a plugin): disk streaming, splice during playback, the recording writer with crash recovery, multi-channel capture, the float-WAV pool with peak pyramids, import/conform, a band-limited resampler, the clip model with its ACID ops and the arranger node, and the arrangement-command codec. |
+| `crates/workflow` | The shell workflow defined once: the modal, key-driven editing model both shells implement, the `Action` vocabulary, the snap-grid state, and the keymap that generates `?` help. Toolkit-free, with a test proving every action claimed to be a log op is an op the host's parser accepts. |
+| `crates/host` | The Host API contract — commands are logged events, plus events and values a shell reads — and the headless reference host: `run_script` assembles a profile and bounces byte-identically, while a live session takes incremental edits, gestures (one undo step each), sessions as directories, seeking at scale, recording, and export. |
+| `crates/shell` | **Retired** (2026-09-22) — the Tauri + Vue shell. Frozen, excluded from the workspace, kept as the porting reference: [`crates/shell/RETIRED.md`](crates/shell/RETIRED.md). |
+| `spikes/tui-shell` | The terminal shell (primary): arrangement view with braille envelopes, edits dispatched through the host's own `arrange` language, a console whose faders read back from the log, pool panel, mouse, deterministic `--dump`. |
+| `spikes/iced-shell` | The iced shell (second): window, transport, meters following the audio, and a real mixer — `iced_audio` faders on a dB range, positions read from the host's parameter fold. |
+| `plugins/` | External-integration home (placeholder): programs and devices we drive and record, not plugin binaries — see [plugins/README.md](plugins/README.md). |
 
 ## Documentation map
 
-**New here?** Read in this order: first **operate the actual product**
-([docs/tui-first-session.md](docs/tui-first-session.md) — twenty minutes in the
-terminal shell: import a jam, cut it, name it, master it, export a mix), then what
-it does and does not do ([docs/capabilities.md](docs/capabilities.md)) and the
-checklist a second person runs ([docs/beta-acceptance.md](docs/beta-acceptance.md)).
-Then, to understand the *host* underneath it, run
-[docs/FIRST_SESSION.md](docs/FIRST_SESSION.md) (fifteen minutes of `host v1`
-scripts, no UI), learn the language through the codebase
-([docs/rust-course/](docs/rust-course/README.md)), then learn why it is shaped
-that way ([docs/architecture-explainer.md](docs/architecture-explainer.md)), and
-finally read the *theory* that makes the whole thing one program
-([docs/theory-of-the-program.md](docs/theory-of-the-program.md) — the what/why;
-the explainer is the how).
-Only then do the research and decision records make sense. To build on the
-engine — e.g. design your own soft-synth voices on fundsp — read
-[docs/soft-synth-fundsp.md](docs/soft-synth-fundsp.md) as a follow-on.
+New here? **Operate the thing first** — [docs/tui-first-session.md](docs/tui-first-session.md), then
+what it does and does not do ([docs/capabilities.md](docs/capabilities.md)) and the checklist a second
+person runs ([docs/beta-acceptance.md](docs/beta-acceptance.md)). Then the host underneath it:
+[docs/FIRST_SESSION.md](docs/FIRST_SESSION.md). Then learn the language through the codebase
+([docs/rust-course/](docs/rust-course/README.md)), learn why it is shaped that way
+([docs/architecture-explainer.md](docs/architecture-explainer.md)), and read the theory that makes it
+one program ([docs/theory-of-the-program.md](docs/theory-of-the-program.md)). Only then do the
+research and decision records read as consequences rather than claims.
 
-- [docs/clip-arranger.md](docs/clip-arranger.md) — the *product* side: the arrangement value,
-  the ACID editing ops, the render node, the media pool, and the host wiring that makes edits
-  reach audio.
-- [docs/theory-of-the-program.md](docs/theory-of-the-program.md) — the *theory* of the program,
-  in Peter Naur's sense (1985): why the whole thing coheres, and how the "understand the
-  codebase" debate applies here.
-- [docs/capabilities.md](docs/capabilities.md) — the capability/limitations statement: what
-  the alpha does, the cuts that are decisions rather than omissions, the known rough edges, and
-  the measured performance numbers.
-- [docs/beta-acceptance.md](docs/beta-acceptance.md) — the checklist a second person runs from
-  the docs alone (their own files, a different session rate, an export they hand to someone else).
-- [docs/design/](docs/design/) — the **retired** Tauri/Vue UI design, kept as history:
-  `ui-plan.md` (interaction spec), `design-system.md` (token contract), `mocks/` (live mockups).
-  The two Rust shells (the terminal one is primary) are the live UI.
-- [RESEARCH.md](RESEARCH.md) — working research & architecture (verified crate versions,
-  licensing matrix, latency notes, plugin-architecture research, DAW prior art)
-- [.agents/notes/](.agents/notes/README.md) — decision records (Agent Notes); standing
-  orders in [AGENTS.md](AGENTS.md)
-- [docs/audio-latency.md](docs/audio-latency.md) — Linux kernel/userspace latency tuning
-- [docs/soft-synth-fundsp.md](docs/soft-synth-fundsp.md) — building native soft-synth
-  voices on fundsp: the opaque-tier design, the feature flag, and the release-mode gotcha.
-- [research/](research/) — dated research inputs (gear notes, external reviews)
+- [docs/capabilities.md](docs/capabilities.md) — the capability and limitations statement, with the
+  cuts that are decisions rather than omissions, and the measured numbers.
+- [docs/clip-arranger.md](docs/clip-arranger.md) — the product side: the arrangement value, the
+  editing ops, the render node, the pool, and the host wiring that makes edits reach audio.
+- [docs/beta-acceptance.md](docs/beta-acceptance.md) — the checklist a second person runs from the
+  docs alone.
+- [.agents/notes/](.agents/notes/README.md) — decision records (Agent Notes), each with the
+  alternatives that were rejected; standing orders in [AGENTS.md](AGENTS.md).
+- [RESEARCH.md](RESEARCH.md) — working research: verified crate versions, the licensing matrix,
+  latency notes, DAW prior art.
+- [docs/design/](docs/design/) — the **retired** Tauri/Vue design, kept as history. The Rust shells
+  are the live UI.
+- [docs/audio-latency.md](docs/audio-latency.md) — Linux kernel and userspace latency tuning;
+  [docs/soft-synth-fundsp.md](docs/soft-synth-fundsp.md) — building native voices on fundsp.
 
-Docs that explain the code carry a `Last verified against commit …` banner; if
-the code has moved on, trust the code and move the line forward.
+Docs that explain the code carry a `Last verified against commit …` banner; if the code has moved on,
+trust the code and move the line forward.
 
-The surrounding ecosystem (composition-theory corpus, jam rig, sibling projects) is indexed
-by the [`~/Projects/music`](../music/README.md) symlink view.
+## Development
 
-## Dev environment
-
-**Native host toolchain** (Arch/CachyOS). Dev builds use the system `node`/`pnpm` and the
-**host** Mesa (and, only for the retired shell, GTK/WebKit); the **Rust toolchain is rustup-managed**, declared in
-[`rust-toolchain.toml`](rust-toolchain.toml) (`stable` + rustfmt/clippy/rust-analyzer), so the
-compiler is a property of the repo rather than of the distro package. The Nix/devenv setup is
-parked under [`nix/`](nix/): on this non-NixOS host a Nix-built GUI binary cannot open a window (the
-Nix glvnd ships no EGL vendor, and host WebKit needs `GLIBC_2.44` vs the Nix toolchain's 2.42). The
-diagnosis and the decisions are in the
-[host toolchain note](.agents/notes/implemented/process/2026-09-10-native-host-dev-toolchain.md)
-and the [rustup note](.agents/notes/implemented/process/2026-09-21-rustup-managed-toolchain.md).
-
-Install (Arch) — `rustup` **replaces** the distro `rust` package (they conflict); the retired
-shell's GTK/WebKit and `pnpm` are only needed if it is ever resurrected:
-```sh
-sudo pacman -S --needed base-devel rustup alsa-lib
-# for the retired Tauri shell only:
-#   sudo pacman -S nodejs npm pnpm webkit2gtk-4.1 gtk3 libsoup3 librsvg libayatana-appindicator openssl appmenu-gtk-module
-
-rustup default stable     # the repo's rust-toolchain.toml then supplies the components
-```
-
-The **shells** are their own workspaces, so iced, wgpu and the terminal backend never enter
-the core build. Both drive the same in-process `HostHandle`:
+The toolchain is **rustup-managed** and declared in [`rust-toolchain.toml`](rust-toolchain.toml)
+(`stable` plus rustfmt, clippy, rust-analyzer), so the compiler is a property of the repository rather
+than of the distro package. On Arch:
 
 ```sh
-cd spikes/iced-shell           # iced 0.14 + iced_audio 0.17 — a native window
-cargo run                      # the window (needs a display and an audio device)
-cargo run -- --probe           # headless proof: host thread + transport + live meters
-
-cd spikes/tui-shell            # ratatui 0.30 — a terminal
-cargo run                      # the TUI (press ? for the keymap, q to quit)
-cargo run -- --wave f.wav      # …with a timeline for a real audio file (v selects)
-cargo run -- --dump            # render one deterministic frame as text, no TTY needed
-cargo run -- --probe           # the same headless proof
+sudo pacman -S --needed base-devel rustup alsa-lib    # rustup replaces the distro rust package
+rustup default stable                                 # rust-toolchain.toml supplies the components
 ```
 
-One-time git setup — hooks live in-repo:
+One-time git setup — the hooks live in the repository, so they need pointing at:
 
 ```sh
 git config core.hooksPath .githooks
 ```
 
-The pre-commit hook verifies the Agent Notes tree and refuses edits under
-`.agents/notes/archived/`. It needs `node` on `PATH`; without node it warns and skips
-rather than blocking the commit.
+The pre-commit hook runs `cargo fmt --all --check` and then the Agent Note verifier, which checks the
+notes' structure **and** that every cross-reference resolves. Each gate warns and skips when its tool
+is missing, so a docs-only checkout can still commit — the authority is CI
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml): formatting, clippy with `-D warnings`, the
+workspace tests, the notes verifier, and one job per shell spike, because `spikes/*` are separate
+workspaces a root test run does not cover).
+
+A change lands as a short-lived branch (`slice/…`, `fix/…`, `docs/…`) with a pull request, and merges
+are **not squashed** — per-commit authorship and the `Assisted-by` trailers are this project's
+attribution record. Docs and typo fixes may still go straight to `main`; releases are tags, never
+branches ([the workflow note](.agents/notes/implemented/process/2026-09-27-git-and-ci-workflow.md)).
+
+## How this is built
+
+Decisions are recorded as dated [Agent Notes](.agents/notes/README.md), each stating the problem, the
+decision, the **alternatives that were rejected and why**, and the consequences — including the
+mistakes, which are recorded rather than tidied away. When two decisions conflict, **the later one
+governs**: the theory of this program is being refined, so a superseded note is linked from the new
+one rather than rewritten.
+
+Development is model-assisted and disclosed per commit: the model is the **author**, the human is the
+**committer**, and every agent commit carries an `Assisted-by` trailer naming the model and the
+harness. Known-flaky tests are named in the capability page with what is known about them, rather than
+quietly retried.
 
 ## License
 
-GPL-3.0-or-later ([LICENSE](LICENSE)) — rationale and the dependency compatibility matrix
-are in RESEARCH.md §12.
+GPL-3.0-or-later ([LICENSE](LICENSE)) — rationale and the dependency compatibility matrix are in
+[RESEARCH.md](RESEARCH.md) §12.
