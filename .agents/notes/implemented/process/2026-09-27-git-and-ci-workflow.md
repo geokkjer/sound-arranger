@@ -133,8 +133,11 @@ What is live as of this note:
    made this criterion unmeetable (protection and rulesets both answered `403 Upgrade to GitHub Pro or
    make this repository public` on a private repo): the four checks are required, force-pushes and
    deletions are refused, and **no pull request is required** — deliberately, so a docs or typo fix can
-   still go straight to `main` when CI is green. Admins stay exempt, which is what keeps that
-   exception workable for the only account that pushes.
+   still go straight to `main` when CI is green. Admins stay exempt on purpose: the agent pushes on the
+   human's behalf and the human is accountable, so the constraint belongs on the workflow rather than on
+   the account. The consequence is recorded because it was observed: a merge went through while its
+   checks were still running, which is what makes the discipline textual — the checks are read before a
+   merge, not enforced on the person doing it.
 3. A slice lands as a branch plus a PR whose body carries its note, and the merge does **not** squash.
    Verified on this very change: the rebase-merge preserved per-commit authorship (the model) and
    every `Assisted-by` trailer, with the human as committer.
