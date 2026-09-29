@@ -144,6 +144,12 @@ What is live as of this note:
    `rust` 1m11s / `notes` 6s / `tui` 42s / `iced` 1m2s. A warm run is about a minute of wall time; the
    first run after a cache miss is the expensive one.
 
+The first red `main` was the flake already named in the capabilities list:
+`a_take_records_into_the_pool_and_plays`, which fails when a capture stops on a partial
+interleaved frame ("1/2 samples"). That is the whole argument in one incident — a gate
+cannot be "always green" while a known-flaky test sits inside it, so fixing that flake
+is a prerequisite for this invariant rather than a nice-to-have.
+
 The merge exposed one more thing worth a line: locally `scripts/agent-commit` sets the human
 committer to `geir@geokkjer.eu`, while GitHub's rebase-merge sets the account's
 `geokkjer@gmail.com`. A `.mailmap` folds the two together for every authorship-reading tool,
