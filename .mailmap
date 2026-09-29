@@ -1,0 +1,5 @@
+# Authorship canonicalisation. GitHub's rebase-merge sets the committer to the
+# account's email (geokkjer@gmail.com) while local agent-commit runs set it to the
+# project address (geir@geokkjer.eu) — one person, two records. `git shortlog -sne`,
+# `git log --use-mailmap` and `git blame` fold them together; no history is rewritten.
+Geir Okkenhaug Jerstad <geir@geokkjer.eu> <geokkjer@gmail.com>
