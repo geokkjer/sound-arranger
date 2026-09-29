@@ -4,6 +4,11 @@
 //! permanent render-thread wedge. The walk is now capped and what it could not
 //! walk is **counted**, published under a context key the way the clock-out
 //! plugin publishes its overflows.
+//!
+//! The pattern is bounded separately, because bounding the walk did not bound
+//! it: the pattern is one `bool` per step and a mount param is checked for
+//! finiteness and nothing else, so an absurd `steps` asked for a multi-gigabyte
+//! allocation on the render thread from a script line.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,19 +20,7 @@ const SR: u32 = 48_000;
 /// The euclidean generator on its own, plus a tone to own the bus (the
 /// generator emits no audio, so without it the graph has no out node).
 fn engine() -> Engine {
-    let mut e = Engine::new(SR, 120.0, 4);
-    e.register_factory(
-        "euclidean",
-        plugins::euclidean_factory,
-        plugins::euclidean::EUCLIDEAN_PORTS,
-        &[],
-    );
-    e.register_factory(
-        "tone",
-        plugins::tone_factory,
-        plugins::tone::TONE_PORTS,
-        plugins::tone::TONE_PARAMS,
-    );
+    let mut e = engine_nothing_mounted();
     e.mount("euclidean", &[]).unwrap();
     e.mount("tone", &[("gain", 0.2), ("blip_len", 800.0)])
         .unwrap();
@@ -38,6 +31,18 @@ fn engine() -> Engine {
 /// not the trigger buffer, is what stops a block: one pulse in 1024 steps fills
 /// no buffer, so the counts asserted below are about the walk alone.
 fn engine_sparse() -> Engine {
+    let mut e = engine_nothing_mounted();
+    e.mount("euclidean", &[("steps", 1024.0), ("pulses", 1.0)])
+        .unwrap();
+    e.mount("tone", &[("gain", 0.0), ("blip_len", 8.0)])
+        .unwrap();
+    e
+}
+
+/// Both plugins registered, nothing mounted — the state a mount that is
+/// **refused** leaves behind, which is what the absurd-`steps` test needs to
+/// show: the refusal is complete, so the next mount of the same name works.
+fn engine_nothing_mounted() -> Engine {
     let mut e = Engine::new(SR, 120.0, 4);
     e.register_factory(
         "euclidean",
@@ -51,10 +56,6 @@ fn engine_sparse() -> Engine {
         plugins::tone::TONE_PORTS,
         plugins::tone::TONE_PARAMS,
     );
-    e.mount("euclidean", &[("steps", 1024.0), ("pulses", 1.0)])
-        .unwrap();
-    e.mount("tone", &[("gain", 0.0), ("blip_len", 8.0)])
-        .unwrap();
     e
 }
 
@@ -147,4 +148,54 @@ fn unmounting_withdraws_the_drop_counter() {
         !e.ctx.has(EUCLIDEAN_DROPS_KEY),
         "withdrawn by the disposer, like every other mount's service"
     );
+}
+
+/// **The allocation, by name.** Bounding the *walk* did not bound the *pattern*:
+/// the pattern is one `bool` per step, the node holds three copies of it, and a
+/// mount param is checked for finiteness and nothing else — with `steps:
+/// get("steps", 8.0) as u32` **saturating**, so `mount euclidean
+/// steps=4294967295` reached `vec![false; n]` and asked the render thread for
+/// ~4 GB, three times over, from a 30-byte script line. The mount is refused
+/// synchronously, and the session keeps rendering.
+#[test]
+fn an_absurd_step_count_is_refused_and_the_session_still_renders() {
+    let mut e = engine_nothing_mounted();
+    let err = e
+        .mount("euclidean", &[("steps", 4_294_967_295.0)])
+        .expect_err("a saturated `steps` is refused at the door, not allocated");
+    assert!(
+        err.contains("4294967295"),
+        "the refusal names the value: {err}"
+    );
+    assert!(
+        err.contains(&EUCLIDEAN_MAX_STEPS.to_string()),
+        "and the limit, so the user knows what to type instead: {err}"
+    );
+
+    // The refusal is complete: nothing was logged, nothing was scheduled, and
+    // the name was never taken — so the engine renders an empty bus and the
+    // very next mount of the same name succeeds.
+    let rendered = e.render(BLOCK);
+    assert_eq!(
+        rendered.len(),
+        BLOCK,
+        "a refused mount does not wedge the loop"
+    );
+    assert_eq!(e.node_of("euclidean"), None, "no instance was created");
+    assert!(
+        !e.provider_names_of(SignalKind::Trigger)
+            .contains(&"euclidean"),
+        "and no node published its trigger port"
+    );
+
+    e.mount("euclidean", &[("steps", 8.0)]).unwrap();
+    e.mount("tone", &[("gain", 0.2), ("blip_len", 800.0)])
+        .unwrap();
+    let rendered = e.render(BLOCK);
+    assert_eq!(
+        rendered.len(),
+        BLOCK,
+        "the session renders after the refusal"
+    );
+    assert_eq!(count(&e), 0, "a real mount at 120 bpm walks its whole grid");
 }

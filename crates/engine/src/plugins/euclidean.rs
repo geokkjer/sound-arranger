@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use super::{Disposer, DisposerCtx, Plugin, PluginApi};
-use crate::graph::{Direction, EuclideanGen, NodeId, NodeKind, Port, SignalKind};
+use crate::graph::{
+    Direction, EUCLIDEAN_MAX_STEPS, EuclideanGen, NodeId, NodeKind, Port, SignalKind,
+};
 
 /// The plugin's declared port surface (the dropdown's data source).
 pub const EUCLIDEAN_PORTS: &[Port] = &[Port {
@@ -26,10 +28,26 @@ pub const EUCLIDEAN_PORTS: &[Port] = &[Port {
 /// disposer. See [`EuclideanGen::drops`] for what the count means.
 pub const EUCLIDEAN_DROPS_KEY: &str = "euclidean.drops";
 
+/// The refusal a `steps` over [`EUCLIDEAN_MAX_STEPS`] gets, from the factory
+/// (a script line) and from [`Euclidean::apply`] (a hand-assembled instance).
+/// One wording, so the door and the backstop say the same thing.
+pub fn steps_refusal(steps: u32) -> String {
+    format!(
+        "euclidean 'steps' is {steps}, over the {EUCLIDEAN_MAX_STEPS}-step limit — the pattern is \
+         one bool per step and the node holds three copies of it"
+    )
+}
+
 /// Maximally-even pulse placement: a pulse at `floor(i * steps / pulses)`,
 /// rotated by `rotation` steps. A valid Euclidean rhythm generator (the
 /// canonical Bjorklund rotation is a rotation of this one).
+///
+/// **Panics** if `steps` is over [`EUCLIDEAN_MAX_STEPS`]: the pattern is one
+/// `bool` per step and this is the allocation site, so the bound belongs here as
+/// well as at the plugin boundary. A `steps` that large is not a rhythm, it is
+/// a multi-megabyte request from a parameter.
 pub fn euclid(steps: u32, pulses: u32, rotation: u32) -> Vec<bool> {
+    assert!(steps <= EUCLIDEAN_MAX_STEPS, "{}", steps_refusal(steps),);
     let n = steps.max(1) as usize;
     let k = pulses.min(steps) as usize;
     let mut pattern = vec![false; n];
@@ -82,6 +100,14 @@ impl Plugin for Euclidean {
     }
 
     fn apply(&mut self, api: &mut PluginApi) -> Result<(NodeId, Disposer), String> {
+        // `apply` runs on the render thread, so the one thing this node must
+        // never do there is panic — and `Euclidean`'s fields are public, so an
+        // instance can be hand-assembled without the factory's door. Refuse the
+        // oversize pattern here, before the allocation, rather than reaching
+        // `euclid`'s or the constructor's assert from a render call.
+        if self.steps > EUCLIDEAN_MAX_STEPS {
+            return Err(steps_refusal(self.steps));
+        }
         // The 'clock' dependency is a core service: satisfied by the engine
         // (see `Engine::core_services`), read via the block's tempo map.
         let pattern = euclid(self.steps, self.pulses, self.rotation);
@@ -120,6 +146,14 @@ impl Plugin for Euclidean {
 
 /// Factory form: build the plugin from a flat parameter list (the log's
 /// `Event::Mount` payload, and the seed of a future declarative config).
+///
+/// **The door.** `steps` is bounded here, where the mount param is read, so an
+/// oversize pattern is refused synchronously and loudly by `Engine::mount` (it
+/// dry-runs the factory) instead of allocating on the render thread: mount
+/// params are otherwise checked for finiteness and nothing else, and
+/// `as u32` **saturates**, so `steps=4294967295` used to arrive intact. The
+/// same bound is asserted by the node's constructor and by `euclid`; this is
+/// the only one of the three a user can reach.
 pub fn euclidean_factory(params: &[(&'static str, f32)]) -> Result<Box<dyn Plugin>, String> {
     let get = |key: &str, default: f32| {
         params
@@ -128,8 +162,12 @@ pub fn euclidean_factory(params: &[(&'static str, f32)]) -> Result<Box<dyn Plugi
             .map(|(_, value)| *value)
             .unwrap_or(default)
     };
+    let steps = get("steps", 8.0) as u32;
+    if steps > EUCLIDEAN_MAX_STEPS {
+        return Err(steps_refusal(steps));
+    }
     Ok(Box::new(Euclidean {
-        steps: get("steps", 8.0) as u32,
+        steps,
         pulses: get("pulses", 3.0) as u32,
         rotation: get("rotation", 0.0) as u32,
         pulses_per_beat: get("pulses_per_beat", 4.0) as u32,
@@ -183,5 +221,41 @@ mod tests {
         assert_eq!(euclid(8, 0, 0), vec![false; 8]);
         assert_eq!(euclid(8, 99, 0), vec![true; 8]);
         assert_eq!(euclid(4, 4, 0), vec![true; 4]);
+    }
+
+    /// `steps` is one `bool` per step and the factory's `as u32` **saturates**,
+    /// so a mount param could ask for a ~4 GB pattern: allocated, cloned and
+    /// retained three times over, on the render thread, from a 30-byte script
+    /// line. The bound is one named constant, shared with the node, and the
+    /// refusal names it.
+    #[test]
+    fn the_factory_refuses_an_absurd_step_count() {
+        let err = euclidean_factory(&[("steps", 4_294_967_295.0)])
+            .err()
+            .expect("a saturated `steps` is not a rhythm");
+        assert!(err.contains("4294967295"), "it names the value: {err}");
+        assert!(
+            err.contains(&EUCLIDEAN_MAX_STEPS.to_string()),
+            "and the limit, so the user knows what to type instead: {err}"
+        );
+    }
+
+    /// The bound is a limit, not a hole in the surface: the largest allowed
+    /// pattern still mounts, so the refusal is about size and nothing else.
+    #[test]
+    fn the_factory_still_builds_at_the_limit() {
+        for steps in [8.0, 1024.0, EUCLIDEAN_MAX_STEPS as f32] {
+            let plugin = euclidean_factory(&[("steps", steps)])
+                .unwrap_or_else(|e| panic!("{steps} steps must mount: {e}"));
+            assert_eq!(plugin.id(), "euclidean");
+        }
+    }
+
+    /// The allocation site refuses too, so a caller who reaches `euclid` without
+    /// the factory's door cannot ask it for gigabytes either.
+    #[test]
+    #[should_panic(expected = "over the 4096-step limit")]
+    fn euclid_refuses_an_absurd_step_count() {
+        euclid(EUCLIDEAN_MAX_STEPS + 1, 3, 0);
     }
 }

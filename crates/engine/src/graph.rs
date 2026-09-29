@@ -473,18 +473,55 @@ impl AudioNode for Gain {
 /// not walked ([`EuclideanGen::drops`]).
 pub const EUCLIDEAN_STEP_CAP: u64 = BLOCK as u64 * 8;
 
+/// The hard bound on a euclidean **pattern's length** — one `bool` per step, and
+/// the node holds three copies of it (its own, the plugin's clone, the
+/// `rhythm` service's). Distinct from [`EUCLIDEAN_STEP_CAP`], which bounds one
+/// block's *walk*.
+///
+/// It exists because the walk bound did not bound this: a mount param is
+/// checked for finiteness and nothing else, and `steps: get("steps", 8.0) as
+/// u32` saturates, so `mount euclidean steps=4294967295` reached
+/// `vec![false; n]` and asked the render thread for ~4 GB — three times over —
+/// from a 30-byte script line. 4096 steps is far past any rhythm a person
+/// writes (a bar of 64th notes in 4/4 is 64) and it keeps the pattern a page of
+/// memory. The number lives here, once: the node asserts it, and the plugin
+/// names it in the refusal a mount param gets.
+pub const EUCLIDEAN_MAX_STEPS: u32 = 4096;
+
 /// Opaque tier: the euclidean generator as a node. Pure function of the block
 /// and the tempo map: emits `out("triggers")` sample-accurately. No voice —
 /// patch the triggers into whatever you like.
 ///
-/// `pattern` is indexed by `step % steps.max(1)`, so the two are built together
-/// and [`EuclideanGen::new`] asserts the length; a node hand-assembled with a
-/// shorter pattern would index out of bounds **on the render thread**, which is
-/// why the fields that make a node are set through a constructor.
+/// **The fields are private and the constructor is the only way in**, because
+/// two invariants live here and neither can be enforced after the fact:
+///
+/// - `pattern` is indexed `step % steps.max(1)`, so it must be exactly
+///   `steps.max(1)` long — a shorter one is an out-of-bounds index **on the
+///   render thread**;
+/// - `steps` is bounded by [`EUCLIDEAN_MAX_STEPS`], because the pattern is one
+///   `bool` per step and a nonsense length is a multi-megabyte allocation.
+///
+/// A public `steps` would let a caller reintroduce the first (`n.steps = 64`
+/// after a valid `new`) with nothing to stop it, so the shape is the fix rather
+/// than a convention. Read them back with [`Self::steps`],
+/// [`Self::pulses_per_beat`] and [`Self::pattern`].
+///
+/// ```
+/// let node = engine::EuclideanGen::new(8, 4, vec![false; 8]);
+/// assert_eq!((node.steps(), node.pattern().len()), (8, 8));
+/// ```
+///
+/// The verifier's reproduction of the first invariant, kept as a test — it does
+/// not compile, which is the point:
+///
+/// ```compile_fail
+/// let mut node = engine::EuclideanGen::new(8, 4, vec![false; 8]);
+/// node.steps = 64; // E0616, private field
+/// ```
 pub struct EuclideanGen {
-    pub steps: u32,
-    pub pulses_per_beat: u32,
-    pub pattern: Vec<bool>,
+    steps: u32,
+    pulses_per_beat: u32,
+    pattern: Vec<bool>,
     /// Grid steps a block did not evaluate because its walk hit
     /// [`EUCLIDEAN_STEP_CAP`] (or because the trigger buffer was already full,
     /// which no further push could have used). Behind a shared atomic so the
@@ -498,19 +535,30 @@ pub struct EuclideanGen {
 impl EuclideanGen {
     /// Build a node with its own drop counter, for a caller that mounts it
     /// directly. Reads the count back with [`Self::drops`].
+    ///
+    /// **Panics** if `steps` is over [`EUCLIDEAN_MAX_STEPS`] or if `pattern` is
+    /// not exactly `steps.max(1)` long. Both refusals are loud and immediate:
+    /// the alternative is a node that allocates gigabytes, or that indexes out
+    /// of bounds, on a thread that cannot afford either.
     pub fn new(steps: u32, pulses_per_beat: u32, pattern: Vec<bool>) -> Self {
         Self::with_drop_counter(steps, pulses_per_beat, pattern, Arc::new(AtomicU64::new(0)))
     }
 
     /// Build a node against an **existing** counter — the plugin's form, which
     /// publishes the same `Arc` into the context so a reader outside the graph
-    /// sees the live count.
+    /// sees the live count. Same two refusals as [`Self::new`].
     pub fn with_drop_counter(
         steps: u32,
         pulses_per_beat: u32,
         pattern: Vec<bool>,
         drops: Arc<AtomicU64>,
     ) -> Self {
+        assert!(
+            steps <= EUCLIDEAN_MAX_STEPS,
+            "euclidean steps is {steps}, over the {EUCLIDEAN_MAX_STEPS}-step limit — the pattern \
+             is one bool per step, and a larger one is a multi-megabyte allocation before the \
+             first block is rendered",
+        );
         assert_eq!(
             pattern.len() as u64,
             steps.max(1) as u64,
@@ -523,6 +571,21 @@ impl EuclideanGen {
             pattern,
             drops,
         }
+    }
+
+    /// Steps in one pattern revolution.
+    pub fn steps(&self) -> u32 {
+        self.steps
+    }
+
+    /// Pattern subdivisions per beat (4 = sixteenth notes).
+    pub fn pulses_per_beat(&self) -> u32 {
+        self.pulses_per_beat
+    }
+
+    /// The pattern, exactly `steps.max(1)` long.
+    pub fn pattern(&self) -> &[bool] {
+        &self.pattern
     }
 
     /// Grid steps this node did not evaluate, over every block it has rendered.
@@ -564,13 +627,29 @@ impl AudioNode for EuclideanGen {
         // or a wrapped one — which is what makes the count of what the walk
         // *skipped* exact below.
         let grid = s1.saturating_sub(s0).max(0) as u64;
-        let stride = self.steps.max(1) as u64;
+        // The pattern's **own** length, not `steps.max(1)`: the constructor
+        // asserts the two agree, but indexing by the length means the render
+        // path cannot go out of bounds even if some future edit moved the
+        // assert. A render-thread index must be right by construction.
+        let stride = self.pattern.len() as u64;
         let mut step = s0;
         let mut walked = 0u64;
         while step < s1 {
             if step >= 0 {
                 let index = step as u64;
                 if self.pattern[(index % stride) as usize] {
+                    // **A known per-step cost, deliberately not redesigned
+                    // here:** `TempoMap::frame_at` walks the tempo map's
+                    // segments from the first, so a pulse costs one scan —
+                    // O(segments), not O(1). The loose bound is
+                    // `EUCLIDEAN_STEP_CAP × segments` per block; the measured
+                    // one is far under it, because only pattern-*true* steps
+                    // reach this line and the full-buffer stop below ends the
+                    // walk at `CAP_EVENTS` pulses. Instrumented on a 512-frame
+                    // block at 1e9 bpm with an all-true 8-step pattern: 32
+                    // calls, whatever the tempo. Making `frame_at` O(log n) is a
+                    // `clock` change (prefix sums on push), not a node-local
+                    // one, and it is the map's other reader's problem too.
                     let frame = block.tempo.frame_at(index as f64 * step_beats);
                     if frame >= block.frame && frame < block.frame + len {
                         out_triggers.push((frame - block.frame) as u32);
@@ -1998,5 +2077,42 @@ mod tests {
         // 511 frames at 1e9 bpm is 177 430.556 beats, +1/4 beat, /1/4 beat per step
         // → 709 724 steps in the block's grid.
         assert_eq!(drops.load(Ordering::Relaxed), 709_724 - EUCLIDEAN_STEP_CAP);
+    }
+
+    /// The length invariant is **not** enforced by the constructor alone: a
+    /// public `steps` field could be reassigned after the assert, and the very
+    /// next block would index a 64-step modulo into an 8-long pattern — a panic
+    /// on the render thread, from safe code. The fields are private now, so
+    /// the constructor is the only way in, and the node's own read is back by
+    /// the pattern's own length. The accessors are the whole read surface.
+    #[test]
+    fn a_node_is_built_through_its_constructor_and_read_through_accessors() {
+        let node = EuclideanGen::new(8, 4, vec![false; 8]);
+        assert_eq!(node.steps(), 8);
+        assert_eq!(node.pulses_per_beat(), 4);
+        assert_eq!(node.pattern().len(), 8);
+        // `steps = 0` is the degenerate form the `max(1)` exists for: one step,
+        // a one-long pattern, and a walk that indexes within bounds.
+        let degenerate = EuclideanGen::new(0, 4, vec![false; 1]);
+        assert_eq!(degenerate.steps(), 0);
+        assert_eq!(degenerate.pattern().len(), 1);
+    }
+
+    /// A pattern that does not match `steps` is refused at construction, with a
+    /// message that says why the two are one thing.
+    #[test]
+    #[should_panic(expected = "indexed by `step % steps`")]
+    fn a_pattern_shorter_than_its_steps_is_refused() {
+        EuclideanGen::new(8, 4, vec![false; 4]);
+    }
+
+    /// The pattern is one `bool` per step and the node is built on the render
+    /// thread's call stack, so a nonsense length is refused **before** the
+    /// allocation — loudly, and naming the limit, so a 30-byte script line
+    /// cannot ask for a gigabyte.
+    #[test]
+    #[should_panic(expected = "over the 4096-step limit")]
+    fn an_absurd_step_count_is_refused_before_it_is_allocated() {
+        EuclideanGen::new(EUCLIDEAN_MAX_STEPS + 1, 4, Vec::new());
     }
 }
