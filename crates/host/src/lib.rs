@@ -2378,6 +2378,11 @@ impl HostSession {
     ///
     /// Pure with respect to `self`: the caller decides what to adopt and what to carry.
     ///
+    /// The history is re-issued as a **document walk** ([`Engine::enter_walk`]): while
+    /// the state is being applied, the one-instance-per-name rule is the *history's*
+    /// question, not the engine's — which is what lets a `mount … unmount … mount`
+    /// gesture survive a rebuild (see [`Self::rebuild_prefix`], which walks the same way).
+    ///
     /// The rebuilt session **shares this session's slot object** (and the port
     /// name), so the gear keeps being driven after a seek — but the rebuild's
     /// renders happen with the slot **emptied by the caller**: nothing is sent
@@ -2390,29 +2395,47 @@ impl HostSession {
             Some(self.midi_slot.clone()),
             self.midi_port.clone(),
         );
-        for entry in &self.history {
-            match upto {
-                Some(frame) => {
-                    if entry
-                        .first()
-                        .and_then(|c| c.at_frame())
-                        .is_some_and(|at| at > frame)
-                    {
-                        continue;
+        // **The history is a document, so it is re-issued as a document walk** (see
+        // [`Engine::enter_walk`]). The loop below renders nothing between the commands
+        // in the `at_now` case — and nothing at all for an unplaced command — so the
+        // engine's apply queue never drains: a `mount … unmount … mount` history that
+        // the live path accepted and recorded (the mixer going away mid-session and
+        // coming back is enough) was refused here as a second instance, which took
+        // `export` and every seek with it. Under the walk, "is this name live?" is
+        // asked of the history, which is the contract [`Engine::replay_from`] keeps
+        // for a log.
+        //
+        // Scoped deliberately: entered and left with **no `?` between them**, so a
+        // refused state command cannot leave the rebuilt session walking.
+        rebuilt.engine.enter_walk();
+        let walked = (|| -> Result<(), String> {
+            for entry in &self.history {
+                match upto {
+                    Some(frame) => {
+                        if entry
+                            .first()
+                            .and_then(|c| c.at_frame())
+                            .is_some_and(|at| at > frame)
+                        {
+                            continue;
+                        }
+                        for cmd in entry {
+                            rebuilt.process(cmd)?;
+                        }
                     }
-                    for cmd in entry {
-                        rebuilt.process(cmd)?;
-                    }
-                }
-                None => {
-                    // `at_now`: order decides, not timeline position, so applying the
-                    // state does not render the clock through the piece.
-                    for cmd in entry {
-                        rebuilt.process(&cmd.at_now())?;
+                    None => {
+                        // `at_now`: order decides, not timeline position, so applying the
+                        // state does not render the clock through the piece.
+                        for cmd in entry {
+                            rebuilt.process(&cmd.at_now())?;
+                        }
                     }
                 }
             }
-        }
+            Ok(())
+        })();
+        rebuilt.engine.leave_walk();
+        walked?;
         rebuilt.render_to(upto.unwrap_or(0))?;
         rebuilt.playing = self.playing;
         rebuilt.redo = self.redo.clone();
@@ -2579,36 +2602,46 @@ impl HostSession {
             Some(self.midi_slot.clone()),
             self.midi_port.clone(),
         );
-        // **Tempo is the exception to `at_now`.** It is frame-placed *value* state (the
-        // tempo map is a function of the frame), so a change at 60 s must sit at 60 s in
-        // the map even when the run-in starts later — otherwise the audio would be right
-        // (the render reads frames) but every beat reading, the ruler and the shell's
-        // position readout would disagree with a full replay. The segment is pushed
-        // directly (no timeline render); the logged command is applied too, so the folded
-        // `params` value and the rebuilt log stay identical to the full path's.
-        for entry in &self.history {
-            for cmd in entry {
-                if let HostCommand::SetTempo {
-                    bpm,
-                    beats_per_bar,
-                    at_frame,
-                } = cmd
-                {
-                    let at = at_frame.unwrap_or(0);
-                    // Place the clock at the command's own frame (no render) and let the
-                    // engine log and **schedule** it there; the run-in render delivers the
-                    // event at its frame, which pushes the segment — exactly the sequence a
-                    // full replay performs, so the map ends up identical (pushing here as
-                    // well would double every segment).
-                    rebuilt.engine.seek(at);
-                    rebuilt.engine.set_tempo(*bpm, *beats_per_bar)?;
-                    continue;
+        // **A document walk, like `rebuild`** — the run-in renders nothing before it,
+        // so the apply queue never drains and the history's own `mount … unmount …
+        // mount` would be refused as a second instance. Scoped with no `?` between
+        // the enter and the leave.
+        rebuilt.engine.enter_walk();
+        let walked = (|| -> Result<(), String> {
+            // **Tempo is the exception to `at_now`.** It is frame-placed *value* state (the
+            // tempo map is a function of the frame), so a change at 60 s must sit at 60 s in
+            // the map even when the run-in starts later — otherwise the audio would be right
+            // (the render reads frames) but every beat reading, the ruler and the shell's
+            // position readout would disagree with a full replay. The segment is pushed
+            // directly (no timeline render); the logged command is applied too, so the folded
+            // `params` value and the rebuilt log stay identical to the full path's.
+            for entry in &self.history {
+                for cmd in entry {
+                    if let HostCommand::SetTempo {
+                        bpm,
+                        beats_per_bar,
+                        at_frame,
+                    } = cmd
+                    {
+                        let at = at_frame.unwrap_or(0);
+                        // Place the clock at the command's own frame (no render) and let the
+                        // engine log and **schedule** it there; the run-in render delivers the
+                        // event at its frame, which pushes the segment — exactly the sequence a
+                        // full replay performs, so the map ends up identical (pushing here as
+                        // well would double every segment).
+                        rebuilt.engine.seek(at);
+                        rebuilt.engine.set_tempo(*bpm, *beats_per_bar)?;
+                        continue;
+                    }
+                    // Everything else: `at_now` for the same reason the export uses it — the
+                    // state's *order* decides the value, and the clock must not walk the piece.
+                    rebuilt.process(&cmd.at_now())?;
                 }
-                // Everything else: `at_now` for the same reason the export uses it — the
-                // state's *order* decides the value, and the clock must not walk the piece.
-                rebuilt.process(&cmd.at_now())?;
             }
-        }
+            Ok(())
+        })();
+        rebuilt.engine.leave_walk();
+        walked?;
         Ok(rebuilt)
     }
 
@@ -6016,6 +6049,222 @@ mod tests {
             bytes_before,
             "a refused export never touches an existing file"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A session that unmounts and re-mounts a plugin must still rebuild.**
+    ///
+    /// The engine releases a plugin's name when its unmount *applies*, so
+    /// `mount mixer` / `unmount mixer @96 000` / `mount mixer @192 000` is a session
+    /// the live path accepts and records. Every re-apply path — `export` (which
+    /// re-issues the history with its placements stripped) and a seek (the warm
+    /// prefix and the full replay, which `undo`/`redo` share) — used to walk that
+    /// history without rendering between the commands, so the apply queue never
+    /// drained and the second `mount` was refused as a second instance:
+    /// `Err("plugin 'mixer' is already mounted")` out of `export` and out of every
+    /// seek, on a session the platform itself had recorded. The rebuild now answers
+    /// the one-instance rule from the **history's** lifecycle, the way
+    /// `Engine::replay_from` answers it from a log's.
+    #[test]
+    fn a_session_that_re_mounts_a_plugin_still_exports_and_seeks() {
+        let root = std::env::temp_dir().join(format!("host-remount-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 240_000, 48_000);
+
+        // Four clips, one every two seconds: the plugin goes away at 2 s and comes
+        // back at 4 s, so the re-mount is a real lifecycle rather than a no-op pair.
+        let arrangement = |s: &mut HostSession| {
+            s.execute(&HostCommand::Pool { dir: pool.clone() })
+                .expect("pool");
+            s.execute(&HostCommand::Arrange {
+                op: media::ArrangeOp::AddTrack { track: "t0".into() },
+                at_frame: None,
+            })
+            .expect("track");
+            for (id, at) in [
+                ("c0", 0u64),
+                ("c1", 96_000),
+                ("c2", 144_000),
+                ("c3", 192_000),
+            ] {
+                let mut op = add_clip(id, at);
+                if let media::ArrangeOp::AddClip { clip, .. } = &mut op {
+                    clip.src_len = 48_000;
+                }
+                s.execute(&HostCommand::Arrange { op, at_frame: None })
+                    .expect("clip");
+            }
+        };
+        // The **bus**, re-mounted: the shape a `unmount mixer` + `mount mixer`
+        // gesture writes, and the one all three rebuilds refused.
+        let build_mixer = || -> HostSession {
+            let mut s = HostSession::new();
+            s.execute(&HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(0),
+            })
+            .expect("mount mixer");
+            arrangement(&mut s);
+            s.execute(&HostCommand::Unmount {
+                plugin: "mixer",
+                at_frame: Some(96_000),
+            })
+            .expect("unmount the mixer mid-session");
+            s.execute(&HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(192_000),
+            })
+            .expect("mount it again — the live path released the name");
+            s
+        };
+        // A plugin that is **not** the bus, so the clips keep playing across its
+        // re-mount: what the rebuilt session renders is then an observation of the
+        // rebuilt graph rather than of the bus being taken down.
+        let build_clock_out = || -> HostSession {
+            let mut s = HostSession::new();
+            s.execute(&HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(0),
+            })
+            .expect("mount mixer");
+            arrangement(&mut s);
+            s.execute(&HostCommand::Mount {
+                plugin: "clock_out",
+                params: vec![],
+                at_frame: Some(0),
+            })
+            .expect("first mount");
+            s.execute(&HostCommand::Unmount {
+                plugin: "clock_out",
+                at_frame: Some(96_000),
+            })
+            .expect("unmount it mid-session");
+            s.execute(&HostCommand::Mount {
+                plugin: "clock_out",
+                params: vec![],
+                at_frame: Some(192_000),
+            })
+            .expect("mount it again — the live path released the name");
+            s
+        };
+
+        // The history is what a rebuild re-issues: the triple is really there.
+        let text = build_mixer().script_text(&root).expect("the session text");
+        let mounts = text
+            .lines()
+            .filter(|l| l.starts_with("mount mixer"))
+            .count();
+        assert_eq!(
+            mounts, 2,
+            "both mounts are in the session's own text form:\n{text}"
+        );
+        assert!(
+            text.contains("unmount mixer @96000"),
+            "and the unmount keeps its placement:\n{text}"
+        );
+
+        // **`export`**: the rebuild strips every placement, so nothing renders
+        // between the commands — the exact shape that used to be refused.
+        let mut s = build_mixer();
+        s.export(&root.join("mix.wav"), ExportFormat::F32)
+            .expect("a re-mounted mixer still exports");
+        let record = s.last_export().cloned().expect("a report");
+        assert!(
+            record.peak > 0.01,
+            "the re-mounted bus carries the audio: {record:?}"
+        );
+
+        // **The warm-up seek** (`rebuild_prefix`): the run-in is not what releases
+        // the name either — the state walk has to.
+        let mut warm = build_mixer();
+        warm.execute(&HostCommand::TransportSeek { frame: 240_000 })
+            .expect("a warm seek over a re-mounted mixer");
+        let (frame, warmed) = warm.last_seek().expect("a seek ran");
+        assert_eq!(frame, 240_000);
+        assert!(warmed, "this is the prefix path this test is for");
+
+        // **The full replay** seek (the `upto = Some(frame)` rebuild, and the path
+        // `undo`/`redo` take), into the re-mounted era.
+        let mut full = build_clock_out();
+        full.replay_full(200_000)
+            .expect("a full-replay seek over a re-mounted plugin");
+        assert_eq!(full.position().frame, 200_000);
+        assert_eq!(
+            full.arrangement().expect("arrangement"),
+            warm.arrangement().expect("arrangement"),
+            "both rebuilds carry the arrangement across"
+        );
+        let audio = bounce(&mut full, 8_000, &root.join("after.wav"));
+        assert!(
+            audio.iter().any(|x| x.abs() > 0.01),
+            "the rebuilt session renders audio, so the re-mount did not break the graph"
+        );
+
+        // **An unplaced triple** — the shape an interactive `execute` writes, since a
+        // command with no placement renders nothing, so the queue never drains
+        // between them — takes the same three paths down if the rebuild only fixed
+        // the placed shape. Written out command by command, the way a UI sends them.
+        let mut plain = HostSession::new();
+        plain
+            .execute(&HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(0),
+            })
+            .expect("mount mixer");
+        plain
+            .execute(&HostCommand::Pool { dir: pool.clone() })
+            .expect("pool");
+        plain
+            .execute(&HostCommand::Arrange {
+                op: media::ArrangeOp::AddTrack { track: "t0".into() },
+                at_frame: None,
+            })
+            .expect("track");
+        plain
+            .execute(&HostCommand::Arrange {
+                op: add_clip("c0", 0),
+                at_frame: None,
+            })
+            .expect("clip");
+        plain
+            .execute(&HostCommand::Mount {
+                plugin: "clock_out",
+                params: vec![],
+                at_frame: None,
+            })
+            .expect("mount");
+        plain
+            .execute(&HostCommand::Unmount {
+                plugin: "clock_out",
+                at_frame: None,
+            })
+            .expect("unmount");
+        plain
+            .execute(&HostCommand::Bounce {
+                frames: 4_800,
+                path: root.join("unplaced-before.wav"),
+            })
+            .expect("a render applies the unplaced unmount");
+        plain
+            .execute(&HostCommand::Mount {
+                plugin: "clock_out",
+                params: vec![],
+                at_frame: None,
+            })
+            .expect("re-mount after a render — the name was released");
+        plain
+            .export(&root.join("unplaced.wav"), ExportFormat::F32)
+            .expect("an unplaced remount still exports");
+        plain
+            .execute(&HostCommand::TransportSeek { frame: 240_000 })
+            .expect("and still seeks");
 
         let _ = std::fs::remove_dir_all(&root);
     }

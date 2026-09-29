@@ -126,6 +126,58 @@ pub const MAX_DRAIN_FRAMES: usize = 48_000 * 60;
 /// walk) hold for a log that carries one anyway.
 pub const MIN_TEMPO_BPM: f64 = 1e-3;
 
+/// **Which plugin names are live** — mounted, or queued to mount — as far as some
+/// document says.
+///
+/// This is the one-instance-per-name bookkeeping, and *who owns it* is the whole
+/// question. A **live command** answers it from the engine's scheduling state
+/// (`disposers` + `scheduled`), because a render applies what it queues and so the
+/// state is current. A **document walk** — [`Self::enter_walk`]: the recorded state
+/// of a session, re-issued onto an engine — cannot: nothing renders during the walk,
+/// so the apply queue never drains and a name whose unmount the document schedules
+/// would still read as mounted. The lifecycle belongs to the document while it is
+/// being applied, exactly as it belongs to the engine between renders.
+///
+/// A walk is seeded from what the engine already holds ([`Self::of`]), so it never
+/// loses the target's own state: a walk that mounts a name the engine already has
+/// applied is refused like any other second instance.
+struct Live {
+    names: HashSet<&'static str>,
+}
+
+impl Live {
+    /// The names this engine holds live **right now**: applied, or queued to apply.
+    fn of(engine: &Engine) -> Self {
+        Live {
+            names: engine
+                .disposers
+                .keys()
+                .chain(engine.scheduled.iter())
+                .copied()
+                .collect(),
+        }
+    }
+
+    /// Whether one instance of `name` is already in force.
+    fn holds(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
+
+    /// A mount takes the name. The caller has already refused a second instance
+    /// ([`Engine::validate_mount`]), so this never has to answer.
+    fn mount(&mut self, name: &'static str) {
+        self.names.insert(name);
+    }
+
+    /// An unmount gives the name back — the document says the plugin goes away, so a
+    /// later mount of the same name in the same document is a **re-mount**, not a
+    /// second instance. This mirrors `apply_unmount`, which is where the live path
+    /// releases the name.
+    fn unmount(&mut self, name: &str) {
+        self.names.remove(name);
+    }
+}
+
 /// The assembled minimal core.
 pub struct Engine {
     pub clock: Clock,
@@ -155,6 +207,10 @@ pub struct Engine {
     disposers: HashMap<&'static str, Disposer>,
     /// plugins whose mount is queued but not yet applied.
     scheduled: HashSet<&'static str>,
+    /// The **document walks** in force, innermost last (see [`Self::enter_walk`]).
+    /// Non-empty exactly while a caller re-issues a recorded document — a session
+    /// log, the host's command history — onto this engine.
+    walks: Vec<Live>,
     /// registered plugin-message handlers, keyed by op (closed-core dispatch).
     op_handlers: HashMap<&'static str, OpHandler>,
     /// Arrangement ops that reached the render stack (a host that rendered
@@ -188,6 +244,7 @@ impl Engine {
             node_of: HashMap::new(),
             disposers: HashMap::new(),
             scheduled: HashSet::new(),
+            walks: Vec::new(),
             op_handlers: HashMap::new(),
             parked: Vec::new(),
         }
@@ -208,6 +265,36 @@ impl Engine {
         self.params_table.insert(name, params);
     }
 
+    /// Enter a **document walk**: from here until [`Self::leave_walk`], the
+    /// one-instance-per-name rule is answered by the walk's own `Live` set rather
+    /// than by the engine's scheduling state.
+    ///
+    /// A walk is for re-issuing a *recorded* document onto this engine — a session
+    /// log ([`Self::replay_from`]) or a host's command history. Nothing renders
+    /// during one, so the apply queue never drains, and the engine's own view would
+    /// refuse a `mount … unmount … mount` sequence the live path accepts (it releases
+    /// the name when the unmount *applies*). The document is the authority while it
+    /// is being applied.
+    ///
+    /// Walks stack: the new one starts from the walk it is nested in, or from what
+    /// the engine holds, so no name in force is ever forgotten. **Pair every
+    /// `enter_walk` with a `leave_walk`** — a `?` between them would leave the
+    /// engine answering from a half-applied document.
+    pub fn enter_walk(&mut self) {
+        let live = match self.walks.last() {
+            Some(outer) => Live {
+                names: outer.names.clone(),
+            },
+            None => Live::of(self),
+        };
+        self.walks.push(live);
+    }
+
+    /// Leave a document walk, restoring the walk it was nested in (or none).
+    pub fn leave_walk(&mut self) {
+        self.walks.pop();
+    }
+
     /// Mount a plugin at the current frame: validated synchronously (fail-loud),
     /// logged with its frame, then applied by the render loop at that frame.
     pub fn mount(
@@ -216,6 +303,10 @@ impl Engine {
         params: &[(&'static str, f32)],
     ) -> Result<(), String> {
         self.validate_mount(name, params)?;
+        if let Some(live) = self.walks.last_mut() {
+            // The document takes the name; its own unmount gives it back.
+            live.mount(name);
+        }
         let at_frame = self.clock.frame();
         self.log.push(Event::Mount {
             plugin: name,
@@ -241,10 +332,21 @@ impl Engine {
         name: &'static str,
         params: &[(&'static str, f32)],
     ) -> Result<(), String> {
-        if self.disposers.contains_key(name) || self.scheduled.contains(name) {
+        if self.holds_instance_of(name) {
             return Err(Self::already_mounted(name));
         }
         self.validate_mount_declaration(name, params)
+    }
+
+    /// "Is one instance of `name` already in force?" — the one-instance-per-name
+    /// question, asked of whoever owns the lifecycle: a **document walk** answers
+    /// from the document ([`Self::enter_walk`]), the live path from the engine's
+    /// scheduling state (applied, or queued to apply).
+    fn holds_instance_of(&self, name: &str) -> bool {
+        match self.walks.last() {
+            Some(live) => live.holds(name),
+            None => self.disposers.contains_key(name) || self.scheduled.contains(name),
+        }
     }
 
     /// The lifecycle-free half of [`Self::validate_mount`]. [`Self::replay_from`]
@@ -281,9 +383,22 @@ impl Engine {
     }
 
     /// The refusal the "one instance per name" rule speaks in, from the live
-    /// engine and from a replay alike.
+    /// engine, from a document walk and from a replay alike.
     fn already_mounted(name: &str) -> String {
         format!("plugin '{name}' is already mounted (one instance per name in spike A.5)")
+    }
+
+    /// The refusal a **replay onto a non-fresh engine** speaks in. `replay_from`'s
+    /// contract is a fresh engine, and the reason is this: replaying a log that
+    /// mounts a name the target already holds would apply a *second* instance —
+    /// `node_of`/`disposers` overwrite the first, whose node stays in the graph and
+    /// whose disposer is dropped with it. A loud `Err` beats a silent leak.
+    fn replay_needs_fresh_engine(name: &str) -> String {
+        format!(
+            "replay: plugin '{name}' is already mounted on this engine — replay_from needs a \
+             fresh engine (the replayed log owns every mount; a second instance would overwrite \
+             the applied node and drop its disposer)"
+        )
     }
 
     fn apply_mount(
@@ -452,6 +567,14 @@ impl Engine {
     /// Schedule an unmount at an absolute frame — the scheduling queue driving
     /// lifecycle, sample-accurately.
     pub fn schedule_unmount(&mut self, name: &'static str, at_frame: u64) {
+        if let Some(live) = self.walks.last_mut() {
+            // In a **document walk** the name is free from here: the document says
+            // the plugin goes away, so a later mount in the same document is a
+            // re-mount. On the live path the release still happens at apply
+            // (`apply_unmount`), which is why the same-tick `mount → unmount →
+            // mount` window stays refused there.
+            live.unmount(name);
+        }
         self.log.push(Event::ScheduleUnmount {
             plugin: name,
             at_frame,
@@ -702,18 +825,43 @@ impl Engine {
         Ok(())
     }
 
-    /// Replay a log onto this engine. Must be a *fresh* engine: every event is
-    /// scheduled at its recorded frame and applied by the render loop — nothing
-    /// is applied eagerly, so the timeline reproduces exactly.
+    /// Replay a log onto this engine. Must be a *fresh* engine — enforced, and
+    /// loudly refused otherwise: every event is scheduled at its recorded frame and
+    /// applied by the render loop, so nothing is applied eagerly and the timeline
+    /// reproduces exactly. A log's mounts are the *only* mounts the engine may have
+    /// after a replay; a name the target already holds would be applied twice, and
+    /// the second `apply_mount` would overwrite the first instance's `node_of` entry
+    /// and drop its disposer, leaving its node in the graph forever.
+    ///
+    /// The one-instance-per-name rule itself is a fact about the **log's** lifecycle,
+    /// so it is tracked here in a `Live` set rather than read off `self.scheduled`:
+    /// a replay applies nothing (nothing renders yet), so a name whose unmount the
+    /// log schedules stays in `scheduled` for the whole walk — and the
+    /// `mount … unmount … mount` shape the live engine produces (it releases the
+    /// name when the unmount *applies*) would be refused as a second instance. The
+    /// engine writes such logs; it must be able to read them.
     pub fn replay_from(&mut self, log: &SessionLog) -> Result<(), String> {
-        // The one-instance-per-name rule is a fact about the **log's** lifecycle,
-        // so it is tracked from the log here, not read off `self.scheduled`: a
-        // replay applies nothing (nothing renders yet), so a name whose unmount
-        // the log schedules stays in `scheduled` for the whole walk — and the
-        // `mount … unmount … mount` shape the live engine produces (it releases
-        // the name when the unmount *applies*) would be refused as a second
-        // instance. The engine writes such logs; it must be able to read them.
-        let mut live: HashSet<&str> = HashSet::new();
+        // The fresh-engine precondition, spoken by the engine rather than assumed: an
+        // applied plugin *or* a queued one (nothing has rendered, so both are
+        // pre-existing state) means the target is not a clean slate.
+        let applied = self.disposers.keys().next().copied();
+        let queued = self.scheduled.iter().next().copied();
+        if let Some(name) = applied.or(queued) {
+            return Err(Self::replay_needs_fresh_engine(name));
+        }
+        // A walk, entered and left around the loop below: the log's lifecycle owns
+        // "is this name live?" for the duration, exactly as the host's command
+        // history does when a session is rebuilt. Nothing may return between the
+        // two calls, or the engine would answer from a half-walked document.
+        self.enter_walk();
+        let result = self.replay_events(log);
+        self.leave_walk();
+        result
+    }
+
+    /// The walk of [`Self::replay_from`]: every event scheduled at its recorded
+    /// frame, the lifecycle owned by the log, the engine's own log repopulated.
+    fn replay_events(&mut self, log: &SessionLog) -> Result<(), String> {
         for event in log.events() {
             match event {
                 Event::Mount {
@@ -721,7 +869,7 @@ impl Engine {
                     params,
                     at_frame,
                 } => {
-                    if live.contains(plugin) {
+                    if self.holds_instance_of(plugin) {
                         return Err(Self::already_mounted(plugin));
                     }
                     self.validate_mount_declaration(plugin, params)?;
@@ -732,13 +880,23 @@ impl Engine {
                             params: params.clone(),
                         },
                     );
+                    // Both halves of the apply queue's view, as the live `mount`
+                    // records them: a patch or a parameter change arriving before
+                    // this mount applies must be validated against the surface the
+                    // queued instance *will* have (`ports_of`/`params_of` ask
+                    // `scheduled_params`), not against the nominal catalog.
                     self.scheduled.insert(plugin);
-                    live.insert(plugin);
+                    self.scheduled_params.insert(plugin, params.clone());
+                    if let Some(live) = self.walks.last_mut() {
+                        live.mount(plugin);
+                    }
                 }
                 Event::ScheduleUnmount { plugin, at_frame } => {
                     self.scheduler
                         .schedule(*at_frame, SchedEvent::Unmount { plugin });
-                    live.remove(plugin);
+                    if let Some(live) = self.walks.last_mut() {
+                        live.unmount(plugin);
+                    }
                 }
                 Event::Patch {
                     from_plugin,

@@ -396,6 +396,63 @@ fn replay_accepts_a_log_that_re_mounts_a_plugin() {
     );
 }
 
+/// **`replay_from` refuses a target that already has plugins.** The doc's
+/// precondition ("must be a *fresh* engine") was carried by the one-instance guard
+/// alone, and the guard's lifecycle is the log's now — so the `disposers` half of
+/// that check fell away with the rest of the engine-state check. A replay onto a
+/// dirty engine is not refused: the log's `Mount p` would apply a *second* instance
+/// over the first, and `apply_mount`'s `node_of`/`disposers` insert would overwrite
+/// it — the first instance's node stays in the graph and its disposer is dropped with
+/// its entry. A silent leak, so the replay says so instead.
+///
+/// The queued half is refused too: nothing has rendered, so a mount that is still
+/// waiting to apply is pre-existing state just as much as an applied one.
+#[test]
+fn replay_onto_an_engine_that_already_has_plugins_is_refused() {
+    // A log that mounts the whole chain — what a fresh replay is given.
+    let mut e = engine();
+    mount_chain(&mut e);
+    let _ = e.render(48_000);
+    let log = e.log.clone();
+
+    // The target has already **applied** `tone`.
+    let mut dirty = engine();
+    mount_chain(&mut dirty);
+    let _ = dirty.render(48_000);
+    let err = dirty
+        .replay_from(&log)
+        .expect_err("a replay onto a mounted engine must be refused");
+    assert!(
+        err.contains("fresh engine")
+            && ["euclidean", "scale", "tone", "mixer"]
+                .iter()
+                .any(|p| err.contains(&format!("'{p}'"))),
+        "the refusal names the precondition and a plugin already on the engine: {err}"
+    );
+
+    // …and the target has merely **queued** it (nothing rendered, so the mount has
+    // not applied): the same refusal, because the same second instance would be
+    // applied over the first.
+    let mut queued = engine();
+    mount_chain(&mut queued);
+    let err = queued
+        .replay_from(&log)
+        .expect_err("a replay onto an engine with a queued mount must be refused");
+    assert!(err.contains("fresh engine"), "{err}");
+
+    // The refused replay left nothing behind: no event was scheduled or logged, and
+    // the engine still renders its own (unreplayed) session.
+    assert_eq!(
+        queued.render(4_096).len(),
+        4_096 * 2,
+        "the refused replay left the engine as it was"
+    );
+
+    // And the fresh case still replays — the precondition is the only new refusal.
+    let mut fresh = engine();
+    fresh.replay_from(&log).expect("a fresh engine replays");
+}
+
 /// Spatial composability, static half: a consumer plugin declares `rhythm`,
 /// resolves it at mount (fail-loud when the provider is absent).
 #[test]
