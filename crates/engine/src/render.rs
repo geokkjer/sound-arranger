@@ -106,12 +106,24 @@ pub struct DrainOutcome {
 /// reported, not hidden).
 pub const MAX_DRAIN_FRAMES: usize = 48_000 * 60;
 
-/// The slowest tempo [`Engine::set_tempo`] accepts. Below it a quarter note
-/// takes longer than the whole `u64` frame range can hold (a beat of 1e-3 bpm
-/// is ~1000 s), so the tempo map cannot place a tick inside any block and MIDI
-/// clock has nothing to say: refusing it is the honest answer, and the render
-/// path's own bounds — [`crate::clock::TempoMap::frame_at`] saturating, the
-/// clock-out node's capped walk — hold for a log that carries one anyway.
+/// The slowest tempo [`Engine::set_tempo`] accepts: 1e-3 bpm, where a quarter
+/// note lasts 60 000 s — 16.7 hours. Nothing musical is that slow (a whole note
+/// over a minute is ~50× above the floor), so the floor excludes only nonsense.
+///
+/// The lower end of the range is not a matter of taste but of what the tempo map
+/// can express. [`crate::clock::TempoMap::frame_at`] covers the final
+/// open-ended segment with `u64::MAX` frames at `bpm`, so a segment spans
+/// `u64::MAX × bpm / 60 / sample_rate` beats — at 48 kHz that falls under one
+/// 24-PPQN tick (1/24 beat) below ~6.5e-15 bpm, and every tick after the first
+/// then resolves to the segment's start frame instead of its own. The floor sits
+/// some 1.5e11× above that point, so a `u64` frame range is never the binding
+/// constraint: `u64::MAX` frames at 48 kHz is ~1.2e7 years, and the timeline
+/// itself is never the thing that runs out.
+///
+/// Refusing below the floor is the honest answer — a tick the map cannot place is
+/// a tick MIDI clock has nothing to say about — and the render path's own bounds
+/// ([`crate::clock::TempoMap::frame_at`] saturating, the clock-out node's capped
+/// walk) hold for a log that carries one anyway.
 pub const MIN_TEMPO_BPM: f64 = 1e-3;
 
 /// The assembled minimal core.
@@ -526,7 +538,7 @@ impl Engine {
         if bpm < MIN_TEMPO_BPM {
             return Err(format!(
                 "tempo must be at least {MIN_TEMPO_BPM} bpm \
-                 (a quarter note longer than the timeline itself), got {bpm}"
+                 (a quarter note taking 16.7 hours), got {bpm}"
             ));
         }
         let at_frame = self.clock.frame();

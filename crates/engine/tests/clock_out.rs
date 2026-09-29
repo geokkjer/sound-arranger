@@ -105,3 +105,20 @@ fn a_tempo_below_the_floor_is_refused_and_the_session_still_renders() {
         .expect("the floor itself is a tempo");
     assert_eq!(e.render(BLOCK).len(), BLOCK);
 }
+
+/// The **fast** side, the way a user reaches it: `set_tempo(1e300, 4)` is
+/// accepted (the floor bounds the slow side only), and from the *second* block
+/// on `block.frame >= 1`. `clock_out`'s `first_tick_at_or_after` saturated its
+/// candidate at `u64::MAX`, read `tick_frame(u64::MAX)` back as frame 0, and
+/// incremented past the top — a debug panic on the render thread, and in release
+/// a wrap to 0 that restarted the walk. The floor cannot cover this end, so the
+/// walk itself has to: rendering must return, quietly.
+#[test]
+fn an_absurd_fast_tempo_renders_the_next_block() {
+    let mut e = engine_with_clock_out(false);
+    e.set_tempo(1e300, 4).expect("the fast side is not floored");
+    for block in 0..4 {
+        let rendered = e.render(BLOCK);
+        assert_eq!(rendered.len(), BLOCK, "block {block} rendered");
+    }
+}
