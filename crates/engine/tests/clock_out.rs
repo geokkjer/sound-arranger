@@ -41,7 +41,7 @@ fn engine_with_clock_out(sink: bool) -> Engine {
     );
     e.register_factory("clock_out", clock_out_factory, &[], &[]);
     if sink {
-        let shared: SharedMidiSink = Arc::new(Mutex::new(Box::new(FakeSink)));
+        let shared: SharedMidiSink = Arc::new(Mutex::new(Some(Box::new(FakeSink))));
         e.ctx.provide(MIDI_OUT_KEY, shared);
     }
     // The canonical one-voice chain: tone owns the out bus, clock_out hangs

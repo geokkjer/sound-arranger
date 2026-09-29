@@ -8,4 +8,14 @@ description = "sound-arranger media engine — disk streaming, recording writer,
 [dependencies]
 engine = { path = "../engine" }
 cpal = "0.18.2"
+# The MIDI output backend (the midi-clock-out note, slice B). `midir` is the
+# pragmatic cross-platform choice: ALSA seq underneath on Linux (CI already
+# installs `libasound2-dev`), CoreMIDI on macOS, WinMM on Windows — the role
+# cpal plays for audio, small enough to isolate in one module (`midi`).
+# The crates.io release (0.10.1) pins `alsa ^0.9`, which conflicts with cpal
+# 0.18's `alsa 0.11` — two crates may not both `links = "alsa"` — so this is
+# the maintainer's master (0.11.0), whose `alsa >=0.9, <0.13` resolves to the
+# same `alsa` cpal already links. Pinned by Cargo.lock; revisit when 0.11
+# ships.
+midir = { git = "https://github.com/Boddlnagg/midir" }
 serde = { version = "1", features = ["derive"] }

@@ -2,6 +2,14 @@
 //! note): reads a script from a file or stdin, executes it against the Host
 //! API contract, writes the bounce, and prints the session summary. No
 //! frontend — the reference host a Tauri shell will eventually mirror.
+//!
+//! Flags (everything else is the script path):
+//! - `--midi-out <port>` (or `--midi-out=<port>`): open a real MIDI output for
+//!   the `clock_out` plugin; `<port>` is a case-insensitive substring of a
+//!   port name. Equivalent to `DSH_MIDI_OUT=<port>` in the environment. The
+//!   sink is provided into **every** session this process builds (see
+//!   `midi_out_from_process` in lib.rs) — configuration, never session state,
+//!   and never logged.
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -9,7 +17,22 @@ use std::path::PathBuf;
 use host::{parse_script, run_script, summarize};
 
 fn main() {
-    let script_text = if let Some(path) = std::env::args().nth(1) {
+    // The script path is the first argument that is not one of the host's own
+    // flags (the flag's value is skipped too; the sink itself is opened by the
+    // session constructor reading the same args).
+    let mut args = std::env::args().skip(1);
+    let mut script_path: Option<String> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--midi-out" => {
+                args.next();
+            }
+            other if other.starts_with("--midi-out=") => {}
+            _ if script_path.is_none() => script_path = Some(arg),
+            _ => {}
+        }
+    }
+    let script_text = if let Some(path) = script_path {
         std::fs::read_to_string(&path).unwrap_or_else(|e| {
             eprintln!("host: cannot read script '{path}': {e}");
             std::process::exit(2);
@@ -111,6 +134,15 @@ fn main() {
         .any(|c| matches!(c, host::HostCommand::Export { .. }))
     {
         eprintln!("host: no export written (the Export command failed)");
+    }
+    // The MIDI clock-out status: whether gear is being driven, and the
+    // plugin's overflow counter (a mount this sane never overflows — a nonzero
+    // count is a loud failure, so it prints as one).
+    let midi = session.midi_status();
+    match (&midi.port, midi.overflows) {
+        (Some(port), 0) => println!("host: midi out: {port} (no overflows)"),
+        (Some(port), n) => println!("host: midi out: {port} — OVERFLOWED {n} events"),
+        (None, _) => {}
     }
     print!("{}", summarize(&session));
 }

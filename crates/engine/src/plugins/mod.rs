@@ -21,8 +21,8 @@ use crate::graph::{NodeId, Port};
 use crate::render::SchedEvent;
 
 pub use clock_out::{
-    CLOCK_OUT_PORTS, ClockOutNode, ClockOutPlugin, MIDI_OUT_KEY, SharedMidiSink,
-    SharedTransportLog, TRANSPORT_KEY, Transport, TransportLog, clock_out_factory,
+    CLOCK_OUT_OVERFLOWS_KEY, CLOCK_OUT_PORTS, ClockOutNode, ClockOutPlugin, MIDI_OUT_KEY,
+    SharedMidiSink, SharedTransportLog, TRANSPORT_KEY, Transport, TransportLog, clock_out_factory,
 };
 pub use euclidean::{Euclidean, Rhythm, euclid, euclidean_factory};
 pub use master::{
