@@ -125,20 +125,22 @@ impl Capture {
                             None => break,
                         }
                     }
-                    // Whole frames only: a partial frame at the tail is kept
-                    // for the next batch — discarding it would shift every
-                    // channel by a sample (a real bug found by the e2e test).
-                    let whole = buf.len() - (buf.len() % channels);
-                    let n_frames = whole / channels;
+                    // Whole frames only: mid-batch, a partial frame is carried to the
+                    // next batch — discarding it would shift every channel by a sample
+                    // (a real bug found by the e2e test). At **stop** there is no next
+                    // batch, so the tail is padded with silence and kept: a sample of
+                    // silence is honest, the samples the other channels *did* deliver
+                    // are real material, and dropping the tail would leave the
+                    // per-channel stems unequal length.
+                    let all = buf.len();
+                    let mut n_frames = all / channels;
+                    let stopping = stop2.load(Ordering::Acquire);
+                    if n_frames == 0 && stopping && all > 0 {
+                        buf.resize(channels, 0.0);
+                        n_frames = 1;
+                    }
                     if n_frames == 0 {
-                        if stop2.load(Ordering::Acquire) {
-                            if !buf.is_empty() {
-                                *err2.lock().unwrap() = Some(format!(
-                                    "capture stopped with a partial frame ({}/{} samples) dropped",
-                                    buf.len() % channels,
-                                    channels
-                                ));
-                            }
+                        if stopping {
                             break;
                         }
                         std::thread::sleep(std::time::Duration::from_micros(50));
@@ -178,7 +180,7 @@ impl Capture {
                         }
                     }
                     frames2.fetch_add(last_ok as u64, Ordering::Relaxed);
-                    buf.drain(..whole);
+                    buf.drain(..n_frames * channels);
                 }
                 for (k, w) in writers.into_iter().enumerate() {
                     if let Some(pc) = w
@@ -390,6 +392,60 @@ mod tests {
                 assert_eq!(*s, expected, "ch{k} sample {i} must round-trip exactly");
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A device that stops mid-frame **keeps** what it delivered: the tail is padded
+    /// with silence, never dropped. The samples the other channels did deliver are real
+    /// material, silence is the honest value for a channel that never delivered, and
+    /// padding keeps the per-channel stems the same length (dropping the tail would
+    /// leave them unequal).
+    ///
+    /// This is also why the host's capture test flaked: whether a stray sample happened
+    /// to be sitting in the buffer at stop was pure timing, and the old code turned that
+    /// into an error.
+    #[test]
+    fn a_tail_that_never_completed_a_frame_is_padded_not_dropped() {
+        let dir = std::env::temp_dir().join(format!("p12-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (sr, channels) = (48_000u32, 2usize);
+        let source = Arc::new(Spsc::new(4096));
+        for i in 0..5 {
+            assert!(source.try_push(0.1 * (i as f32 + 1.0)), "ch0 {i}");
+            assert!(source.try_push(-0.2), "ch1 {i}");
+        }
+        // ch0 of a frame whose ch1 never arrived: an odd sample count for a stereo device.
+        assert!(source.try_push(0.75), "the stray ch0 sample");
+
+        let cap = Capture::start(&dir, "tail", channels, sr, sr, source).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        cap.stop()
+            .expect("an incomplete tail is kept, never an error");
+        assert_eq!(cap.frames(), 6, "five whole frames plus the padded one");
+
+        let read = |k: usize| {
+            let mut r = crate::wav::WavReader::open(&cap.path_for(k)).unwrap();
+            let mut buf = vec![0.0f32; r.total_frames() as usize];
+            let n = r.read_into(&mut buf);
+            buf.truncate(n);
+            buf
+        };
+        let (ch0, ch1) = (read(0), read(1));
+        assert_eq!(
+            ch0.len(),
+            ch1.len(),
+            "the per-channel stems stay equal length"
+        );
+        assert_eq!(
+            ch0.last().copied(),
+            Some(0.75),
+            "the delivered sample is kept"
+        );
+        assert_eq!(
+            ch1.last().copied(),
+            Some(0.0),
+            "the channel that never delivered is silence, not a shorter file"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
