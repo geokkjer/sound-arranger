@@ -125,15 +125,38 @@ in AGENTS.md so the difference is not folklore.
 ## Acceptance criteria
 
 1. CI runs formatting, clippy (`-D warnings`), the workspace tests and the notes verifier on every
-   push to a branch and every PR; the two shell spikes are covered by their own jobs; `crates/shell`
-   is not built.
-2. `main` requires those jobs, refuses force-push and deletion.
+   pull request and on every push to `main`; the two shell spikes are covered by their own jobs;
+   `crates/shell` is not built. — **Met** (`.github/workflows/ci.yml`, green on
+   `ci/gates-and-worktrees`). The trigger split matters: `push: ['**']` *plus* `pull_request` runs
+   every PR commit twice, doubling the minutes and leaving two checks with one name.
+2. `main` requires those jobs, refuses force-push and deletion. — **Pending, and the only human
+   step**: a GitHub setting. The PR *does* report the checks (a pull-request run uses the head's
+   workflow), so they can be required immediately rather than after a first merge.
 3. A slice lands as a branch plus a PR whose body carries its note; the merge preserves per-commit
-   authorship and `Assisted-by` trailers (verified once, on a real branch, not assumed).
+   authorship and `Assisted-by` trailers (verified once, on a real branch, not assumed). — **This
+   branch is the test**; its record is below.
 4. `git worktree` is the documented convention for concurrent agent sessions, and the main checkout
-   is clean on `main` between sessions.
-5. The alpha is a tag plus a release note, never a release branch.
-6. CI runtime stays under roughly five minutes warm, so it is a gate and not a queue.
+   is clean on `main` between sessions. — **Met in practice**: this work happened in a worktree
+   (`../sa-ci`) while the main checkout stayed clean on `main`, and AGENTS.md carries the orders.
+5. The alpha is a tag plus a release note, never a release branch. — Not yet exercised.
+6. CI runtime stays under roughly five minutes warm, so it is a gate and not a queue. — **Refined by
+   measurement, cold cache**: `rust` 1m14s, `agent notes` 8s, `spike tui-shell` 1m23s,
+   `spike iced-shell` **7m11s**. The iced spike *is* the runtime, so the honest form is "the default
+   gate is about 90 seconds; the iced spike is minutes and moves behind a path filter or a nightly
+   trigger if it starts to cost attention".
+
+### What the first run found — the argument for this note, made by the tool itself
+
+1. **A real regression, invisible locally.** The tui-shell spike failed 36 of 54 tests on an
+   index-out-of-bounds: `Snapshot.channels` became a `Vec` earlier in this session (the mixer-width
+   work) and that spike's fixture still indexed it. `spikes/*` are separate workspaces, so no
+   `cargo test --workspace` ever touched them. CI found it in its first minute.
+2. **A gate that meant different things in two places.** The notes verifier rejected cross-project
+   links to the studio notes and sibling projects — the links AGENTS.md *requires* — because a clone
+   cannot resolve them. It passed locally only because those checkouts exist on this machine. Now
+   skipped, with the reason written at the check.
+3. **An environment guess one package short.** The iced spike needs `libasound2-dev` too: its tree
+   reaches cpal through the host and media crates.
 
 ## Risks
 

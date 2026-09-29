@@ -21,8 +21,11 @@
 name: ci
 
 on:
+  # `main` gets a post-merge run; a branch gets its run from its pull request.
+  # Without this split, a PR commit runs twice (once for the push, once for the PR),
+  # which doubles the minutes and leaves two checks with the same name.
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
   # Manual runs, for when a branch needs re-checking without a new commit.
   workflow_dispatch:
