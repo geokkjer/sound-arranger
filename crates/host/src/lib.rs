@@ -3093,6 +3093,9 @@ impl HostSession {
     /// and rebuild **to the current position**, so the playhead does not jump and
     /// the pool/mounts survive. `Ok(false)` when there is nothing to undo.
     ///
+    /// **A refused replay changes nothing** — the contract `seek_to` states, owed
+    /// here too: see the restore below.
+    ///
     /// Only `Arrange` ops are undoable — a `Mount`/`Pool`/`SetTempo` is session
     /// setup, not an edit, and undoing one would tear down the graph under the UI.
     pub fn undo(&mut self) -> Result<bool, String> {
@@ -3105,21 +3108,45 @@ impl HostSession {
             return Ok(false);
         };
         let undone = self.history.remove(pos);
+        // The rebuild re-applies the *remaining* history, so it can be refused for a
+        // reason this edit has nothing to do with — the ordinary one being a pool
+        // directory that moved or was deleted. Then the edit goes back where it came
+        // from, in *both* stacks, which is what keeps the history describing the
+        // session: left out of it, the next `save` would write a script the live
+        // arrangement no longer matches, `can_undo`/`can_redo` would report a state
+        // that is not there, and the next `undo` would revert a *different* edit. The
+        // copy is one gesture, so it is cheaper than a snapshot of the whole history.
+        let restore = undone.clone();
+        let redo_len = self.redo.len();
         self.redo.push((pos, undone));
-        self.replay_to_kind(self.engine.clock.frame(), false)?;
+        let replayed = self.replay_to_kind(self.engine.clock.frame(), false);
+        if let Err(e) = replayed {
+            // `truncate` and not a `pop`: a take finalized on the way into the rebuild
+            // clears the branch for itself (`commit_state`), and a refusal undoes
+            // neither that nor the edit above it.
+            self.redo.truncate(redo_len);
+            self.history.insert(pos, restore);
+            return Err(e);
+        }
         Ok(true)
     }
 
     /// Redo the most recently undone edit, re-inserted at its original history
     /// position so the reconstruction is faithful. `Ok(false)` when nothing is
-    /// undone.
+    /// undone. A **refused replay** takes the entry back off the history and leaves
+    /// the redo branch whole, for the reason [`Self::undo`] gives.
     pub fn redo(&mut self) -> Result<bool, String> {
         let Some((pos, cmd)) = self.redo.pop() else {
             return Ok(false);
         };
         let at = pos.min(self.history.len());
         self.history.insert(at, cmd);
-        self.replay_to_kind(self.engine.clock.frame(), false)?;
+        let replayed = self.replay_to_kind(self.engine.clock.frame(), false);
+        if let Err(e) = replayed {
+            let cmd = self.history.remove(at);
+            self.redo.push((pos, cmd));
+            return Err(e);
+        }
         Ok(true)
     }
 
@@ -5266,6 +5293,85 @@ mod tests {
         assert!(!s.undo().expect("undo is a no-op"), "nothing was undone");
         assert!(!s.redo().expect("redo is a no-op"), "nothing was redone");
         assert_eq!(s.position().frame, 0);
+    }
+
+    /// **A refused replay changes nothing** — the contract `seek_to` states, owed by an
+    /// undo too. The rebuild re-applies the *remaining* history, so it can be refused
+    /// for a reason this edit has nothing to do with (the ordinary one being a pool
+    /// directory that moved or was deleted). The edit then has to go back where it came
+    /// from: out of the history and onto the redo branch it would leave the history
+    /// describing a session that never existed — the next `save` would write a script
+    /// the live arrangement no longer matches, `can_undo`/`can_redo` would report a
+    /// state that is not there, and the next `undo` would revert a *different* edit.
+    #[test]
+    fn a_refused_undo_leaves_the_history_alone() {
+        let (mut s, pool) = session_with_clip("undo-refused");
+        s.execute(&HostCommand::Arrange {
+            op: move_clip("c0", 4_800),
+            at_frame: None,
+        })
+        .expect("move");
+
+        // The pool goes away under the session: the live arrangement value still holds
+        // the clip, but a rebuild cannot re-open the pool.
+        std::fs::remove_dir_all(&pool).expect("remove pool");
+        let err = s.undo().expect_err("the rebuild refuses without the pool");
+        assert!(err.contains("pool"), "and it says why: {err}");
+        assert_eq!(
+            clip_of(&s).at_frame,
+            4_800,
+            "the refused undo did not revert the move"
+        );
+        assert!(s.can_undo(), "the edit is still there to undo");
+        assert!(
+            !s.can_redo(),
+            "nothing was undone, so there is nothing to redo"
+        );
+
+        // Put the pool back: the next undo undoes the *same* edit, not another one.
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_take(&pool, "s1", 48_000);
+        assert!(s.undo().expect("undo works"), "the move is undone");
+        let tl = s.arrangement().expect("tl");
+        assert_eq!(
+            tl.tracks[0].clips.len(),
+            1,
+            "the clip's own add was not what got undone"
+        );
+        assert_eq!(tl.tracks[0].clips[0].at_frame, 0, "the move is reverted");
+
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// The mirror: a refused **redo** leaves the redo branch whole. Popping the entry
+    /// and inserting it before the replay would destroy it outright — the one edit the
+    /// branch held is gone and cannot be brought back.
+    #[test]
+    fn a_refused_redo_keeps_the_redo_branch() {
+        let (mut s, pool) = session_with_clip("redo-refused");
+        s.execute(&HostCommand::Arrange {
+            op: move_clip("c0", 4_800),
+            at_frame: None,
+        })
+        .expect("move");
+        assert!(s.undo().expect("undo works"), "the move is undone");
+
+        std::fs::remove_dir_all(&pool).expect("remove pool");
+        let err = s.redo().expect_err("the rebuild refuses without the pool");
+        assert!(err.contains("pool"), "and it says why: {err}");
+        assert_eq!(
+            clip_of(&s).at_frame,
+            0,
+            "the refused redo did not re-apply the move"
+        );
+        assert!(s.can_redo(), "the edit is still there to redo");
+
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_take(&pool, "s1", 48_000);
+        assert!(s.redo().expect("redo works"), "the move is re-applied");
+        assert_eq!(clip_of(&s).at_frame, 4_800, "and it is the move");
+
+        let _ = std::fs::remove_dir_all(&pool);
     }
 
     /// The undo / redo grammar lines parse.
