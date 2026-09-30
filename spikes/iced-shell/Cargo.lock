@@ -1542,6 +1542,7 @@ dependencies = [
 name = "iced-shell"
 version = "0.1.0"
 dependencies = [
+ "engine",
  "host",
  "iced",
  "iced_audio",
