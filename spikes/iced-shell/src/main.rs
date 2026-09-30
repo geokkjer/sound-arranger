@@ -872,6 +872,22 @@ fn sweep() -> i32 {
         spike.snap = spike.host.snapshot();
         underruns(spike)
     };
+
+    // Phase 0a — measure the idle RATE, not just the delta: one underrun per
+    // source frame means the callback is running at 100 % starvation.
+    {
+        let a = read(&mut spike);
+        let t = std::time::Instant::now();
+        std::thread::sleep(Duration::from_millis(1000));
+        let b = read(&mut spike);
+        let secs = t.elapsed().as_secs_f64();
+        if let (Some(a), Some(b)) = (a, b) {
+            println!(
+                "sweep: idle rate {:.0} underruns/s (48 kHz = total starvation; 0 = device paused)",
+                (b - a) as f64 / secs
+            );
+        }
+    }
     // The device opens during `spawn_with_audio`, so this is the counter at the
     // instant we can first see it.
     let t0 = std::time::Instant::now();
