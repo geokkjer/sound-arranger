@@ -2,6 +2,7 @@
 name = "tui-shell"
 version = "0.1.0"
 edition = "2024"
+license = "GPL-3.0-or-later"
 publish = false
 description = "ratatui spike — the terminal counterpart of the iced spike, driving the same in-process Host API (tui-shell evaluation note)"
 

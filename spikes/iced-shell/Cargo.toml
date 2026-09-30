@@ -2,6 +2,7 @@
 name = "iced-shell"
 version = "0.1.0"
 edition = "2024"
+license = "GPL-3.0-or-later"
 publish = false
 description = "iced spike — the minimal proof that a second, in-process Rust shell can drive the Host API (iced-shell evaluation note)"
 

@@ -3,6 +3,7 @@ name = "sound-arranger-shell"
 version = "0.1.0"
 description = "RETIRED (2026-09-22) Tauri v2 shell — kept frozen as a reference; see ../RETIRED.md."
 edition = "2021"
+license = "GPL-3.0-or-later"
 
 # Retired: excluded from the root workspace (see ../../Cargo.toml), so it needs
 # its own workspace table to stay buildable in place.
