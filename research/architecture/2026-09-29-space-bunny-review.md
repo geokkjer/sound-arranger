@@ -72,6 +72,8 @@ suite, the agent-notes verifier, and both shell-spike builds).
 | `2-media-io#2` a crossfade of 0 or 1 samples drops the incoming's first sample | MAJ | CONFIRMED | `6e834f8` |
 | `2-media-io#3` `Capture::start` never validates `input_rate` | MAJ | CONFIRMED | `aefe129` |
 | `6-tests#3` the WAV reader rejects a valid odd-sized metadata chunk | MIN | CONFIRMED | `e981f81` |
+| `3-media-dsp#5` a mono import leaves the replaced take's channel addressable | MAJ | CONFIRMED | `3fdaf3e` |
+| `4-host#4` `unmount mixer` leaves the arranger wiring stale | MAJ | CONFIRMED | `4334a6e` |
 
 Defects the **verification** found, not the original reviewers — all fixed: the euclidean grid walk
 was unbounded (`6814cfc`) and its pattern-size invariant was breakable from safe code (`069d27a`);
@@ -94,15 +96,10 @@ rejected as false; these are real findings left for a next pass, with the reason
 - **`3-media-dsp#4` `replace_sources` deletes the previous take before the new material is
   committed** (PARTLY: the stated trigger could not be constructed, the ordering contradiction is
   real). A commit-ordering change in the pool; worth doing with the pool's own tests as the gate.
-- **`3-media-dsp#5` a mono import over a split id leaves `{id}.ch0` addressable**, so a clip keeps
-  playing material the user replaced. Data-correctness, needs a pool-level rule for stale
-  per-channel siblings.
 - **`3-media-dsp#7` / `7-mechanical#6` a reader thread and a 512 KiB ring per clip per edit.**
   A resource-cost issue; the fix is architectural (share or lazily mount readers).
 - **`4-host#1` `wire_pending` resolves the mixer as `graph.out_node`** (PARTLY: the failure is real,
   the stated route is not). Needs the host to track the mixer node independently of the bus owner.
-- **`4-host#4` `unmount mixer` leaves the arranger wiring stale** (a remounted mixer gets no inputs,
-  orphaned nodes keep reading files). Needs the unmount path to release the cords it created.
 - **`5-midi#4` the sink's `dropped_events`/`dropped_bytes` are unreachable in the product.** The
   host boxes the sink into a trait object, so the counters cannot be read; needs an accessor on the
   seam rather than a concrete-type downcast.
