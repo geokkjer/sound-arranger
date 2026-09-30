@@ -567,6 +567,14 @@ pub struct HostSession {
     wired_tracks: std::collections::HashMap<String, engine::NodeId>,
     /// the arrangement value changed since last wiring (re-wire before render).
     arrange_dirty: bool,
+    /// The bus went away **while the arrangement was wired**, so the wiring was
+    /// retired with it and the session now owes a bus. This is what separates the
+    /// two bus-less cases `wire_arranger` has to answer differently: a session that
+    /// unmounts the mixer mid-piece and mounts it again later is rendering a window
+    /// of its own timeline — silence there, then the wiring rebuilt on the next bus —
+    /// while an arrangement with no bus *anywhere* is a session that cannot render,
+    /// and says so. Cleared by the reconcile that answers the debt.
+    arranger_awaiting_bus: bool,
     /// Whether the transport is running. The live runtime reads this; the
     /// offline reference host only records it (`Bounce` renders regardless).
     playing: bool,
@@ -741,6 +749,7 @@ impl HostSession {
             sources: Vec::new(),
             wired_tracks: std::collections::HashMap::new(),
             arrange_dirty: false,
+            arranger_awaiting_bus: false,
             playing: false,
             last_drain: DrainOutcome::default(),
             history: Vec::new(),
@@ -1638,6 +1647,20 @@ impl HostSession {
                     self.player_underruns = None;
                     self.player_deferred = None;
                     self.mixer_channels = None;
+                    // …and the **arranger wiring goes with the bus**: the mixer's
+                    // disposer removes only the mixer node, so every `ArrangerNode`
+                    // would otherwise stay mounted with its cords dropped — rendering
+                    // into nothing, reading its pool file every block, and still
+                    // counted by `underruns()`. Only a *wired* arrangement marks the
+                    // session as owing a bus (see `arranger_awaiting_bus`): that is
+                    // what makes a re-mount reconcile, and what turns a bus-less
+                    // window of the timeline into silence rather than a refusal.
+                    let was_wired = !self.wired_tracks.is_empty();
+                    self.retire_arranger_wiring();
+                    if was_wired {
+                        self.arrange_dirty = true;
+                        self.arranger_awaiting_bus = true;
+                    }
                 }
                 r
             }
@@ -2055,6 +2078,21 @@ impl HostSession {
         Ok(())
     }
 
+    /// Retire the arranger wiring: every `ArrangerNode` leaves the graph, and the
+    /// underrun counters go with it. `wire_arranger` calls this on every reconcile
+    /// and `unmount mixer` calls it when the **bus** goes away — the mixer's own
+    /// disposer removes only the mixer node, and `Graph::remove_node` keeps every
+    /// cord that does not touch the node it removes, so without this an arranger
+    /// would stay mounted with its cords dropped: rendering every block, reading its
+    /// pool file, and counted by `underruns()`, all into a bus that is not there.
+    fn retire_arranger_wiring(&mut self) {
+        let old_nodes: Vec<engine::NodeId> = self.wired_tracks.drain().map(|(_, id)| id).collect();
+        for id in old_nodes {
+            self.engine.graph.remove_node(id);
+        }
+        self.arranger_underruns.clear();
+    }
+
     /// Reconcile the arranger nodes against the current arrangement value.
     ///
     /// The reference host is **reconcile-on-dirty**, not add-only: an `Arrange`
@@ -2100,14 +2138,20 @@ impl HostSession {
         // partial arrangement behind and the dirty flag survives for a clean
         // retry.
         self.engine.flush_scheduled();
-        let mixer = self
-            .engine
-            .node_of("mixer")
-            .ok_or("arrange requires the mixer to be mounted (mount mixer channels=N)")?;
+        let Some(mixer) = self.engine.node_of("mixer") else {
+            // **A bus-less window is a shape of the session's own timeline** (the
+            // mixer unmounted mid-piece, mounted again later): the wiring was retired
+            // with the bus, so there is nothing to build and nothing to say — the
+            // window renders the silence a session with no bus renders, and the debt
+            // (`arranger_awaiting_bus`) is settled by the next bus. An arrangement
+            // with no bus *anywhere* is a different question, and the `Err` under it
+            // is that answer.
+            if self.arranger_awaiting_bus {
+                return Ok(());
+            }
+            return Err("arrange requires the mixer to be mounted (mount mixer channels=N)".into());
+        };
 
-        // A new wiring replaces the old nodes (and their counters); drop the
-        // previous counters now so underruns() reflects the current wiring.
-        self.arranger_underruns.clear();
         let mut built: Vec<(String, usize, media::ArrangerNode)> = Vec::new();
         for (ti, track) in timeline.tracks.iter().enumerate() {
             if ti >= channels {
@@ -2131,11 +2175,9 @@ impl HostSession {
 
         // All validated — now commit (this phase cannot fail: `insert_before`
         // has a live pivot and `connect` is forward-ordered with `ch0..ch7`
-        // declared). Retire the previous wiring, then place each new node.
-        let old_nodes: Vec<engine::NodeId> = self.wired_tracks.drain().map(|(_, id)| id).collect();
-        for id in old_nodes {
-            self.engine.graph.remove_node(id);
-        }
+        // declared). Retire the previous wiring — nodes *and* their counters — then
+        // place each new node.
+        self.retire_arranger_wiring();
 
         for (tid, ti, node) in built {
             let id = self.engine.graph.insert_before(
@@ -2155,6 +2197,8 @@ impl HostSession {
             self.wired_tracks.insert(tid, id);
         }
         self.arrange_dirty = false;
+        // The debt is settled: the wiring matches the value again, on a bus.
+        self.arranger_awaiting_bus = false;
         Ok(())
     }
 

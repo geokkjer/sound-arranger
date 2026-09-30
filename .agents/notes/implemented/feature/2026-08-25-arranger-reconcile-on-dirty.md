@@ -45,6 +45,18 @@ Wire the arranger by **reconcile-on-dirty**:
 4. **The mixer is resolved by plugin name** (`engine.node_of("mixer")`), not by `graph.out_node` —
    the bus points at whatever audio node was mounted last, so `out_node` is a misleading mixer
    proxy when the mixer has been unmounted.
+5. **The bus going away is a reconcile too.** `unmount mixer` calls the same teardown
+   (`retire_arranger_wiring`: drain `wired_tracks`, `remove_node` every id, clear
+   `arranger_underruns`) and marks the arrangement dirty, so a **re-mounted bus reconciles** on
+   its next render. The mixer's own disposer removes only the mixer node and
+   `Graph::remove_node` keeps the cords that do not touch it, so without this the arrangers
+   stayed mounted with their cords dropped — rendering into nothing, reading their pool files
+   for the rest of the session — and a mixer mounted later got no inputs at all. The dirty
+   flag cannot say *why* there is no mixer, so `arranger_awaiting_bus` records the debt: a
+   bus-less **window** of a session's timeline (`mount` / `unmount @f` / `mount`) renders
+   silence and stays dirty until the next bus settles it, while an arrangement with no bus
+   *anywhere* still refuses with `arrange requires the mixer to be mounted`. See the
+   [bus-remount note](../bug-fix/2026-09-29-a-remounted-mixer-is-rewired-not-orphaned.md).
 
 Reconcile fixes both failures at once: a removed track is not rebuilt (so its audio stops), and an
 edited track is rebuilt from the current value (so the edit reaches audio). The rebuild is a
@@ -63,6 +75,7 @@ replay tests never ran the rewire path).
   deterministic; reuse needs a reader-reconcile path that SPSC can't reposition mid-clip.
 - **Mixer-remount dance** (unmount → rebuild arrangers → remount → re-apply mixer params) —
   rejected: heavyweight and would have to re-apply every mixer param; `insert_before` is simpler.
+  (A *user* unmounting the mixer is a different thing, and step 5 is what answers it.)
 - **Rebuild at source[0] (the initial bug)** — rejected after a co-worker (GLM-5.3) review found
   it was a **critical restart bug**: a node rebuilt at the current transport frame restarted every
   clip from its source start (`popped=0` while `off` was already `off0`), playing the wrong region
@@ -86,6 +99,11 @@ replay tests never ran the rewire path).
   covered directly (media `stream.rs`): a non-looped reader continues from `off0`, and a looped
   reader wraps to its true region start. Host suite gained a bounce → edit → re-bounce byte-identical
   replay test. 147 tests across the workspace (was 139 before this work), clippy clean.
+- **The bus leaving is covered by the same reconcile** (step 5): a re-mounted mixer is wired
+  again, and no `ArrangerNode` is left rendering into nothing. Verified by
+  `arranger_commands::a_remounted_mixer_is_rewired_and_leaves_no_orphan_nodes`, which fails on
+  both halves of that claim without step 5. The teardown is one function, so the reconcile and
+  the bus departure cannot drift apart.
 - **Known edge**: a clip declared longer than its source file (`src_start + src_len` past the file's
   last frame) renders truncated-but-fine from frame 0, but a rebuild past the real EOF makes the
   reader's `seek_frames(start + phase)` fail loud — a consistent, loud error rather than silent

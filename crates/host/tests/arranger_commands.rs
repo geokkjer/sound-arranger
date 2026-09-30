@@ -302,6 +302,112 @@ fn edit_then_rewire_replays_byte_identically() {
     let _ = std::fs::remove_dir_all(&out_dir);
 }
 
+/// **The bus going away takes the arranger wiring with it, and a re-mount gets it
+/// back.** `unmount mixer` cleared the host's player-side mixer state but not the
+/// arranger's, and the mixer's own disposer removes only the mixer node — so every
+/// `ArrangerNode` stayed mounted with its cords dropped, `arrange_dirty` stayed
+/// `false`, and the re-mounted bus was never wired: the bounce after the re-mount
+/// was **silent with no error**, while the orphaned readers kept rendering and
+/// reading their pool files for the rest of the session.
+///
+/// The window with no bus is a shape of the session's own timeline (`mount
+/// mixer` / `unmount mixer` / `mount mixer` is a session the platform records), so
+/// it renders the silence a bus-less session renders — silently here, and the
+/// arrangement is wired again the moment a bus is back.
+#[test]
+fn a_remounted_mixer_is_rewired_and_leaves_no_orphan_nodes() {
+    let pool = tmp_dir("remountbus");
+    // The clip outlasts both 4 000-frame renders: a re-wired arranger anchors its
+    // readers at the transport frame, so a clip that had already ended would read as
+    // silence for the right reason.
+    write_ramp(&pool, "s1", 16_000, 257);
+    let out_dir = tmp_dir("remountbusout");
+    let mount_mixer = || HostCommand::Mount {
+        plugin: "mixer",
+        params: vec![("channels", 2.0)],
+        at_frame: Some(0),
+    };
+
+    let mut s = HostSession::new();
+    s.execute(&mount_mixer()).unwrap();
+    s.execute(&HostCommand::Pool { dir: pool.clone() }).unwrap();
+    s.execute(&HostCommand::Arrange {
+        op: ArrangeOp::AddTrack { track: "t0".into() },
+        at_frame: Some(0),
+    })
+    .unwrap();
+    s.execute(&HostCommand::Arrange {
+        op: ArrangeOp::AddClip {
+            track: "t0".into(),
+            clip: clip("c0", 0, 16_000),
+        },
+        at_frame: Some(0),
+    })
+    .unwrap();
+
+    // The first render wires the arranger and plays it.
+    let a = out_dir.join("a.wav");
+    s.execute(&HostCommand::Bounce {
+        frames: 4000,
+        path: a.clone(),
+    })
+    .unwrap();
+    assert!(
+        read_channel(&a, 0).iter().any(|s| s.abs() > 1e-4),
+        "the wired arrangement plays"
+    );
+    assert_eq!(
+        s.engine_ref().graph.nodes().len(),
+        2,
+        "the graph is the mixer and the one arranger — nothing else"
+    );
+
+    // The bus goes away. The host retires the wiring with it — and the render that
+    // applies the unmount releases the name, which is what lets the re-mount through.
+    s.execute(&HostCommand::Unmount {
+        plugin: "mixer",
+        at_frame: None,
+    })
+    .unwrap();
+    let window = s
+        .render(16)
+        .expect("a bus-less window renders silence, not a refusal");
+    assert!(
+        window.iter().all(|s| *s == 0.0),
+        "…and what it renders is the silence of a session with no bus"
+    );
+    assert_eq!(
+        s.engine_ref().graph.nodes().len(),
+        0,
+        "the arranger went with the bus — an orphan renders into nothing and reads \
+         its pool file for the rest of the session"
+    );
+
+    // …and the re-mount re-wires: the arrangement is dirty, so the next render
+    // rebuilds it into the new bus.
+    s.execute(&mount_mixer())
+        .expect("the unmount applied, so the name is free");
+    let b = out_dir.join("b.wav");
+    s.execute(&HostCommand::Bounce {
+        frames: 4000,
+        path: b.clone(),
+    })
+    .expect("a re-mounted bus renders the arrangement");
+    assert_eq!(
+        s.engine_ref().graph.nodes().len(),
+        2,
+        "the re-mounted bus is wired again"
+    );
+    assert!(
+        read_channel(&b, 0).iter().any(|s| s.abs() > 1e-4),
+        "the re-mounted bus carries the arrangement — this bounce was silent \
+         (and error-free) before the wiring was retired with the bus"
+    );
+
+    let _ = std::fs::remove_dir_all(&pool);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
 fn clip(id: &str, at: u64, len: u64) -> Clip {
     Clip {
         reversed: false,
