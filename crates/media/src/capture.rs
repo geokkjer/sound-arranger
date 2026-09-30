@@ -53,7 +53,7 @@ impl Capture {
     /// from the session; the demux runs a [`DriftCompensator`] per channel to
     /// keep the recorded take in *session* frames (a 20-min jam can drift
     /// thousands of samples otherwise). Pass `input_rate == sample_rate` for a
-    /// no-drift passthrough.
+    /// no-drift passthrough. Both rates must be non-zero.
     pub fn start(
         pool_dir: &Path,
         take_id: &str,
@@ -66,6 +66,18 @@ impl Capture {
             return Err(format!(
                 "capture channels must be 1..={CAPTURE_CHANNELS_SANITY} (a sanity bound, not a \
                  design limit), got {channels}"
+            ));
+        }
+        // The drift ratio is `input_rate / sample_rate`, and the demux sizes a session
+        // buffer from its reciprocal. A zero rate is therefore an infinity that the
+        // demux thread would meet as an overflowing `usize` — a panic in a debug
+        // build (`stop` then blames the thread), a take that records DC and grows
+        // `pending` forever in release. Refuse it here, where the message can name
+        // the parameter, like `Resampler::new` and `Pool::write_source` do.
+        if input_rate == 0 || sample_rate == 0 {
+            return Err(format!(
+                "capture rates must be non-zero (got input_rate {input_rate} → sample_rate \
+                 {sample_rate}): the drift ratio is input_rate / sample_rate"
             ));
         }
         if !take_id
@@ -392,6 +404,37 @@ mod tests {
                 assert_eq!(*s, expected, "ch{k} sample {i} must round-trip exactly");
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A zero clock is refused by `start`, while the message can still name the
+    /// parameter. Downstream it is a division: the drift ratio is
+    /// `input_rate / sample_rate` and the demux sizes a session buffer from its
+    /// reciprocal, so `input_rate == 0` made `session_cap` an overflowing `usize` —
+    /// a demux-thread panic in debug that `stop` reports as the wrong cause, and in
+    /// release a take that records one DC sample per batch while `pending` grows
+    /// without bound.
+    #[test]
+    fn a_zero_rate_is_refused_by_start() {
+        let dir = std::env::temp_dir().join(format!("p12-rate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sr = 48_000u32;
+
+        let Err(e) = Capture::start(&dir, "zerod", 2, sr, 0, Arc::new(Spsc::new(4096))) else {
+            panic!("a zero device rate must be refused, not divided by");
+        };
+        assert!(e.contains("input_rate"), "the message names the rate: {e}");
+        let Err(e) = Capture::start(&dir, "zerod", 2, 0, sr, Arc::new(Spsc::new(4096))) else {
+            panic!("a zero session rate must be refused, not divided by");
+        };
+        assert!(e.contains("sample_rate"), "the message names the rate: {e}");
+
+        // Refused before anything was created: no pool dir, no take, no thread.
+        assert!(
+            !dir.exists(),
+            "a refused take leaves no pool material behind: {}",
+            dir.display()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
