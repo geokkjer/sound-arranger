@@ -122,6 +122,27 @@ fn fader_max_db() -> f32 {
     20.0 * first.log10()
 }
 
+/// The fader's step over the unit range.
+///
+/// iced's `VerticalSlider` defaults `step` to `T::from(1)` — for `f32` a step of
+/// **1.0**. Over a `0.0..=1.0` range its drag maths
+/// (`(percent * (end - start) / step).round()`) then yields only 0 or 1, so the
+/// fader had exactly two positions: `-60.0 dB` and `+6.0 dB`. A fader needs a
+/// step smaller than anything a hand can express.
+const FADER_STEP: f32 = 0.001;
+
+/// Build one fader. Every fader goes through here so the step cannot be
+/// forgotten at a call site — the bug above was a default nobody set.
+fn fader_widget(index: usize, value: f32) -> Element<'static, Message> {
+    vertical_slider(0.0..=1.0, value, move |normal| {
+        Message::Fader(index, normal)
+    })
+    .step(FADER_STEP)
+    .width(18.0)
+    .height(FADER_HEIGHT)
+    .into()
+}
+
 /// `set_param` targets as `&'static str` (the command carries static names):
 /// `ch0.gain` … `ch7.gain`, then the master. `MIXER_CHANNELS_MAX` is 8.
 const GAIN_PARAMS: [&str; 8] = [
@@ -147,6 +168,13 @@ fn strip_of(param: &str, channels: usize) -> Option<usize> {
 fn main() -> iced::Result {
     if std::env::args().any(|arg| arg == "--probe") {
         std::process::exit(probe());
+    }
+
+    // `--sweep` drives a fader the way the mouse does, in-process, and reports
+    // what it costs the audio device. A GUI drag cannot be piped in, and the
+    // question ("does a drag starve the device?") is a measurement, not a claim.
+    if std::env::args().any(|arg| arg == "--sweep") {
+        std::process::exit(sweep());
     }
 
     // `--keys` opens the keymap overlay at boot: the same affordance the TUI spike has,
@@ -761,11 +789,7 @@ impl Spike {
                         container(progress_bar(0.0..=1.0, meter).vertical())
                             .width(Length::Fixed(16.0))
                             .height(FADER_HEIGHT),
-                        vertical_slider(0.0..=1.0, fader.normal.as_f32(), move |normal| {
-                            Message::Fader(index, normal)
-                        })
-                        .width(18.0)
-                        .height(FADER_HEIGHT),
+                        fader_widget(index, fader.normal.as_f32()),
                     ]
                     .spacing(6),
                     text(label).size(11),
@@ -826,6 +850,108 @@ fn audio_label(snap: &Snapshot) -> String {
     match &snap.last_error {
         Some(e) => format!("{base} — pump error: {e}"),
         None => base,
+    }
+}
+
+/// Drive a fader through the **real** message path — the same `Message::Fader`
+/// the slider emits on every frame it moves — and report the device's underruns
+/// before and after.
+///
+/// This exists because a GUI drag cannot be scripted from outside and cannot be
+/// piped in: the only way to answer "does dragging starve the audio device?" is
+/// to make the shell do the dragging itself.
+fn sweep() -> i32 {
+    // With audio: the underrun counter is the device's, so a silent host measures nothing.
+    let mut spike = Spike::from_host(HostHandle::spawn_with_audio());
+
+    let underruns = |spike: &Spike| spike.snap.audio.as_ref().map(|a| a.underruns);
+    let index = spike.channels.min(spike.faders.len().saturating_sub(1));
+
+    // Phase 0 — STOPPED, and untouched: does the device starve on its own?
+    let read = |spike: &mut Spike| {
+        spike.snap = spike.host.snapshot();
+        underruns(spike)
+    };
+    std::thread::sleep(Duration::from_millis(700));
+    let stopped_a = read(&mut spike);
+    std::thread::sleep(Duration::from_millis(700));
+    let stopped_b = read(&mut spike);
+    println!("sweep: STOPPED, no input — underruns {stopped_a:?} -> {stopped_b:?}");
+
+    if let Err(e) = spike.host.execute(HostCommand::TransportPlay) {
+        eprintln!("sweep: transport play refused: {e}");
+        return 1;
+    }
+
+    // Settle: let the ring fill and the playing clock run.
+    std::thread::sleep(Duration::from_millis(800));
+    spike.snap = spike.host.snapshot();
+    let before = underruns(&spike);
+    println!(
+        "sweep: settled — underruns {before:?}, playing {}",
+        spike.snap.playing
+    );
+
+    // A drag, at about the rate a 60 Hz pointer produces: 300 messages over a
+    // second, sweeping the fader's range and back.
+    const STEPS: u32 = 300;
+    let started = std::time::Instant::now();
+    let mut sent = 0u32;
+    for step in 0..STEPS {
+        let phase = step as f32 / STEPS as f32;
+        let normal = if step % 2 == 0 { phase } else { 1.0 - phase };
+        spike.update(Message::Fader(index, normal));
+        sent += 1;
+        if step % 20 == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let elapsed = started.elapsed();
+
+    std::thread::sleep(Duration::from_millis(300));
+    spike.snap = spike.host.snapshot();
+    let after = underruns(&spike);
+
+    // What does the HOST settle on for each position? The endpoints alone would
+    // mean the intermediate values never survive the round trip.
+    println!("sweep: position -> the gain the host reports back");
+    for i in 0..=10 {
+        let normal = i as f32 / 10.0;
+        spike.update(Message::Fader(index, normal));
+        let outcome = spike.host.outcome().ok();
+        let reported = outcome.as_ref().and_then(|o| {
+            o.params
+                .iter()
+                .find(|(_, param, _)| *param == "master.gain")
+                .map(|(_, _, v)| *v)
+        });
+        println!("  normal {normal:.1} -> host master.gain {reported:?}");
+    }
+    println!(
+        "sweep: {sent} fader messages in {:?} ({:.0}/s) — underruns {after:?}",
+        elapsed,
+        sent as f32 / elapsed.as_secs_f32().max(1e-6),
+    );
+    match (before, after) {
+        (Some(b), Some(a)) => {
+            println!("sweep: delta {} underruns", a.saturating_sub(b));
+            println!(
+                "sweep: OK — audio: {} Hz, {} ch, drops {}",
+                spike
+                    .snap
+                    .audio
+                    .as_ref()
+                    .map(|x| x.sample_rate)
+                    .unwrap_or(0),
+                spike.snap.audio.as_ref().map(|x| x.channels).unwrap_or(0),
+                spike.snap.audio.as_ref().map(|x| x.drops).unwrap_or(0)
+            );
+            0
+        }
+        _ => {
+            eprintln!("sweep: no audio device was opened — nothing to measure");
+            1
+        }
     }
 }
 
@@ -1274,5 +1400,55 @@ mod fader_matches_the_declared_bounds {
         assert!((fader_unity().as_f32() - expected).abs() < 1e-6);
         let db = fader_range().unmap_to_db(fader_unity());
         assert!(db.abs() < 1e-3, "unity reads {db:+.3} dB, not 0");
+    }
+}
+
+#[cfg(test)]
+mod fader_step {
+    use super::*;
+
+    /// The fader must have positions *between* its ends.
+    ///
+    /// Regression: iced's `VerticalSlider` defaults `step` to `T::from(1)`, which
+    /// for `f32` is a step of 1.0. Its drag maths is
+    /// `(percent * (end - start) / step).round()`, so over a `0.0..=1.0` range a
+    /// default-stepped slider can only ever produce 0.0 or 1.0 — the fader jumped
+    /// between `-60.0 dB` and `+6.0 dB` and nothing in between existed.
+    #[test]
+    fn the_step_leaves_usable_positions_between_the_ends() {
+        // What the widget would compute, on the same maths it uses.
+        let locate = |percent: f64, step: f32| -> f32 {
+            let steps = (percent * (1.0 - 0.0) / step as f64).round();
+            (steps * step as f64 + 0.0) as f32
+        };
+
+        // The crate's default collapses the whole throw to its ends.
+        let default_step: f32 = 1.0;
+        let distinct_default: std::collections::BTreeSet<u32> = (0..=100)
+            .map(|i| (locate(i as f64 / 100.0, default_step) * 1e6) as u32)
+            .collect();
+        assert_eq!(
+            distinct_default.len(),
+            2,
+            "the default step should collapse to two positions (this is the bug)"
+        );
+
+        // Ours must not.
+        let distinct: std::collections::BTreeSet<u32> = (0..=100)
+            .map(|i| (locate(i as f64 / 100.0, FADER_STEP) * 1e6) as u32)
+            .collect();
+        assert!(
+            distinct.len() >= 100,
+            "the fader offers only {} positions across the throw",
+            distinct.len()
+        );
+
+        // And a mid-throw position must be a genuine intermediate gain.
+        let mid = locate(0.5, FADER_STEP);
+        let db = fader_range().unmap_to_db(Normal::new(mid));
+        assert!(
+            db > FADER_FLOOR_DB + 1.0 && db < fader_max_db() - 1.0,
+            "mid-throw reads {db:+.1} dB, which is not between the ends"
+        );
     }
 }
