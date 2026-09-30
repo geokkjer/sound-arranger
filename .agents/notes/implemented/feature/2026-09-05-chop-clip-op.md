@@ -26,8 +26,15 @@ Add `ArrangeOp::ChopClip { track, clip, times, prefix }` to the arrangement valu
   the op (and interned into the engine log), matching the value model's
   "ids are logged and deterministic" rule.
 - **Fail-loud refusals** (never logged): `times == 0`, `times > src_len`, a
-  derived id that already exists or repeats, and chopping a **looped** clip (the
-  loop phase at a cut is not representable — the same rule as razor-split).
+  derived id that already exists or repeats **anywhere in the arrangement**
+  (ids are unique per value, not per track), chopping a **looped** clip (the
+  loop phase at a cut is not representable — the same rule as razor-split), and
+  `times > MAX_CHOP_SLICES` (4096 — a bound added by the
+  [chop-bound fix](../bug-fix/2026-09-29-a-chop-is-bounded-before-it-is-tiled.md),
+  because `times` is a `u32` off the wire and `times <= src_len` alone reaches
+  `i64::MAX`: one logged line could otherwise ask for billions of pieces, each a
+  scan of every clip plus three heap `String`s). The bound is inclusive and is a
+  refusal, not a clamp.
 - The op is wired end-to-end through the closed-codec path (the clip-arranger's
   "everything is a logged command" discipline): `encode_op`/`decode_op`
   (`crates/media/src/clip_editor.rs`, added to `ALL_OPS`) and the versioned text

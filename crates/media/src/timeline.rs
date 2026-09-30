@@ -144,6 +144,16 @@ pub struct Track {
     pub clips: Vec<Clip>,
 }
 
+/// The most slices one [`ArrangeOp::ChopClip`] will make.
+///
+/// A chop's grain is a slice per bar or finer, so 4096 is far past any hand-made
+/// arrangement — and it is a **bound**, not a cap: a larger `times` is refused by name
+/// rather than sized. `times` is a `u32` off the wire and the only other limit is
+/// `times <= src_len`, which reaches `i64::MAX`; without this the op is one logged
+/// line that builds billions of `Clip`s (three heap `String`s each) inside a
+/// `Timeline` `apply` already cloned, and sorts them.
+const MAX_CHOP_SLICES: Frame = 4096;
+
 /// Normalise a deserialized marker list: sorted by frame, at most one per frame (the
 /// last one wins, which is what "set" means).
 fn markers_from_json<'de, D>(deserializer: D) -> Result<Vec<Marker>, D::Error>
@@ -298,6 +308,8 @@ pub enum ArrangeOp {
     ChopClip {
         track: Id,
         clip: Id,
+        /// The slice count. Bounded: `1 <= times <= min(src_len, 4096)` — a count past
+        /// that is refused by name, not sized (`MAX_CHOP_SLICES` in this module).
         times: u32,
         prefix: Id,
     },
@@ -939,6 +951,20 @@ impl Timeline {
                         times_f, c.src_len
                     ));
                 }
+                // `times > src_len` is the only bound above, and `src_len` reaches
+                // `i64::MAX` — so `times` (a `u32` straight off the wire) can ask for
+                // billions of pieces. The loop below is `times` iterations, each
+                // allocating a `Clip` with three heap `String`s, inside a `Timeline`
+                // `apply` already cloned, followed by a `times`-element sort: a logged
+                // op that hangs long before it aborts on the allocation. The op's own
+                // grain is a slice per bar or finer, so a few thousand is a typo and
+                // the refusal names the bound.
+                if times_f > MAX_CHOP_SLICES {
+                    return Err(format!(
+                        "chop {} times exceeds the {MAX_CHOP_SLICES}-slice bound",
+                        times_f
+                    ));
+                }
                 // Split the source region into `times` contiguous equal (within 1
                 // frame) pieces. Piece ids are a pure function of `prefix` + index,
                 // so replay reproduces them deterministically with no randomness.
@@ -955,10 +981,21 @@ impl Timeline {
                     c.src_start
                 };
                 let mut at = c.at_frame;
-                let mut seen = std::collections::HashSet::new();
+                // The arrangement's clip ids, gathered **once**: ids are unique across
+                // every track (`clip_id_exists` is the rule this preserves), so one set
+                // answers both questions the piece loop asks — is this derived id
+                // already taken, and has this loop already produced it — in O(1) each.
+                // Asking `clip_id_exists` per piece was `times` × clips string
+                // comparisons, which is what made an unbounded `times` quadratic.
+                let mut ids: std::collections::HashSet<Id> = self
+                    .tracks
+                    .iter()
+                    .flat_map(|t| t.clips.iter())
+                    .map(|c| c.id.clone())
+                    .collect();
                 for i in 0..times_f {
                     let pid = format!("{prefix}.{i}");
-                    if self.clip_id_exists(&pid) || !seen.insert(pid.clone()) {
+                    if !ids.insert(pid.clone()) {
                         return Err(format!("chop derived id '{pid}' already exists or repeats"));
                     }
                     let slen = base + if i < rem { 1 } else { 0 };
@@ -2775,6 +2812,113 @@ mod tests {
                 prefix: "p".into()
             })
             .is_err()
+        );
+    }
+
+    /// **A chop is refused a slice count past its bound rather than sized for it.**
+    /// `times` is a `u32` straight off the wire (`arrange chop t0 c0 4294967295 pre @0`)
+    /// and the only other limit was `times <= src_len`, which reaches `i64::MAX`. So one
+    /// logged op could walk billions of pieces — each iteration a full scan of every
+    /// track's clip ids *and* a `Clip` with three heap `String`s, inside a `Timeline`
+    /// `apply` already cloned — and sort the result: a hang first, an allocation abort
+    /// second. The bound is a **refusal naming the limit**, and it is inclusive: the
+    /// count at the bound still applies, so nothing a hand makes is turned away.
+    #[test]
+    fn a_chop_past_the_slice_bound_is_refused_not_sized() {
+        let mut t = two_tracks();
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 0, MAX_CHOP_SLICES + 1),
+            })
+            .unwrap();
+
+        // One past the bound, on a clip long enough to satisfy `times <= src_len`. This
+        // is the assertion the fix turns: on the unbounded value the op *applies* and
+        // builds 4097 pieces, so it also fails fast there rather than hanging.
+        let err = t
+            .apply(&ArrangeOp::ChopClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: (MAX_CHOP_SLICES + 1) as u32,
+                prefix: "pre".into(),
+            })
+            .expect_err("a chop past the slice bound is refused");
+        assert!(
+            err.contains(&MAX_CHOP_SLICES.to_string()),
+            "the refusal names the bound, got: {err}"
+        );
+
+        // The reported trigger: the wire's largest `u32`, on a clip long enough that
+        // `times <= src_len` does not catch it. Refused before a piece is built.
+        let mut wide = two_tracks();
+        wide = wide
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 0, u32::MAX as Frame),
+            })
+            .unwrap();
+        assert!(
+            wide.apply(&ArrangeOp::ChopClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: u32::MAX,
+                prefix: "pre".into(),
+            })
+            .is_err(),
+            "chop times = u32::MAX is refused"
+        );
+
+        // At the bound it still applies, and every piece is a clip the model accepts.
+        let at_bound = t
+            .apply(&ArrangeOp::ChopClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: MAX_CHOP_SLICES as u32,
+                prefix: "pre".into(),
+            })
+            .expect("a chop at the bound applies");
+        assert_eq!(
+            at_bound.tracks[0].clips.len(),
+            MAX_CHOP_SLICES as usize,
+            "every slice at the bound is produced"
+        );
+        assert_all_clips_valid(&at_bound);
+    }
+
+    /// **The derived-id check spans every track, not the chopped one.** Clip ids are
+    /// unique across the whole arrangement (`Timeline::clip` resolves an id without
+    /// naming a track, and `Duplicate` checks the whole value), so a chop whose piece id
+    /// is already taken on *another* track is refused. The duplicate check is now a hash
+    /// set gathered before the walk — this is what keeps it from becoming the chopped
+    /// track's own ids, which would let two tracks hold the same clip id.
+    #[test]
+    fn a_chop_is_refused_a_derived_id_taken_on_another_track() {
+        let mut t = two_tracks();
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 0, 4000),
+            })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t1".into(),
+                clip: clip("pre.1", 0, 4000),
+            })
+            .unwrap();
+
+        let err = t
+            .apply(&ArrangeOp::ChopClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 4,
+                prefix: "pre".into(),
+            })
+            .expect_err("a piece id already on another track is refused");
+        assert_eq!(
+            err, "chop derived id 'pre.1' already exists or repeats",
+            "the refusal names the colliding piece"
         );
     }
 }
