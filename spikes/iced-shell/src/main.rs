@@ -733,10 +733,18 @@ impl Spike {
             let Some(fader) = self.faders.get(index) else {
                 continue;
             };
+            // Two counts that used to be assumed equal: `self.channels` is the
+            // **fold's** mixer width, `snap.channels` is the **snapshot's** meter
+            // levels, and they disagree whenever no device is open. Indexing the
+            // meter vector by the fold's count panicked at startup ("len is 0 but
+            // the index is 0"); a strip we cannot meter simply reads 0.
             let (label, meter) = if index == self.channels {
                 ("master".to_string(), self.snap.master)
             } else {
-                (format!("ch{index}"), self.snap.channels[index])
+                (
+                    format!("ch{index}"),
+                    self.snap.channels.get(index).copied().unwrap_or(0.0),
+                )
             };
             let db = FADER.unmap_to_db(fader.normal);
 
@@ -880,6 +888,28 @@ fn probe() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A strip we cannot meter must read 0 rather than panicking.
+    ///
+    /// Regression: the console guarded on the **fold's** channel count but
+    /// indexed the **snapshot's** meter vector. At startup the fold reports the
+    /// mounted mixer width while `snap.channels` is still empty (no device yet),
+    /// which panicked with "index out of bounds: the len is 0 but the index is 0".
+    #[test]
+    fn an_unmetered_strip_reads_zero_instead_of_panicking() {
+        let mut spike = Spike::headless();
+        spike.adopt();
+        assert!(
+            spike.channels > 0,
+            "the headless fixture should mount a mixer"
+        );
+
+        // The mismatch that panicked: the fold says there are channels, the
+        // published snapshot has no meter levels for them yet.
+        spike.snap.channels.clear();
+        // The assertion is that this returns rather than panicking.
+        let _ = spike.console();
+    }
 
     /// The one mapping the host's fold and the widgets must agree on: channels
     /// first, the master last — and nothing outside the mounted channels.
