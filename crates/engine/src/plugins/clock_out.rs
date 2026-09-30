@@ -107,14 +107,27 @@ impl TransportLog {
 
     /// Take every entry whose frame is `< block_end` — due in this block *or
     /// earlier*, so a command logged after its frame has passed still flushes
-    /// into the very next block instead of sitting in the queue forever. The
-    /// node reuses a preallocated buffer, so draining allocates nothing.
+    /// into the very next block instead of sitting in the queue forever.
+    ///
+    /// The drain is bounded by the room `out` has, so the node's preallocated
+    /// buffer is never grown and this stays allocation-free on the render path
+    /// however many commands are pending. What does not fit stays **queued** —
+    /// this log's contract is that a command flushes late, not that it is
+    /// dropped — and the next block's drain carries it, at that block's first
+    /// frame. A buffer that was never given a capacity has no bound to honour,
+    /// so it takes the whole due prefix (the pre-bound behaviour, for a caller
+    /// that is not the render path).
     pub fn take_due(&self, block_end: u64, out: &mut Vec<(u64, Transport)>) {
         let mut queue = self
             .queue
             .lock()
             .expect("the transport log is not poisoned");
-        let at = queue.partition_point(|&(f, _)| f < block_end);
+        let due = queue.partition_point(|&(f, _)| f < block_end);
+        let at = if out.capacity() == 0 {
+            due
+        } else {
+            due.min(out.capacity() - out.len())
+        };
         out.extend(queue.drain(..at));
         drop(queue);
     }
@@ -156,8 +169,9 @@ pub struct ClockOutNode {
     /// Per-block event scratch, allocated once at construction and `clear`ed
     /// each block: the render path never grows it (see [`CLOCK_OUT_CAP`]).
     scratch: Vec<ExternalEvent>,
-    /// Transport drained from the log this block — also preallocated, for the
-    /// same reason.
+    /// Transport drained from the log this block — also preallocated, and the
+    /// render path never grows it: [`TransportLog::take_due`] takes what fits
+    /// and leaves the rest queued for the next block.
     transport_scratch: Vec<(u64, Transport)>,
     /// Events that did not fit the scratch: a loud bound, kept behind a shared
     /// atomic so the plugin can **publish** it under [`CLOCK_OUT_OVERFLOWS_KEY`]
@@ -651,6 +665,62 @@ mod tests {
             vec![0, 1000, 2000, 3000, 4000, 5000]
         );
         assert_eq!(node.overflows(), 0);
+    }
+
+    /// A block can owe **more transport commands than the scratch holds**: the
+    /// host feeds the log from its control path with no bound, and nothing
+    /// renders between the commands (a script of seventy `transport play`
+    /// lines, or a stopped session's worth of commands to a live host, which
+    /// renders only while playing). `take_due` drained the *whole* due prefix
+    /// into `transport_scratch`, and `Vec::extend` over a `Drain` reallocates,
+    /// so the overflow was an allocation inside `render` under a doc that
+    /// promised otherwise. The drain is now bounded by the room the buffer has:
+    /// the scratch keeps its capacity, and the commands that did not fit stay
+    /// **queued** and flush into the next block — this log drops nothing, which
+    /// is the whole of its contract.
+    #[test]
+    fn a_transport_flood_is_bounded_and_nothing_is_lost() {
+        let map = TempoMap::new(48_000, 120.0, 4);
+        let log = Arc::new(TransportLog::new());
+        let (sink, recorded) = FakeSink::new();
+        let slot: SharedMidiSink = Arc::new(Mutex::new(Some(Box::new(sink))));
+        let mut node = ClockOutNode::new(Some(slot), Some(log.clone()));
+        // Two caps and one, all logged at frame 300, so all of them are due in
+        // the first block ([0, 512)) and three blocks are needed to carry them.
+        let due = CLOCK_OUT_CAP * 2 + 1;
+        for _ in 0..due {
+            log.push(300, Transport::Start);
+        }
+        render_range(&mut node, &map, 0, 3 * 512, 512);
+        let sent = FakeSink::transport(&recorded);
+        assert_eq!(sent.len(), due, "every queued command reached the wire");
+        assert_eq!(sent[0], (300, "Start"), "the first at its logged frame");
+        assert_eq!(
+            sent[CLOCK_OUT_CAP],
+            (512, "Start"),
+            "the cap's next command flushed at the next block's first frame"
+        );
+        assert_eq!(
+            sent[due - 1],
+            (1024, "Start"),
+            "and the last one a block after that — late, not lost"
+        );
+        assert_eq!(
+            node.transport_scratch.capacity(),
+            CLOCK_OUT_CAP,
+            "the drain must never grow the scratch: that allocation was on the render path"
+        );
+        // The bound stays loud about what it did drop. Transport is sent before
+        // ticks, so a block whose scratch is all transport drops its own tick —
+        // counted, never grown, exactly as the tick path already was.
+        let ticks_due = (0..)
+            .map(|n| ClockOutNode::tick_frame(&map, n))
+            .take_while(|&f| f < 3 * 512)
+            .count() as u64;
+        assert_eq!(
+            FakeSink::clock_frames(&recorded).len() as u64 + node.overflows(),
+            ticks_due
+        );
     }
 
     /// The bound is loud: a tempo absurd enough to exceed [`CLOCK_OUT_CAP`] in

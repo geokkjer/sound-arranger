@@ -36,11 +36,14 @@ inferred from continuity, and nothing is required to be present.**
   session with neither mounts and renders.
 - **`TransportLog`** is sorted on push (a late feed arrives out of order — a test found it) and
   write-and-drain: entries due before the block's end are taken into a preallocated buffer and flushed,
-  so a late transport command lands at offset 0 rather than being lost. The *record* of transport is
-  the session log, not this tap; the tap exists to get frames to the wire.
+  so a late transport command lands at offset 0 rather than being lost. The drain is bounded by the
+  room that buffer has, so a flood of commands never grows it on the render path — what does not fit
+  stays queued and flushes into the next block ([the drain-bound note](../../implemented/bug-fix/2026-09-29-the-transport-drain-is-bounded-by-the-scratch.md)).
+  The *record* of transport is the session log, not this tap; the tap exists to get frames to the wire.
 - **A loud bound on the scratch**: `CLOCK_OUT_CAP` events per block, with the rest counted through
   `overflows()`. Dropping clock is bad; allocating on the render path is worse; a bound that grows
-  silently is worst.
+  silently is worst. The cap is on the **send** scratch, and the tick **walk** carries its own bound
+  ([the tick-walk note](../../implemented/bug-fix/2026-09-29-the-tick-walk-is-bounded-not-just-the-scratch.md)).
 - **One `sink.send(&scratch, block.frame)` per block**, with the mutex held only across that call. A
   single sender means the lock is uncontended, and the real device sink (slice B) will make it a fast
   queue push so the render path never touches the device.

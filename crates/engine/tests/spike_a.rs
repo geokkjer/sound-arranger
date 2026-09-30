@@ -9,6 +9,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use engine::*;
@@ -1185,19 +1186,31 @@ fn render_path_does_not_allocate() {
     mount_chain(&mut e);
     // The clock generator is portless and sinkless here — its per-block
     // scratch is preallocated, so steady-state clocking must also allocate
-    // nothing (midi-clock-out note, acceptance 5).
+    // nothing (midi-clock-out note, acceptance 5). The **transport tap** is
+    // provided as well and fed past the scratch cap, because a drain that grew
+    // its buffer would allocate here and nowhere else: with no log in the
+    // context, `take_due` is never entered.
     e.register_factory(
         "clock_out",
         plugins::clock_out_factory,
         plugins::clock_out::CLOCK_OUT_PORTS,
         &[],
     );
+    let transport: plugins::SharedTransportLog = Arc::new(plugins::TransportLog::new());
+    e.ctx
+        .provide(plugins::clock_out::TRANSPORT_KEY, transport.clone());
     e.mount("clock_out", &[]).unwrap();
     e.schedule_unmount("euclidean", 100_000)
         .expect("scheduled unmount");
     // Prime: applying the mounts/patches allocates on the control side
     // (factories, boxes, service table). The measured region must be free.
     let _prime = e.render(512);
+    // Fed after the prime, so the commands are due inside the measured region:
+    // 200 is well over the 64-entry transport scratch, and nothing renders
+    // between them — which is how a stopped host accumulates them.
+    for i in 0..200u64 {
+        transport.push(600 + i, plugins::Transport::Stop);
+    }
     let mut out = vec![0.0f32; 8192]; // allocated before measuring
 
     ALLOCS.store(0, Ordering::Relaxed);
