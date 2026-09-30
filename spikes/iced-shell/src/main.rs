@@ -50,7 +50,7 @@ use iced::keyboard;
 use iced::widget::{column, container, progress_bar, row, text};
 use iced::window;
 use iced::{Center, Element, Fill, Length, Subscription, Theme};
-use iced_audio::{DBRange, Gesture, Normal, NormalParam, VSlider};
+use iced_audio::{DBRange, Gesture, Normal, NormalParam, VSlider, virtual_slider};
 use workflow::{Action, Key as WorkflowKey, Mode};
 
 /// The demo profile — the `docs/FIRST_SESSION.md` chain, so the meters have
@@ -71,16 +71,39 @@ set_param mixer master.gain 0.8 @0
 /// open (the snapshot carries the device's rate only when audio is).
 const SAMPLE_RATE: i64 = 48_000;
 
-/// The console fader range: -60 dB (silence) to +12 dB, with unity at ~83 % of
-/// the travel — the console convention. `DBRange` is logarithmic and skewed
-/// towards 0 dB, so the useful part of the throw is not squeezed into the top
-/// millimetre, and `unmap_to_db` is the exact inverse of `map_db`.
+/// The console fader's geometry: the height a fader is drawn at, and therefore
+/// the distance a drag has to cover to cross its whole range.
+const FADER_HEIGHT: f32 = 150.0;
+
+/// The fader range: -60 dB (silence) to +12 dB, with unity at ~83 % of the
+/// travel — the console convention, and `unmap_to_db` is the exact inverse of
+/// `map_db`.
+///
+/// The top is deliberately **+12, not +24**. `DRange`'s skew is non-linear, so a
+/// knee far above unity compresses the whole useful top into the last few
+/// millimetres of throw: with a +24 ceiling the final 10 % of travel bought
+/// ~0.9 dB. Capping the knee at +12 keeps the top usable everywhere from
+/// silence to the ceiling.
 const FADER: DBRange = DBRange::new(
     -60.0,
     12.0,
     Normal::new(0.833),
     DBRange::DEFAULT_SKEW_FACTOR,
 );
+
+/// Fader sensitivity: **one pixel of drag is one pixel of fader travel.**
+/// `iced_audio`'s default (`0.00385` per pixel) is a scroll-wheel rate, not a
+/// fader mapping — over a 150 px fader a full-height drag moved the parameter by
+/// only 0.58, i.e. barely half its range, which reads as a stuck control.
+const FADER_DRAG_SCALAR: f32 = 1.0 / FADER_HEIGHT;
+
+/// The slider config that turns the crate default into a mixer fader.
+fn fader_config() -> virtual_slider::Config {
+    virtual_slider::Config {
+        drag_scalar: FADER_DRAG_SCALAR,
+        ..Default::default()
+    }
+}
 
 /// `set_param` targets as `&'static str` (the command carries static names):
 /// `ch0.gain` … `ch7.gain`, then the master. `MIXER_CHANNELS_MAX` is 8.
@@ -722,11 +745,12 @@ impl Spike {
                     row![
                         container(progress_bar(0.0..=1.0, meter).vertical())
                             .width(Length::Fixed(16.0))
-                            .height(Length::Fixed(150.0)),
+                            .height(Length::Fixed(FADER_HEIGHT)),
                         VSlider::new(*fader)
                             .on_gesture(move |gesture| Message::Fader(index, gesture))
+                            .config(&fader_config())
                             .width(Length::Fixed(18.0))
-                            .height(Length::Fixed(150.0)),
+                            .height(Length::Fixed(FADER_HEIGHT)),
                     ]
                     .spacing(6),
                     text(label).size(11),
@@ -1085,5 +1109,50 @@ mod tests {
         assert!(workflow::help_len() > 0);
         app.on_key(WorkflowKey::Esc);
         assert!(!app.help, "Esc closes it");
+    }
+}
+
+#[cfg(test)]
+mod fader_travel {
+    use super::*;
+
+    /// A full-height drag must cross the fader's whole range.
+    ///
+    /// Regression: `iced_audio`'s default `drag_scalar` (0.00385/px) is a
+    /// scroll rate, so dragging the fader's full 150 px moved the parameter only
+    /// 0.58 — the control felt stuck and never reached its top.
+    #[test]
+    fn a_full_height_drag_uses_the_whole_range() {
+        let travel = FADER_HEIGHT * FADER_DRAG_SCALAR;
+        assert!(
+            (travel - 1.0).abs() < 1e-6,
+            "a full {FADER_HEIGHT} px drag covers {travel:.3} of the range, not all of it"
+        );
+    }
+
+    /// Every part of the throw has to be usable, including the top.
+    ///
+    /// Regression: a far-above-unity knee (the obvious "+24 dB for headroom")
+    /// squeezed the useful top of the range into the last few pixels — the final
+    /// 10 % of travel bought ~0.9 dB.
+    #[test]
+    fn the_top_of_the_throw_is_usable() {
+        let knee = FADER.unmap_to_db(Normal::new(1.0));
+        assert!(knee <= 12.0 + 1e-3, "the ceiling drifted to {knee:+.2} dB");
+
+        // The top tenth must buy at least 2 dB, or the fader is unusable there.
+        let at_90 = FADER.unmap_to_db(Normal::new(0.9));
+        assert!(
+            knee - at_90 >= 2.0,
+            "the last 10 % of travel buys only {:.2} dB (from {at_90:+.2} to {knee:+.2})",
+            knee - at_90
+        );
+
+        // And unity must sit near the console convention's 83 %.
+        let unity = FADER.map_db(0.0).as_f32();
+        assert!(
+            (unity - 0.833).abs() < 0.01,
+            "unity landed at {unity:.3} of the travel, not ~0.833"
+        );
     }
 }
