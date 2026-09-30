@@ -114,7 +114,17 @@ pub fn open_output(
     let (config, rate_mismatch) = select_output_config(&device, requested_rate)?;
     let sample_rate = config.sample_rate();
     let channels = config.channels();
-    let stream_config = config.config();
+    let mut stream_config = config.config();
+    // Ask for a small callback buffer instead of accepting the device default.
+    //
+    // `BufferSize::Default` lets ALSA negotiate the period, and on this machine it
+    // chose a buffer larger than the host's whole output ring (measured: a single
+    // callback asking for ~67.6k frames, 1.4 s at 48 kHz). The callback then finds
+    // the ring short and counts an underrun **per frame**, which is what produced a
+    // one-shot burst of ~68k underruns at the moment of play. A fixed small period
+    // also keeps transport and parameter changes responsive — the same latency a
+    // fader move feels.
+    stream_config.buffer_size = cpal::BufferSize::Fixed(OUTPUT_PERIOD_FRAMES);
     let underruns = Arc::new(AtomicU64::new(0));
     let err: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
     let err_cb = {
@@ -151,6 +161,14 @@ pub fn open_output(
 /// The most source channels `fill_output` maps (the app's master is mono or
 /// stereo); a larger source is clamped rather than indexed past the frame.
 const MAX_SOURCE_CHANNELS: usize = 2;
+
+/// The output callback's requested period, in frames.
+///
+/// ~21 ms at 48 kHz: large enough to be a sane ALSA period, small enough that a
+/// transport or fader change is felt rather than queued. Requesting it explicitly
+/// matters — `BufferSize::Default` let ALSA pick a period larger than the host's
+/// output ring, and the callback counted the shortfall one underrun per frame.
+const OUTPUT_PERIOD_FRAMES: u32 = 1024;
 
 /// Choose an output config. The device's **own default** wins whenever it already
 /// runs at `requested_rate` — that layout is the one the system considers correct.

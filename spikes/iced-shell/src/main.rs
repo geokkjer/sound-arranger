@@ -872,19 +872,30 @@ fn sweep() -> i32 {
         spike.snap = spike.host.snapshot();
         underruns(spike)
     };
+    // The device opens during `spawn_with_audio`, so this is the counter at the
+    // instant we can first see it.
+    let t0 = std::time::Instant::now();
+    let at_open = read(&mut spike);
+    println!("sweep: t+{}ms at first sight — underruns {at_open:?}", t0.elapsed().as_millis());
     std::thread::sleep(Duration::from_millis(700));
     let stopped_a = read(&mut spike);
+    println!("sweep: t+{}ms STOPPED — underruns {stopped_a:?}", t0.elapsed().as_millis());
     std::thread::sleep(Duration::from_millis(700));
     let stopped_b = read(&mut spike);
-    println!("sweep: STOPPED, no input — underruns {stopped_a:?} -> {stopped_b:?}");
+    println!("sweep: t+{}ms STOPPED — underruns {stopped_b:?}", t0.elapsed().as_millis());
 
     if let Err(e) = spike.host.execute(HostCommand::TransportPlay) {
         eprintln!("sweep: transport play refused: {e}");
         return 1;
     }
 
+    // The shape of the burst: sample as fast as we can right after play.
+    for i in 1..=10 {
+        std::thread::sleep(Duration::from_millis(20));
+        let u = read(&mut spike);
+        println!("sweep: playing +{}ms — underruns {u:?}", i * 20);
+    }
     // Settle: let the ring fill and the playing clock run.
-    std::thread::sleep(Duration::from_millis(800));
     spike.snap = spike.host.snapshot();
     let before = underruns(&spike);
     println!(
