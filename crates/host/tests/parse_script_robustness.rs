@@ -1,6 +1,6 @@
 //! Parse-script robustness: a truncated/malformed command line must be a clean
 //! `Err` (the designed `bad script` path), never an index-out-of-bounds panic —
-//! this is the wire schema a future Tauri shell feeds, so it cannot panic.
+//! this is the wire schema the shells feed, so it cannot panic.
 
 use host::parse_script;
 

@@ -8,7 +8,7 @@
 //! 1. **The window opens** on this host (niri/Wayland, Mesa) — iced's winit +
 //!    wgpu path, the thing the parked Nix shell died on.
 //! 2. **The host thread is unchanged.** The shell owns a
-//!    [`host::live::HostHandle`] — the exact actor the Tauri bridge uses — and
+//!    [`host::live::HostHandle`] — the exact actor the retired Tauri bridge used — and
 //!    never touches the render path. No IPC, no serde wire, no webview.
 //! 3. **Transport** (play / stop / rewind + spacebar) drives it.
 //! 4. **Meters and the playhead follow the audio** — the published `Snapshot` is
@@ -302,7 +302,7 @@ impl Spike {
     }
 
     /// A fixed dark theme — iced's built-in theme enum is the whole theming story
-    /// here; the Vue side's token contract has no iced equivalent yet.
+    /// here; the retired Vue shell's token contract has no iced equivalent yet.
     fn theme(&self) -> Theme {
         Theme::Dark
     }

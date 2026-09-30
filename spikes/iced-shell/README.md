@@ -4,7 +4,7 @@
 [iced-shell evaluation note](../../.agents/notes/proposed/architecture/2026-09-21-iced-shell-evaluation.md):
 can [iced](https://github.com/iced-rs/iced) be a sound-arranger shell — in-process
 Rust over the same Host API the retired Tauri + Vue shell drove? The shell decision
-itself (Tauri retired; iced and ratatui are the candidates) is the
+itself (Tauri tried and decided against; iced and ratatui are the shells) is the
 [shells note](../../.agents/notes/implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md).
 
 It is its **own workspace** on purpose: iced and wgpu must never enter the core's

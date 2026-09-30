@@ -3,7 +3,7 @@
 **Status: an evaluation, not a shell.** This is the terminal counterpart of
 [`spikes/iced-shell`](../iced-shell/), behind the same question: what should the
 sound-arranger shell be? It drives the *same* `host::live::HostHandle` the Tauri
-bridge uses — in-process, no IPC, no webview — and was written to the **same
+bridge used — in-process, no IPC, no webview — and was written to the **same
 scope** as the iced spike so the two can be compared directly.
 
 The evaluation note is

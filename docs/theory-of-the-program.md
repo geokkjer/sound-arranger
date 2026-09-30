@@ -295,8 +295,11 @@ carve-out**: the arrangement node's *state* is the logged value.
 
 ### 3.7 The host — the product is a contract, and the UI is a plugin
 
-`crates/host`. The central claim of the UI-as-plugin note: **our Tauri app is a
-reference implementation of the host, not the host.** So a *headless* host is
+`crates/host`. The central claim of the UI-as-plugin note: **every shell is an
+implementation of the host, not the host.** (The Tauri + Vue shell that first
+proved this was tried and decided against — 2026-09-22,
+[framing note](../.agents/notes/implemented/architecture/2026-09-30-tauri-was-an-experiment-and-iced-is-next.md).)
+So a *headless* host is
 built first and drives the whole thing deterministically via a versioned text
 script (`parse_script`, `host v1`). The contract has three carefully-separated
 parts:
@@ -307,9 +310,11 @@ parts:
 - **Values** — declarative snapshots (graph value, `providers_of`, pool index).
   *The host never mutates shared state directly.*
 
-This keeps the *profile* logic out of Vue by construction: a headless host must
-be able to run it, so it can't hide in a component. And it makes the shell
-interchangeable — swap the transport adapter, the contract stays.
+This keeps the *profile* logic out of the shell by construction: a headless host
+must be able to run it, so it can't hide in a widget. And it makes the shell
+interchangeable — swap the transport adapter, the contract stays. Today the TUI is
+the shell that exercises it; the iced shell is taken to the recorder profile once
+the recorder itself is good enough.
 
 ---
 

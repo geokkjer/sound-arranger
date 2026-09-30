@@ -1,7 +1,7 @@
 //! The headless smoke binary (composition-seams acceptance, UI-as-plugin
 //! note): reads a script from a file or stdin, executes it against the Host
 //! API contract, writes the bounce, and prints the session summary. No
-//! frontend — the reference host a Tauri shell will eventually mirror.
+//! frontend — the reference host the Rust shells mirror.
 //!
 //! Flags (everything else is the script path):
 //! - `--midi-out <port>` (or `--midi-out=<port>`): open a real MIDI output for
