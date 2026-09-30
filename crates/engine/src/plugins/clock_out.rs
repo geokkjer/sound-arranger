@@ -6,8 +6,11 @@
 //! The clock is the core's, read-only: the node computes each tick's frame
 //! **statelessly from the block's own frame range** — no continuity is tracked
 //! between blocks, and no transport is inferred from a frame jump. A seek
-//! rebuilds the session, so nothing is sent across a rebuild; the next `play`
-//! re-syncs (the conservative decision the note takes).
+//! rebuilds the session, so nothing is sent across a rebuild; the **host** owns
+//! the re-sync at the far side of one — the same message a `play` at that frame
+//! sends in the rebuilt session's own log (`Start` at frame 0, `Continue`
+//! elsewhere) when the transport was still playing (see `replay_to_kind` in
+//! `crates/host`), and otherwise nothing until the next `play`.
 //!
 //! Device ownership stays with the host: the node holds the sink **slot** the
 //! host provided under the [`MIDI_OUT_KEY`] context key (or its own empty one
@@ -63,6 +66,15 @@ pub type SharedTransportLog = Arc<TransportLog>;
 
 /// A MIDI transport command (the note's scope: `Start`, `Stop`, `Continue` —
 /// Song Position Pointer is explicitly out of this slice).
+///
+/// The distinction between `Start` and `Continue` is **the point of the two**,
+/// not a stylistic choice, and it is the host's job to honour it when it feeds
+/// the log: `Start` means **"return to song start"**, so it is truthful only at
+/// frame 0 — anywhere else it tells a follower to jump to its own top while the
+/// session sits elsewhere. `Continue` means "carry on running from where you
+/// are" and makes no claim about an absolute position, so it is the honest
+/// message at every other frame. Neither states a position in the middle of a
+/// piece; that is what SPP is for, and it is not in this scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
     Start,

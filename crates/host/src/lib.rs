@@ -503,9 +503,11 @@ pub struct HostSession {
     /// effect. Provided under `"transport"` **always** — it is pure
     /// bookkeeping (a queue of frames), no device — so a session mounts
     /// `clock_out` identically with and without gear attached. Fed from the
-    /// **apply** path, so a replayed command re-feeds the tap identically; the
-    /// sink's absence is what makes a replay silent, never a special case
-    /// here.
+    /// **apply** path, which is where a command's frame is known; a rebuild
+    /// gets a **fresh** log and does not replay `Play`/`Stop` (they are
+    /// actions, not state), so the one other feed is the seek's own re-anchor
+    /// in [`Self::replay_to_kind`]. Silence on a replay comes from the sink's
+    /// absence, never from a special case here.
     transport: Arc<TransportLog>,
     /// The MIDI output sink **slot** — always present, containing the device
     /// when the process asked for one (`--midi-out`/`DSH_MIDI_OUT`, see
@@ -1585,14 +1587,19 @@ impl HostSession {
             HostCommand::TransportPlay => {
                 // Feed the transport tap from the **apply** path, at the frame
                 // the command takes effect (the clock's current position, where
-                // the next render starts) — a replayed command re-feeds the tap
-                // identically, and the sink's absence is what makes a replay
-                // silent. `Start` when play begins from the start of the
+                // the next render starts). The sink's absence is what makes a
+                // replay silent. `Start` when play begins from the start of the
                 // timeline, `Continue` when it resumes from a non-zero
                 // position: on the wire, MIDI `Start` tells a follower to
                 // return to its song start, so a play from frame 0 is the only
                 // one whose position that agrees with; every other play
                 // resumes from where we are, which is what `Continue` means.
+                //
+                // A `play` is an **action**, not state (`is_state`), so a
+                // rebuild never re-applies it and never re-feeds this — which is
+                // why the tap lives on the session rather than in the history,
+                // and why a seek feeds its own re-anchor instead
+                // ([`Self::replay_to_kind`]).
                 let frame = self.engine.clock.frame();
                 let transport = if frame == 0 {
                     engine::Transport::Start
@@ -2776,6 +2783,50 @@ impl HostSession {
         })();
         self.restore_midi(device);
         let mut rebuilt = rebuilt?;
+        // **A seek re-anchors a playing follower**, because the rebuilt session
+        // gets a brand-new tap (`new_at_with`) and nothing else ever re-feeds it:
+        // `TransportPlay` is an *action*, so it is not state, is not in the history,
+        // and `rebuild` never re-applies it. Without this the adopted session is
+        // still `playing` (`rebuild` carries the flag across), so its ticks simply
+        // resume at the new position — and a pulse-counting follower keeps the
+        // count it already had, a permanent phase error that **no later message
+        // could correct**, because a playing transport is never followed by a
+        // `play`. The entry goes into the *rebuilt* log and is sent by the first
+        // render after the adoption, with the device already back in the slot: the
+        // "nothing is sent across a rebuild" rule is untouched.
+        //
+        // **The message is the same one a `play` at this frame sends**: `Start`
+        // from frame 0, `Continue` from anywhere else. That distinction is the
+        // whole point of the two messages, so it cannot be traded away for
+        // "re-anchoring": on the wire `Start` does not mean *re-anchor*, it means
+        // **"return to song start"** — which is why the `TransportPlay` arm above
+        // only sends it at frame 0. At 24 000 a `Start` would not re-zero a
+        // follower against the session, it would tell it to jump to its own song
+        // top while the session sits half a second in: a second, larger error
+        // than the phase one this message exists to correct. So a re-anchor
+        // re-declares the *only* thing 24 PPQN can honestly state at a non-zero
+        // frame — "keep running, the position moved" — which is `Continue`, and
+        // a seek that lands on frame 0 gets the `Start` that frame deserves.
+        //
+        // What that buys is a follower that re-bases its beat count on a
+        // `Continue` after a jump, and what it does not buy is a stated
+        // position: only Song Position Pointer can do that, and it is deferred.
+        //
+        // A **seek only**: undo and redo rebuild *at the current frame*
+        // (`replay_to_kind(self.engine.clock.frame(), false)`) over an
+        // arrangement edit, which cannot move a tick, so the follower is still in
+        // phase and a re-anchor there would be a message about nothing.
+        //
+        // A **stopped** transport feeds nothing: the follower was stopped by the
+        // `Stop` the old session already sent, and a rebuild is not what stopped it.
+        if is_seek && self.playing {
+            let transport = if frame == 0 {
+                engine::Transport::Start
+            } else {
+                engine::Transport::Continue
+            };
+            rebuilt.transport.push(frame, transport);
+        }
         rebuilt.carry_over(self, warm, frame, is_seek);
         *self = rebuilt;
         Ok(())
@@ -9388,11 +9439,14 @@ mod clock_out_wiring {
         assert_eq!(
             transport_events(&sends),
             vec![(0, "Start")],
-            "no transport command crossed the rebuild either"
+            "no transport command crossed the rebuild either — the seek's re-anchor is \
+             queued in the rebuilt tap and goes out with the first render after it"
         );
 
         // The device is back in the shared slot: the live render records
-        // ticks again, all at or past the seek target.
+        // ticks again, all at or past the seek target, and the re-anchor
+        // reaches the wire at the target frame — as the `Continue` a non-zero
+        // target gets, pinned in the next test.
         session.render(48_000).expect("render after the seek");
         let all = clock_frames(&sends);
         let resumed = &all[frames_before.len()..];
@@ -9400,6 +9454,159 @@ mod clock_out_wiring {
             !resumed.is_empty() && resumed.iter().all(|&f| f >= 24_000),
             "ticks again after the seek, from the target onward: {resumed:?}"
         );
+    }
+
+    /// **A seek while playing re-anchors the follower.** `TransportPlay` is an
+    /// *action*, so it is not state, never enters the history, and a rebuild
+    /// never re-applies it — and the rebuilt session gets a brand-new tap. So
+    /// without the re-anchor the adopted session is still `playing`, its ticks
+    /// resume at the new position, and a follower is never told the position
+    /// moved at all.
+    ///
+    /// The message is the one a `play` at that frame would send, and the
+    /// distinction is pinned here because it is the whole point of the two: at
+    /// 24 000 it is a **`Continue`**, because `Start` on this wire means "return
+    /// to song start" (the rule the `TransportPlay` arm already follows), and
+    /// sending it here would tell gear to jump to its own top while the session
+    /// sits half a second in. A seek to frame **0** does get the `Start` that
+    /// frame deserves — the same wire message a play from the top sends.
+    #[test]
+    fn a_seek_while_playing_re_anchors_the_follower_at_the_target() {
+        let (sink, sends) = fake_sink();
+        let mut session = HostSession::new_at_with(48_000, Some(sink), Some("fake".into()));
+        mount_clock_out(&mut session);
+        session.execute(&HostCommand::TransportPlay).expect("play");
+        session.render(48_000).expect("render one second");
+        assert_eq!(
+            transport_events(&sends),
+            vec![(0, "Start")],
+            "the play reached the wire once"
+        );
+
+        // Seek while playing: the rebuild is silent (nothing crosses a rebuild),
+        // and the re-anchor is due at the target — which is where the clock now
+        // stands, so it flushes at offset 0 of the first block after the rebuild.
+        session
+            .execute(&HostCommand::TransportSeek { frame: 24_000 })
+            .expect("seek");
+        assert_eq!(session.position().frame, 24_000, "the playhead moved");
+        assert!(session.is_playing(), "and the transport kept running");
+        assert_eq!(
+            transport_events(&sends),
+            vec![(0, "Start")],
+            "the rebuild itself sent nothing"
+        );
+        session
+            .render(512)
+            .expect("render one block after the seek");
+        assert_eq!(
+            transport_events(&sends),
+            vec![(0, "Start"), (24_000, "Continue")],
+            "a seek to a non-zero frame re-anchors with Continue: `Start` would mean \
+             'return to song start', which 24 000 is not"
+        );
+
+        // A seek back to the top re-anchors too, and lands on the same wire
+        // message a play from frame 0 sends — one `Start` at frame 0, not two.
+        // This is the case that keeps the `frame == 0` half of the rule pinned:
+        // the same feed that answered 24 000 with `Continue` answers 0 with
+        // `Start`, because there the two messages finally agree.
+        session
+            .execute(&HostCommand::TransportSeek { frame: 0 })
+            .expect("seek home");
+        session
+            .render(512)
+            .expect("render one block after seeking home");
+        assert_eq!(
+            transport_events(&sends),
+            vec![(0, "Start"), (24_000, "Continue"), (0, "Start")],
+            "a seek to the top re-anchors with Start: frame 0 is the one frame where \
+             'return to song start' and the session's position are the same statement"
+        );
+    }
+
+    /// The re-anchor belongs to a **seek that moved a playing transport**. A
+    /// stopped transport has already been stopped on the wire by the `Stop` the
+    /// old session sent, and a rebuild is not what stopped it, so a seek then
+    /// re-anchors nothing — a `Start` there would be a message about a follower
+    /// that is not running.
+    #[test]
+    fn a_seek_while_stopped_re_anchors_nothing() {
+        let (sink, sends) = fake_sink();
+        let mut session = HostSession::new_at_with(48_000, Some(sink), Some("fake".into()));
+        mount_clock_out(&mut session);
+        session.execute(&HostCommand::TransportPlay).expect("play");
+        session.render(48_000).expect("render one second");
+        session.execute(&HostCommand::TransportStop).expect("stop");
+        session.render(512).expect("render past the stop");
+        let before = transport_events(&sends);
+        assert_eq!(before, vec![(0, "Start"), (48_000, "Stop")]);
+
+        // A seek while stopped moves the playhead and re-anchores nothing.
+        session
+            .execute(&HostCommand::TransportSeek { frame: 24_000 })
+            .expect("seek while stopped");
+        session.render(512).expect("render after the seek");
+        assert_eq!(
+            transport_events(&sends),
+            before,
+            "a stopped transport re-anchors nothing"
+        );
+    }
+
+    /// …and it belongs to a **seek** alone. Undo and redo rebuild *at the current
+    /// frame*, over an arrangement edit, which cannot move a tick: the follower
+    /// is still in phase across the edit, so a re-anchor there would put a
+    /// message on the wire about nothing having moved.
+    #[test]
+    fn an_undo_while_playing_re_anchors_nothing() {
+        let root = std::env::temp_dir().join(format!("host-undo-midi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let (sink, sends) = fake_sink();
+        let mut session = HostSession::new_at_with(48_000, Some(sink), Some("fake".into()));
+        session
+            .execute(&HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(0),
+            })
+            .expect("mixer");
+        mount_clock_out(&mut session);
+        session
+            .execute(&HostCommand::Pool { dir: pool })
+            .expect("pool");
+        session
+            .execute(&HostCommand::Arrange {
+                op: media::ArrangeOp::AddTrack { track: "t0".into() },
+                at_frame: None,
+            })
+            .expect("track");
+        session.execute(&HostCommand::TransportPlay).expect("play");
+        session.render(48_000).expect("render one second");
+        let before = transport_events(&sends);
+        assert_eq!(before, vec![(0, "Start")]);
+
+        // An arrangement edit, then its undo: both rebuild the session, and
+        // neither moves the playhead (it is at 48 000 throughout).
+        session
+            .execute(&HostCommand::Arrange {
+                op: add_clip("c0", 0),
+                at_frame: None,
+            })
+            .expect("clip");
+        assert!(session.undo().expect("undo"), "an edit was undone");
+        assert_eq!(session.position().frame, 48_000, "the playhead stayed");
+        session.render(512).expect("render after the undo");
+        assert_eq!(
+            transport_events(&sends),
+            before,
+            "an undo at the current frame re-anchors nothing"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The export clone renders offline: it must send nothing, while the sink

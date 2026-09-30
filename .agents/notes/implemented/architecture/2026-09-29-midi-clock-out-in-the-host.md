@@ -26,13 +26,24 @@ jitter figure is asserted.
   device was requested.
 - The tap is fed from the **apply** path at the frames `Play`/`Stop` take effect: `Start` only from
   frame 0 — MIDI `Start` means "return to song start", so a resume is `Continue` — and `Stop` on stop.
-  Feeding it in apply is what makes a replay re-feed it identically; silence on a replay comes from the
-  empty slot, never from a special case.
+  Silence on a rebuild comes from the empty slot, never from a special case.
 - **The slot is what makes the conservative decision executable.** Around *every* rebuild render — the
   seek warm-up, undo/redo replay, and an export's clone plus its offline render — the host empties the
   slot and restores the device afterwards, with the restore on the failure path too. So a rebuild sends
-  nothing, live playback drives gear, and the next `play` re-syncs. The rebuilt session shares the same
-  slot `Arc`, which is why the refill is visible to its node.
+  nothing, live playback drives gear, and the rebuilt session shares the same slot `Arc`, which is why
+  the refill is visible to its node.
+- **The far side of a rebuild is where the follower is re-synced.** `Play`/`Stop` are *actions*, not
+  state, so they are not in the history and a replay never re-applies them — and each rebuilt session
+  gets a brand-new tap. A **seek that moved a playing transport** therefore feeds **the message a
+  `play` at that frame would send** into the rebuilt session's own log at the target frame, which the
+  first render after the adoption sends with the device back in the slot: the gear is told the
+  position moved, instead of keeping a pulse count the jump invalidated ([the re-anchor
+  note](../../implemented/bug-fix/2026-09-29-a-seek-re-anchors-a-playing-follower.md)). The
+  `Start`/`Continue` split is the same rule the `Play` arm follows and is not relaxed here: at a
+  non-zero target the message is a `Continue`, because `Start` would mean "return to song start" and
+  the session is not there. A stopped transport feeds nothing, and undo/redo rebuild at the current
+  frame, so neither adds a message. A gear that took the earlier wording literally — "the next
+  `play` re-syncs" — had no next `play` to wait for.
 - **Which device is attached is configuration, not session state**: `--midi-out <port>` or
   `DSH_MIDI_OUT`. A port name in a logged command would put a machine-specific fact in the session,
   and destinations belong to the rig binding. The snapshot carries `midi: MidiOutStatus { port,
@@ -63,10 +74,11 @@ jitter figure is asserted.
 ## Consequences
 
 - Verified by the gates (26 suites, clippy `-D warnings`, fmt) and by tests that pin the behaviour
-  rather than the intention: **a seek sends nothing while it rebuilds and resumes afterwards**; an
-  export clone sends nothing; a session with no sink mounts, renders and replays byte-identically; the
-  ticks land at the tempo map's frames with the transport mapped `Start`/`Continue`/`Stop`; and the
-  overflow counter reaches the snapshot.
+  rather than the intention: **a seek sends nothing while it rebuilds and resumes afterwards**, and
+  **re-anchors the follower on the render after it** — `Continue` at a non-zero target, `Start` at
+  frame 0, both ends pinned; an export clone sends nothing; a session with no sink mounts, renders
+  and replays byte-identically; the ticks land at the tempo map's frames with the transport mapped
+  `Start`/`Continue`/`Stop`; and the overflow counter reaches the snapshot.
 - The shell spikes are separate workspaces with their **own committed `Cargo.lock`s**, so a new
   transitive dependency has to be added to each as well. CI caught precisely that — `--locked`
   refusing to update them — while the root workspace passed, which is the class of breakage a
