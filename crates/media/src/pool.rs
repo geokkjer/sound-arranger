@@ -496,7 +496,9 @@ impl Pool {
         // A mono file: resampled, or copied byte for byte when it already fits
         // (no re-quantization) — both through a temporary name, then committed,
         // so a failure cannot leave a torn source. The id means this file, so any
-        // channel sources an earlier multi-channel import left under it go.
+        // channel sources an earlier multi-channel import left under it go — all
+        // of them, `ch0` included, because this import writes `{id}.wav` and no
+        // `{id}.ch{k}` (a mono keep-count of 0).
         let converted = from_rate != session_rate;
         let tmp = dest.with_extension("converting");
         let frames_out = if converted {
@@ -514,7 +516,7 @@ impl Pool {
             }
             frames_in
         };
-        self.replace_sources(&id, 1);
+        self.replace_sources(&id, 0);
         if let Err(e) = fs::rename(&tmp, &dest) {
             let _ = fs::remove_file(&tmp);
             return Err(format!(
@@ -596,10 +598,13 @@ impl Pool {
 
     /// Remove the sources an earlier import left under `id`: the whole-file
     /// source itself, and every `{id}.ch{k}` channel at or beyond
-    /// `keep_channels`. **Importing replaces the id** — without this, a stereo
-    /// file imported over a stem that held a 5.1 take (or a mono source) would
-    /// leave the old material addressable, and a clip on that id would keep
-    /// playing audio the user just replaced.
+    /// `keep_channels` — the number of `{id}.ch{k}` names this import is about
+    /// to write (a multi-channel import overwrites `ch0..channels-1`; a **mono**
+    /// import writes none, so it passes `0` and every sibling of an earlier split
+    /// goes with it). **Importing replaces the id** — without this, a stereo file
+    /// imported over a stem that held a 5.1 take (or a mono source) would leave
+    /// the old material addressable, and a clip on that id would keep playing
+    /// audio the user just replaced.
     ///
     /// Called only once the new material is safely written, so a failed import
     /// changes nothing. A filesystem error here is ignored: `list` reports what

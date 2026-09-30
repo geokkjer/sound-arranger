@@ -379,6 +379,58 @@ fn a_narrower_import_removes_the_older_channels() {
     let _ = std::fs::remove_dir_all(&pool_dir);
 }
 
+/// Importing a **mono** file over a stem a split left as `{id}.ch0`,
+/// `{id}.ch1` replaces the id outright: the new material lands as `{id}.wav`, so
+/// *every* channel of the old take is stale — `ch0` included, which a keep-count
+/// of 1 (the mono channel count) did not reach. Left in place, a clip on
+/// `jam.ch0` — an id the pool itself handed out — keeps playing the left channel
+/// of the take the user just replaced.
+#[test]
+fn a_mono_import_removes_the_older_split_channels() {
+    let first_dir = tmp_dir("mono-over-split-first");
+    let src_dir = tmp_dir("mono-over-split-src");
+    let pool_dir = tmp_dir("mono-over-split-pool");
+    write_stereo(&first_dir, "jam", 4800, 48_000, 0.25, -0.5); // the replaced take
+    write_finalized(&src_dir, "jam", 2400, 48_000, 0.75); // the new, unrelated mono take
+
+    let pool = Pool::open(&pool_dir).unwrap();
+    let split = pool.import(&first_dir.join("jam.wav"), 48_000).unwrap();
+    assert_eq!(split.ids(), vec!["jam.ch0", "jam.ch1"]);
+
+    let done = pool.import(&src_dir.join("jam.wav"), 48_000).unwrap();
+    assert_eq!(done.ids(), vec!["jam"]);
+
+    let index = pool.list().unwrap();
+    assert_eq!(index.errors, Vec::new());
+    let ids: Vec<&str> = index.sources.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["jam"],
+        "the replaced take's channels must not survive the import"
+    );
+    for stale in [
+        "jam.ch0.wav",
+        "jam.ch1.wav",
+        "jam.ch0.peaks",
+        "jam.ch1.peaks",
+    ] {
+        assert!(
+            !pool_dir.join(stale).exists(),
+            "{stale} outlived the import that replaced it"
+        );
+    }
+    let (audio, rate, frames) = read_all(&pool_dir.join("jam.wav"));
+    assert_eq!((rate, frames), (48_000, 2400));
+    assert!(
+        audio.iter().all(|s| (s - 0.75).abs() < 1e-6),
+        "jam.wav must hold the new mono take"
+    );
+
+    let _ = std::fs::remove_dir_all(&first_dir);
+    let _ = std::fs::remove_dir_all(&src_dir);
+    let _ = std::fs::remove_dir_all(&pool_dir);
+}
+
 /// A **torn sibling** (an interrupted split, or a hand-placed truncated file) is
 /// re-derived by the next pass instead of being trusted: `{id}.ch{k}` means
 /// "channel k of `{id}`", so the pass overwrites it through a temporary name.

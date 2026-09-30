@@ -50,10 +50,15 @@ through.
   a source that is not yet mono.
 - **Importing over an id replaces it**, the multi-channel case included:
   `replace_sources(id, keep_channels)` drops the old whole-file source **and every
-  `{id}.ch{k}` at or beyond the new channel count** — after the new material is staged, so a
-  failed import changes nothing. Without it, a stereo file imported under a stem that held a
-  5.1 take would leave `jam.ch2`…`jam.ch5` addressable, and a clip on them would play audio
-  the user had just replaced.
+  `{id}.ch{k}` at or beyond `keep_channels`**, the number of channel names the incoming
+  import writes — the channel count for a multi-channel import, which overwrites
+  `ch0..channels-1`, and **0 for a mono import**, whose material lands as `{id}.wav` and
+  keeps no channel name (so a split's `ch0` goes with the rest). Dropped after the new
+  material is staged, so a failed import changes nothing. Without it, a stereo file imported
+  under a stem that held a 5.1 take would leave `jam.ch2`…`jam.ch5` addressable, and a clip
+  on them would play audio the user had just replaced; the [mono
+  fix](../bug-fix/2026-09-29-a-mono-import-leaves-no-channel-of-the-take-it-replaced.md)
+  covers the same failure in the other direction.
 - `Pool::conform` **expands** a multi-channel source in place (hand-filled or legacy
   pools): the extra channels are written beside it as `{id}.ch{k}`, and `{id}` is
   rewritten as its channel 0 — preserving the original as `{id}.wav.pre{rate}` (or
@@ -114,11 +119,12 @@ and panned independently, and no reader ever has to de-interleave on the audio p
   reader picks channel *k* of a six-channel file and reads past one chunk boundary
   (the sizing fix), and refuses a frame wider than its chunk; `conform` splits a stereo
   source, preserves the original, is idempotent, and resamples-and-splits in one pass;
-  a narrower import removes the older channels; a **torn sibling is re-derived** (a
-  never-finalized `jam.ch1.wav` holding the wrong audio comes back finalized and correct);
-  an existing backup is not clobbered; at host level a stereo file adopted into the pool is
-  arranged on two panned tracks and the **bounce** carries 440 Hz on the left and 880 Hz on
-  the right, so a dropped *or swapped* channel fails the test.
+  a narrower import removes the older channels, and a **mono** import over a split removes its
+  channels as well (`a_mono_import_removes_the_older_split_channels`); a **torn sibling is
+  re-derived** (a never-finalized `jam.ch1.wav` holding the wrong audio comes back finalized and
+  correct); an existing backup is not clobbered; at host level a stereo file adopted into the
+  pool is arranged on two panned tracks and the **bounce** carries 440 Hz on the left and 880 Hz
+  on the right, so a dropped *or swapped* channel fails the test.
 - Three defects were found by **self-review before the gate**, all now fixed and tested:
   (a) a file whose declared channel count made one frame wider than the reader's chunk
   buffer (`want == 0`) made `read_into` **loop forever** — the ceiling is now enforced in
