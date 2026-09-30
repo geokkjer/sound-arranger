@@ -771,7 +771,13 @@ impl ToneGen {
 
     fn schedule(&mut self, offset: u32, len: u32, freq: f32) {
         if self.pending_count < MAX_PENDING {
-            let at = self.pending_head + self.pending_count;
+            // The queue is a **ring**, so the write index wraps: `head + count`
+            // alone is only in range while every block starts with the head back
+            // at 0 (the end-of-block clear in `render` is what keeps that true),
+            // and a render-thread index must not lean on a second invariant it
+            // cannot see. Wrapping puts the write in range whatever head and
+            // count are.
+            let at = (self.pending_head + self.pending_count) % MAX_PENDING;
             self.pending[at] = (offset, len.max(1), freq);
             self.pending_count += 1;
         }
@@ -823,7 +829,7 @@ impl AudioNode for ToneGen {
                         len,
                     });
                 }
-                self.pending_head += 1;
+                self.pending_head = (self.pending_head + 1) % MAX_PENDING;
                 self.pending_count -= 1;
             }
             let mut s = 0.0f32;
@@ -843,9 +849,15 @@ impl AudioNode for ToneGen {
             }
             *sample = s;
         }
-        if self.pending_count == 0 {
-            self.pending_head = 0;
-        }
+        // Nothing queued outlives the block it was queued for. Every onset the
+        // loop above drained had an offset inside `out`, so whatever is left was
+        // offset at or past the block's last sample and this block could never
+        // reach it. Clearing it here is what makes the queue honest **across**
+        // blocks: the head used to return to 0 only when the queue emptied by
+        // itself, so one note at `offset >= frames` parked it, and the next
+        // block's write walked off the end of the array.
+        self.pending_count = 0;
+        self.pending_head = 0;
     }
 
     fn set_param(&mut self, name: &str, value: f32) {
@@ -2127,5 +2139,88 @@ mod tests {
     #[should_panic(expected = "over the 4096-step limit")]
     fn an_absurd_step_count_is_refused_before_it_is_allocated() {
         EuclideanGen::new(EUCLIDEAN_MAX_STEPS + 1, 4, Vec::new());
+    }
+
+    /// Render one block of `notes` into `out` through a bare [`ToneGen`] — the
+    /// view a note consumer gets, with no graph around it.
+    fn tone_block(node: &mut ToneGen, notes: &[NoteEvent], out: &mut [f32], frame: u64) {
+        let map = tempo();
+        let io = NodeIO {
+            audio_in: &[],
+            audio_ins: AudioInputs::none(),
+            audio_in_count: 0,
+            audio_out_channels: 1,
+            frames: out.len(),
+            control_in: 0.0,
+            triggers_in: &[],
+            notes_in: notes,
+        };
+        let mut control = 0.0f32;
+        let mut triggers = EventBuf::new();
+        let mut out_notes = EventBuf::new();
+        node.render(
+            &io,
+            out,
+            &mut control,
+            &mut triggers,
+            &mut out_notes,
+            RenderBlock {
+                frame,
+                sample_rate: 48_000,
+                tempo: &map,
+                mode: RenderMode::Timeline,
+            },
+        );
+    }
+
+    /// A note at `offset == frames` is a **legal `EventBuf` payload** and nothing
+    /// forbids one: `EventBuf` bounds capacity, never offsets. The tone's
+    /// pending-onset queue is a ring of [`MAX_PENDING`], the per-sample loop
+    /// reaches only `0..out.len()`, and the head used to return to 0 **only when
+    /// the queue emptied by itself** — so such a note was queued and never
+    /// drained, the head stayed parked, and the next block's write at
+    /// `head + count` indexed past the end of the array: an out-of-bounds panic
+    /// on the render thread.
+    #[test]
+    fn an_onset_past_the_block_does_not_outlive_its_block() {
+        const FRAMES: usize = 64;
+        let inside = NoteEvent {
+            offset: 0,
+            pitch: 0.0,
+            velocity: 1.0,
+            duration: 4,
+        };
+        let mut node = ToneGen::new(0.25, 4);
+
+        // Block A: one note the block can reach, then a pool's worth of notes
+        // offset past its last sample.
+        let mut notes = vec![inside];
+        for _ in 0..MAX_PENDING {
+            notes.push(NoteEvent {
+                offset: FRAMES as u32,
+                ..inside
+            });
+        }
+        let mut a = [0.0f32; FRAMES];
+        tone_block(&mut node, &notes, &mut a, 0);
+        assert!(
+            a[1] > 0.0,
+            "the in-block note still sounds: the first sample is sin(0), the second is not"
+        );
+        assert_eq!(
+            (node.pending_head, node.pending_count),
+            (0, 0),
+            "nothing queued outlives the block it was queued for"
+        );
+
+        // Block B: one ordinary note. Unfixed, the write at `pending[8]` panicked
+        // here — and with the queue merely *bounded* instead of cleared, this
+        // block would be silent.
+        let mut b = [0.0f32; FRAMES];
+        tone_block(&mut node, &[inside], &mut b, FRAMES as u64);
+        assert!(
+            b[1] > 0.0,
+            "the next block's note sounds: the queue is empty, not full of undrained entries"
+        );
     }
 }
