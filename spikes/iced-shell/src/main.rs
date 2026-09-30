@@ -876,13 +876,22 @@ fn sweep() -> i32 {
     // instant we can first see it.
     let t0 = std::time::Instant::now();
     let at_open = read(&mut spike);
-    println!("sweep: t+{}ms at first sight — underruns {at_open:?}", t0.elapsed().as_millis());
+    println!(
+        "sweep: t+{}ms at first sight — underruns {at_open:?}",
+        t0.elapsed().as_millis()
+    );
     std::thread::sleep(Duration::from_millis(700));
     let stopped_a = read(&mut spike);
-    println!("sweep: t+{}ms STOPPED — underruns {stopped_a:?}", t0.elapsed().as_millis());
+    println!(
+        "sweep: t+{}ms STOPPED — underruns {stopped_a:?}",
+        t0.elapsed().as_millis()
+    );
     std::thread::sleep(Duration::from_millis(700));
     let stopped_b = read(&mut spike);
-    println!("sweep: t+{}ms STOPPED — underruns {stopped_b:?}", t0.elapsed().as_millis());
+    println!(
+        "sweep: t+{}ms STOPPED — underruns {stopped_b:?}",
+        t0.elapsed().as_millis()
+    );
 
     if let Err(e) = spike.host.execute(HostCommand::TransportPlay) {
         eprintln!("sweep: transport play refused: {e}");
