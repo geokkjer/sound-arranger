@@ -231,14 +231,21 @@ impl AudioNode for ArrangerNode {
         debug_assert!(out.len() <= engine::BLOCK, "render chunk exceeds BLOCK");
         let mut acc = [0.0f32; engine::BLOCK];
         for c in self.clips.iter() {
-            if c.end() <= f0 {
+            // `ArrangerNode::new` validated every clip on the track (`validate_clip`
+            // bounds the span), so this is the clip's end. The saturating fallback keeps
+            // the block loop *total* for a hand-built node — a wrapped end here would
+            // clip the block short and a panic here would stop the render — and it only
+            // differs from the true end for a span that cannot be represented, which
+            // `new` refuses.
+            let c_end = c.end().unwrap_or(u64::MAX);
+            if c_end <= f0 {
                 continue; // fully before this block
             }
             if c.at_frame >= f1 {
                 break; // sorted by at_frame: nothing later is active
             }
             let start = c.at_frame.max(f0);
-            let end = c.end().min(f1);
+            let end = c_end.min(f1);
             let j0 = (start - f0) as usize;
             let j1 = (end - f0) as usize;
             let Some(reader) = self.readers.get_mut(&c.id) else {

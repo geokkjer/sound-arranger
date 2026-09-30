@@ -2062,7 +2062,10 @@ impl HostSession {
     /// so the export is the session's *current* value rendered from the start — a
     /// limiter mounted halfway through a session masters the whole file rather than
     /// silently missing from the deliverable. The length is the arrangement's own
-    /// ([`media::Timeline::end_frame`]), never a hand-computed count. The output is
+    /// ([`media::Timeline::end_frame`]), never a hand-computed count — and that call is
+    /// fallible on purpose: an arrangement holding a clip whose span cannot be
+    /// represented is **refused by name** rather than exported at a wrapped length.
+    /// The output is
     /// **f32** (bit-exact) or **s16 with fixed-seed TPDF dither** (reproducible), and a
     /// mix whose peak exceeds full scale is **refused with nothing written** — "never a
     /// clipped file" is a property of the command, not of the user's care.
@@ -2086,7 +2089,11 @@ impl HostSession {
         // The clone: current state, clock at 0, and no rendering while the state is
         // applied (`at_now`), so this is cheap even for a long session.
         let mut fresh = self.rebuild(None)?;
-        let frames = self.arrangement()?.end_frame();
+        // `?` on the arrangement's end: a clip whose span cannot be represented has no
+        // export length, and the two wrong answers (a wrapped sum, a `Frame::MAX`-frame
+        // render) are both worse than a refusal that names the clip. No op admits such a
+        // clip — this is the `Timeline` that came back from the session, named.
+        let frames = self.arrangement()?.end_frame()?;
         if frames == 0 {
             return Err("nothing to export: the arrangement has no clips".into());
         }

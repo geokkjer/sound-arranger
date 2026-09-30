@@ -702,24 +702,58 @@ fn a_razor_split_of_a_full_length_fade_still_bounces_audio() {
     );
 
     let mut r = media::WavReader::open(&out).unwrap();
+    // `read_into` de-interleaves and yields channel 0 (L), so `audio[f]` is frame `f`
+    // of the bounce — not a raw interleaved sample index.
     let mut audio = vec![0.0f32; r.total_frames() as usize];
     let n = r.read_into(&mut audio);
     assert!(
         audio[..n].iter().any(|s| s.abs() > 1e-4),
         "the split halves render audio"
     );
-    // The capped fade is *audible*, not merely present: the left half ramps from
-    // silence at its first frame to full level over the 1200 frames it now spans.
+
+    // **The fade is proved by its gain, not by a sample being non-zero.** The mix is
+    // scaled by a constant on the way out (a mono source spread across the stereo bus),
+    // so these assertions compare *frames that read the same source value*, which
+    // cancels that constant exactly and leaves the per-clip gain.
+    //
+    // The ramp source repeats every 257 frames. `cL` (frames 0..1200, `src_start` 0,
+    // `fade_in` 1200 after the cap) reads the same source value at frames 500 and 757 as
+    // `cR` (frames 1200..4000, `src_start` 1200, no fades) does at frame 1271: all three
+    // are `243 / 257`, because 500 ≡ 757 ≡ 1271 ≡ 243 (mod 257). So a left sample over
+    // that right sample **is** the fade's gain at that frame — and the fades that would
+    // fail are named: an uncapped 4000-frame fade gives 0.125 and 0.189, a cap of 600
+    // gives 0.833 and 1.0, and a dropped fade gives 1.0 and 1.0. The old assertions
+    // (`audio[0]` quiet, `audio[1000] > 0.05`) were satisfied by all three, because the
+    // ramp is 0 at frame 0 whatever the gain, and any fade shorter than 1000 frames is
+    // fully open by frame 1000.
+    let reference = audio[1_271];
     assert!(
-        audio[0].abs() < 1e-3,
-        "the first frame of the split half is still inside its fade-in, got {}",
-        audio[0]
+        reference > 1e-3,
+        "the reference frame is a real sample, got {reference}"
+    );
+    // The right half plays its source at a *constant* gain — the seam the split made is
+    // hard, and that is what makes `reference` the denominator it is used as: frames
+    // 1271 and 1298 read `243/257` and `13/257` of the ramp, both unfaded.
+    let (probe, want_ratio) = (
+        1_298u64,
+        source_value(1_298, 257) / source_value(1_271, 257),
     );
     assert!(
-        audio[1000].abs() > 0.05,
-        "and the fade opens within the half, got {}",
-        audio[1000]
+        (audio[probe as usize] / reference - want_ratio).abs() < 0.01,
+        "the right half is unfaded, so two of its frames are at the ratio of their \
+         source values ({want_ratio}); got {}",
+        audio[probe as usize] / reference
     );
+    // The left half's fade, sampled twice inside the window: linear gains `f / 1200`
+    // (the renderer ramps `off / fade_in`), so the ratio pins both the cap and the shape.
+    for (frame, want_gain) in [(500usize, 500.0 / 1200.0), (757, 757.0 / 1200.0)] {
+        let got = audio[frame] / reference;
+        assert!(
+            (got - want_gain).abs() < 0.01,
+            "inside the 1200-frame fade: frame {frame} is at gain {want_gain}, got {got} \
+             — that is a fade of a different length than the capped one"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&pool);
     let _ = std::fs::remove_dir_all(&out_dir);
@@ -879,7 +913,11 @@ fn chop_text_format_splits_a_clip_and_renders() {
     assert_eq!(timeline.tracks[0].clips.len(), 4, "chop 4 -> four pieces");
     assert_eq!(timeline.tracks[0].clips[0].id, "pre.0");
     assert_eq!(timeline.tracks[0].clips[3].id, "pre.3");
-    assert_eq!(timeline.tracks[0].clips.last().unwrap().end(), 4000);
+    assert_eq!(
+        timeline.tracks[0].clips.last().unwrap().end(),
+        Some(4000),
+        "the four pieces tile the clip's 4000-frame span"
+    );
 
     let mut r = media::WavReader::open(&out).unwrap();
     let mut audio = vec![0.0f32; r.total_frames() as usize];

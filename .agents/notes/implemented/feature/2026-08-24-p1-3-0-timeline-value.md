@@ -50,7 +50,20 @@ cap the fades they can no longer fit (the rule `Stretch` has always followed, an
 the shell's trim-to-content gesture uses) and validate what they produce. This is not
 cosmetic: `ArrangerNode::new` validates every clip on a track and refuses the *whole
 track* over one, so an op the log accepted but the renderer refused would make the
-session unplayable. `LoopRegion` is the growth arm and validates for the same reason.
+session unplayable. `LoopRegion` validates for the same reason, and — because a re-bake
+with a smaller `times` **shortens** the clip — caps the fades there too.
+
+**An op checks the arithmetic it does, and the clip it was handed.** `Timeline` is
+`Deserialize` and a hand-built `Track` is a legal `&self` to `apply`, so a clip can reach
+an arm without having passed `AddClip`: every sum a geometry op computes is `checked`,
+`ChopClip` validates the clip before it walks it, and `Clip::end` is `Option` for the same
+reason.
+
+**`LoopRegion.times` is the number of passes, not a factor.** The region is fixed by the
+first bake (`loop_len`, or the clip's own length on the first loop), so a re-bake re-reads
+the same region and sets the total to `times` passes: `times: 3` twice is three passes,
+not nine, and `times: 1` is the single pass the clip was before its first bake. `times: 0`
+is refused — un-looping is not an op in this model.
 
 Opaque loop phase handled explicitly: **`RazorSplit` and `Trim(Start)` refuse a looped
 clip** — the loop phase at the cut is not representable in this model, and "drop the
@@ -77,21 +90,26 @@ fail-loud rather than a silent audio change.
 - The value alone (an empty timeline) is reproducible from an op log: the
   `pure_apply_is_deterministic_and_replays` test applies the same ops twice and asserts
   equality. This is the byte-identical-replay foundation for the arrangement.
-- `Clip::end()` assumes the span was validated on admission; `AddClip` validates the
-  embedded `Clip` (a hand-built clip that would overflow/NaN/zero-length is refused on
-  the way in), so later ops (`RazorSplit`, `MoveClip`) can trust `at_frame + src_len` —
-  and, since the [geometry-op fix](../bug-fix/2026-09-29-geometry-ops-leave-a-renderable-clip.md),
+- `Clip::end()` returns `Option<Frame>` (`at_frame.checked_add(src_len)`) and
+  `Timeline::end_frame()` returns `Result<Frame, String>`, **naming the clip** whose span
+  cannot be represented. `AddClip` validates the embedded `Clip` (a hand-built clip that
+  would overflow/NaN/zero-length is refused on the way in), so later ops (`RazorSplit`,
+  `MoveClip`) can trust the span — and, since the [geometry-op fix](../bug-fix/2026-09-29-geometry-ops-leave-a-renderable-clip.md),
   `src_start + src_len` too. `source_frame_at` adds to `src_start` and is therefore
-  panic-free for any clip that passed admission.
+  panic-free for any clip that passed admission. `HostSession::export` refuses such an
+  arrangement by name rather than rendering a wrapped length; `ArrangerNode::render`
+  saturates, because `ArrangerNode::new` validated every clip it holds.
 - `RazorSplit`, `MoveClip`, `MoveClipToTrack`, and `Trim(Start)` all re-sort their track
   (stable, deterministic), so a track's `clips` stays sorted even when a neighbor starts
   *inside* the split clip's span (the kimi slice-1 sortedness bug).
 - `LoopRegion` uses `checked_mul` *before* any assignment (the kimi slice-1
-  panic/partial-mutation fix) and validates the grown clip, since the growth is what can
-  push a span or a source window out of range; the "refused op is never logged" contract
-  holds because no op mutates before its last possible failure point.
-- 9 timeline tests pass (sortedness across split/move/trim, loop refusal, validation
-  gate, determinism/replay). Workspace: 34 media unit tests, clippy clean.
+  panic/partial-mutation fix) and validates the clip it produced, since growing `src_len`
+  is what can push a span or a source window out of range; the "refused op is never
+  logged" contract holds because no op mutates before its last possible failure point.
+- The value's own tests cover sortedness across split/move/trim, loop refusal, the
+  validation gate, determinism/replay, and the geometry-op invariants; the
+  [geometry-op fix](../bug-fix/2026-09-29-geometry-ops-leave-a-renderable-clip.md) lists
+  the ones that pin the rules above, each verified to fail on the unfixed value.
 - **Deferred**: the engine log integration (`Event::Arrangement` + dispatch + `at_frame`)
   is P1.3.2; the render node is P1.3.1; `Trim` currently keeps `at_frame`/`src_len`
   consistent and re-sorts, and a baked-loop *crossfade* at the seam is not represented
