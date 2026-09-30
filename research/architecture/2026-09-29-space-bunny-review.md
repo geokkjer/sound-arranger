@@ -68,6 +68,7 @@ suite, the agent-notes verifier, and both shell-spike builds).
 | `5-midi#3` the transport drain allocates on the render path | MAJ | CONFIRMED | `a917a1c` |
 | `2-media-io#1` (also `6-tests#1`, `7-mech#4`) 24-bit recovery truncates | MAJ | CONFIRMED | `74186ec`, `117f2f1` |
 | `2-media-io#2` a crossfade of 0 or 1 samples drops the incoming's first sample | MAJ | CONFIRMED | [fix note](../../.agents/notes/implemented/bug-fix/2026-09-29-a-crossfade-too-short-to-mix-is-a-cut.md) |
+| `6-tests#3` the WAV reader rejects a valid odd-sized metadata chunk | MIN | CONFIRMED | [fix note](../../.agents/notes/implemented/bug-fix/2026-09-29-a-chunk-body-is-skipped-with-its-pad-byte.md) |
 
 Defects the **verification** found, not the original reviewers — all fixed: the euclidean grid walk
 was unbounded (`6814cfc`) and its pattern-size invariant was breakable from safe code (`069d27a`);
@@ -109,9 +110,9 @@ rejected as false; these are real findings left for a next pass, with the reason
 - **`5-midi#6` / `7-mechanical#7` the clock-out node takes two mutexes and two `expect`s on the
   render path.** PARTLY: reachable only through the slot the host fills on the control side. Worth
   revisiting when the sink seam loses its `Mutex`.
-- **`6-tests#2` the media no-allocation test does not cover the retire free it claims to**, and
-  **`6-tests#3` the WAV reader rejects a valid odd-sized metadata chunk** (RIFF word alignment is
-  not applied when skipping). Both confirmed; the second is a real reader bug with a one-line fix.
+- **`6-tests#2` the media no-allocation test does not cover the retire free it claims to.** A test
+  defect rather than a code one: the fix re-times the existing fixture (splice inside the measured
+  window) and adds an EOF-before-splice variant, which is its own pass over that test.
 - **`6-tests#4` `docs/FIRST_SESSION.md`'s expected output and silence-detection snippet are both
   false against the current code** (PARTLY). A docs fix that should also advance the freshness
   banner.

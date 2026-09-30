@@ -96,9 +96,11 @@ is left alone.
   `is_finalized` is true, `recover` refuses, and every byte is unchanged), and
   `pool::a_foreign_source_with_a_trailing_chunk_is_left_alone` (the pool-level shape: peaks still
   derived, source byte-identical, 1000 frames in the index).
-- **Not this note:** `parse_header`'s chunk walk still skips a chunk's body without its RIFF
-  word-alignment pad byte, so a file with an *odd-length chunk before* `data` still fails to parse
-  (`wav.rs:142`'s else arm). That is a read-path defect, separate from this recovery-path decision.
+- **Not this note:** `parse_header`'s chunk walk used to skip a chunk's body without its RIFF
+  word-alignment pad byte, so a file with an *odd-length chunk before* `data` failed to parse
+  ("missing data chunk"). Fixed by the [chunk-walk note](2026-09-29-a-chunk-body-is-skipped-with-its-pad-byte.md);
+  the walk that reaches the data chunk is now aligned, which is what lets a foreign file carrying
+  metadata get as far as the recovery predicates at all.
 - Tests: `cargo test -p media` green (154 tests, 7 pre-existing hardware/soak ignores).
 
 *Authored with Space Bunny · OpenCode, 2026-09-29.*

@@ -93,9 +93,13 @@ sites were 16-bit, float, 16-bit and float.
   `data_offset + declared <= file_len` and `recover` refuses a file whose data chunk is not the
   file's tail. The media-pool note's "never mutates a well-formed source" invariant now holds for
   foreign WAVs too.
-- **Still open, and not this note:** `parse_header`'s chunk walk seeks a chunk's body without the RIFF
-  word-alignment pad byte, so a file with an odd-length chunk *before* `data` still fails to parse
-  ("missing data chunk"). That is a read-path defect, not a recovery one.
+- **Superseded, the second hazard this note left open:** `parse_header`'s chunk walk sought a chunk's
+  body without the RIFF word-alignment pad byte, so a file with an odd-length chunk *before* `data`
+  failed to parse ("missing data chunk"). Fixed by the [chunk-walk
+  note](2026-09-29-a-chunk-body-is-skipped-with-its-pad-byte.md) — the skip is now `size + (size & 1)`.
+  That is a read-path defect, not a recovery one, and it is what the [recovery salvage
+  note](2026-09-29-recovery-salvages-only-what-is-there.md) later recorded as still open on its own
+  walk; both are now closed.
 - Tests: `cargo test -p media` green (147 tests, 6 pre-existing hardware/soak ignores).
 
 *Authored with Space Bunny · OpenCode, 2026-09-29.*

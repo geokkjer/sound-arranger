@@ -98,8 +98,11 @@ fn parse_header(reader: &mut (impl Read + Seek)) -> Result<Header, String> {
                 .read_exact(&mut body[..n])
                 .map_err(|e| format!("fmt chunk: {e}"))?;
             if size > 40 {
+                // The overshoot skips a body like any other chunk, so it carries
+                // the same pad byte.
+                let pad = size & 1;
                 reader
-                    .seek(SeekFrom::Current(size as i64 - n as i64))
+                    .seek(SeekFrom::Current(size as i64 - n as i64 + pad as i64))
                     .map_err(|e| e.to_string())?;
             }
             let format = u16::from_le_bytes([body[0], body[1]]);
@@ -144,8 +147,14 @@ fn parse_header(reader: &mut (impl Read + Seek)) -> Result<Header, String> {
             ));
             break; // data is the last chunk for files we write; a reader may re-seek
         } else {
+            // RIFF pads an odd-sized chunk body to a word boundary. Skipping only
+            // the body leaves the reader on the pad byte, reads `[pad, 'd','a']`
+            // as the next tag, and loses every chunk from there on — so a valid
+            // foreign WAV with a `LIST`/`cue `/`bext` before `data` was refused
+            // with "missing data chunk".
+            let pad = size & 1;
             reader
-                .seek(SeekFrom::Current(size as i64))
+                .seek(SeekFrom::Current(size as i64 + pad as i64))
                 .map_err(|e| e.to_string())?;
         }
     }
@@ -904,6 +913,63 @@ mod tests {
         let mut back = vec![0.0f32; n as usize];
         assert_eq!(r.read_into(&mut back), n as usize);
         assert!(back.iter().all(|s| (*s - 0.5).abs() < 1e-3));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A **foreign WAV with an odd-sized chunk before `data`** is valid RIFF: the
+    /// pad byte is what puts the next chunk on a word boundary, and a conforming
+    /// writer emits it. The chunk walk skipped a body *without* its pad, so the
+    /// reader landed on the pad byte, read `[pad, 'd','a']` as the next tag, and
+    /// `parse_header` reported "missing data chunk" — a valid file refused with no
+    /// diagnostic about alignment, so `Pool::list` filed it in `errors` and
+    /// `import` failed. The writer never emits such a chunk, which is why no
+    /// round-trip test could see it — this file is hand-spliced.
+    #[test]
+    fn an_odd_sized_chunk_before_data_is_skipped_with_its_pad_byte() {
+        let path = tmp("odd-chunk-before-data");
+        let n = 1_000u64;
+        {
+            let mut w = WavWriter::create(&path, 48_000, 1).unwrap();
+            w.write(&vec![0.5; n as usize]).unwrap();
+            w.finalize().unwrap();
+        }
+        // Splice an 11-byte `LIST`/`INFO` chunk — the odd-length tag other tools
+        // write routinely — and its pad byte in front of the `data` tag at 36.
+        let body = b"INFOISFTav\x00";
+        assert_eq!(body.len() % 2, 1, "an odd length is what needs the pad");
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(b"LIST");
+        chunk.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        chunk.extend_from_slice(body);
+        chunk.push(0); // the RIFF pad byte, so `data` starts word-aligned
+        let mut bytes = std::fs::read(&path).unwrap();
+        let tail = bytes.split_off(36); // the `data` tag, its size, the audio
+        bytes.extend_from_slice(&chunk);
+        bytes.extend_from_slice(&tail);
+        // And the RIFF size the foreign tool wrote counts the chunk and its pad.
+        let riff = ((bytes.len() - 8) as u32).to_le_bytes();
+        bytes[4..8].copy_from_slice(&riff);
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            44 + chunk.len() as u64 + n * 2,
+            "2000 audio bytes + the LIST chunk and its pad"
+        );
+
+        let mut r = WavReader::open(&path)
+            .expect("an odd-sized chunk before `data` is not a reason to refuse a file");
+        assert_eq!(r.sample_rate(), 48_000);
+        assert_eq!(r.total_frames(), n);
+        let mut back = vec![0.0f32; n as usize];
+        assert_eq!(r.read_into(&mut back), n as usize);
+        assert!(back.iter().all(|s| (*s - 0.5).abs() < 1e-3));
+
+        // The pool's crash pass asks the same question of this file, through the
+        // same walk — it is a well-formed take that happens to carry metadata.
+        assert!(
+            WavWriter::is_finalized(&path).unwrap(),
+            "the chunk walk must reach the data chunk for the recovery predicate too"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
