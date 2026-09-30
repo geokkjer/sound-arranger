@@ -151,5 +151,14 @@ an entry that cannot be read is dropped and reported, never fatal.**
 - The [session-directory note](../architecture/2026-09-23-session-directory-save-and-journal.md)
   is updated in place: its debt list no longer carries the malformed-journal-line item, and
   its journal bullet states the read-back and the per-entry drop.
+- **Refined by the verification of this change.** The round-trip check first compared the
+  re-parsed commands with the derived `PartialEq`, and `HostCommand` carries `f32`/`f64`
+  operands — so one `NaN` (`SetParam`, the one numeric operand the host applied with no
+  finiteness check) made the comparison permanently false and the autosave refused *every*
+  later append, with a message blaming the text form; the next successful write then erased
+  the refusal. The check now compares the serialised commands through `same_commands`,
+  `SetParam` refuses a non-finite value at the door the way the arrange path already did, and
+  `journal_error` carries a `JournalFault` that distinguishes a `Refused` edit from a `Write`
+  failure — only the latter is cleared by a later success, so a refusal cannot be erased.
 
 *Authored with Space Bunny · OpenCode, 2026-09-29.*

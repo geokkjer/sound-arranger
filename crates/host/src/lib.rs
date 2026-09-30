@@ -591,9 +591,13 @@ pub struct HostSession {
     /// The session directory, when the session has one (`Save`/`Load`): the journal
     /// — the autosave — is appended here.
     session_dir: Option<PathBuf>,
-    /// The last journal write failure. A failed *append* never fails the edit (the
-    /// edit is already applied and logged), but it must not be silent.
-    journal_error: Option<String>,
+    /// Why the last journal write did not happen, if it did not. The two kinds are kept
+    /// apart because they **clear differently**: a *write* failure belongs to the file,
+    /// and the next successful append proves the file is writable again; a *refusal*
+    /// belongs to the entry, and no later write makes that edit durable — so it stands
+    /// until the next [`HostSession::save`], which rewrites the journal from a history
+    /// that can then be spelled in full.
+    journal_error: Option<JournalFault>,
     /// What the last `Load` recovered from the journal.
     last_recovery: Option<JournalRecovery>,
     /// The media intent value (pool dir, player, splices, bounce records). The
@@ -1152,11 +1156,16 @@ impl HostSession {
         self.session_dir.as_deref()
     }
 
-    /// The last journal write failure, if any. An edit is never *failed* by a
-    /// journal error (it is already applied and logged), but autosave must not fail
-    /// silently either.
+    /// Why the last journal write did not happen, if it did not. An edit is never
+    /// *failed* by a journal fault (it is already applied and logged), but autosave must
+    /// not fail silently either.
+    ///
+    /// A refusal (an edit the `host v1` form cannot carry) **outlives the next
+    /// successful append**: that edit is still in no durable record, and a save would
+    /// refuse the same history, so the report stands until the next `save`. A write
+    /// failure is the file's and the next successful append clears it.
     pub fn journal_error(&self) -> Option<&str> {
-        self.journal_error.as_deref()
+        self.journal_error.as_ref().map(JournalFault::message)
     }
 
     /// What the last [`HostSession::load_session`] recovered from the journal.
@@ -1193,7 +1202,10 @@ impl HostSession {
         // and compare it to the history before writing anything. A command the text
         // form cannot express (a path with whitespace, a region play, a future op)
         // refuses the save instead of writing a file that opens as a *different*
-        // session.
+        // session. The comparison is the same *serialised* one `journal_append` uses
+        // (`same_commands`): an `f32` operand that cannot compare equal to itself (a
+        // `NaN`) is in the form, and comparing it with `PartialEq` refused every save of
+        // the session for good — the wedge the autosave half of this rule shared.
         let mut check = parse_script(&text).map_err(|e| {
             format!(
                 "save: the session text does not parse ({e}) — refusing to write a lossy session"
@@ -1214,7 +1226,7 @@ impl HostSession {
             })
             .collect();
         // The first parsed command is the `session_rate` header.
-        if check.get(1..).unwrap_or(&[]) != expected.as_slice() {
+        if !same_commands(check.get(1..).unwrap_or(&[]), &expected) {
             return Err(
                 "save: the session text does not round-trip — refusing to write a lossy session"
                     .into(),
@@ -1373,12 +1385,12 @@ impl HostSession {
         // a session directory, and it takes the *whole* session unopenable with it, not
         // just that edit. So the entry is not written, and the refusal is reported: the
         // edit stands in the live session and a save would refuse it too.
-        if !entry_round_trips(entry, &text) {
-            self.journal_error = Some(format!(
-                "journal: an edit has no host v1 text form, so it is not autosaved (a save \
-                 would refuse it as well) and this session cannot be reopened: {}",
+        if let Err(why) = entry_round_trips(entry, &text) {
+            self.journal_error = Some(JournalFault::Refused(format!(
+                "journal: {why}, so this edit is not autosaved — it is in the live session and \
+                 nowhere else, and a save refuses the history as well: {}",
                 text.trim()
-            ));
+            )));
             return;
         }
         let path = dir.join(JOURNAL_FILE);
@@ -1392,8 +1404,22 @@ impl HostSession {
                 file.flush()
             });
         match result {
-            Ok(()) => self.journal_error = None,
-            Err(e) => self.journal_error = Some(format!("journal {}: {e}", path.display())),
+            // A **write** failure is the journal file's, so a later successful append
+            // proves the file is writable again and clears it. A **refusal** is this
+            // entry's and is deliberately *not* cleared here: the edit that could not be
+            // written is still not durable anywhere, and a save refuses it too, so a
+            // later success must not erase the report of what was lost.
+            Ok(()) => {
+                if matches!(&self.journal_error, Some(JournalFault::Write(_))) {
+                    self.journal_error = None;
+                }
+            }
+            Err(e) => {
+                self.journal_error = Some(JournalFault::Write(format!(
+                    "journal {}: {e}",
+                    path.display()
+                )));
+            }
         }
     }
 
@@ -1430,7 +1456,16 @@ impl HostSession {
                 param,
                 value,
                 ..
-            } => self.engine.set_param(plugin, param, *value),
+            } => {
+                // **The finiteness rule is the engine's**, and this arm routes to it: a
+                // non-finite value is refused (`parameter '<name>' must be finite, got
+                // NaN`) before it is logged, so it never reaches the history, the
+                // journal or a saved session. The host keeps no second copy — the engine's
+                // `set_param` already speaks for every command in this match, and two
+                // rules for one value is one that drifts
+                // (`a_non_finite_param_is_refused_at_the_door_and_leaves_nothing_behind`).
+                self.engine.set_param(plugin, param, *value)
+            }
             HostCommand::SetTempo {
                 bpm, beats_per_bar, ..
             } => self.engine.set_tempo(*bpm, *beats_per_bar),
@@ -2926,6 +2961,29 @@ pub struct RecordingStatus {
     pub channels: usize,
 }
 
+/// Why the last journal write did not happen (see [`HostSession::journal_error`]). The
+/// edit itself is never failed by either — it is already applied and logged — so both
+/// are reported rather than raised; they differ only in what clears them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JournalFault {
+    /// The entry is **not in the `host v1` text form**, or does not read back as itself,
+    /// so it is not written. The edit stands in the live session and a save refuses the
+    /// same history — so no later successful append clears this: the edit is still not
+    /// durable anywhere.
+    Refused(String),
+    /// The **journal file** refused the write or the flush. The next successful append
+    /// proves the file is writable again.
+    Write(String),
+}
+
+impl JournalFault {
+    fn message(&self) -> &str {
+        match self {
+            JournalFault::Refused(message) | JournalFault::Write(message) => message,
+        }
+    }
+}
+
 /// What a load recovered from the journal.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JournalRecovery {
@@ -3003,12 +3061,31 @@ fn journal_entries(lines: &[&str]) -> Vec<String> {
     entries
 }
 
+/// Whether two command lists are **the same commands** — compared by their *serialised
+/// form*, not by the derived `PartialEq`.
+///
+/// `HostCommand` carries `f32`/`f64`, and IEEE-754 leaves one hole in `==`: a `NaN` is
+/// not equal to itself. So the derived comparison answered "no, and no, and no" to a
+/// value the log *does* carry — `NaN` spells as `NaN` and reads back as `NaN` — which is
+/// a different answer from "the form lost it", and it never recovers. The serialised form
+/// compares what the log says, which is the question the round trip is asking. Every
+/// other difference the derived comparison caught is a difference in the text too: a
+/// field `format_command` never writes, a path the parser read differently, a gesture
+/// regrouped.
+fn same_commands(parsed: &[HostCommand], expected: &[HostCommand]) -> bool {
+    format!("{parsed:?}") == format!("{expected:?}")
+}
+
 /// Whether the rendered `text` of one history **entry** reads back as that entry: the
 /// same round trip `save` checks over a whole script, for a single gesture.
 /// `parse_script` must accept the line(s) *and* return the commands they came from — a
 /// line the tokenizer mangles (a `play` path with whitespace) is not the same command,
-/// and a journal that carries it cannot be reopened.
-fn entry_round_trips(entry: &[HostCommand], text: &str) -> bool {
+/// and a journal that carries it cannot be reopened. The `Err` names **which** of the
+/// two it was, because "the edit is not in the form" and "the form reads this edit back
+/// as something else" are different faults with different fixes.
+fn entry_round_trips(entry: &[HostCommand], text: &str) -> Result<(), String> {
+    let parsed = parse_script(&format!("host v1\n{text}"))
+        .map_err(|e| format!("the host v1 text form cannot read it back ({e})"))?;
     let expected: Vec<HostCommand> = if entry.len() == 1 {
         entry.to_vec()
     } else {
@@ -3016,7 +3093,14 @@ fn entry_round_trips(entry: &[HostCommand], text: &str) -> bool {
             commands: entry.to_vec(),
         }]
     };
-    parse_script(&format!("host v1\n{text}")).is_ok_and(|parsed| parsed == expected)
+    if same_commands(&parsed, &expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "the host v1 text form reads it back as {parsed:?}, which is not the edit that was \
+             made"
+        ))
+    }
 }
 
 /// Re-point every `pool` command in the history at `pool` (recursing into gestures).
@@ -7878,8 +7962,7 @@ mod tests {
             at_frame: None,
         })
         .expect("the live path plays it");
-        // …and the autosave says so, naming the line it would not write. (A later
-        // successful write clears the error, so it is read here, not at the end.)
+        // …and the autosave says so, naming the line it would not write.
         let error = s
             .journal_error()
             .expect("the autosave reports what it could not write")
@@ -7912,6 +7995,17 @@ mod tests {
             journal.contains("arrange trim t0 c0 start 1200"),
             "but the spellable edit is: {journal}"
         );
+        // …and the report of the refused one **stands**: a later successful write does
+        // not put that play back in any durable record, and a save still refuses the
+        // history, so clearing the message here would leave the loss unreported.
+        let still = s
+            .journal_error()
+            .expect("a refusal is not erased by the next successful write")
+            .to_string();
+        assert!(
+            still.contains("play") && still.contains("host v1"),
+            "and it is the same report: {still}"
+        );
 
         // The point of the guard: the session still opens, and it opens with the edit
         // that *was* spellable.
@@ -7928,6 +8022,145 @@ mod tests {
             "and the trim is in the reopened session"
         );
         assert!(s.save(&dir).is_err(), "a save still refuses the history");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A value that cannot compare equal to itself must not wedge the writer that has
+    /// to spell it.** `HostCommand` carries `f32`/`f64` and IEEE-754 leaves `NaN != NaN`,
+    /// so the read-back — the autosave's, and `save`'s, which is the same check over a
+    /// whole script — answered "no" to a `NaN` operand *permanently*: the entry was
+    /// refused, the message blamed the spelling rather than the value, and every later
+    /// save of the session failed for good. The `host v1` form spells a `NaN` as `NaN`
+    /// and reads it back as `NaN`, so the entry **is** in the form.
+    ///
+    /// The `NaN` is committed through `commit_state` because the live path cannot produce
+    /// one: `Engine::set_param` refuses a non-finite value before it is logged (the test
+    /// below). What is under test is the *guard*, not the door — so the guard must be a
+    /// property of the form and not of the value's ability to compare equal to itself.
+    #[test]
+    fn a_value_that_cannot_compare_equal_to_itself_does_not_wedge_the_autosave() {
+        let root = std::env::temp_dir().join(format!("host-journal-nan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = session_with_pool("journal-nan", &pool);
+        let dir = root.join("song.d");
+        s.save(&dir).expect("save the baseline");
+        let journal = || std::fs::read_to_string(dir.join("journal.txt")).expect("journal");
+
+        // A `NaN` param committed to the document — the one way it can be in a history.
+        s.commit_state(vec![HostCommand::SetParam {
+            plugin: "mixer",
+            param: "ch0.gain",
+            value: f32::NAN,
+            at_frame: None,
+        }]);
+        assert!(
+            journal().contains("set_param mixer ch0.gain NaN"),
+            "the form spells a NaN and reads it back, so the entry is journalled:\n{}",
+            journal()
+        );
+        assert!(
+            s.journal_error().is_none(),
+            "and there is nothing to report: {:?}",
+            s.journal_error()
+        );
+
+        // The next edit is journalled too: one operand that cannot compare equal to
+        // itself stops nothing.
+        s.execute(&gesture(vec![media::ArrangeOp::Trim {
+            track: "t0".into(),
+            clip: "c0".into(),
+            edge: media::Edge::Start,
+            by_frames: 1_200,
+        }]))
+        .expect("a normal edit");
+        let text = journal();
+        assert!(
+            text.contains("set_param mixer ch0.gain NaN")
+                && text.contains("arrange trim t0 c0 start 1200"),
+            "both entries are in the journal:\n{text}"
+        );
+
+        // The reopened session costs that one refused param and nothing else: the entry
+        // parses, and the *engine* refuses the value (the door below), which the replay
+        // reports per entry rather than treating as fatal.
+        let mut loaded = HostSession::new();
+        loaded.load_session(&dir).expect("load");
+        let recovery = loaded.last_recovery().cloned().expect("a report");
+        assert_eq!(recovery.applied, 1, "the trim replayed (one gesture)");
+        assert_eq!(recovery.refused, 1, "the NaN param is refused on replay");
+        let reason = recovery.refused_reason.expect("and it says why");
+        assert!(
+            reason.contains("finite") && reason.contains("NaN"),
+            "naming the value, not the spelling: {reason}"
+        );
+        assert_eq!(
+            clip_of(&loaded).src_len,
+            3_600,
+            "and the edit beside it is in the reopened session"
+        );
+
+        // The permanent half of the wedge: one such operand made *every* later save
+        // refuse, so a session that has one became unsaveable for good.
+        s.save(&dir)
+            .expect("a NaN operand must not make the session unsaveable");
+        assert!(
+            std::fs::read_to_string(dir.join(SESSION_FILE))
+                .expect("session")
+                .contains("set_param mixer ch0.gain NaN"),
+            "and the saved script carries the operand it was given"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **`SetParam` does not take a non-finite value, and the host keeps no second copy
+    /// of the rule.** The engine's `set_param` refuses it before the value is logged, so
+    /// the refusal is the engine's message and the host's commit path is never reached:
+    /// no history entry, no journal line, no reason to report, and a session that still
+    /// saves. This is what makes the test above a statement about the *form* — the door
+    /// is what stops a `NaN`, and this is where it is pinned on the host side.
+    #[test]
+    fn a_non_finite_param_is_refused_at_the_door_and_leaves_nothing_behind() {
+        let root = std::env::temp_dir().join(format!("host-journal-door-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = session_with_pool("journal-door", &pool);
+        let dir = root.join("song.d");
+        s.save(&dir).expect("save the baseline");
+
+        for (value, what) in [(f32::NAN, "a NaN"), (f32::INFINITY, "an infinity")] {
+            let refused = s
+                .execute(&HostCommand::SetParam {
+                    plugin: "mixer",
+                    param: "ch0.gain",
+                    value,
+                    at_frame: None,
+                })
+                .expect_err("a non-finite param is refused");
+            assert!(
+                refused.contains("ch0.gain") && refused.contains("finite"),
+                "{what} is named by the engine's rule: {refused}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("journal.txt")).expect("journal"),
+            "",
+            "and a refused command is not an edit, so nothing was journalled"
+        );
+        assert!(
+            s.journal_error().is_none(),
+            "nor is it a journal fault to report: {:?}",
+            s.journal_error()
+        );
+        s.save(&dir).expect("and the session still saves");
 
         let _ = std::fs::remove_dir_all(&root);
     }
