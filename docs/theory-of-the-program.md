@@ -1,6 +1,6 @@
 # Theory of the program: sound-arranger
 
-> 🕒 Last verified against commit `7c5a2e7` (2026-09-05). If the code has
+> 🕒 Last verified against commit `2f6ad78` (2026-09-30). If the code has
 > moved on, trust the code and move this line forward.
 
 > *Authored with DeepSeek-V4-Flash · DeepSeek Harness, 2026-09-05.*
@@ -140,6 +140,13 @@ On top of the four pieces, two **governing invariants** do all the work
 > **I2 — Rendering is a pure function of the log: no wall clock, no randomness —
 > the same log renders byte-identical audio, including mid-session changes.**
 
+One edge I1 gained in the 2026-09 hardening pass: validation is now strong
+enough that a logged patch is a patch the graph will make, and the rare refusal
+that still surfaces at apply time is recorded as data — an `ApplyFault`,
+bounded, never cleared — while the log stands, so replay reproduces the same
+refusal. A refusal still never corrupts history; its intent is simply allowed
+to coexist with its fault.
+
 Keep those two lines in your head; every design decision below is in service of
 them, and every "cons" entry in §6 is a place where they are only *partially*
 held. This is the theory-of-the-solution matched to the theory-of-the-problem:
@@ -207,9 +214,10 @@ noticing:
 
 `render.rs`. Every public mutator is **two-phase**: validate synchronously and
 fail-loud (return `Err`), then log + schedule. A **refused mutation is never
-logged** — so bad input can't corrupt history. This is the "event-sourcing"
-discipline made concrete, and it's why `same log ⇒ same audio` holds even for
-failed commands.
+logged** — so bad input can't corrupt history. (A refusal discovered on the
+render path is recorded as an `ApplyFault` — data, not a log entry.) This is
+the "event-sourcing" discipline made concrete, and it's why `same log ⇒ same
+audio` holds even for failed commands.
 
 The render loop is the clever bit. Events arrive at *arbitrary sample frames*,
 not block boundaries, so `render_block` **splits each 512-frame block around
@@ -267,9 +275,10 @@ The theory-critical properties:
 - **Ids are carried *in* the ops** — never random/UUID/time. So replay
   reproduces the *identical* value; nothing here depends on a clock or a hash.
 - **A `Clip` is a window into an immutable pool source.** It references a source
-  by content-hash id, with a source window `[src_start, src_start+src_len)`,
-  placed at `at_frame`. It can have per-clip fades, gain, and an optional baked
-  `loop_len`.
+  by pool id (the source's file stem — never a path, never a hash), with a source
+  window `[src_start, src_start+src_len)`, placed at `at_frame`. It can have
+  per-clip fades, gain, an optional baked `loop_len`, a one-word name, and a
+  `reversed` property.
 - **Clips layer and overlap** (they sum at render); a gap is silence. A track's
   clips are kept sorted by `at_frame` so the render node can binary-search the
   active window and never depend on insertion order.
@@ -364,9 +373,15 @@ places a modification that *ignores* the theory would hurt most:
   inspiration — is **not expressible**. Also only one audio `Out` per node, and
   control inputs are single-driver. These are the direct costs of a dead-simple
   linear render.
-- **Two command vocabularies.** Engine commands are logged; the recorder's
-  `play`/`splice` are not yet logged events (the *arrangement* ops are). So
-  determinism is split-brain until they merge.
+- **Mount identity is enforced by convention, not type.** `node_of`/`disposers`
+  are keyed by the plugin's `id()` while patches and unmounts key by mount
+  name, and only a `debug_assert` says the two agree (found in the 2026-09-29
+  external review, deferred with a reason —
+  [the disposition](../research/architecture/2026-09-29-space-bunny-review.md)).
+  A rename or alias at that seam would be invisible until release. *(Closed
+  since the last revision: the "two command vocabularies" split — media
+  commands such as `pool`/`play`/`splice`/`bounce`/`export` now log arrangement
+  events in the same engine log, so determinism is no longer split-brain.)*
 - **Control→render handoff is seeded, not finished.** Control-side mutations
   currently apply on the render call stack; the real handoff is `flush_scheduled`
   and the parked-op contract — present but young.

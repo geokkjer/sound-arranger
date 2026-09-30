@@ -1,6 +1,6 @@
 # audio — an audio platform where everything is a plugin
 
-> 🕒 Last verified against commit `4a3706f` (2026-09-29). If the code has moved on,
+> 🕒 Last verified against commit `2f6ad78` (2026-09-30). If the code has moved on,
 > trust the code and move this line forward.
 
 *(The repository is still named `sound-arranger`; the rename to **`audio`** is decided but not done —
@@ -15,7 +15,7 @@ Three profiles are planned. One works today.
 
 | Profile | What it is | State |
 |---|---|---|
-| **recorder** | send a clock to external gear, capture it, align the takes, master, export | **the focus** — capture and takes work; clock-out and alignment are not built |
+| **recorder** | send a clock to external gear, capture it, align the takes, master, export | **the focus** — capture, takes and MIDI clock-out work; alignment of takes is not built |
 | **arranger** | record long live jams, then cut them into a finished piece (ACID-style clips) | works end to end |
 | **sculptor** | offline, non-realtime transformation (CDP8, PaulStretch, phase vocoder) | deferred |
 
@@ -60,24 +60,27 @@ Fifteen minutes of `host v1` with no UI at all: [docs/FIRST_SESSION.md](docs/FIR
 compensation wired into the capture; import at any rate (conformed once to the session rate, the
 original preserved); the clip editor — cut, copy, paste, move, trim, loop, chop, fade, gain, tracks,
 snap grid with a bar/beat ruler, markers and clip names; the soft mixer (gain/pan/mute/solo, stereo
-master) and a mastering chain (compressor plus lookahead brickwall limiter) on the bus; export to f32
-or dithered s16 that refuses to write a clipped file; sessions as directories with a crash-safe
-per-gesture journal; undo/redo where one gesture is one entry; byte-identical replay, save/load and
-export; and a jump into a 30-minute arrangement in about 0.1 s.
+master) and a mastering chain (compressor plus lookahead brickwall limiter) on the bus; **MIDI
+clock out** — a 24 PPQN, sample-accurate clock the engine renders and the host sends to a named
+device (`--midi-out`), re-anchored on seek, with an offline bounce that never drives the gear;
+export to f32 or dithered s16 that refuses to write a clipped file; sessions as directories with a
+crash-safe per-gesture journal; undo/redo where one gesture is one entry; byte-identical replay,
+save/load and export; and a jump into a 30-minute arrangement in about 0.1 s.
 
-**Not yet.** The recorder's two defining capabilities — **MIDI clock out** and **alignment of takes**
-— are stubs, so the record → align loop has no first half yet; there is no record *gesture* in the
-shells (a take is started from the `:` command line); no effects (`fundsp` is an optional seam, off by
-default); MIDI and OSC are declared seams with no implementation; no stereo *clip* (the master is
-stereo, stereo material is split into one mono pool source per channel and panned); one sample rate
-per session; and a cold backward seek into a long piece wants a checkpoint. Reasons, not just
-absences: [docs/capabilities.md](docs/capabilities.md).
+**Not yet.** The recorder's remaining defining capability — **alignment of takes** — is not built,
+so the record → align loop has no second half yet (the clock is sent, but nothing aligns captured
+material against it); there is no record *gesture* in the shells (a take is started from the `:`
+command line); no effects (`fundsp` is an optional seam, off by default); OSC is a declared seam
+with no implementation; no stereo *clip* (the master is stereo, stereo material is split into one
+mono pool source per channel and panned); one sample rate per session; and a cold backward seek
+into a long piece wants a checkpoint. Reasons, not just absences:
+[docs/capabilities.md](docs/capabilities.md).
 
 ## Where the code is
 
 | Crate | What it is |
 |---|---|
-| `crates/engine` | The minimal core: tempo map and sample-accurate scheduler, the typed-port patch-bay graph interpreter with plugin delay compensation, the session event log, context plumbing — plus the built-in plugins (euclidean, scale, tone, soft mixer, mastering `master`). Std-only, allocation-free on the render path. |
+| `crates/engine` | The minimal core: tempo map and sample-accurate scheduler, the typed-port patch-bay graph interpreter with plugin delay compensation, the session event log, context plumbing — plus the built-in plugins (euclidean, scale, tone, soft mixer, mastering `master`, MIDI `clock_out`). Std-only, allocation-free on the render path. |
 | `crates/media` | The media engine (core-privileged, not a plugin): disk streaming, splice during playback, the recording writer with crash recovery, multi-channel capture, the float-WAV pool with peak pyramids, import/conform, a band-limited resampler, the clip model with its ACID ops and the arranger node, and the arrangement-command codec. |
 | `crates/workflow` | The shell workflow defined once: the modal, key-driven editing model both shells implement, the `Action` vocabulary, the snap-grid state, and the keymap that generates `?` help. Toolkit-free, with a test proving every action claimed to be a log op is an op the host's parser accepts. |
 | `crates/host` | The Host API contract — commands are logged events, plus events and values a shell reads — and the headless reference host: `run_script` assembles a profile and bounces byte-identically, while a live session takes incremental edits, gestures (one undo step each), sessions as directories, seeking at scale, recording, and export. |

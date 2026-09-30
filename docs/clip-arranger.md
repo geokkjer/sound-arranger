@@ -1,6 +1,6 @@
 # The clip arranger — an arrangement is data
 
-> 🕒 Last verified against commit `100999a` (2026-09-24). If the code has moved on,
+> 🕒 Last verified against commit `2f6ad78` (2026-09-30). If the code has moved on,
 > trust the code and move this line forward.
 
 **What this is.** The engine ([`architecture-explainer.md`](architecture-explainer.md)) is a
@@ -28,20 +28,28 @@ audible-preserving, diffable, loggable, and (because it's data) byte-identically
 ```
 Timeline
  └─ Track { id, clips: Vec<Clip> }
-     ├─ Clip { id, source, src_start, src_len, at_frame, fade_in, fade_out, gain, loop_len }
+     ├─ Clip { id, source, src_start, src_len, at_frame, fade_in, fade_out, gain, loop_len, name, reversed }
      ├─ Clip { ... }
      └─ ...
  └─ Track { ... }
 ```
 
 A `Clip`'s fields all mean something precise (`timeline.rs`):
-- **`source`** — a content-hash `Id` of an immutable float-WAV in the media pool (§4).
+- **`source`** — a pool **id** (the file stem of an immutable float-WAV in the media pool, §4).
+  It is *not* a path: a clip that could name a file outside the pool would make the document
+  unportable and the pool unsealable, so the id is guarded (`valid_id` rejects separators and
+  `..`) and the pool resolves it.
 - **`src_start` / `src_len`** — which *region* of the source to read, and how long.
 - **`at_frame`** — where on the track the clip starts (absolute sample frames).
 - **`fade_in` / `fade_out`** — per-clip fades (frames), **authoritative** at boundaries.
 - **`gain`** — per-clip gain (serialised bit-exactly in the log).
 - **`loop_len`** — `Some(r)` means the source read wraps every `r` frames (a baked loop);
   `src_len` is then `r * times`.
+- **`name`** — `Some(word)`, a human label with no semantics (ops and the render path key on
+  `id`); it must be one word the `host v1` format can spell, or the session could not be
+  reopened — which is why `RenameClip` refuses a space.
+- **`reversed`** — play the region **backwards** (a clip property: the source stays immutable
+  and the reader reads the other way). A reversed clip cannot be looped or re-looped.
 
 Two helpers are the whole per-clip math: `end()` = `at_frame + src_len`, and
 `source_frame_at(offset)` maps a position inside the clip back to a source frame, wrapping at
@@ -60,6 +68,7 @@ the editor: there is no `timeline.mutate()` kitchen sink — there is a fixed se
 | Op | What it does |
 |---|---|
 | `AddTrack` / `RemoveTrack` | add/remove a named track |
+| `RenameTrack` / `MoveTrack` | rename a track / reorder it to an index (the mixer channel follows) |
 | `AddClip` | place a clip on a track |
 | `RazorSplit` | split a clip in two at `at_frame` (the "cut" gesture) |
 | `Trim` | trim a clip's start or end edge by `by_frames` (negative = shrink) |
@@ -68,7 +77,11 @@ the editor: there is no `timeline.mutate()` kitchen sink — there is a fixed se
 | `Delete` | remove a clip |
 | `SetClipGain` / `SetClipFade` | set the clip's gain / fade |
 | `LoopRegion` | bake a loop (repeat the region `times`) |
-| `ChopClip` | slice a clip into `times` contiguous pieces (ids derived from a `prefix`) — the auto-slice / chop verb |
+| `ChopClip` | slice a clip into `times` contiguous pieces (ids derived from a `prefix`) — the auto-slice / chop verb; bounded (`MAX_CHOP_SLICES`), and the first/last piece keep capped outer fades so the result always renders |
+| `Reverse` | play a clip's region backwards (a property flip, not a pool rewrite; not loopable) |
+| `RenameClip` | name or unname a clip (one word — the format has no quoting) |
+| `SetMarker` / `RemoveMarker` | named points on the ruler — logged, silent (they never change audio or export bytes) |
+| `Stretch` | offline WSOLA time-stretch of a clip's material `num/den`, materialised into the pool as a **new** source (the op carries the new id and the rendered length) |
 
 Crucially, **every entity-creating op carries the id it creates** (`new_left`, `new_right`,
 `new_id`, `track`, `clip`, ...), so *all* ids are logged and deterministic. The whole model
@@ -130,7 +143,8 @@ Per block, the node:
 - **Determinism is scoped to "no underrun."** Byte-identical output holds for a reader that never
   underruns. An underrun is counted and must be surfaced (`assert underruns == 0`), because an
   SPSC ring has no random access — you can't skip a frame you never received. The node
-  `debug_assert!(popped == off)` so a slipped test fails loudly.
+  `debug_assert!`s `popped + off0 == off` (except at a source's end-of-file, where `off`
+  runs ahead into silence) so a slipped test fails loudly.
 
 ---
 
@@ -145,7 +159,10 @@ Clips reference pool **source ids**, resolved to WAV paths by a `PoolResolver`. 
   and skipped — never fatal to the whole index.
 - `Pool::recover` finalizes **un-finalized** takes and rebuilds missing/corrupt `.peaks`
   sidecars. This pairs with the crash-recoverable WAV writer (the header carries placeholder
-  sizes; a crashed take is formally well-formed after recovery).
+  sizes; a crashed take is formally well-formed after recovery). Recovery salvages only what
+  is there — it never lengthens a file — and describes a take at the sample width its header
+  declares, so a 24-bit take is recovered at 3 bytes a sample, not truncated; foreign WAVs
+  with trailing chunks are left alone.
 - **Ids are plain file stems.** `valid_id` rejects path separators and `..` so a *user-craftable*
   clip id can never escape the pool directory (a `..` traversal guard).
 
@@ -185,11 +202,17 @@ Channels map to **track index** (`ch{ti}`), the same stable mapping as a fresh a
 `flush_scheduled` materializes the mixer before the inserts (no discarded block). The whole
 thing stays **control-side**: readers are warmed here; the render path only pops.
 
+Unmounting the mixer is the mirror case: `unmount mixer` **retires** the arranger wiring —
+the per-track nodes are removed from the graph, their underrun counters cleared, and the
+arranger marked as awaiting a bus — so a later `mount mixer` rebuilds the wiring instead of
+finding cords aimed at a node that no longer exists (and reader nodes holding files open for
+nothing). Before the 2026-09 hardening a remounted mixer had *no inputs at all*.
+
 ---
 
 ## 6. Driving it — the text format
 
-The versioned host script spells the ops directly. From the README:
+The versioned host script spells the ops directly:
 
 ```text
 host v1
@@ -209,10 +232,16 @@ clip editor end-to-end with no GUI.
 
 ## 7. Honest corners
 
-- **Dual command vocabulary.** Arrangement ops are logged but not scheduled; media commands
-  (`play`/`splice`/`bounce`) are a parallel seam not yet merged into the engine log. Engine
-  determinism and media determinism are kept in sync by discipline, not one system (the explainer
-  §9 flags this; P1.3 intends to merge them).
+- **One log, two livenesses.** Arrangement ops and media commands (`pool`/`play`/`splice`/
+  `bounce`/`export`) all log events in the **one** engine log — an `Arrange` event carries its
+  op and fields; a media command logs its record — so determinism is one system, not a
+  discipline bridging two. The corner that remains: arrangement ops are logged but *never
+  scheduled* (value-level, applied on rebuild), while media commands run eagerly — the log is
+  the document, and the split is liveness, not truth.
+- **A reader thread and a 512 KiB ring per clip, per edit.** Each rebuild re-warms one reader
+  (and its thread) per active clip; sharing or lazily mounting readers is deferred because the
+  fix is architectural, not local — recorded with a reason in
+  [the review disposition](../research/architecture/2026-09-29-space-bunny-review.md).
 - **Reader reuse is deferred.** After an edit the arrangement is rebuilt and readers re-warmed
   from the transport frame; the shared-state `ArrangerNode` reuse (reusing a reader across
   rebuilds without re-warming) is still deferred — see the README's honest gaps.
@@ -232,4 +261,5 @@ clip editor end-to-end with no GUI.
 ---
 
 *Authored with DeepSeek-v4-flash · DeepSeek Harness, 2026-08-27; re-verified against
-`7c5a2e7` with DeepSeek-V4-Flash · DeepSeek Harness, 2026-09-05.*
+`7c5a2e7` with DeepSeek-V4-Flash · DeepSeek Harness, 2026-09-05; re-verified against
+`2f6ad78` with GLM-5.3 · OpenCode, 2026-09-30.*

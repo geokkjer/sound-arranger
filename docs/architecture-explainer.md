@@ -1,6 +1,6 @@
 # sound-arranger: from architecture up
 
-> 🕒 Last verified against commit `a917a1c` (2026-09-29). If the code has moved on,
+> 🕒 Last verified against commit `2f6ad78` (2026-09-30). If the code has moved on,
 > trust the code and move this line forward.
 
 > A plain-English (mostly) tour of the Rust code, for a developer with roughly six
@@ -944,9 +944,9 @@ targets a recent toolchain, as does `edition = "2024"` in `Cargo.toml`.
 
 ### 7.1 Why a headless host first
 
-The UI-as-plugin note's central claim: **the UI must be interchangeable — our
-Tauri app is a *reference implementation* of the host, not the host.** And a
-contract no second host has exercised is a wish. So before any Tauri shell, there
+The UI-as-plugin note's central claim: **the UI must be interchangeable — the
+reference shell is a *reference implementation* of the host, not the host.** And a
+contract no second host has exercised is a wish. So before any GUI shell, there
 is a *headless* host that exercises the entire contract deterministically, CI-
 tested. The `host` binary reads a text script and runs it — record, splice,
 mix, bounce — with no frontend whatsoever.
@@ -964,9 +964,9 @@ worth internalizing):
   mutates shared state directly.**
 
 The crisp rule that keeps the whole thing honest: *the UI thread never touches the
-render path, and the profile's logic lives in the shared contract layer, not in
-Vue components.* The headless host running the same script is the guard — if the
-logic leaked into Vue, the headless host couldn't run it.
+render path, and the profile's logic lives in the shared contract layer, not in a
+shell's widgets.* The headless host running the same script is the guard — if the
+logic leaked into a shell, the headless host couldn't run it.
 
 ### 7.2 `HostSession` and the script
 
@@ -1090,9 +1090,9 @@ considered, and the code is candid about its edges.
 - The core is genuinely reusable: the same clock/log/graph serves an arranger and
   (later) a generative improviser or a headless box, because it encodes no product
   assumptions.
-- Enforced by the seam: `engine`/`media` compile with no `tauri` dependency, so
-  swapping the shell (headless CLI today, Tauri later, possibly egui or WASM
-  after) is provably possible, not just claimed.
+- Enforced by the seam: `engine`/`media` compile with no GUI-toolkit dependency,
+  so swapping the shell (the headless CLI plus two live shells today, possibly
+  egui or WASM after) is provably possible, not just claimed.
 
 **Cons**
 
@@ -1129,11 +1129,14 @@ considered, and the code is candid about its edges.
   control-rate streams into gestures, but that's unshipped. Until then, a smooth
   fade is a staircase of `SetParam` events or nothing.
 - The flat `Event::Mount` payload is `Vec<(&'static str, f32)>` — it *cannot*
-  carry a file handle, so media mounts (a clip's `FilePlayer`, a recorder) bypass
-  the core log and use a parallel command seam. The notes record this as a
-  "core-shape finding" to be resolved in P1.3 (merging media commands into the
-  log). It's an honest, temporary seam, but it means determinism is *engine*
-  determinism plus *media* determinism kept in sync by discipline, not one system.
+  carry a file handle, and it never has to: media state (a clip's `FilePlayer`, a
+  recorder) is reached by *name*, not by handle. The seam this section used to
+  flag — media commands on a parallel, unlogged vocabulary — is **closed**: `pool`/
+  `play`/`splice`/`bounce`/`export` log `Event::Arrangement` records in the one
+  core log, the records carry pool **ids** (never paths or handles), and replay
+  rebuilds the handles from the pool. Determinism is one system, and the proof
+  shape is `a_take_declaration_replays_without_a_device`: the log names the
+  material, the pool supplies it.
 
 ### Decision: the graph is a typed patch bay with a forward-order rule
 
@@ -1177,7 +1180,7 @@ considered, and the code is candid about its edges.
 - `VecDeque::with_capacity(8)` in the player's splice buffer is a documented
   "would allocate on the render path past 8" edge — a real, if unlikely, footgun.
 
-### Decision: the headless host before, and as a gate on, the Tauri shell
+### Decision: the headless host before, and as a gate on, the GUI shell
 
 **Pros**
 
@@ -1192,9 +1195,10 @@ considered, and the code is candid about its edges.
 
 - Slower to a visible product: you get a CLI before you get a window. For a
   hobby project that might *feel* like a detour, even if it's the right one.
-- The media commands (`Play`/`Splice`/`Bounce`) are not yet folded into the core
-  log — there are two command vocabularies until they merge (the arrangement ops
-  already go through the logged dispatch envelope, §4.1).
+- *(Resolved 2026-09: this decision's con — media commands on a second,
+  unlogged vocabulary — closed when they folded into the one core log; see the
+  updated finding under "log everything" above. The remaining con is the one
+  above: patience.)*
 
 ### Decision: hand-rolled std-only WAV and SPSC ring
 
@@ -1227,14 +1231,23 @@ Beyond the per-decision cons above, a few systemic risks worth naming:
 1. **Voice management is undesigned.** The moment euclidean drives real
    polyphony, `MAX_BLIPS = 16` bites. It's deferred, consciously, but it's the
    schedule's loudest ticking clock.
-2. **Two command vocabularies** until P1.3 merges media commands into the core
-   log. Every day they stay split is more client code that learns both.
+2. **Mount identity is convention, not type.** `node_of`/`disposers` key on the
+   plugin's `id()` while patches and unmounts key on the mount name, and only a
+   `debug_assert` holds the two together (a 2026-09-29 review finding, deferred
+   with a reason —
+   [the disposition](../research/architecture/2026-09-29-space-bunny-review.md)).
+   Every new mount-site author inherits the trap silently. *(Closed since the
+   last revision: the "two command vocabularies" risk — media commands now ride
+   the one core log.)*
 3. **Ceremony without payoff** — the whole plugin machinery must earn its keep
-   via at least the second host; if the project stalls before Tauri, the elegant
-   seams look like overhead.
-4. **Determinism is split-brain** — engine replay is byte-identical, but media
-   determinism rests on a parallel command seam and matched discipline, not one
-   log. A subtle divergence there would be *very* hard to debug.
+   via more than one host. The terminal and iced shells both exercise the same
+   contract today (the Tauri shell this originally gated on never arrived), so
+   the question is answered for now; a seam with exactly one client is a tax.
+4. **Determinism is scoped to "no underrun."** Engine replay is byte-identical
+   and media commands ride the same log — but a streaming reader that underruns
+   emits zeros, and an SPSC ring has no random access. Byte-identity holds for a
+   reader that kept ahead of the clock; the underrun counter is the tripwire,
+   and surfacing it (`underruns == 0`) is a hard requirement, not a courtesy.
 5. **Stated-present-tense discipline.** This codebase lives by the rule that
    shipped notes describe *reality*, and docs written against an older commit go
    quietly wrong — this document itself drifted within days (it said "three
@@ -1265,10 +1278,12 @@ How the current debate bears on it:
   the "why shaped this way and not that" — purely from the text. Those live in the
   decisions you had to make, and they're exactly what this repo's notes and
   banners try to externalize.
+
 - **"Theory is one value you can trade off"** underestimates it. Speed, deps,
   accessibility, "keep it simple" aren't *opposed* to the theory — they're *part*
   of it. Here, the no-alloc rule, the forward-order rule (which sacrifices feedback
-  delay — the dub staple), the dual command vocabulary, and the deferred voice
+  delay — the dub staple), the bounded-cap discipline (walks bounded, caps
+  counted and reported), and the deferred voice
   management are *the theory as it stands*, not failures to maintain it. A
   modification that ignores them is a patch; one that extends them is grounded in
   it.
