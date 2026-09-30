@@ -52,12 +52,44 @@ and found two more on the same path:
   read "autosave failed" after every subsequent edit. A false alarm is the mirror image of
   the lost alarm the previous change fixed, and it is the one users actually hit.
 
+**Refined again, by the verification of the "save *applies* the script" half.** That
+correction was right about the hole and wrong about how it closed it. It made `save`
+build a whole `HostSession` from the script it was about to write, to prove the file
+would open. **Building a session is running it**, and a saved script is full of state
+commands that are *actions against material*: a `play` opens the file it names, starts a
+`FilePlayer` on a decoder thread, and blocks in `warm_player` until the ring fills or a
+ten-second deadline expires. So the check asked questions the document cannot answer:
+
+- **A `play` whose file had moved failed the save.** The play line names an absolute path
+  (`rebase_pool` rewrites `pool` commands, not play paths), so a renamed file, an ejected
+  drive or a pool deleted under the session made `save` refuse a history that is a
+  perfectly good document. The same shape as a save that fails because the disk is full:
+  the document is fine, and the session must still save.
+- **`save` could block for ten seconds and spawn a decoder thread** to validate a file
+  that was never going to be played — on the control path, in a UI's save handler.
+- **A *successful* save manufactured a false alarm whose text was false.** After writing,
+  `save` re-derives the outstanding refusal, because its pool re-point can have changed
+  the answer. But the re-derivation asked only the **journal's** spelling, and the two
+  spellings differ for exactly one line: `Pool`. The journal names the pool by the
+  absolute path the session used; a save names the copy inside the session directory,
+  relative to it. So `save "/…/My Songs/song.d"` re-pointed the history at
+  `"/…/My Songs/song.d/pool"`, the journal could not spell that, and the save reported a
+  refusal — "…and a save refuses the history as well" — over a save that had plainly
+  succeeded, for a path the form spells perfectly well as `pool pool`. A user cannot act
+  on that message, which makes it worse than no message.
+
+The root of all three is one confusion: **"can this document be read back and applied" is
+a question about the *document*, and the check was asking the *machine*.** Whether a
+particular WAV is on this disk right now is not a property of the session text; the text
+says what the session is, and the file is this machine's copy of it.
+
 ## Decision
 
 **A journal line is read back by the parser that will read it, before it is written; an
 entry that cannot be read is dropped and reported, never fatal; a saved session is
-*applied* before it is written, so the platform cannot write a file it will not open; and
-a report of what could not be saved cannot outlive the edit it names.**
+*checked against the applier's own doors* before it is written, by a **dry run** that
+runs the document and none of the material; and a report of what could not be saved
+cannot outlive the edit it names, or claim a loss that a `save` has already repaired.**
 
 - **`journal_append` verifies its entry, the way `save` verifies the script.**
   `entry_round_trips` renders the entry's expected command(s) — a bare command, or a
@@ -83,42 +115,94 @@ a report of what could not be saved cannot outlive the edit it names.**
   door beats accepting an edit that quietly costs the user the ability to reopen their
   session; the shells speak this form through `parse_script`, which would have refused
   the same spelling anyway.
-- **`save` validates by *building* the session, not by parsing the text — and the check
-  sits before the temp file, not before the rename.** The write side's rule is now
-  **"whatever is written can be read back *and applied*"**: the script is applied to a
-  fresh session by the very walk `load_session` runs (`HostSession::from_script`, reached
-  through the private `from_script_with`, whose only difference from a load is a silent
-  MIDI sink — a save must not open a device, let alone take the live session's), and the
-  first refusal is named by **the edit** (its own lines in the file) plus the applier's
-  reason. `HostSession::from_script` now returns the index of the command it refused
-  behind its usual reason, because an index is what lets a *writer* name an edit and a
-  *reader* needs nothing more.
+- **`save` validates by *walking the script on a dry run*, not by parsing the text alone —
+  and the check sits before the temp file, not before the rename.** The write side's rule is
+  **"whatever is written reads back, and every value in it passes the applier's own
+  doors"**: the script is issued to a fresh session by the very walk `load_session` runs
+  (`HostSession::from_script`, reached through the private `from_script_with`, whose
+  differences from a load are a silent MIDI sink — a save must not open a device, let
+  alone take the live session's — and the `validating` mode), and the first refusal is
+  named by **the edit** (its own lines in the file) plus the applier's reason.
+  `HostSession::from_script` now returns the index of the command it refused behind its
+  usual reason, because an index is what lets a *writer* name an edit and a *reader*
+  needs nothing more.
   **The order is the decision.** Every refusal happens before a single byte is written, and
   in particular before the journal is truncated: the journal is the autosave and the only
   durable record of the edits since the last save, so truncating it and then failing would
   destroy the tail to buy nothing. A refused save therefore leaves the directory exactly as
   it was — the previous `session.txt` still opens, the journal still holds the unsaved
   edits, and not even a `session.txt.tmp` appears.
+- **The dry run is a *mode* on the session, not a second list of checks** — and that is the
+  whole correction. `HostSession::validating` is a flag, and the check is the ordinary
+  apply path with three places standing down, so **the value doors a reader would meet are
+  the reader's own code** (`Engine::set_param`'s finiteness and range, the timeline's op
+  rules, the mixer's channel count, the editor's arrangement) rather than a writer-side
+  list of "commands that will not apply", which is the same list that rots one layer up and
+  would be worse for *looking* complete. A writer-side list of unspellable commands was
+  already rejected below; a writer-side list of unappliable ones is the identical mistake in
+  a new place, and a dry run is what makes it unnecessary. The three places that stand down
+  are exactly the three whose work is **not about the document**:
+  1. `Play`/`Splice` do not resolve a whole-file region through `WavReader::open`, do not
+     start a `FilePlayer`, and do not `warm_player`. They keep the document's doors (the
+     mixer must be mounted, the channel must be inside it, one clip at a time) and record
+     the state a later `splice` in the same script reads, so a `splice` after a `play` is
+     still checked against a session that has a player.
+  2. `process` does not render up to a command's `at_frame`. Rendering is what wires the
+     arranger, opens every pool source through a reader thread and warms it; a walk that
+     renders is a session *running*, and a save must not run the session it is saving. No
+     verdict is lost: every door this walk reaches asks a question of the *sequence* of
+     commands (`mount`/`patch`/`set_param` all accept a scheduled-or-mounted plugin, and the
+     document walk is what makes `mount … unmount … mount` legal), and the sequence is
+     walked whole either way.
+  3. `Pool` adopts the directory without `conform`ing it (`note_pool`). The door half of
+     `set_pool` still runs — the path must be a directory, which is what the reader asks —
+     and the guarded resolver is still installed, so every arrangement op behind it sees a
+     pool. What stands down is the *write*: `conform` reads every source's header and
+     rewrites the ones at a foreign rate, so a save that ran it would write into the very
+     directory it is publishing.
+- **A file that has moved is a runtime condition, and the reader still reports it.** A
+  missing WAV is not a defect in the session text; it is this machine's copy of it, and the
+  same argument that a full disk must not fail a save applies to a file on another volume.
+  So the save lands, and the missing file is reported where it always was — by the **reader**
+  (`a_session_whose_play_file_moved_still_saves` pins both halves: the baseline walk's `Err`
+  naming the path, and the journal path's existing drop-and-report). The tolerance is
+  deliberately on the *write* side only, and the test asserts the report is not lost, so
+  "the save tolerates it" can never quietly become "nobody mentions it".
 - **The two write paths hold deliberately different strengths, and the split is by
   durability.** The journal checks *reads back as itself* (`entry_fault`), per entry,
   because it is best-effort and the load side already drops and reports an entry it cannot
-  apply — the one write path that cannot be made to refuse opens. `save` checks *reads
-  back and applies*, over the whole script, because it writes the baseline the session is
+  apply — the one write path that cannot be made to refuse opens. `save` additionally walks
+  the applier's doors, over the whole script, because it writes the baseline the session is
   rebuilt from and that file has to open. So an entry the session itself would refuse (a
   `NaN` param) is journalled and reported per entry on replay, and the save that would
   have bricked the directory is refused by name instead.
 - **A refusal is re-derived from the history; it is not latched and not merely cleared.**
   `rederive_journal_fault` re-reads the outstanding refusal whenever the history changes
   under it — `carry_over` (undo, redo, a seek) and `save`'s pool re-point — from
-  `outstanding_refusal`, the *same predicate the write uses* (`entry_fault`) and the same
-  report text (`refusal_report`), so the write and the report cannot disagree about what
-  is spellable. One rule, both directions: an entry still in the history and still
+  `outstanding_refusal`, which uses the *same predicate the write uses* (`entry_fault`) and
+  the same report text (`refusal_report`), so the write and the report cannot disagree about
+  what is spellable. One rule, both directions: an entry still in the history and still
   unspellable keeps its report (which is what a successful write must not erase), an entry
   that `undo` removed takes it with it, and one a `redo` put back brings it back. Two
   guards: **no session directory, no report** (there is no autosave to have refused
   anything — an unspellable edit in a directory-less session is a `save` refusal, named by
   `save`), and **a write fault stands** (it is the file's, and a history edit is no
   evidence about a file; a `save` rewrote the file, so it clears that one itself).
+- **The re-derivation asks *both* spellings, because the report is a claim about *both*
+  records.** `entry_fault` now takes the spelling to ask in: the journal's (`None`, the
+  absolute paths the session used) or the save's (`Some(dir)`, the copy inside the session
+  directory). `Pool` is the only line the directory changes, and a pool path with a space is
+  unspellable in one and spellable in the other. An entry the journal can write is a record
+  full stop; an entry the journal cannot but a save can is a `pool` line, and the pool is
+  **context, not an edit** (`rebase_pool` says so) — it is in `session.txt` the moment the
+  save lands, so there is no standing loss to report. `entry_round_trips` takes the resolve
+  directory for the same reason: a save's `pool pool` must read back as the absolute path it
+  resolves to, which is `resolve_session_paths` — the same step `save` and `load_session`
+  run — or the two spellings would not compare equal to the entry that made them.
+  This is what removes the false alarm: the report's sentence ("it is in the live session
+  and nowhere else, and a save refuses the history as well") is a claim about both records,
+  so it is now only made where it is true of both. **A report that is not actionable is
+  worse than no report**, which is the same reason the load side drops rather than aborts.
 - **The word-based form still says so when it cannot express a command**, and says it as
   a fact about the *form*: `write_entry`'s refusal is now the bare
   "the host v1 text form cannot express …", and the caller adds what it does about it (a
@@ -176,6 +260,46 @@ a report of what could not be saved cannot outlive the edit it names.**
     dropped entry — and its final assertion is now that the save **refuses** it, which is
     the honest verdict rather than a brick. The test's doc states the split: that is the
     autosave's half of the rule; `save` holds the stronger one.
+- **From the verification of that correction** (`cargo test -p host`: 80 lib tests green,
+  1 ignored, plus the four session/journal integration binaries at 16/4/4/8). Each of the
+  three new tests was run against the *unfixed* `save` — the same file with the previous
+  check restored and only the tests added — and **each fails there, with the finding's own
+  words**:
+  - `a_session_whose_play_file_moved_still_saves` — a saved session, a `play` of a file in
+    the pool, then the file is deleted. The save lands, the play line is in the baseline,
+    the journal restarts from it, and **the reader still reports the missing file in the
+    shape it always used**: the baseline walk's `Err` naming `s1.wav`, and — for a `play`
+    that arrives through the autosave instead — the journal path's existing
+    drop-and-report (`refused: 1`, reason naming the file, the rest of the session intact).
+    On the unfixed code the *save* fails: `save: the session text does not apply — refusing
+    to write a session that would not open: play /…/pool/s1.wav ch0 is refused when the
+    file is read back: open /…/pool/s1.wav: No such file or directory`.
+  - `the_save_check_never_opens_the_material_it_validates` — a `play` naming a file that
+    exists and is deliberately **not a WAV**. The moved-file case above is refused *fast*
+    by the old code, so on its own it says nothing about the ten-second `warm_player`
+    deadline or its decoder thread, which are paid for a file that **is** there; a
+    non-WAV is the case where the old code read the file before it ever reached the warm.
+    The save lands in well under two seconds (a **bound**, not a measurement — it is there
+    so a future blocking read fails here rather than costing a user ten seconds per save)
+    and the play line is written. On the unfixed code the save fails with `not a RIFF
+    file: expected 'RIFF', found [116, 104, 105, 115]` — the check read the file.
+  - `a_save_into_a_directory_with_a_space_reports_nothing` — a save into
+    `…/My Songs/song.d`. It lands, the baseline spells the pool **relative**
+    (`pool pool`, the movable-session rule), `journal_error` is `None`, and it is *still*
+    `None` after a later edit, a second save and a reopen — the re-derivation runs on every
+    history change, so a false claim would come back on the next `undo` too. On the
+    unfixed code the save **succeeds** and then reports:
+    `the host v1 text form cannot read it back (line 2: pool takes 1 operand(s), got 2), so
+    this edit is not autosaved — it is in the live session and nowhere else, and a save
+    refuses the history as well: pool /…/My Songs/song.d/pool`.
+  - `a_session_the_applier_refuses_is_not_saved` (the `NaN` case the dry run exists for) is
+    **unchanged and still load-bearing**: replacing the dry run with `Ok(())` — i.e.
+    dropping the applier walk entirely — is the only one of the four that then fails, so
+    the tolerance above was not bought by weakening the check. A scratch probe (removed
+    before the commit) confirmed the dry run still catches doors that are not `NaN` at all:
+    a `Take` with `channels: 9999` is refused by name with `take 'take-1' channels must be
+    1..=64, got 9999`, which is the evidence that the walk still runs the *reader's* rules
+    rather than a list.
 
 ## Alternatives considered
 
@@ -217,7 +341,49 @@ a report of what could not be saved cannot outlive the edit it names.**
   the same rot argument as the hand-written unspellable list, one layer up — and it is
   worse, because it *looks* complete. The writer already has the reader: `from_script` is
   the definition of "applies", so a save that does not use it is the one place on the
-  platform where a second, stale answer to that question could be maintained.
+  platform where a second, stale answer to that question could be maintained. **This is
+  also the argument against answering the *dry run* with a list**, which is why the mode
+  is a flag on the ordinary apply path and not a `match` of "safe to check" commands: such
+  a list is the same rot, and the new commands that need to be in it are exactly the ones
+  nobody remembers.
+- **A dry run that skips a `match` of "these commands are safe to validate"** (the mirror
+  of the list above — enumerate the arms with no material in them, and refuse the rest).
+  Rejected for the same reason, and it is the *more* dangerous of the two because the
+  enumeration grows silently: a new media command is refusing-by-default until someone
+  adds it, and the failure is a save that writes a file nobody can open — the exact
+  regression this note's first correction was made to stop. The three stand-downs here are
+  at the *leaf* that does the work (`FilePlayer::start`, `warm_player`, `conform`, the
+  pre-`at_frame` render), so a new command is in the check by default and only has to be
+  argued out of it.
+- **Give the applier a real "dry" enum per command** (`Apply::Live` / `Apply::Check`), so
+  each arm declares its own behaviour. Rejected as more machinery than the problem needs
+  for the same answer: it spreads one fact ("this session is being checked") across every
+  arm of a 900-line `match`, and the arms that must change are the three that do I/O. A
+  session-level flag is one fact in one place, and the arms read it where the work is.
+- **Keep building the session, but validate the script's *values* separately** (walk the
+  parsed commands and check only the numeric operands against the engine's finiteness and
+  range rules, without building anything). Rejected: it is the writer-side list again, and
+  it is the version that *looks* most complete, because "check every `f32` is finite" does
+  catch today's `NaN`. It still knows nothing about the mixer's channel count, the
+  arrangement's op rules or anything else a new door adds — and those are exactly the
+  refusals a reader will meet. The dry run asks the reader.
+- **Tolerate the failure in `save` instead of in the check** (build, and ignore a
+  `Play`/`Splice` failure that names a file). Rejected: it cannot tell the two apart. The
+  same `Err` type carries "this WAV is not on this disk" and "this arrangement op is
+  illegal in this arrangement", and string-matching an `Err` to decide which is a writer
+  guessing at the reader's reasons — and it would silently widen every time a door learns
+  to mention a path. The mode is declared where the work is, so the split is a fact about
+  the code rather than a reading of a message.
+- **Make the baseline walk tolerant of a missing file too** (drop the `play` on load, as
+  the journal path already does). Rejected as out of scope and *not* obviously right: the
+  journal's tolerance is justified by the journal being best-effort, and a baseline is the
+  one file the session is rebuilt from, so a `play` it cannot resolve is a load the user
+  needs to be told about loudly. The requirement here is the narrower and more defensible
+  one — the save must not refuse, and the reader keeps reporting the file in the shape it
+  already used — and the test pins that the report is not lost. **Owed:** whether a
+  baseline whose material has moved should open degraded (the arrangement, the pool, the
+  mixer, minus the `play`) is a real product question, and it is a decision about the
+  reader, not about this bug fix.
 - **Refuse the operand at the door instead** — `format_command`/`parse_script` rejecting
   a `NaN`, as the *clip id* is a plain stem and the *source* a pool id (the
   [pool-id note](2026-09-29-a-clip-source-is-a-pool-id-not-a-path.md)). Not rejected on
@@ -256,6 +422,14 @@ a report of what could not be saved cannot outlive the edit it names.**
   journal; an unreadable entry in an existing journal costs that entry and is reported in
   `last_recovery()`; and a `save` whose text would not apply is refused by name, with
   nothing written.
+- **What a `save` refuses is a property of the document; what it tolerates is a property
+  of the machine.** A value the applier's own doors reject (a `NaN` param, a param out of
+  range, a `take` with a channel count no capture could have recorded, an op illegal in
+  this arrangement) still refuses the write, by name, before a byte is written. A `play`
+  whose WAV is not on this disk, right now, does not — the save lands and the reader
+  reports the file in the shape it always used. The two are the same question asked of
+  two different things, and conflating them is what made a session unsaveable over a
+  renamed file.
 - A path with whitespace, or a `#` anywhere in it, is now a session that **applies, plays
   and exports, but will not save and will not autosave** — the same verdict `save` has
   always given it, now consistent across both write paths, and visible in one place
@@ -273,6 +447,19 @@ a report of what could not be saved cannot outlive the edit it names.**
   journal `fsync` (the journal is flushed, not synced, so a power cut can still lose the
   tail) and non-strict arity for `pool`/`save`/`load`. And a quoting rule for the text
   form, which is what would make a spaced path saveable at all.
+- **Owed from this correction:** whether a *baseline* whose material has moved should open
+  degraded — the arrangement, the pool and the mixer, minus the `play` — the way the
+  journal already does. Today the reader is loud about it, which is defensible (the
+  baseline is the one file the session is rebuilt from) but is a product question, not a
+  consequence of this fix, and it belongs to a decision about the reader.
+- **Owed, and new:** `play`/`splice` lines name **absolute paths that `rebase_pool` does
+  not rewrite**, so a saved session's player material is not part of the copy the session
+  directory makes — a saved session moved to another machine (or reopened after the pool
+  moved) has a `play` pointing at a path that was never copied. The recorder profile is
+  built on pool ids for clip *sources* (the
+  [pool-id note](2026-09-29-a-clip-source-is-a-pool-id-not-a-path.md)) and `play` is the
+  same argument one command later; this note only stops the save from *refusing* such a
+  session, which is the correct half to fix here.
 - The [session-directory note](../architecture/2026-09-23-session-directory-save-and-journal.md)
   is updated in place: its debt list no longer carries the malformed-journal-line item, and
   its journal bullet states the read-back and the per-entry drop.
@@ -305,12 +492,26 @@ a report of what could not be saved cannot outlive the edit it names.**
     successful write, and is re-read after `save`'s pool re-point — the one case where a
     save *legitimately* changes the answer, because the journal spells a pool by the
     absolute path the session used while the save spells the copy inside the directory, so
-    a pool path with a space is unspellable in the journal and fine in a save.
-- **Costs.** `save` now applies the whole script to a fresh session before writing — the
-  work a load does, including the media open and warm-up a `play` in the log performs —
-  against a rebuild an undo or a seek already pays. The re-derivation is one `parse_script`
-  per history entry, and only where a fault could be outstanding: not with no session
-  directory, and not for a `Write` fault. Neither cost is on the render path.
+    a pool path with a space is unspellable in the journal and fine in a save. **Refined a
+    third time:** that re-derivation was reading only the journal's spelling, so it turned a
+    legitimate change of the answer into a *false alarm* instead of honouring it. It asks
+    both spellings now, and a save into a directory whose own path holds a space reports
+    nothing at all.
+- **Costs.** `save` walks the whole script on a fresh session before writing — the work a
+  load does, minus the I/O: **no file is opened, no decoder thread is spawned, no ring is
+  warmed, no pool is written, and no frame is rendered.** The re-derivation is one
+  `parse_script` per history entry (two for an entry the journal cannot spell, the second
+  asking the save's spelling), and only where a fault could be outstanding: not with no
+  session directory, and not for a `Write` fault. Neither cost is on the render path.
+  **Owed, honestly:** the dry run is a *list of three stand-downs* in the sense that
+  anything it fails to name is validated for real. The three are at the leaves that do the
+  work, and a new media command is in the check by default — but a new door that *writes*
+  (a conform, an export, a capture) would be validated for real until someone adds it here.
+  The alternative (enumerate the safe arms instead) fails in the other direction and is
+  worse; what this note owes is a line in the `validating` doc for each new I/O-bearing
+  command, which is the discipline the
+  [fade-sum note](2026-09-29-fade-sums-are-checked-not-wrapped.md) already records for
+  the same reason.
 - **A refused `save` leaves the directory exactly as it was** — the previous `session.txt`,
   the journal tail, no temp file — so retrying after fixing the offending edit costs the
   user nothing but the fix.
@@ -322,4 +523,6 @@ a report of what could not be saved cannot outlive the edit it names.**
   kind (`JournalFault` is private, so a shell cannot branch on it) — an API decision with
   two shells and a snapshot struct in it, not something to slip in under a bug fix.
 
-*Authored with Space Bunny · OpenCode, 2026-09-29.*
+*Authored with Space Bunny · OpenCode, 2026-09-29. Refined by the independent verification
+of the "save applies the script" half, 2026-09-30: the check is a dry run, so it asks the
+document's questions and not the machine's.*
