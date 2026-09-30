@@ -1,6 +1,6 @@
 # First session in the terminal shell — arrange a jam in twenty minutes
 
-> 🕒 Last verified against commit `971524b` (2026-09-24). If the code has moved on,
+> 🕒 Last verified against commit `2f6ad78` (2026-09-30). If the code has moved on,
 > trust the code and move this line forward.
 
 This is the hands-on tour of **sound-arranger's primary shell**: a terminal
@@ -63,7 +63,7 @@ work there).
 | mouse capture | `m` (off by default: your terminal keeps its own copy/paste) |
 | leave | `q` — and **`Esc` never quits**, it only cancels |
 
-Spend a minute here: press `b` twice so the ruler shows bar numbers, then `[` and
+Spend a minute here: press `b` so the ruler shows bar numbers, then `[` and
 `]` to step the playhead a grid line at a time. The frame an edit lands on is
 quantized through the session's tempo map, so an edit lands on the grid you can
 see.
@@ -206,8 +206,10 @@ Two properties worth knowing:
 
 1. **An export that would clip.** Raise a clip's gain until the mix exceeds full
    scale (`G` a few times), then `X` and Enter. Nothing is written, and the
-   refusal says `export would clip: the mix peaks at 1.4x (−1.x dBFS) — lower the
-   mix or mount a master chain with a ceiling; the file was not written`.
+   refusal says `export would clip: the mix peaks at 1.4000 (2.9 dBFS) — lower the
+   mix or mount a master chain with a ceiling; the file was not written` (a
+   1.4× overpeak is **2.9** dBFS — over full scale is a *positive* number; the
+   earlier edition of this doc showed a negative placeholder).
 2. **A warp with no source tempo.** `W` on a fresh import says
    `no tempo recorded for source … — set it with \`: source_tempo … <bpm>\``.
    Refusals are loud and specific; a silent wrong answer is the failure mode this

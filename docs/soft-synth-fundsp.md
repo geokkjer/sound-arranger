@@ -1,6 +1,6 @@
 # Building our own soft-synth voices (fundsp)
 
-> 🕒 Last verified against commit `82e50da` (2026-08-30). If the code has moved on, trust the code and move this line forward.
+> 🕒 Last verified against commit `2f6ad78` (2026-09-30). If the code has moved on, trust the code and move this line forward.
 
 This is the human-facing guide to the platform's first **native soft synth**: how we build our own voices
 in the Rust engine on top of the [**fundsp**](https://crates.io/crates/fundsp) DSP library, how to turn it
@@ -54,7 +54,7 @@ fundsp is an **optional, feature-gated** dependency of the minimal core, so the 
 `cargo test -p engine` (no feature) builds without fundsp at all.
 
 ```sh
-# Run the fundsp-backed soft-synth test suite (8 tests) + the rest of the engine:
+# Run the fundsp-backed soft-synth test suite (9 tests) + the rest of the engine:
 cargo test -p engine --features fundsp
 
 # Same, optimized (important — see the gotcha below):
@@ -64,7 +64,7 @@ cargo test -p engine --features fundsp --release
 cargo clippy -p engine --features fundsp --all-targets
 ```
 
-The 8 tests prove the claims we actually care about:
+The 9 tests prove the claims we actually care about:
 
 | Test | What it proves |
 |---|---|
@@ -76,6 +76,7 @@ The 8 tests prove the claims we actually care about:
 | `fundsp_set_param_is_logged_and_validated` | params are logged; undeclared params are refused |
 | `fundsp_render_does_not_allocate` | the render path allocates nothing |
 | `fundsp_latency_is_reported_for_pdc` | the node reports its latency for plugin-delay compensation |
+| `fundsp_voice_tail_is_drained` | a decaying voice's tail is rendered past the last note, not cut |
 
 The feature flag lives in [`crates/engine/Cargo.toml`](../crates/engine/Cargo.toml): `fundsp` is
 `optional = true`, `default-features = false`, `features = ["std"]`. We use only two primitives today
@@ -115,6 +116,14 @@ SchedEvent::Mount { plugin, params } => {
 
 See the [bug-fix note](../.agents/notes/implemented/bug-fix/2026-08-30-scheduled-mounts-apply-in-release.md).
 
+**How that arm has grown since.** The 2026-09-29 hardening pass changed what a
+refusal there *means*: `apply_mount` is now transactional (a refused apply
+undoes what it touched — the name is free again, the next mount succeeds), and
+the refusal is **recorded, not asserted**: it becomes an `ApplyFault` whose
+`String` is *moved* off the render path without allocating, visible in release
+builds, and `apply_faults()` / `is_degraded()` surface it. The lesson below is
+unchanged — but its enforcement is now data, not a `debug_assert!`.
+
 **The lesson for anyone touching the engine:** always test **release**, not just debug. Debug-only `debug_assert!`
 gating of a real operation is a silent release bug. A quick way to keep it honest:
 
@@ -139,9 +148,15 @@ This is a **proof of concept**, not a finished instrument. Recorded in the
   a fine bridge; long-term the voice belongs in a separate `crates/fundsp-synth` that depends on `engine`, so
   the minimal core stays truly dep-lean.
 
-**One honest caveat:** "a scheduled mount must apply" is enforced by **tests, not the type system**.
-`validate_mount` calls `inject()` but not `apply`, so a plugin whose `apply` returns `Err` would be silently
-skipped in release. Dead for today's plugins; worth closing if "must apply" becomes a hard contract.
+**One honest caveat — closed 2026-09-29:** this doc originally warned that "a
+scheduled mount must apply" was enforced only by tests, because
+`validate_mount` injected but never applied, so a plugin whose `apply` returned
+`Err` would be silently skipped in release. The hardening pass closed it —
+recorded as an update to
+[the same bug-fix note](../.agents/notes/implemented/bug-fix/2026-08-30-scheduled-mounts-apply-in-release.md):
+`apply_mount` is transactional, a refusal is recorded as an `ApplyFault` that is
+loud in **every** build, and the euclidean plugin's `apply` re-checks its
+`steps` bound — the door the caveat warned about is now alarmed.
 
 ---
 
@@ -150,4 +165,5 @@ skipped in release. Dead for today's plugins; worth closing if "must apply" beco
 fundsp is MIT OR Apache-2.0 — permissive, and it composes cleanly with our GPL-3.0-or-later app
 (see [RESEARCH.md §12](../RESEARCH.md)). The license matrix there lists fundsp as ✅.
 
-*Authored with deepseek-v4-flash-vision-exp · DeepSeek Harness, 2026-08-30.*
+*Authored with deepseek-v4-flash-vision-exp · DeepSeek Harness, 2026-08-30; re-verified
+against `2f6ad78` with GLM-5.3 · OpenCode, 2026-09-30.*
