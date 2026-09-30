@@ -144,6 +144,13 @@ pub enum Action {
     SeekSeconds(i64),
     /// Jump the playhead to the next (`true`) / previous (`false`) clip start.
     SeekClip(bool),
+    /// Start a take if none is running, stop the running one otherwise — the
+    /// recorder's primary verb, and the reason the recorder profile exists.
+    ///
+    /// The host requires a take **id** up front (a take is declared state), so a
+    /// shell supplies one: `take-1`, `take-2`, … The shell owns the naming because
+    /// only it can see what the session already holds.
+    RecordToggle,
     // panels and viewport
     CycleFocus(i32),
     /// Move down (+1) / up (-1) inside the focused panel: mixer channel, active track.
@@ -255,6 +262,7 @@ impl Action {
             Action::Rewind => "rewind",
             Action::SeekSeconds(_) => "seek by seconds",
             Action::SeekClip(_) => "next / previous clip",
+            Action::RecordToggle => "record / stop recording",
             Action::CycleFocus(_) => "move the focus",
             Action::Vertical(_) => "move the selection",
             Action::Timeline(_) => "scroll / extend the selection",
@@ -305,6 +313,13 @@ impl Action {
     /// The `host v1` operation this action dispatches, when it is a log op. The
     /// strings are the parser's own op names (`arrange <name> …`), so a shell builds a
     /// line and the test below proves the vocabulary still has it.
+    /// The **arrange-line verb** this action logs, when it has one.
+    ///
+    /// `None` for anything a shell drives itself rather than through
+    /// `parse_arrange_line` — every transport verb, and `RecordToggle`, whose take
+    /// id the shell must choose (a take is declared state, so the id exists before
+    /// the recording starts). A shell sends `record <take_id>` / `record stop`
+    /// itself.
     pub fn command_name(self) -> Option<&'static str> {
         match self {
             Action::Split => Some("razor_split"),
@@ -379,6 +394,11 @@ const fn bind_aliased(
 pub static KEYMAP: &[Binding] = &[
     bind("space", &[(Key::Space, Action::PlayToggle)], "play / stop"),
     bind("s", &[(Key::Char('s'), Action::Stop)], "stop"),
+    bind(
+        "o",
+        &[(Key::Char('o'), Action::RecordToggle)],
+        "record / stop recording",
+    ),
     bind(
         "r  Home",
         &[

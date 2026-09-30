@@ -549,6 +549,12 @@ pub struct HostSession {
     /// The sources the last `set_pool` resampled to the session rate (see
     /// [`HostSession::pool_conformed`]).
     pool_conformed: Vec<media::Conform>,
+    /// Cached pool source ids, for the snapshot. Listing the pool reads the
+    /// directory, and the snapshot is published on every pump tick, so the listing
+    /// is refreshed only where the pool can change (`set_pool`, a finished take)
+    /// rather than per frame. A shell reads it to name a new take without
+    /// colliding with an existing source.
+    pool_ids: Vec<String>,
     /// The last successful export's report (length, format, peak, RMS) — a shell
     /// shows what was written without recomputing the render.
     last_export: Option<media_ops::ExportRecord>,
@@ -743,6 +749,7 @@ impl HostSession {
             pool_resolver: None,
             pool_dir: None,
             pool_conformed: Vec::new(),
+            pool_ids: Vec::new(),
             last_export: None,
             last_seek: None,
             source_tempos: std::collections::HashMap::new(),
@@ -775,7 +782,11 @@ impl HostSession {
     /// [`HostOutcome`](crate::live::HostOutcome) so a shell can say what moved.
     pub fn set_pool(&mut self, pool_dir: impl Into<PathBuf>) -> Result<(), String> {
         let dir: PathBuf = pool_dir.into();
-        let pool = media::Pool::open(&dir)?; // validate it exists as a directory
+        // Validate it exists as a directory. **This refusal is load-bearing**: the
+        // rebuild path relies on it to force a refusal when a session's pool is
+        // gone (`a_refused_undo_leaves_the_history_alone`), so a caller that wants
+        // a fresh pool creates the directory itself.
+        let pool = media::Pool::open(&dir)?;
         // A file that cannot be converted is reported, not fatal: it stays at its
         // own rate and the arranger names it if a clip reads it.
         self.pool_conformed = pool.conform(self.engine.clock.sample_rate)?.converted;
@@ -784,7 +795,28 @@ impl HostSession {
         // otherwise read a WAV from outside the pool.
         self.pool_resolver = Some(pool.resolver());
         self.pool_dir = Some(dir);
+        self.refresh_pool_ids();
         Ok(())
+    }
+
+    /// Re-list the pool's source ids into the cache the snapshot publishes.
+    ///
+    /// Called where the pool can change, not per frame: `Pool::list` reads the
+    /// directory.
+    fn refresh_pool_ids(&mut self) {
+        self.pool_ids = self
+            .pool_dir
+            .as_ref()
+            .and_then(|dir| media::Pool::open(dir).ok())
+            .and_then(|pool| pool.list().ok())
+            .map(|index| index.sources.into_iter().map(|s| s.id).collect())
+            .unwrap_or_default();
+    }
+
+    /// The pool source ids, cached — what a shell reads to name a new take
+    /// without colliding with a source the session already holds.
+    pub fn pool_ids(&self) -> &[String] {
+        &self.pool_ids
     }
 
     /// The sources the last [`set_pool`](Self::set_pool) brought to the session
@@ -1015,6 +1047,9 @@ impl HostSession {
             at_frame,
         };
         self.last_take = Some(report.clone());
+        // The take's sources are in the pool now: refresh the cache so the next
+        // take is named against what actually exists.
+        self.refresh_pool_ids();
         match stop {
             Ok(()) => Ok(report),
             Err(e) => Err(format!(

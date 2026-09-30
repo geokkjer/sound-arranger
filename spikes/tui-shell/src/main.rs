@@ -852,6 +852,7 @@ impl App {
         match action {
             Action::PlayToggle => self.toggle(),
             Action::Stop => self.stop(),
+            Action::RecordToggle => self.record_toggle(),
             Action::Rewind => self.rewind(),
             Action::SeekSeconds(seconds) => self.nudge(seconds),
             Action::SeekClip(forward) => self.timeline_key(|app| app.seek_clip(forward)),
@@ -1349,6 +1350,29 @@ impl App {
     /// `R`: open the command line **prefilled** with the rename line, so the name is
     /// typed through the host's own format (one prompt, one parser, no second text
     /// widget to keep in sync).
+    /// `o`: stop the take in progress, or open the command line to name a new one.
+    ///
+    /// The iced shell auto-names takes (`take-N`, checked against the pool it reads);
+    /// this shell asks, because a take's id is **declared state** — the session
+    /// replays without the device — so the name is a real decision and the prompt is
+    /// where this shell makes decisions. Both shells send the same `record` verb.
+    fn record_toggle(&mut self) {
+        // A take in progress is visible in the status the outcome refresh writes;
+        // stopping needs no name, so it runs immediately.
+        if self.status.starts_with("● recording") {
+            let line = "record stop".to_string();
+            self.prompt = Some(line.clone());
+            self.prompt_prefill = Some(line);
+            self.history_at = self.history.len();
+            return;
+        }
+        let prefill = "record ".to_string();
+        self.prompt = Some(prefill.clone());
+        self.prompt_prefill = Some(prefill);
+        self.history_at = self.history.len();
+        self.status = "name the take and press Enter (e.g. `record take-1`)".to_string();
+    }
+
     fn rename_track_prompt(&mut self) {
         let Some(track) = self.active_lane_id() else {
             self.status = "no active track to rename".to_string();

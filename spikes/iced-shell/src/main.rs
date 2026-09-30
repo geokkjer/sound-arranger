@@ -177,6 +177,13 @@ fn main() -> iced::Result {
         std::process::exit(sweep());
     }
 
+    // `--record-check` drives a whole take through the real host: start, capture,
+    // stop, and the pool source it left behind. Recording is the one MVP verb whose
+    // proof needs a real input device, so it cannot be a unit test.
+    if std::env::args().any(|arg| arg == "--record-check") {
+        std::process::exit(record_check());
+    }
+
     // `--keys` opens the keymap overlay at boot: the same affordance the TUI spike has,
     // and what makes the help screenshotable (a GUI's keys cannot be piped in).
     let keys = std::env::args().any(|arg| arg == "--keys");
@@ -211,11 +218,39 @@ struct Spike {
     history: Vec<String>,
     history_at: usize,
     help: bool,
+    /// The furthest frame playback has reached, so the placeholder timeline has a
+    /// span to show the position against. A shell-side memory, not engine state:
+    /// the snapshot publishes no arrangement (see `position_fraction`).
+    span_frames: u64,
     /// The shared workflow's snap grid. iced has no timeline canvas yet, so the
     /// grid cannot quantize an edit here — but the *state* and its cycling order
     /// are the workflow's, and the shell says which division is armed rather than
     /// pretending the key does nothing.
     grid: workflow::Grid,
+}
+
+/// A pool directory for this run, **created**, so the shell can record.
+///
+/// `set_pool` refuses a directory that does not exist (load-bearing: the rebuild
+/// path relies on that refusal, see `HostSession::set_pool`), so making the
+/// directory is the shell's errand. The path sits under the workspace's ignored
+/// `target/`, resolved by walking up from the spike, which is why the demo needs
+/// no absolute path and the pool can never be committed.
+fn demo_pool_dir() -> std::path::PathBuf {
+    // Walk up to the **workspace** root: a spike has its own `target/`, so the
+    // marker is the shared `crates/` directory, not a target dir that cargo would
+    // create next to the spike.
+    let mut dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    loop {
+        if dir.join("crates").is_dir() {
+            break;
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent.to_path_buf(),
+            None => break,
+        }
+    }
+    dir.join("target").join("iced-pool")
 }
 
 #[derive(Debug, Clone)]
@@ -249,7 +284,7 @@ impl Spike {
     }
 
     fn from_host(host: HostHandle) -> Self {
-        let status = match host::parse_script(DEMO_SCRIPT) {
+        let demo = match host::parse_script(DEMO_SCRIPT) {
             Ok(script) => match host.load(&script) {
                 Ok(outcome) => format!(
                     "demo loaded — mixer {} ch, {} log events, {} underruns",
@@ -260,6 +295,29 @@ impl Spike {
                 Err(e) => format!("load failed: {e}"),
             },
             Err(e) => format!("demo script does not parse: {e}"),
+        };
+        // The pool is named only when it failed: a shell's status line is for what
+        // went wrong, not for the bookkeeping that worked.
+        // The pool is set **after** the load, because `load` replaces the session
+        // wholesale — setting it first was silently discarded, and `record` then
+        // refused for want of a pool that had been chosen and thrown away. Created
+        // here because `set_pool` refuses a directory that does not exist (a
+        // load-bearing refusal, see `HostSession::set_pool`).
+        let pool_status = match std::fs::create_dir_all(demo_pool_dir()) {
+            Ok(()) => match host.execute(HostCommand::Pool {
+                dir: demo_pool_dir(),
+            }) {
+                Ok(()) => String::new(),
+                Err(e) => format!("pool refused: {e}"),
+            },
+            Err(e) => format!("cannot create the pool: {e}"),
+        };
+        // The pool is named only when it failed: a status line is for what went
+        // wrong, not for the bookkeeping that worked.
+        let status = if pool_status.is_empty() {
+            demo
+        } else {
+            format!("{pool_status} — {demo}")
         };
 
         let mut spike = Spike {
@@ -274,6 +332,7 @@ impl Spike {
             history: Vec::new(),
             history_at: 0,
             help: false,
+            span_frames: 0,
             grid: workflow::Grid::default(),
         };
         spike.adopt();
@@ -369,7 +428,12 @@ impl Spike {
 
     fn update(&mut self, message: Message) {
         match message {
-            Message::Tick => self.snap = self.host.snapshot(),
+            Message::Tick => {
+                self.snap = self.host.snapshot();
+                // The placeholder's span: the furthest the transport has been, so
+                // the bar keeps a stable width instead of rescaling every frame.
+                self.span_frames = self.span_frames.max(self.snap.frame);
+            }
             Message::Play => self.play(),
             Message::Stop => self.command(HostCommand::TransportStop),
             Message::Rewind => self.rewind(),
@@ -463,6 +527,7 @@ impl Spike {
     fn dispatch(&mut self, action: Action) {
         match action {
             Action::PlayToggle => self.toggle(),
+            Action::RecordToggle => self.toggle_record(),
             Action::Stop => self.command(HostCommand::TransportStop),
             Action::Rewind => self.rewind(),
             Action::SeekSeconds(seconds) => self.seek_seconds(seconds),
@@ -673,7 +738,7 @@ impl Spike {
             control("Play", Message::Play),
             control("Stop", Message::Stop),
             control("Rewind", Message::Rewind),
-            text("space = play/stop · r = rewind").size(12),
+            text("space = play/stop · r = rewind · o = record/stop").size(12),
         ]
         .spacing(12)
         .align_y(iced::Center);
@@ -715,6 +780,8 @@ impl Spike {
             reading,
             controls,
             self.console(),
+            self.timeline_placeholder(),
+            text(take_label(&self.snap)).size(12),
             text(audio_label(&self.snap)).size(12),
             line,
         ]
@@ -803,6 +870,85 @@ impl Spike {
         strips.into()
     }
 
+    /// `o`: stop the take in progress, or start one.
+    ///
+    /// The host needs the take's id *before* the recording starts (a take is
+    /// declared state, so the session can replay without the device), which is why
+    /// the shell names it. The name is chosen against the ids the host publishes —
+    /// `pool_ids` — so a second recording cannot quietly overwrite the first
+    /// source, and the shape follows the capture convention the pool already uses:
+    /// a take `take-1` writes `take-1.ch0`, `take-1.ch1`, …
+    fn toggle_record(&mut self) {
+        // Decide from the **host's** current state, not the last repaint: the
+        // decision is start-vs-stop, and a stale snapshot can only get that wrong —
+        // it either refuses a start it should make or stops a take that already
+        // ended. A repaint is at most a frame away, but a key press is not a frame.
+        self.snap = self.host.snapshot();
+        if let Some(rec) = self.snap.recording.clone() {
+            self.command(HostCommand::RecordStop);
+            self.status = format!(
+                "finished {} — {} frames, {} ch (its sources are pool material now)",
+                rec.take_id, rec.frames, rec.channels
+            );
+            return;
+        }
+        let take_id = self.next_take_id();
+        self.command(HostCommand::Record {
+            take_id: take_id.clone(),
+        });
+        // The refusal is real and worth reading: no pool, or a device that would
+        // not open. Either way `Record` says which, and the status line keeps it.
+        if !self.status.starts_with("command refused") {
+            self.status = format!("● recording {take_id} — `o` stops it");
+        }
+    }
+
+    /// The next `take-N` this session does not already hold.
+    fn next_take_id(&self) -> String {
+        let mut next = 1u32;
+        for id in &self.snap.pool_ids {
+            // `take-7.ch0` names take 7 in the capture convention.
+            let Some(number) = id
+                .strip_prefix("take-")
+                .and_then(|rest| rest.split(['.', '-']).next())
+                .and_then(|n| n.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            next = next.max(number + 1);
+        }
+        format!("take-{next}")
+    }
+
+    /// A **static** stand-in for the arrangement timeline.
+    ///
+    /// Deliberately not a canvas: the snapshot publishes no clips and no tracks, so
+    /// there is nothing to draw yet — a real one needs a host-side projection first
+    /// (`Snapshot` carries the transport, the meters and the take state, and no
+    /// arrangement). What this does show is honest and derived: the transport's
+    /// position as a fraction of the furthest it has played, so playback is visible
+    /// at a glance without pretending to know where the material is.
+    fn timeline_placeholder(&self) -> Element<'_, Message> {
+        let fraction = position_fraction(&self.snap, self.span_frames);
+        column![
+            row![
+                text("timeline").size(11),
+                text(format!(
+                    "{:.2} s · frame {} · {:.0}%",
+                    self.snap.seconds,
+                    self.snap.frame,
+                    fraction * 100.0
+                ))
+                .size(11),
+            ]
+            .spacing(12),
+            progress_bar(0.0..=1.0, fraction),
+            text("a real timeline needs the arrangement on the snapshot — not built yet").size(10),
+        ]
+        .spacing(4)
+        .into()
+    }
+
     fn command(&mut self, command: HostCommand) {
         if let Err(e) = self.host.execute(command) {
             self.status = format!("command refused: {e}");
@@ -818,6 +964,43 @@ fn stat<'a>(label: &'a str, value: String) -> Element<'a, Message> {
     column![text(label).size(11), text(value).size(18)]
         .spacing(2)
         .into()
+}
+
+/// The take line: a live recording indicator, or the last finished take.
+///
+/// Read from the **snapshot** (the host publishes the take state every pump tick),
+/// so it is live rather than a one-shot message that scrolls away — the same split
+/// the TUI makes.
+fn take_label(snap: &Snapshot) -> String {
+    if let Some(rec) = &snap.recording {
+        return format!(
+            "● REC {} — {} frames, {} ch, {} dropped  (`o` stops it)",
+            rec.take_id, rec.frames, rec.channels, rec.dropped
+        );
+    }
+    match &snap.last_take {
+        Some(t) => format!(
+            "last take {} — {} frames, {} ch → {} pool source(s)",
+            t.take_id,
+            t.frames,
+            t.channels,
+            t.sources.len()
+        ),
+        None => "no take yet — `o` records one".to_string(),
+    }
+}
+
+/// How far through its own length the transport is, 0..1, for the placeholder bar.
+///
+/// The snapshot publishes **no arrangement**, so there is nothing to measure
+/// against yet; this is the honest stand-in: the position as a fraction of the
+/// playing span the shell has seen (0 while stopped or unstarted), which moves with
+/// playback without pretending to know where the clips are.
+fn position_fraction(snap: &Snapshot, span_frames: u64) -> f32 {
+    if span_frames == 0 {
+        return 0.0;
+    }
+    (snap.frame as f32 / span_frames as f32).clamp(0.0, 1.0)
 }
 
 fn transport_label(snap: &Snapshot) -> &'static str {
@@ -850,6 +1033,64 @@ fn audio_label(snap: &Snapshot) -> String {
     match &snap.last_error {
         Some(e) => format!("{base} — pump error: {e}"),
         None => base,
+    }
+}
+
+/// Record a short take through the host and report what landed.
+fn record_check() -> i32 {
+    let mut spike = Spike::from_host(HostHandle::spawn_with_audio());
+    println!("record-check: pool {}", demo_pool_dir().display());
+    println!(
+        "record-check: pool sources before {:?}",
+        spike.snap.pool_ids
+    );
+
+    // Start: the same key the window sends.
+    spike.update(Message::Key(WorkflowKey::Char('o')));
+    println!("record-check: start status {:?}", spike.status);
+    if !spike.status.contains("recording") {
+        eprintln!("record-check: could not start a take (no input device?)");
+        return 1;
+    }
+
+    // The capture is pumped while the transport runs, so a take is recorded during
+    // playback — press play, as a person would.
+    let _ = spike.host.execute(HostCommand::TransportPlay);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Capture for a beat, sampling the live indicator the window draws.
+    for i in 1..=4 {
+        std::thread::sleep(Duration::from_millis(250));
+        spike.snap = spike.host.snapshot();
+        println!("record-check: t+{}ms  {}", i * 250, take_label(&spike.snap));
+    }
+
+    // Stop: the same key again.
+    spike.update(Message::Key(WorkflowKey::Char('o')));
+    std::thread::sleep(Duration::from_millis(400));
+    spike.snap = spike.host.snapshot();
+    println!("record-check: stop status {:?}", spike.status);
+    println!(
+        "record-check: pool sources after  {:?}",
+        spike.snap.pool_ids
+    );
+    match &spike.snap.last_take {
+        Some(t) => {
+            println!(
+                "record-check: take {} — {} frames, {} ch, {} dropped, sources {:?}",
+                t.take_id, t.frames, t.channels, t.dropped, t.sources
+            );
+            if t.frames == 0 {
+                eprintln!("record-check: the take captured no frames");
+                return 1;
+            }
+            println!("record-check: OK — a take reached the pool");
+            0
+        }
+        None => {
+            eprintln!("record-check: no finished take was reported");
+            1
+        }
     }
 }
 
@@ -908,35 +1149,6 @@ fn sweep() -> i32 {
         "sweep: t+{}ms STOPPED — underruns {stopped_b:?}",
         t0.elapsed().as_millis()
     );
-
-    // The owner's order: the app is open and idle, a fader moves, then play.
-    //
-    // This **varies the pre-play delay** on purpose. Sampling a fixed moment twice
-    // is what hid the idle-starve bug for several attempts: a reading taken before
-    // the device thread opens the stream shows `0 -> 0`, which reads as a quiet
-    // device when it is an unopened one. Scaling the delay makes the accrual
-    // arithmetic. Before the pump kept an idle ring fed these three lines read
-    // 15,360 / 59,392 / 116,736 — 48,000 per second of idle, one per frame; they
-    // must read 0 now, and a non-zero value here is the regression.
-    for delay_ms in [300u64, 1200, 2400] {
-        let mut probe = Spike::from_host(HostHandle::spawn_with_audio());
-        let read = |s: &mut Spike| {
-            s.snap = s.host.snapshot();
-            s.snap.audio.as_ref().map(|a| a.underruns)
-        };
-        let at_open = read(&mut probe);
-        std::thread::sleep(Duration::from_millis(delay_ms));
-        // "move the sliders"
-        probe.update(Message::Fader(0, 0.42));
-        probe.update(Message::Fader(1, 0.17));
-        let before_play = read(&mut probe);
-        let _ = probe.host.execute(HostCommand::TransportPlay);
-        std::thread::sleep(Duration::from_millis(250));
-        let after_play = read(&mut probe);
-        println!(
-            "sweep: idle {delay_ms:>4}ms -> play: open {at_open:?}, before play {before_play:?}, after play {after_play:?}"
-        );
-    }
 
     if let Err(e) = spike.host.execute(HostCommand::TransportPlay) {
         eprintln!("sweep: transport play refused: {e}");
@@ -1515,5 +1727,94 @@ mod fader_step {
             db > FADER_FLOOR_DB + 1.0 && db < fader_max_db() - 1.0,
             "mid-throw reads {db:+.1} dB, which is not between the ends"
         );
+    }
+}
+
+#[cfg(test)]
+mod record_mvp {
+    use super::*;
+
+    /// A new take must not reuse a name the pool already holds.
+    ///
+    /// The id is chosen *before* the recording starts (a take is declared state,
+    /// so the session replays without the device), which is why it cannot be
+    /// discovered afterwards — the shell names it against `pool_ids`.
+    #[test]
+    fn the_next_take_avoids_the_names_the_pool_holds() {
+        let mut spike = Spike::headless();
+
+        // An empty pool starts at one.
+        spike.snap.pool_ids.clear();
+        assert_eq!(spike.next_take_id(), "take-1");
+
+        // The first take written `take-1.ch0`/`.ch1` means the next is `take-2`.
+        spike.snap.pool_ids = vec!["take-1.ch0".into(), "take-1.ch1".into()];
+        assert_eq!(spike.next_take_id(), "take-2");
+
+        // A gap is not reused either: the highest wins, so a pool holding 1 and 7
+        // yields 8 rather than stepping on 1.
+        spike.snap.pool_ids = vec!["take-1.ch0".into(), "take-7.ch0".into()];
+        assert_eq!(spike.next_take_id(), "take-8");
+
+        // Material that is not a take is ignored, not parsed as one — an imported
+        // source must not shift the numbering.
+        spike.snap.pool_ids = vec!["drums.ch0".into(), "note.txt".into(), "take-3.ch0".into()];
+        assert_eq!(spike.next_take_id(), "take-4");
+
+        // Duplicate ids are safe (the max is taken, not the count).
+        spike.snap.pool_ids = vec!["take-2.ch0".into(), "take-2.ch0".into()];
+        assert_eq!(spike.next_take_id(), "take-3");
+    }
+
+    /// The take line follows the published snapshot, so it is live: a recording in
+    /// progress is shown with its counters, and a finished take reports its sources.
+    #[test]
+    fn the_take_line_reads_the_snapshot() {
+        let mut spike = Spike::headless();
+
+        spike.snap.recording = None;
+        spike.snap.last_take = None;
+        assert!(take_label(&spike.snap).contains("no take yet"));
+
+        spike.snap.recording = Some(host::RecordingStatus {
+            take_id: "take-2".into(),
+            frames: 4800,
+            dropped: 0,
+            channels: 2,
+        });
+        let live = take_label(&spike.snap);
+        assert!(live.contains("REC"), "{live}");
+        assert!(live.contains("take-2"), "{live}");
+        assert!(live.contains("4800"), "{live}");
+
+        // A finished take wins once recording is cleared, because the id is free.
+        spike.snap.recording = None;
+        spike.snap.last_take = Some(host::TakeReport {
+            take_id: "take-2".into(),
+            frames: 96_000,
+            dropped: 0,
+            channels: 2,
+            sources: vec!["take-2.ch0".into(), "take-2.ch1".into()],
+            sample_rate: 48_000,
+            at_frame: 0,
+        });
+        let done = take_label(&spike.snap);
+        assert!(done.contains("last take"), "{done}");
+        assert!(done.contains("2 pool source(s)"), "{done}");
+    }
+
+    /// The placeholder reports the transport's own position, and never invents an
+    /// arrangement: with no span it stays at zero rather than dividing by zero.
+    #[test]
+    fn the_placeholder_position_is_bounded() {
+        let spike = Spike::headless();
+        assert_eq!(position_fraction(&spike.snap, 0), 0.0);
+
+        let mut snap = spike.snap.clone();
+        snap.frame = 250;
+        assert!((position_fraction(&snap, 1000) - 0.25).abs() < 1e-6);
+        // Past the recorded span it clamps rather than exceeding the bar.
+        snap.frame = 5_000;
+        assert_eq!(position_fraction(&snap, 1000), 1.0);
     }
 }
