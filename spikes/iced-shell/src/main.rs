@@ -1876,6 +1876,9 @@ mod record_toggle {
             "a started take should say so: {:?}",
             spike.status
         );
+        // Play, as a person would: the pump drives the capture, so a take with the
+        // transport stopped holds at 0 frames.
+        let _ = spike.host.execute(HostCommand::TransportPlay);
         // The expected name comes from the shell's own rule, read *before* the
         // press: pinning `take-1` here would pass once on a clean pool and fail on
         // the next run, which is a test that only works the first time.
@@ -1900,6 +1903,27 @@ mod record_toggle {
         );
         let report = spike.snap.last_take.clone().expect("finished");
         assert_eq!(report.take_id, take_id, "the finished take keeps its id");
+
+        // Scope item 3, asserted where it is drawn: the finished take reports pool
+        // sources, and the take's channels are published as pool ids — which is the
+        // list the *next* take is named against, so a take that is not published
+        // would be overwritten by the next one.
+        let line = take_label(&spike.snap);
+        assert!(line.contains("last take"), "{line}");
+        assert!(line.contains("pool source"), "{line}");
+        for source in &report.sources {
+            assert!(
+                spike.snap.pool_ids.contains(source),
+                "the finished take's source {source:?} did not reach the published pool: {:?}",
+                spike.snap.pool_ids
+            );
+        }
+        // And the next name steps over it rather than reusing it.
+        assert_ne!(
+            spike.next_take_id(),
+            take_id,
+            "the next take would reuse the id just recorded"
+        );
         assert!(
             !spike.status.starts_with("command refused"),
             "{:?}",
