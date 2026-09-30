@@ -1,6 +1,6 @@
 # Lesson 1 — Structs, methods, and ownership
 
-**Material:** [`crates/engine/src/clock.rs`](../../crates/engine/src/clock.rs) (270 lines)
+**Material:** [`crates/engine/src/clock.rs`](../../crates/engine/src/clock.rs) (420 lines)
 
 The clock is the best first file in the repo: it's pure std, small, and uses
 almost no "clever" Rust. It defines three things: a `TempoMap` (frames ↔ beats), a `Clock` (where are
@@ -73,9 +73,20 @@ core daily decision of Rust ownership:
 
 ```rust
 pub fn advance(&mut self, frames: u64) {
-    self.frame += frames;
+    self.frame = self.frame.saturating_add(frames);
 }
 ```
+
+One line, and it changed during the 2026-09 hardening pass: it used to be
+`self.frame += frames`, and that `+` is a **debug panic / release wrap** at the
+top of the `u64` range. Why does that matter here? Because `seek_to` (just
+below it) can place the clock at *any* `u64`, and the render loop advances
+every block — a block crossing the top of the range would wrap the timeline
+back to frame 0 mid-render, in release, silently. `saturating_add` makes
+`advance` a **total function**: every input has a defined, sane output. Look at
+the doc comment above it — the *reason* is written next to the *code*, and the
+tests pin it (`advance_saturates_at_the_top_of_the_frame_range`). When you own
+a counter that anything can set, saturate.
 
 ## 1.3 The ownership rules (the actual heart of Rust)
 

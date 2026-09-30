@@ -1,7 +1,7 @@
 # Lesson 4 — Closures and the disposer pattern
 
 **Material:** [`crates/engine/src/plugins/euclidean.rs`](../../crates/engine/src/plugins/euclidean.rs)
-(170 lines, and its `apply` is the whole lesson).
+(261 lines, and its `apply` is the whole lesson).
 
 Closures — functions that capture variables from their surroundings — are the
 feature this codebase leans on most for its architecture. The key idea of the
@@ -60,17 +60,17 @@ this, and does it need to change captured state?"
 
 ## 4.3 `move`: taking ownership into the closure
 
-Now the star. `Euclidean::apply` mounts a node, provides a service, and returns
-a disposer that undoes both:
+Now the star. `Euclidean::apply` mounts a node, provides **two** services (the
+rhythm handle, and a dropped-triggers counter the hardening pass added so a
+bounded walk can *report* what its bound clipped), and returns a disposer that
+undoes all three:
 
 ```rust
-Ok((
-    node,
-    Box::new(move |dis: &mut DisposerCtx| {
-        dis.graph.remove_node(node);
-        dis.ctx.remove("rhythm");
-    }),
-))
+Box::new(move |dis: &mut DisposerCtx| {
+    dis.graph.remove_node(node);
+    dis.ctx.remove("rhythm");
+    dis.ctx.remove(EUCLIDEAN_DROPS_KEY);
+}),
 ```
 
 Walk through it slowly:
@@ -143,10 +143,12 @@ assert_eq!(count, 2);
 
 Then try calling a `FnOnce` twice and read the error.
 
-🔧 **3.** Add a second contribution to the euclidean plugin's `apply`: provide a
-service under `"euclidean.config"` containing steps/pulses/rotation, and extend
-the disposer to remove it. Run the plugin tests — the existing teardown tests
-will verify your disposer actually undoes both.
+🔧 **3.** The plugin already provides two services — `"rhythm"` and the
+`euclidean.drops` counter (a `move`-captured `Arc<AtomicU64>`; the disposer
+removes both). Add a **third**: a config snapshot under `"euclidean.config"`
+containing steps/pulses/rotation, and extend the disposer to remove it. Run the
+plugin tests — the existing teardown tests will verify your disposer actually
+undoes everything.
 
 🔧 **4.** Rewrite `drain_until`'s return type as
 `Box<dyn Iterator<Item = T> + '_>` and confirm the tests still pass. Then put

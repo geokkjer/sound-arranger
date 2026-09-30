@@ -119,7 +119,11 @@ pub fn set_param(&mut self, plugin: &'static str, param: &'static str, value: f3
 ```
 
 The discipline here is worth copying into your own code: **validate now, fail
-loud, never log a refusal.**
+loud, never log a refusal.** (One refinement added by the 2026-09 hardening:
+validation is strong enough that a logged patch *will* apply — and on the rare
+occasion the render path still refuses, the refusal is recorded as data, an
+`ApplyFault`, rather than corrupting or crashing anything. Lesson 5 shows the
+machinery.)
 
 ```rust
 if !value.is_finite() { return Err(...); }              // NaN/∞ banned
@@ -180,6 +184,8 @@ convince yourself both versions are equivalent.
 vocabularies, enums are closed and compiler-checked. 2 — unwraps a `Result`/
 `Option`, returning early on `Err`/`None`; allowed inside functions that return
 `Result`/`Option` themselves. 3 — when the invariant violated would mean a
-programming bug, not bad input; e.g. `clock.rs`'s "tempo map never empty".)*
+programming bug, not bad input; e.g. `render.rs`'s `pop().expect("peeked")` —
+the scheduler promised an event when it peeked, so an empty pop is *our* bug,
+not the session's input.)*
 
 Next: [Lesson 3 — Traits and generics](03-traits-and-generics.md)

@@ -40,7 +40,7 @@ Lessons 2–3 noted that names throughout the engine are `&'static str`, which
 seems to forbid user input. Here's the reconciliation:
 
 ```rust
-pub const HOST_PLUGINS: &[&str] = &["euclidean", "scale", "tone", "mixer", "master"];
+pub const HOST_PLUGINS: &[&str] = &["euclidean", "scale", "tone", "mixer", "master", "clock_out"];
 
 fn in_list(list: &'static [&str], s: &str, what: &str) -> Result<&'static str, String> {
     list.iter()
@@ -166,6 +166,9 @@ only when actually `None`.)*
 
 ## Where next
 
+- [Lesson 9 — Paradigms and design principles](09-paradigms-and-principles.md)
+  zooms out: functional, OO and procedural Rust in one codebase, and the design
+  principles this repo actually practices.
 - Re-read [`../architecture-explainer.md`](../architecture-explainer.md) — it
   will read very differently now.
 - The tests are specifications: `spike_a.rs` (determinism, allocation),

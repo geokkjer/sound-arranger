@@ -111,9 +111,9 @@ at how the callers differ — `media/src/stream.rs` holds both sides of a clip
 read:
 
 - the reader thread (may block): sleeps 50 µs when `try_push` returns false
-  (`stream.rs:156`);
+  (`stream.rs:163`);
 - the render path (must not block): `pop_sample` pops once and counts an
-  underrun if the ring is empty before the clip is done (`stream.rs:272`).
+  underrun if the ring is empty before the clip is done (`stream.rs:276`).
 
 The recorder is the mirror image: `record.rs` pushes each captured frame and
 counts an *overrun* when the ring is full (`record.rs:144`).

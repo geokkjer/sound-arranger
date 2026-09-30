@@ -1,6 +1,6 @@
 # Lesson 6 — The no-allocation render path
 
-**Material:** `EventBuf` in [`crates/engine/src/graph.rs`](../../crates/engine/src/graph.rs) (lines 51–121),
+**Material:** `EventBuf` in [`crates/engine/src/graph.rs`](../../crates/engine/src/graph.rs) (lines 53–123),
 and the counting-allocator test in `crates/engine/tests/spike_a.rs`.
 
 One rule dominates this codebase's style: **the steady-state render loop never
@@ -159,13 +159,14 @@ the hot path can call `push`.
 
 ## Your turn
 
-⭐ **1.** Find the counting-allocator test:
+⭐ **1.** Find the counting-allocator tests (there are several now — one per
+slice that needs the proof):
 
 ```sh
 rg -l "global_allocator" crates/
 ```
 
-Read it, then run just that test and watch it pass. Break a rule: add a
+Read one, then run just that test and watch it pass. Break a rule: add a
 temporary `vec![0.0f32; 8]` inside some node's `render` and watch the test
 fail. Feel the guard rail click. Revert.
 

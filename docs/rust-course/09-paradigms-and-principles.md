@@ -78,8 +78,12 @@ claim: *"rendering is a pure function of the log"* (`render.rs`'s module doc).
 That's functional thinking elevated to system architecture: the session log is
 immutable history (append-only!), current model state is a **fold** — a
 reduction — over that history, and replay (`replay_from`) re-runs the fold to
-reproduce byte-identical audio. Determinism isn't luck; it's what you get when
-you refuse hidden inputs (no wall clock, no randomness).
+reproduce byte-identical audio. (Replay grew teeth in the 2026-09 hardening: a
+`replay_from` now demands a **fresh engine**, walks the log as a document —
+mounts, unmounts, remounts, in lifecycle order — and refuses a frame that runs
+backwards. The fold is still the idea; the machinery around it just refuses to
+fold a log the engine itself could not have written.) Determinism isn't luck;
+it's what you get when you refuse hidden inputs (no wall clock, no randomness).
 
 **Immutability by default.** `let x = ...` is immutable unless you write
 `let mut`. The language nudges you functional-first and makes mutation a

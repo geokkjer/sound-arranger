@@ -84,10 +84,19 @@ that's called **disjoint borrows**.
 Here's the idiom that unlocks it, from `apply_mount`:
 
 ```rust
-let (node, disposer) = {
+let watermark = self.graph.next_id();
+let applied = {
     let Engine { ctx, scheduler, graph, clock, .. } = self;
     let mut api = PluginApi { ctx, scheduler, graph, clock };
-    plugin.apply(&mut api)?
+    plugin.apply(&mut api)
+};
+let (node, disposer) = match applied {
+    Ok(mounted) => mounted,
+    Err(refusal) => {
+        self.scheduled.remove(name);
+        self.undo_a_refused_apply(watermark, bus);
+        return Err(refusal);
+    }
 };
 ```
 
@@ -104,6 +113,16 @@ state to a helper.
 
 (The inner `{ }` block scopes the borrows: `api` and the field borrows die at
 its end, releasing them before the next lines use `self.scheduled` etc.)
+
+Notice also what changed when the 2026-09 hardening pass touched this code: the
+`?` used to sit directly on `plugin.apply(&mut api)?`, and a refusal left the
+name *reserved* — a wedge. Now `apply`'s result is bound and matched, and the
+`Err` arm is a **transaction rollback**: the reservation goes back, and
+`undo_a_refused_apply(watermark, bus)` removes every node the failed apply
+added (node ids come from a monotonic counter, so "what this apply added" is
+exactly "the ids at or above the watermark"). "A refused apply changes
+nothing" became a property the code maintains, not a hope — and the
+destructure-and-scope idiom above is what makes the rollback writable at all.
 
 ## 5.5 `let ... else`: early-return binding
 
