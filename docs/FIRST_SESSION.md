@@ -152,7 +152,7 @@ length is `blip_len`, so the trap moved with the code.)
   [architecture-explainer.md](architecture-explainer.md) §3 (the patch bay) and
   §4 (the log and the engine).
 - To be able to *modify* these crates, work through
-  [rust-course/README.md](rust-course/README.md) — nine lessons, each anchored
+  [rust-course/README.md](rust-course/README.md) — twelve lessons, each anchored
   in one real file of this repo.
 - Beyond this tour: the same script format speaks `pool` / `arrange ...`
   commands (cut-and-arrange clips from recorded WAVs — see

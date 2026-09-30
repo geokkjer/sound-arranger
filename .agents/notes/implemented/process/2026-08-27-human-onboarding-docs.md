@@ -54,6 +54,14 @@ copy/paste, the prefilled prompts) through a real pty.
 - The map now also links the **product-side** explainer ([`docs/clip-arranger.md`](../../../../docs/clip-arranger.md)) and the UI design docs ([`docs/design/`](../../../../docs/design/)), both added 2026-08-27. The clip-arranger substrate was the explanation gap the v1 tour deferred (the `pool`/`arrange` recorded-clip route was pushed off in Alternatives) — it is now an explainer, not a tour.
 - The banner rule adds one maintenance duty per doc-touch — accepted, small.
 - The tour depends on script syntax and output wording (`host: bounced …`, exit codes); if those change, FIRST_SESSION is the canary, which is fine — it exists to be rerun.
-- Side finding worth keeping: parameter lengths are frame-valued (`note_len`, `blip_len` are `u32` sample frames); the tour documents this because even its author bounced silence on the first attempt.
+- Side finding worth keeping: parameter lengths are frame-valued (`note_len`, `blip_len` are `u32` sample frames); the tour documents this because even its author bounced silence on the first attempt. *(Advanced 2026-09-30: the silence trap is now `blip_len`, not `note_len` — in the four-plugin chain `note_len` is audibly inert, and the tour was re-run against the shipped binary when the fix run's output changes made its expected block false.)*
+- **The course gained a hardening tier (2026-09-30):** lessons 10–12 teach the discipline the
+  space-bunny review forced — refusals recorded as allocation-free data (`ApplyFault`,
+  `ConnectClass`), total functions and saturating arithmetic on the audio path, and bounded walks
+  with loud caps (`EUCLIDEAN_STEP_CAP` + drops, `TICK_WALK_CAP`, `MAX_DRAIN_FRAMES`,
+  `MAX_APPLY_FAULTS`). The material is the review's own: mainstream Rust courses have no
+  equivalent, because almost nobody has a render path with these constraints. The tier is
+  optional in the reading order (after lesson 6) but it is where "why is this written so
+  defensively?" now sends you.
 
 *Authored with GLM-5.3 Flash · ZCode, 2026-08-27.*

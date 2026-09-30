@@ -56,6 +56,14 @@ compiler is the teacher; your job is to keep asking it questions.
 | 7 | [Threads, atomics, and a lock-free ring](07-concurrency.md) | `thread::spawn`, `Arc`, atomics, memory ordering, a peek at `unsafe` | `media/src/ring.rs` |
 | 8 | [Modules, errors, and the whole program](08-modules-errors-host.md) | crate/module layout, visibility, error idioms, putting it together | `host/src/lib.rs` |
 | 9 | [Paradigms and design principles](09-paradigms-and-principles.md) | functional / OO / procedural modes in Rust; SOLID, KISS, DRY, YAGNI as this codebase practices them | everything |
+| 10 | [Refusals as data](10-refusals-as-data.md) | error enums designed for a path that cannot allocate; bounds that are capacity; one rule, two doorways | `render.rs` (`ApplyFault`), `graph.rs` (`ConnectClass`) |
+| 11 | [Total functions and saturating arithmetic](11-total-functions-and-saturating-arithmetic.md) | total vs partial, `saturating_*`, float→int casts, refusing the unrepresentable | `clock.rs`, `render.rs` (`MIN_TEMPO_BPM`) |
+| 12 | [Bounded walks and loud caps](12-bounded-walks-and-loud-caps.md) | no unbounded loop on the render thread; caps paired with counters; binary search on monotone lookups | `graph.rs`, `plugins/clock_out.rs`, `render.rs` (`drain`) |
+
+Lessons 10–12 are the **hardening tier**, written from the 2026-09 review's
+material: they teach the discipline the codebase learned the hard way, in the
+code that learned it. Do them after 6, or whenever a "why is this written so
+defensively?" question sends you here.
 
 ## The two ideas everything hangs on
 
@@ -63,9 +71,13 @@ If you internalize nothing else from either the code or the course:
 
 1. **Time, graph, log — then plugins.** The core (`crates/engine`) knows about
    time, wiring, and events. Nothing else.
-2. **The render path never allocates or blocks.** This single rule explains
-   nearly every "weird" Rust choice in the codebase — the fixed-capacity
-   buffers, the atomics, the `unsafe` ring buffer, the closure-shaped APIs.
+2. **The render path never allocates or blocks — and no loop on it runs
+   unbounded.** This single rule explains nearly every "weird" Rust choice in
+   the codebase — the fixed-capacity buffers, the atomics, the `unsafe` ring
+   buffer, the closure-shaped APIs. Lessons 10–12 are the rule's finest print:
+   refusals recorded as *data* (not formatted sentences), counters total and
+   saturating (not panicking or wrapping), and every cap paired with a counter
+   that says what the cap clipped.
 
 ## Reading order inside a lesson
 
