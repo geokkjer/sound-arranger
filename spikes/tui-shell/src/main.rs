@@ -2422,6 +2422,12 @@ impl App {
             }
         };
 
+        // Only a load can set the journal-recovery record, so only a load pays
+        // for asking (checked before the loop consumes the batch).
+        let loads = commands
+            .iter()
+            .any(|c| matches!(c, host::HostCommand::Load { .. }));
+
         let started = Instant::now();
         for command in commands {
             if let Err(e) = self.host.execute(command) {
@@ -2431,6 +2437,16 @@ impl App {
         }
         self.last_command = Some(("prompt", started.elapsed()));
         self.status = format!(": {line}");
+        // A load replays the session directory's journal, and the host counts
+        // what that recovery applied, tore and refused. The counts are the
+        // crash story — say them beside the line that triggered them, so a
+        // recovered session tells the user what the crash cost.
+        if loads
+            && let Ok(Some(rec)) = self.host.last_recovery()
+            && rec.has_story()
+        {
+            self.status = format!(": {line} — {}", rec.describe());
+        }
         // A line may have edited the arrangement, the parameters, or the transport:
         // re-read what the log now says rather than guessing which.
         self.refresh_arrangement();
@@ -6009,6 +6025,58 @@ mod tests {
                 .clip_count(),
             1,
             "the journal's edits came back: {}",
+            app.status
+        );
+
+        let _ = std::fs::remove_dir_all(&pool);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `load` says what the journal's recovery did: the counts beside the line
+    /// that triggered them. A torn autosave line (a crash mid-write) is reported,
+    /// the intact edits are counted as applied, and a clean load stays quiet —
+    /// the report is the crash story, not a ritual.
+    #[test]
+    fn a_load_reports_the_journals_recovery() {
+        let (pool, script_path) = pool_script("torn-load", "");
+        let mut app = App::idle();
+        app.snap = App::demo_snapshot();
+        app.open_script(&script_path);
+
+        let dir = std::env::temp_dir().join(format!("tui-torn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let line = format!("save {}", dir.display());
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::empty()));
+        for c in line.chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(dir.join("session.txt").is_file(), "saved: {}", app.status);
+
+        // A clean load has no story: the journal is empty, so the line stands alone.
+        let line = format!("load {}", dir.display());
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::empty()));
+        for c in line.chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(app.status, format!(": {line}"), "nothing to report: {}", app.status);
+
+        // A crashed journal: one intact edit, one torn final line (no newline).
+        std::fs::write(
+            dir.join("journal.txt"),
+            "arrange trim t0 c0 start 1200\narrange trim t0 c0 sta",
+        )
+        .expect("torn journal");
+
+        app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::empty()));
+        for c in line.chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(
+            app.status.contains("journal: 1 applied, 1 torn, 0 refused"),
+            "the crash story is on the status line: {}",
             app.status
         );
 

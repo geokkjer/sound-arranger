@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use media::Spsc;
 use media::devices::OutputHandle;
 
-use crate::{HostCommand, HostSession};
+use crate::{HostCommand, HostSession, JournalRecovery};
 
 /// The published state a shell reads: transport position + the mixer meters +
 /// the audio state. Updated by the pump and by command handling; cheap to clone.
@@ -216,6 +216,10 @@ enum Request {
     /// Read the current outcome (arrangement + diagnostics) without changing
     /// anything — what the bridge returns after a single incremental edit.
     Outcome(Sender<HostOutcome>),
+    /// Read what the last `Load` recovered from the session directory's journal
+    /// (applied / torn / refused), so a shell can say what a crash cost. Nothing
+    /// changes.
+    Recovery(Sender<Option<JournalRecovery>>),
     Shutdown,
 }
 
@@ -308,6 +312,21 @@ impl HostHandle {
             .lock()
             .map_err(|_| "host actor poisoned".to_string())?
             .send(Request::Outcome(reply_tx))
+            .map_err(|_| "host actor exited".to_string())?;
+        reply_rx.recv().map_err(|_| "host actor exited".to_string())
+    }
+
+    /// What the last `Load` recovered from the session directory's journal:
+    /// `None` before anything has been loaded, and the counts (applied / torn /
+    /// refused, plus the first refusal's words) afterwards — including for a
+    /// clean load, where [`JournalRecovery::has_story`] says whether there is
+    /// anything worth printing.
+    pub fn last_recovery(&self) -> Result<Option<JournalRecovery>, String> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .lock()
+            .map_err(|_| "host actor poisoned".to_string())?
+            .send(Request::Recovery(reply_tx))
             .map_err(|_| "host actor exited".to_string())?;
         reply_rx.recv().map_err(|_| "host actor exited".to_string())
     }
@@ -455,6 +474,9 @@ fn run(
             Ok(Request::Outcome(reply)) => {
                 let _ = reply.send(build_outcome(&session));
                 publish(&session, &shared, &audio);
+            }
+            Ok(Request::Recovery(reply)) => {
+                let _ = reply.send(session.last_recovery().cloned());
             }
             Ok(Request::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
