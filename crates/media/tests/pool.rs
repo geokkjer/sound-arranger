@@ -736,6 +736,76 @@ fn conform_brings_a_hand_filled_pool_to_the_session_rate() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A **foreign** WAV in the pool directory — one another tool wrote, carrying a
+/// `LIST`/`INFO` chunk after its data — is a well-formed source, and the crash
+/// pass must leave it exactly as it found it. This is the shape that reaches a pool
+/// for real: `import` copies a rate-matching mono file byte for byte, so a DAW
+/// export lands verbatim.
+///
+/// The pre-fix `is_finalized` was `declared_end == file_len`, so the trailing chunk
+/// read as an unfinalized take, `Pool::recover` called `WavWriter::recover` on it,
+/// and the rescan counted the chunk's bytes as audio: the header was patched to
+/// declare 13 extra frames of `LISTINFOISFT…` and the peaks were baked over them.
+/// The pool's own module doc promised it "never mutates a well-formed source", and
+/// that did not hold for any WAV this crate did not write.
+#[test]
+fn a_foreign_source_with_a_trailing_chunk_is_left_alone() {
+    let dir = tmp_dir("foreign-chunk");
+    let path = dir.join("daw-export.ch0.wav");
+    let frames = 1_000u64;
+
+    // 2000 bytes of 16-bit audio at 44, then a 28-byte `LIST` chunk at 2044 —
+    // the header declares the audio, as a foreign writer's does. (The writer is
+    // dropped before the read: its `finalize` patch is still in the `BufWriter`.)
+    {
+        let mut w = WavWriter::create(&path, 48_000, 1).unwrap();
+        w.write(&vec![0.5f32; frames as usize]).unwrap();
+        w.finalize().unwrap();
+    }
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend_from_slice(b"LIST");
+    bytes.extend_from_slice(&20u32.to_le_bytes()); // "INFOISFT" + payload
+    bytes.extend_from_slice(b"INFOISFTthisisatool\x00");
+    let riff = ((bytes.len() - 8) as u32).to_le_bytes();
+    bytes[4..8].copy_from_slice(&riff);
+    std::fs::write(&path, &bytes).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert_eq!(before.len(), 2_072);
+
+    let pool = Pool::open(&dir).unwrap();
+    let index = pool.list().unwrap();
+    assert_eq!(index.errors, Vec::<(PathBuf, String)>::new());
+    let src = &index.sources[0];
+    assert!(src.finalized, "a trailing chunk is not a crashed take");
+    assert_eq!(
+        src.frames, frames,
+        "and its frames are the take's, not the chunk's"
+    );
+
+    let report = pool.recover().unwrap();
+    assert_eq!(report.errors, Vec::<(PathBuf, String)>::new());
+    assert!(
+        report.finalized.is_empty(),
+        "no take to finalize: {:?}",
+        report.finalized
+    );
+    // The peaks are still derived — that is the pass's other job, and it is
+    // derived from the take, not from a rewrite of it.
+    assert_eq!(report.rebuilt_peaks, vec!["daw-export.ch0".to_string()]);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "a well-formed foreign source is not mutated by the crash pass"
+    );
+    let (_, _, peak_frames, rate, _) = PeakFile::read(&dir.join("daw-export.ch0.peaks")).unwrap();
+    assert_eq!((peak_frames, rate), (frames, 48_000));
+    let (audio, _, read_frames) = read_all(&path);
+    assert_eq!(read_frames, frames);
+    assert!(audio.iter().all(|s| (*s - 0.5).abs() < 1e-3));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn import_and_conform_refuse_what_they_cannot_do() {
     let dir = tmp_dir("conform-guards");

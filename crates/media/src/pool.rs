@@ -43,8 +43,12 @@ pub struct PoolSource {
     /// (`Pool::conform` expands it).
     pub channels: u16,
     pub peaks_missing: bool,
-    /// Whether the take is formally well-formed (a crashed, un-finalized take is
-    /// `false` — it shows its recoverable length until `Pool::recover` runs).
+    /// Whether the take needs no crash recovery — every frame its header declares
+    /// is present (`false` is a take short of its own declaration, which shows its
+    /// recoverable length until `Pool::recover` runs). A file that merely holds
+    /// *more* than it declares — a trailing `LIST`/`INFO` chunk, the RIFF pad byte
+    /// after odd-length 24-bit data — is a well-formed source, not a crashed take,
+    /// and is `true`.
     pub finalized: bool,
 }
 
@@ -236,9 +240,12 @@ impl Pool {
 
     /// Recover crashed takes (finalize un-finalized `.wav`s) and rebuild missing
     /// or corrupt `.peaks` sidecars. Never mutates a well-formed source (other
-    /// than deriving its missing peaks). Per-source failures are reported, not
-    /// fatal. **Ordering is load-bearing:** finalize a source's take *before*
-    /// rebuilding its peaks, so the peak frame count matches the recovered take.
+    /// than deriving its missing peaks): only a take *short of its own
+    /// declaration* is a recovery candidate, and `WavWriter::recover` shortens
+    /// what it recovers — a file with bytes after its data chunk is left untouched.
+    /// Per-source failures are reported, not fatal. **Ordering is load-bearing:**
+    /// finalize a source's take *before* rebuilding its peaks, so the peak frame
+    /// count matches the recovered take.
     pub fn recover(&self) -> Result<Recovery, String> {
         let index = self.list()?;
         // carry list()'s unreadable sources through as recovery failures
@@ -248,7 +255,9 @@ impl Pool {
         };
 
         for src in &index.sources {
-            // Finalize a crashed take: the header still declares placeholder sizes.
+            // Finalize a crashed take: the header declares more audio than the file
+            // holds (the placeholder it was written with). A file that holds more
+            // than it declares is not a candidate — `finalized` is true for it.
             if !src.finalized {
                 match WavWriter::recover(&src.wav) {
                     Ok(frames) => report.finalized.push((src.id.clone(), frames)),

@@ -84,16 +84,18 @@ sites were 16-bit, float, 16-bit and float.
   `crashed_take_is_recovered` and the two `Pool::recover` integration tests pass unchanged.
 - `data_bytes`' signature changed. It is a private helper with three call sites (`patch_sizes`,
   `recover`, and its boundary test), so nothing outside `wav.rs` moved.
-- **Still open, and not this note:** `is_finalized` requires `data_offset + declared == file_len`, so
-  a third-party WAV carrying a trailing chunk (`LIST`/`INFO`/`fact`/`cue`) — or the RIFF pad byte
-  after odd-length 24-bit data — reads as a crashed take, and `recover`'s rescan counts those trailing
-  bytes as audio and *inflates* the take rather than truncating it (the same for 16-bit and float).
-  That needs its own decision: relax `is_finalized` to "the declared audio is all present", or have
-  `recover` refuse a file whose data chunk is not the file's tail — and either way
-  `parse_header`'s chunk walk needs the word-alignment pad it currently skips over. It is a separate
-  claim, recorded here so it is not lost with this commit. Until it is fixed, the [media-pool
-  note](../feature/2026-08-24-p1-3-3-media-pool.md)'s "never mutates a well-formed source" invariant
-  holds for files this crate wrote and not yet for foreign WAVs.
+- **Superseded, the hazard this note left open:** `is_finalized` required
+  `data_offset + declared == file_len`, so a third-party WAV carrying a trailing chunk
+  (`LIST`/`INFO`/`fact`/`cue`) — or the RIFF pad byte after odd-length 24-bit data — read as a
+  crashed take, and `recover`'s rescan counted those trailing bytes as audio and *inflated* the take
+  rather than truncating it. Fixed by the [recovery salvage
+  note](2026-09-29-recovery-salvages-only-what-is-there.md): `is_finalized` is now
+  `data_offset + declared <= file_len` and `recover` refuses a file whose data chunk is not the
+  file's tail. The media-pool note's "never mutates a well-formed source" invariant now holds for
+  foreign WAVs too.
+- **Still open, and not this note:** `parse_header`'s chunk walk seeks a chunk's body without the RIFF
+  word-alignment pad byte, so a file with an odd-length chunk *before* `data` still fails to parse
+  ("missing data chunk"). That is a read-path defect, not a recovery one.
 - Tests: `cargo test -p media` green (147 tests, 6 pre-existing hardware/soak ignores).
 
 *Authored with Space Bunny · OpenCode, 2026-09-29.*
