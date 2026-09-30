@@ -29,25 +29,33 @@ a commit with tests + its own note, and the architectural ones pass the co-work 
 
 ## What exists, what is missing (verified)
 
+> **Re-verified against `main` on 2026-09-30.** The note was written 2026-09-23 and several rows had gone
+> stale — `Audio manipulation`'s "nothing: no reverse" was already false when written. Re-check before
+> trusting a row: this table is a snapshot, and the work order below carries the authoritative status.
+
 | Capability | Today | The gap |
 |---|---|---|
 | Cut | `razor_split` + `delete` (`x`, `d`) | — |
-| Copy / paste | **nothing** | No clipboard. `duplicate` stacks the copy at the *same* `at_frame` (`crates/media/src/timeline.rs`), so a paste is duplicate + move = three undo steps |
-| Append | — | `add_clip` takes an explicit frame; no "after this clip" / "at the end" |
-| Snap to grid | — | No grid, no snap. The tempo map exists; the ruler is **seconds**; `H`/`L`'s "one beat" lives in the TUI, so the *workflow* cannot express it (iced has no beat nudge at all) |
-| Time-stretch / tempo match | — | Nothing. Resampling exists (import conformance) but duration-without-pitch is a different algorithm |
+| Copy / paste | *Closed.* `workflow::Action::{Cut,Copy,Paste,PasteAppend}` over a shell-owned clipboard **value**; paste is one logged gesture, so the duplicate+move three-undo problem is gone | — |
+| Append | *Closed.* `Action::PasteAppend` pastes after the active track's last clip; `MoveClip`/`AddClip` take an explicit `at_frame` | "At the end of the arrangement" across tracks is still per-track |
+| Snap to grid | *Closed.* `media::snap` holds the math and the workflow is grid-aware | The iced shell has no beat nudge |
+| Time-stretch / tempo match | *Closed.* `ArrangeOp::Stretch` renders offline into the pool and the logged op points the clip at it (`crates/host/src/lib.rs`) | Quality/algorithm is the open question, not existence |
 | New tracks | `add_track` in the log / `:` | No key/affordance in the TUI; no rename/delete/reorder; track → channel is fixed by index (`ch{ti}`) |
-| Load clips from the pool | `pool`, `pool_sources`, `--wave`, `arrange add_clip` | No pool panel (browse + place + **audition**); the pool-before-arrange requirement is an error string, not a shell affordance |
-| Export the mix | `bounce <frames> <path>` — 16-bit, deterministic, drain-checked | Needs a hand-computed frame count; 16-bit only; no normalize/loudness report; no stems; the documented `@frame`+bounce trap must not leak into the export UX |
-| Mastering | — | No dynamics processing anywhere; the mixer is gain/pan/mute/solo/meters |
-| Audio manipulation | — | Nothing: no reverse, invert, normalize, silence, trim-to-content |
+| Load clips from the pool | `pool`, `pool_sources`, `--wave`, `arrange add_clip`; `Panel::Pool` exists in the TUI with `PoolSource` rows | No audition; the pool-before-arrange requirement is an error string, not a shell affordance |
+| Export the mix | `bounce <frames> <path>` — 16-bit, deterministic, drain-checked; `ExportFormat` adds f32 | Needs a hand-computed frame count; no normalize/loudness report; no stems |
+| Mastering | *Partly closed.* `master_factory` registers `MasterPlugin` — compressor + lookahead brickwall limiter on the bus (`crates/engine/src/plugins/master.rs`) | Not mounted by default, and no shell affordance to mount/see it |
+| Audio manipulation | *Partly closed.* `ArrangeOp::Reverse` exists end to end (clip editor → log → host) | Invert, normalize, silence, trim-to-content |
 
-**Gaps the owner did not list, which the co-work passes ranked as in-scope — the first four are
-foundational, not polish:**
+**Gaps the owner did not list, which the co-work passes ranked as in-scope — the first two are now
+closed and the remainder are foundational, not polish:**
 
-- **Recording into the host** (above). Verified: the wiring does not exist.
-- **Session save/open.** The log lives in memory; there is no `save`. Arranging for a day and quitting
-  loses the piece. The pool has crash recovery; the log has nothing.
+- **Recording into the host.** *Closed (2026-09-23).* This was the note's headline finding and it is no
+  longer true: `record <take_id>` opens the input device, captures through `media::Capture` into the
+  pool and finalizes on `record stop` ([note](../../implemented/feature/2026-09-23-recording-into-the-host.md)).
+  What remains is not engine work — it is the **shell** affordance that makes it usable.
+- **Session save/open.** *Closed (2026-09-23).* A session is a directory (`session.txt` + `pool/` +
+  journal), written atomically, with crash safety from the append-only journal
+  ([note](../../implemented/architecture/2026-09-23-session-directory-save-and-journal.md)).
 - **Stereo material.** *Closed (2026-09-24).* A multi-channel file is now split at the import boundary into
   one mono source per channel, so a stereo jam imports as `{id}.ch0` + `{id}.ch1` and both are placed and
   panned (slice A4, [note](../../implemented/feature/2026-09-24-stereo-material-per-channel-pool.md)). The
@@ -106,9 +114,11 @@ from the shared workflow (a key or a `: ` line — never a shell-only feature).
    with a ring instead of a device
    ([note](../../implemented/feature/2026-09-23-recording-into-the-host.md)). The gate's stand-in review returned `do not
    merge` on a real blocker (a mono input ring demuxed as multi-channel: every take silently corrupt);
-   fixed in the slice, with a hardware-gated test. The design below is preserved as the record. Wire `media::Capture` (which already has drift compensation, crash
-   recovery and per-channel writers) behind the existing `record <take_id>` line: the host opens the input
-   device, mounts `CaptureNode`s into the pool, and the take lands as pool sources (`{take_id}.ch{N}`)
+   fixed in the slice, with a hardware-gated test.
+
+   **The design, preserved as the record.** Wire `media::Capture` (which already has drift compensation,
+   crash recovery and per-channel writers) behind the existing `record <take_id>` line: the host opens the
+   input device, mounts `CaptureNode`s into the pool, and the take lands as pool sources (`{take_id}.ch{N}`)
    that the pool panel can then place. This is the loop's missing first half.
 4. **Material that is actually usable: stereo and bit depths.** *Done (2026-09-24):* the reader accepts
    **16/24-bit PCM and 32-bit float** (24-bit decoded to f32 on the control side; a 32-bit PCM tag is

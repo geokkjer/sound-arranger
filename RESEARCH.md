@@ -25,15 +25,23 @@
 | **Phase 1 (first profile)** | **Core + the sound-arranger profile: record → cut/splice → clip/loop arrange → soft mixer** | See §11 |
 | **Alpha finish line** | **Record in the tool → cut/copy/paste/append with grid snap → tracks → time-stretch → mastering chain → export → session save/open**, in the TUI, with the iced shell on the same workflow ([plan](.agents/notes/proposed/architecture/2026-09-23-alpha-finish-line.md)) | The co-work passes (GLM-5.3-Flash, GLM-5.3, Kimi K3) found the gaps the owner's list assumed away — [reviews verbatim](research/architecture/2026-09-23-alpha-scope-co-work-reviews.md) |
 
-**Where the project is going (2026-09-23).** The three co-work passes over the owner's alpha ask changed
-the order and the scope: the substrate is further along than the owner's list implies (the whole ACID op
-set, the `host v1` language, undo-by-replay, the shared workflow), but **recording is not wired into the
-host at all** (`HostCommand::Record` is a stub), the session has **no save/open**, stereo material is
-reduced to channel 0, 24-bit WAV is refused, and `TransportSeek` is O(target) (~28 s into a 30-minute
-jam). The plan orders the work foundations-first (compound gestures → session save/open → recording →
-stereo/bit depths → grid snap → clipboard/append → tracks → pool panel → utilities → stretch → mastering
-→ export → markers → seek → docs) and records what is deliberately cut from alpha. The goal is live;
-the slices land as commits with tests and notes, and the architectural ones pass the reviewer gate.
+**Where the project is going (2026-09-23; re-verified against the code 2026-09-30).** The three co-work
+passes over the owner's alpha ask changed the order and the scope: the substrate is further along than the
+owner's list implies (the whole ACID op set, the `host v1` language, undo-by-replay, the shared workflow).
+Four of the five gaps that pass then reported are now **closed**: recording **is** wired into the host
+(`HostCommand::Record`/`RecordStop` → `HostSession::record` opens the input device via
+`media::devices::open_input`, captures into the pool, and finalizes the take on stop —
+`crates/host/src/lib.rs`), the session **does** save and open as a directory (`session.txt` + `pool/` +
+append-only journal, `HostSession::{save, load_session}`), stereo material is **split per channel at the
+import boundary** instead of reduced to channel 0, and 24-bit WAV **is** accepted. What genuinely remains
+is **`TransportSeek`, which is still O(target)** — `replay_to` rebuilds a session and renders from zero
+(~28 s into a 30-minute jam, the one gap that gets worse with use) — plus the *shell* work that makes any
+of the above reachable by a human. The plan orders the work foundations-first (compound gestures → session
+save/open → recording → stereo/bit depths → grid snap → clipboard/append → tracks → pool panel → utilities
+→ stretch → mastering → export → markers → seek → docs) and records what is deliberately cut from alpha;
+items 1–7 of that order have now landed. The goal is live; the slices land as commits with tests and notes,
+and the architectural ones pass the reviewer gate. Corrected here because the earlier text kept steering
+sessions at work that was already done.
 
 ---
 
