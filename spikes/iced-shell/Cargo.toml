@@ -21,6 +21,10 @@ iced = { version = "0.14", features = ["canvas", "image"] }
 # https://github.com/iced-rs/iced_audio
 iced_audio = "0.17"
 host = { path = "../../crates/host" }
+# The mixer's **declared parameter bounds** — the fader's ceiling comes from
+# here, not from a number guessed in the shell, so a fader can never ask the
+# host for a value the host must refuse.
+engine = { path = "../../crates/engine" }
 # The shared shell workflow: modes, keys, actions. This shell is the *second* one to
 # speak it, which is the whole point — one table, two shells.
 workflow = { path = "../../crates/workflow" }

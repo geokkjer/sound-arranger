@@ -75,21 +75,52 @@ const SAMPLE_RATE: i64 = 48_000;
 /// the distance a drag has to cover to cross its whole range.
 const FADER_HEIGHT: f32 = 150.0;
 
-/// The fader range: -60 dB (silence) to +12 dB, with unity at ~83 % of the
-/// travel — the console convention, and `unmap_to_db` is the exact inverse of
-/// `map_db`.
+/// The fader's floor: -60 dB reads as silence, and the linear gain at the
+/// bottom of the declared range is 0 (true silence, so the floor is a display
+/// choice, not a mapping constraint).
+const FADER_FLOOR_DB: f32 = -60.0;
+
+/// Where unity sits on the throw. Not a free choice: it follows from the
+/// declared gain bounds ([0, 2] -> -inf..+6.02 dB), which puts 0 dB at ~91 %.
+fn fader_unity() -> Normal {
+    Normal::new((0.0 - FADER_FLOOR_DB) / (fader_max_db() - FADER_FLOOR_DB))
+}
+
+/// The fader range, derived from the **mixer's own declared bounds**.
 ///
-/// The top is deliberately **+12, not +24**. `DRange`'s skew is non-linear, so a
-/// knee far above unity compresses the whole useful top into the last few
-/// millimetres of throw: with a +24 ceiling the final 10 % of travel bought
-/// ~0.9 dB. Capping the knee at +12 keeps the top usable everywhere from
-/// silence to the ceiling.
-const FADER: DBRange = DBRange::new(
-    -60.0,
-    12.0,
-    Normal::new(0.833),
-    DBRange::DEFAULT_SKEW_FACTOR,
-);
+/// The ceiling is `20·log10` of the largest gain the engine declares, so the top
+/// of every fader is a value the host accepts. Hard-coding +12 dB was the bug:
+/// the mixer declares gain `max: 2.0` (+6.02 dB), so a fader at its top asked
+/// for gain 3.98 and the host refused it — "parameter 'ch0.gain' out of range
+/// [0, 2]" — while the fader snapped back to the unchanged real value.
+fn fader_range() -> DBRange {
+    DBRange::new(
+        FADER_FLOOR_DB,
+        fader_max_db(),
+        fader_unity(),
+        DBRange::DEFAULT_SKEW_FACTOR,
+    )
+}
+
+/// The largest gain the mixer declares, in dB.
+///
+/// Panics at boot if the mixer's gain bounds are missing or inconsistent: a
+/// silent fallback would put the fader and the host out of step again, which is
+/// exactly the defect this replaced.
+fn fader_max_db() -> f32 {
+    let gains: Vec<f32> = engine::plugins::MIXER_PARAMS
+        .iter()
+        .filter(|def| def.name.ends_with(".gain"))
+        .map(|def| def.max)
+        .collect();
+    let first = *gains.first().expect("the mixer declares gain parameters");
+    assert!(
+        gains.iter().all(|max| (*max - first).abs() < f32::EPSILON),
+        "the mixer's gain bounds disagree: {gains:?}"
+    );
+    assert!(first > 0.0, "a gain ceiling of {first} has no dB range");
+    20.0 * first.log10()
+}
 
 /// `set_param` targets as `&'static str` (the command carries static names):
 /// `ch0.gain` … `ch7.gain`, then the master. `MIXER_CHANNELS_MAX` is 8.
@@ -207,7 +238,7 @@ impl Spike {
             snap: host.snapshot(),
             host,
             status,
-            faders: vec![FADER.default_param(); 1],
+            faders: vec![fader_range().default_param(); 1],
             channels: 0,
             selected: 0,
             mode: Mode::Normal,
@@ -243,7 +274,7 @@ impl Spike {
             .min(GAIN_PARAMS.len() - 1);
         if channels + 1 != self.faders.len() {
             self.channels = channels;
-            self.faders = vec![FADER.default_param(); channels + 1];
+            self.faders = vec![fader_range().default_param(); channels + 1];
         }
 
         for (plugin, param, value) in &outcome.params {
@@ -264,7 +295,7 @@ impl Spike {
             } else {
                 f32::NEG_INFINITY
             };
-            fader.set(FADER.map_db(db));
+            fader.set(fader_range().map_db(db));
         }
     }
 
@@ -287,7 +318,7 @@ impl Spike {
             fader.set(normal);
         }
         let param = Spike::gain_param(index, self.channels);
-        let db = FADER.unmap_to_db(normal);
+        let db = fader_range().unmap_to_db(normal);
         let gain = 10f32.powf(db / 20.0);
         self.status = format!("{param} = {db:+.1} dB ({gain:.4})");
         self.command(HostCommand::SetParam {
@@ -562,7 +593,7 @@ impl Spike {
         if index >= self.faders.len() {
             return;
         }
-        let current = FADER.unmap_to_db(self.faders[index].normal);
+        let current = fader_range().unmap_to_db(self.faders[index].normal);
         self.set_selected_fader(10f32.powf((current + 0.5 * direction as f32) / 20.0));
     }
 
@@ -573,7 +604,7 @@ impl Spike {
         if index >= self.faders.len() {
             return;
         }
-        let normal = FADER.map_db(if gain > 0.0 {
+        let normal = fader_range().map_db(if gain > 0.0 {
             20.0 * gain.log10()
         } else {
             f32::NEG_INFINITY
@@ -722,7 +753,7 @@ impl Spike {
                     self.snap.channels.get(index).copied().unwrap_or(0.0),
                 )
             };
-            let db = FADER.unmap_to_db(fader.normal);
+            let db = fader_range().unmap_to_db(fader.normal);
 
             strips = strips.push(
                 column![
@@ -934,17 +965,30 @@ mod tests {
     /// floors at the range minimum instead of going to -inf/NaN.
     #[test]
     fn the_fader_range_round_trips_in_db() {
-        assert!(FADER.unmap_to_db(FADER.map_db(0.0)).abs() < 1e-4);
+        assert!(fader_range().unmap_to_db(fader_range().map_db(0.0)).abs() < 1e-4);
 
         for gain in [1.0f32, 0.5, 0.25, 2.0] {
             let db = 20.0 * gain.log10();
-            let back = 10f32.powf(FADER.unmap_to_db(FADER.map_db(db)) / 20.0);
+            let back = 10f32.powf(fader_range().unmap_to_db(fader_range().map_db(db)) / 20.0);
             assert!((back - gain).abs() < 0.01 * gain, "{gain} -> {back}");
         }
 
-        assert_eq!(FADER.unmap_to_db(FADER.map_db(-120.0)), -60.0);
-        assert_eq!(FADER.unmap_to_db(FADER.map_db(f32::NEG_INFINITY)), -60.0);
-        assert_eq!(FADER.unmap_to_db(FADER.map_db(24.0)), 12.0);
+        assert_eq!(
+            fader_range().unmap_to_db(fader_range().map_db(-120.0)),
+            -60.0
+        );
+        assert_eq!(
+            fader_range().unmap_to_db(fader_range().map_db(f32::NEG_INFINITY)),
+            -60.0
+        );
+        // A value above the ceiling clamps to the ceiling (exact float identity
+        // is not guaranteed through the skew, so compare with a tolerance).
+        let clamped = fader_range().unmap_to_db(fader_range().map_db(24.0));
+        assert!(
+            (clamped - fader_max_db()).abs() < 1e-4,
+            "24 dB clamped to {clamped:+.4}, not the ceiling {:.4}",
+            fader_max_db()
+        );
     }
 
     /// The translation layer is the one place this shell can drift from the shared
@@ -1029,7 +1073,7 @@ mod tests {
         assert!(app.prompt.is_none(), "Enter closes the line");
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.status.starts_with(": set_param"), "{}", app.status);
-        let db = FADER.unmap_to_db(app.faders[master].normal);
+        let db = fader_range().unmap_to_db(app.faders[master].normal);
         assert!(
             (db - 20.0 * 0.5f32.log10()).abs() < 0.01,
             "the fader follows the log fold: {db} dB ({})",
@@ -1091,13 +1135,13 @@ mod tests {
         assert_eq!(app.selected, 0);
         app.on_key(WorkflowKey::Char('j'));
         assert_eq!(app.selected, 1, "{}", app.status);
-        let before = FADER.unmap_to_db(app.faders[1].normal);
+        let before = fader_range().unmap_to_db(app.faders[1].normal);
         app.on_key(WorkflowKey::Char('+'));
-        let after = FADER.unmap_to_db(app.faders[1].normal);
+        let after = fader_range().unmap_to_db(app.faders[1].normal);
         assert!((after - (before + 0.5)).abs() < 0.01, "{before} -> {after}");
         app.on_key(WorkflowKey::Char('0'));
         assert!(
-            FADER.unmap_to_db(app.faders[1].normal).abs() < 0.01,
+            fader_range().unmap_to_db(app.faders[1].normal).abs() < 0.01,
             "0 is unity"
         );
 
@@ -1135,7 +1179,7 @@ mod fader_travel {
     fn the_fader_range_is_the_sliders_whole_range() {
         for normal in [0.0f32, 0.25, 0.5, 0.833, 1.0] {
             let n = Normal::new(normal);
-            let round_tripped = FADER.map_db(FADER.unmap_to_db(n)).as_f32();
+            let round_tripped = fader_range().map_db(fader_range().unmap_to_db(n)).as_f32();
             assert!(
                 (round_tripped - normal).abs() < 1e-5,
                 "normal {normal} round-trips to {round_tripped}"
@@ -1143,8 +1187,8 @@ mod fader_travel {
         }
         // The slider is fed `fader.normal.as_f32()` directly, so the range the
         // widget is given must be the unit interval.
-        assert_eq!(FADER.unmap_to_db(Normal::new(0.0)), -60.0);
-        assert_eq!(FADER.unmap_to_db(Normal::new(1.0)), 12.0);
+        assert_eq!(fader_range().unmap_to_db(Normal::new(0.0)), FADER_FLOOR_DB);
+        assert!((fader_range().unmap_to_db(Normal::new(1.0)) - fader_max_db()).abs() < 1e-4);
     }
 
     /// Every part of the throw has to be usable, including the top.
@@ -1154,22 +1198,81 @@ mod fader_travel {
     /// 10 % of travel bought ~0.9 dB.
     #[test]
     fn the_top_of_the_throw_is_usable() {
-        let knee = FADER.unmap_to_db(Normal::new(1.0));
-        assert!(knee <= 12.0 + 1e-3, "the ceiling drifted to {knee:+.2} dB");
+        let knee = fader_range().unmap_to_db(Normal::new(1.0));
 
-        // The top tenth must buy at least 2 dB, or the fader is unusable there.
-        let at_90 = FADER.unmap_to_db(Normal::new(0.9));
+        // The top tenth must buy a usable amount, or the fader is useless there.
+        let at_90 = fader_range().unmap_to_db(Normal::new(0.9));
         assert!(
             knee - at_90 >= 2.0,
             "the last 10 % of travel buys only {:.2} dB (from {at_90:+.2} to {knee:+.2})",
             knee - at_90
         );
 
-        // And unity must sit near the console convention's 83 %.
-        let unity = FADER.map_db(0.0).as_f32();
+        // Unity is where the *declared bounds* put it, not the 83 % console
+        // convention: with a -60 dB floor and a +6.02 dB ceiling, 0 dB lands at
+        // about 91 %. The test asserts the relationship, so a change to either
+        // bound is a deliberate move rather than an accident in this file.
+        let unity = fader_range().map_db(0.0).as_f32();
         assert!(
-            (unity - 0.833).abs() < 0.01,
-            "unity landed at {unity:.3} of the travel, not ~0.833"
+            (unity - fader_unity().as_f32()).abs() < 1e-6,
+            "unity landed at {unity:.3} of the travel"
         );
+        assert!(
+            at_90 < unity && unity < 1.0,
+            "unity must sit inside the top tenth: {at_90:.3} < {unity:.3} < 1.0"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fader_matches_the_declared_bounds {
+    use super::*;
+
+    /// The fader's top must be a gain the host accepts.
+    ///
+    /// Regression: the ceiling was hard-coded at +12 dB (gain 3.98) while the
+    /// mixer declares gain `max: 2.0`, so the top of every fader asked for a
+    /// value the engine refuses — "[0, 2] out of range" — and the fader jumped
+    /// back to the unchanged real value.
+    #[test]
+    fn the_top_of_the_fader_is_a_value_the_host_accepts() {
+        let ceiling = 10f32.powf(fader_max_db() / 20.0);
+        for def in engine::plugins::MIXER_PARAMS
+            .iter()
+            .filter(|d| d.name.ends_with(".gain"))
+        {
+            assert!(
+                ceiling <= def.max + 1e-4,
+                "the fader's top is gain {ceiling:.4}, but '{}' declares max {}",
+                def.name,
+                def.max
+            );
+            assert!(
+                ceiling >= def.min,
+                "the fader's top is below '{}' min",
+                def.name
+            );
+        }
+        // And it is *at* the declared ceiling, not below it — a fader that stops
+        // short cannot reach the gain the host is willing to give.
+        let declared_max = engine::plugins::MIXER_PARAMS
+            .iter()
+            .filter(|d| d.name.ends_with(".gain"))
+            .map(|d| d.max)
+            .fold(f32::MIN, f32::max);
+        assert!(
+            (ceiling - declared_max).abs() < 1e-4,
+            "ceiling {ceiling} vs declared {declared_max}"
+        );
+    }
+
+    /// Unity sits where the bounds put it: 0 dB between a -60 dB floor and the
+    /// declared ceiling.
+    #[test]
+    fn unity_follows_from_the_bounds() {
+        let expected = (0.0 - FADER_FLOOR_DB) / (fader_max_db() - FADER_FLOOR_DB);
+        assert!((fader_unity().as_f32() - expected).abs() < 1e-6);
+        let db = fader_range().unmap_to_db(fader_unity());
+        assert!(db.abs() < 1e-3, "unity reads {db:+.3} dB, not 0");
     }
 }
