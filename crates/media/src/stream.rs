@@ -6,9 +6,10 @@
 //! `out("audio")` port, zero-fills and counts underruns, and applies
 //! [`SpliceCmd`]s sample-accurately inside the block: an equal-power crossfade
 //! from the current source to the incoming clip over `crossfade` samples at
-//! the requested absolute frame. The render path only pops rings and mixes;
-//! all allocation and thread spawning happened when the command was issued,
-//! and a retired reader is *detached*, never joined, on the render path.
+//! the requested absolute frame (a `crossfade` too short to mix in is a cut).
+//! The render path only pops rings and mixes; all allocation and thread spawning
+//! happened when the command was issued, and a retired reader is *detached*,
+//! never joined, on the render path.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -238,7 +239,10 @@ pub struct SpliceCmd {
     pub at_frame: u64,
     /// the clip to fade into
     pub incoming: FilePlayer,
-    /// crossfade length in samples (equal-power)
+    /// crossfade length in samples (equal-power). A window too short to mix in
+    /// — `0`, or the `1` it is read as — is a **hard cut**: the incoming clip's
+    /// first sample *is* the frame at `at_frame`, at gain 1, so no part of it
+    /// is faded in or lost.
     pub crossfade: u32,
 }
 
@@ -395,6 +399,9 @@ impl AudioNode for PlaybackNode {
                 self.deferred.fetch_add(1, Ordering::Relaxed);
             }
             let offset = cmd.at_frame.saturating_sub(f0).min(out.len() as u64) as u32;
+            // A crossfade too short to mix in (0, or the 1 it is clamped to below)
+            // is a **cut**, and the render loop reads a one-sample window as one.
+            // `max(1)` is here so `remaining` cannot underflow below.
             let crossfade = cmd.crossfade.max(1);
             self.fade = Some(Fade {
                 cur: self.cur.take(), // None → fade from silence
@@ -422,19 +429,27 @@ impl AudioNode for PlaybackNode {
                 }
                 continue;
             }
-            // equal-power crossfade: t runs 0 → 1 across the window, so the
-            // last fade sample is pure incoming (no gain step at the end).
-            let pos = fade.total - fade.remaining;
-            let denom = (fade.total - 1).max(1) as f32;
-            let t = pos as f32 / denom;
-            let g_cur = (std::f32::consts::FRAC_PI_2 * t).cos();
-            let g_in = (std::f32::consts::FRAC_PI_2 * t).sin();
-            let a = match &mut fade.cur {
-                Some(cur) => pop_sample(cur, &self.underruns),
-                None => 0.0,
-            };
+            // A window of one sample is a **cut**, not a crossfade: equal-power has
+            // no room to mix there, and `t` would be 0, so the incoming clip's
+            // first sample — the whole of a one-frame clip — would be multiplied
+            // by zero and lost. So the window's single sample is the incoming's
+            // first at gain 1, and the outgoing's last is the frame before it.
             let b = pop_sample(&mut fade.incoming, &self.underruns);
-            *sample = a * g_cur + b * g_in;
+            if fade.total <= 1 {
+                *sample = b;
+            } else {
+                // equal-power crossfade: t runs 0 → 1 across the window, so the
+                // last fade sample is pure incoming (no gain step at the end).
+                let pos = fade.total - fade.remaining;
+                let t = pos as f32 / (fade.total - 1) as f32;
+                let g_cur = (std::f32::consts::FRAC_PI_2 * t).cos();
+                let g_in = (std::f32::consts::FRAC_PI_2 * t).sin();
+                let a = match &mut fade.cur {
+                    Some(cur) => pop_sample(cur, &self.underruns),
+                    None => 0.0,
+                };
+                *sample = a * g_cur + b * g_in;
+            }
             fade.remaining -= 1;
             if fade.remaining == 0 {
                 let finished = self.fade.take().expect("fade in progress");
@@ -494,6 +509,25 @@ mod tests {
         w.finalize().unwrap();
     }
 
+    /// A position-revealing ramp as `write_ramp` makes it, but phase-shifted by
+    /// `shift`, so its **first sample is not `0.0`**. A clip that starts on zero
+    /// is indistinguishable from silence, which is exactly the mistake these
+    /// cut tests must not be able to make.
+    fn write_shifted_ramp(path: &Path, frames: u64, sr: u32, period: u64, shift: u64) {
+        let mut w = WavWriter::create_float(path, sr, 1).unwrap();
+        let mut buf = vec![0.0f32; 2048];
+        let mut i = 0u64;
+        while i < frames {
+            let n = buf.len().min((frames - i) as usize);
+            for (k, s) in buf[..n].iter_mut().enumerate() {
+                *s = ((i + k as u64 + shift) % period.max(1)) as f32 / period.max(1) as f32;
+            }
+            w.write(&buf[..n]).unwrap();
+            i += n as u64;
+        }
+        w.finalize().unwrap();
+    }
+
     /// The value the ring contains for `k`-th production of an anchored reader.
     fn ramp_at(frames: u64, period: u64) -> f32 {
         (frames % period.max(1)) as f32 / period.max(1) as f32
@@ -526,6 +560,77 @@ mod tests {
             tempo,
             mode: engine::RenderMode::Timeline,
         }
+    }
+
+    /// Read `frames` samples from a WAV (the files under test are short enough to
+    /// be one whole read).
+    fn read_file(path: &Path, frames: usize) -> Vec<f32> {
+        let mut reader = WavReader::open(path).unwrap();
+        let mut out = vec![0.0f32; frames];
+        assert_eq!(reader.read_into(&mut out), frames, "read the whole file");
+        out
+    }
+
+    /// Wait until the reader has produced its whole clip into the ring, so a
+    /// render cannot underrun for want of data (deterministic, not a fixed sleep).
+    fn warm(player: &FilePlayer) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while player.produced() < player.expected() && !player.eof() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reader did not fill its ring in time"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// A `PlaybackNode` playing all of `a`, with a splice of all of `b` waiting
+    /// in its mailbox for frame `f`. Both rings are warm before it returns.
+    fn splice_node(a: &Path, b: &Path, f: u64, crossfade: u32) -> PlaybackNode {
+        let cur = FilePlayer::start(ClipRef::whole(a).unwrap(), DEFAULT_RING_CAPACITY).unwrap();
+        warm(&cur);
+        let incoming =
+            FilePlayer::start(ClipRef::whole(b).unwrap(), DEFAULT_RING_CAPACITY).unwrap();
+        warm(&incoming);
+        let node = PlaybackNode::new(Some(cur), mailbox());
+        node.mailbox().lock().unwrap().push_back(SpliceCmd {
+            at_frame: f,
+            incoming,
+            crossfade,
+        });
+        node
+    }
+
+    /// Render `frames` through a `PlaybackNode` in `engine::BLOCK` chunks — the
+    /// node is mounted opaque, so the graph would hand it exactly this one-block
+    /// `NodeIO`.
+    fn render_node(node: &mut PlaybackNode, frames: usize, sr: u32) -> Vec<f32> {
+        let tempo = engine::TempoMap::new(sr, 120.0, 4);
+        let mut out = vec![0.0f32; frames];
+        let mut control = 0.0f32;
+        let mut triggers = EventBuf::new();
+        let mut notes = EventBuf::new();
+        for (bi, chunk) in out.chunks_mut(engine::BLOCK).enumerate() {
+            let io = NodeIO {
+                audio_in: &[],
+                audio_ins: engine::AudioInputs::none(),
+                audio_in_count: 0,
+                audio_out_channels: 1,
+                frames: chunk.len(),
+                control_in: 0.0,
+                triggers_in: &[],
+                notes_in: &[],
+            };
+            node.render(
+                &io,
+                chunk,
+                &mut control,
+                &mut triggers,
+                &mut notes,
+                block(sr, (bi * engine::BLOCK) as u64, &tempo),
+            );
+        }
+        out
     }
 
     #[test]
@@ -672,5 +777,99 @@ mod tests {
             "the looped remainder must be all the reader produces"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A crossfade too short to mix in — `0`, or the `1` it is read as — is a
+    /// **hard cut**, sample-accurate at the requested frame: pure A before it,
+    /// the incoming clip's **first** sample *at* it, then the incoming clip
+    /// running on unshifted. Equal-power has no room to mix in a one-sample
+    /// window (`t` is 0 there), so the old form multiplied the incoming's first
+    /// sample by zero, emitted the cut one sample late and shifted the whole
+    /// incoming clip by one.
+    #[test]
+    fn a_crossfade_too_short_to_mix_is_a_sample_accurate_cut() {
+        let a = tmp("cut-a");
+        let b = tmp("cut-b");
+        let sr = 48_000u32;
+        let f = 1000usize; // mid-block: the cut must land on this exact frame
+        let total = 2048usize;
+        // Two position-revealing clips that share no value at the seam: A starts
+        // its own ramp, B's is phase-shifted, so A[f] and B[0] differ and neither
+        // is zero.
+        write_shifted_ramp(&a, total as u64, sr, 257, 0);
+        write_shifted_ramp(&b, total as u64, sr, 251, 100);
+        let fa = read_file(&a, total);
+        let fb = read_file(&b, total);
+        assert_ne!(
+            fa[f], fb[0],
+            "the test is only honest if A's frame at the cut differs from B's first"
+        );
+
+        for &crossfade in &[0u32, 1] {
+            let mut node = splice_node(&a, &b, f as u64, crossfade);
+            let out = render_node(&mut node, total, sr);
+            assert_eq!(
+                node.underruns(),
+                0,
+                "warm rings must not underrun (crossfade {crossfade})"
+            );
+            assert_eq!(
+                node.deferred(),
+                0,
+                "the cut applies at its exact frame (crossfade {crossfade})"
+            );
+            assert_eq!(
+                out[..f],
+                fa[..f],
+                "before the cut: pure A (crossfade {crossfade})"
+            );
+            assert_eq!(
+                out[f], fb[0],
+                "the cut frame is the incoming's FIRST sample, not A's (crossfade {crossfade})"
+            );
+            assert_eq!(
+                out[f + 1..],
+                fb[1..total - f],
+                "after the cut: B from its second sample on, unshifted (crossfade {crossfade})"
+            );
+        }
+
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    /// The sharpest form of the same defect: an incoming clip of **one frame**
+    /// has nothing but its first sample, so a fade that starts at `t = 0`
+    /// silenced it for its entire life — the sample was consumed by the window
+    /// and multiplied by zero, the ring then ran dry with `eof` set, and every
+    /// later `pop_sample` returned legitimate silence. A cut plays it.
+    #[test]
+    fn a_one_frame_incoming_clip_is_audible_through_a_cut() {
+        let a = tmp("cut1-a");
+        let b = tmp("cut1-b");
+        let sr = 48_000u32;
+        let f = 700usize; // mid-block again
+        let total = 1024usize;
+        write_shifted_ramp(&a, total as u64, sr, 257, 0);
+        let mut w = WavWriter::create_float(&b, sr, 1).unwrap();
+        w.write(&[0.75]).unwrap(); // one frame, a value nothing else in the test has
+        w.finalize().unwrap();
+
+        let mut node = splice_node(&a, &b, f as u64, 0);
+        let out = render_node(&mut node, total, sr);
+
+        assert_eq!(node.underruns(), 0, "warm rings must not underrun");
+        assert_eq!(node.deferred(), 0, "the cut applies at its exact frame");
+        assert_eq!(
+            out[f], 0.75,
+            "a one-frame clip must be audible, not swallowed by the cut"
+        );
+        assert!(
+            out[f + 1..].iter().all(|s| *s == 0.0),
+            "then silence: the one-frame clip is over, and that is not an underrun"
+        );
+
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
     }
 }
