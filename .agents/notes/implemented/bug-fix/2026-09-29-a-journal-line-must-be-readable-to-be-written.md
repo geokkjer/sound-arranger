@@ -32,10 +32,32 @@ file whose path has a space, and the session is bricked on the next open. The sa
 already made such a session unsaveable, so the journal was the one remaining way the
 material landed — and it destroyed loadability instead.
 
+**Refined by the verification of this change.** The review confirmed the wedge was closed
+and found two more on the same path:
+
+- **`save` wrote a session directory that would not reopen.** Its self-check answered the
+  *form*'s question — "does this text parse to the same commands?" — which is not the
+  reader's question. An entry can be spelled faithfully and still be **refused by the
+  applier**: `set_param … NaN` has exactly one spelling and exactly one verdict
+  (`parameter '…' must be finite`), so the comparison passed and the save wrote a
+  `session.txt` that `load_session` returns `Err` on — the brick this note exists to
+  prevent, with the journal already truncated by the same call. Today's trigger is a
+  `NaN`/`inf` operand; tomorrow it is any op whose form the writer spells and the
+  applier refuses, because a writer-side *list* of commands that will not apply is a list
+  that rots, and the form is not what decides it.
+- **A refusal outlived the edit it named.** Only a `save` cleared the `Refused` variant,
+  `undo` took the offending entry out of the history, and `carry_over` carried the report
+  across the rebuild — so `journal_error()` asserted "this edit is in the live session and
+  nowhere else" about an edit that was no longer in the session, and the TUI's status line
+  read "autosave failed" after every subsequent edit. A false alarm is the mirror image of
+  the lost alarm the previous change fixed, and it is the one users actually hit.
+
 ## Decision
 
-**A journal line is read back by the parser that will read it, before it is written; and
-an entry that cannot be read is dropped and reported, never fatal.**
+**A journal line is read back by the parser that will read it, before it is written; an
+entry that cannot be read is dropped and reported, never fatal; a saved session is
+*applied* before it is written, so the platform cannot write a file it will not open; and
+a report of what could not be saved cannot outlive the edit it names.**
 
 - **`journal_append` verifies its entry, the way `save` verifies the script.**
   `entry_round_trips` renders the entry's expected command(s) — a bare command, or a
@@ -61,6 +83,49 @@ an entry that cannot be read is dropped and reported, never fatal.**
   door beats accepting an edit that quietly costs the user the ability to reopen their
   session; the shells speak this form through `parse_script`, which would have refused
   the same spelling anyway.
+- **`save` validates by *building* the session, not by parsing the text — and the check
+  sits before the temp file, not before the rename.** The write side's rule is now
+  **"whatever is written can be read back *and applied*"**: the script is applied to a
+  fresh session by the very walk `load_session` runs (`HostSession::from_script`, reached
+  through the private `from_script_with`, whose only difference from a load is a silent
+  MIDI sink — a save must not open a device, let alone take the live session's), and the
+  first refusal is named by **the edit** (its own lines in the file) plus the applier's
+  reason. `HostSession::from_script` now returns the index of the command it refused
+  behind its usual reason, because an index is what lets a *writer* name an edit and a
+  *reader* needs nothing more.
+  **The order is the decision.** Every refusal happens before a single byte is written, and
+  in particular before the journal is truncated: the journal is the autosave and the only
+  durable record of the edits since the last save, so truncating it and then failing would
+  destroy the tail to buy nothing. A refused save therefore leaves the directory exactly as
+  it was — the previous `session.txt` still opens, the journal still holds the unsaved
+  edits, and not even a `session.txt.tmp` appears.
+- **The two write paths hold deliberately different strengths, and the split is by
+  durability.** The journal checks *reads back as itself* (`entry_fault`), per entry,
+  because it is best-effort and the load side already drops and reports an entry it cannot
+  apply — the one write path that cannot be made to refuse opens. `save` checks *reads
+  back and applies*, over the whole script, because it writes the baseline the session is
+  rebuilt from and that file has to open. So an entry the session itself would refuse (a
+  `NaN` param) is journalled and reported per entry on replay, and the save that would
+  have bricked the directory is refused by name instead.
+- **A refusal is re-derived from the history; it is not latched and not merely cleared.**
+  `rederive_journal_fault` re-reads the outstanding refusal whenever the history changes
+  under it — `carry_over` (undo, redo, a seek) and `save`'s pool re-point — from
+  `outstanding_refusal`, the *same predicate the write uses* (`entry_fault`) and the same
+  report text (`refusal_report`), so the write and the report cannot disagree about what
+  is spellable. One rule, both directions: an entry still in the history and still
+  unspellable keeps its report (which is what a successful write must not erase), an entry
+  that `undo` removed takes it with it, and one a `redo` put back brings it back. Two
+  guards: **no session directory, no report** (there is no autosave to have refused
+  anything — an unspellable edit in a directory-less session is a `save` refusal, named by
+  `save`), and **a write fault stands** (it is the file's, and a history edit is no
+  evidence about a file; a `save` rewrote the file, so it clears that one itself).
+- **The word-based form still says so when it cannot express a command**, and says it as
+  a fact about the *form*: `write_entry`'s refusal is now the bare
+  "the host v1 text form cannot express …", and the caller adds what it does about it (a
+  save refuses the write, the journal drops the entry and reports it). The journal also no
+  longer skips such an entry **in silence** — the report says "it has no line in the host
+  v1 text form" — because the journal is the one write path that can meet an entry a save
+  never saw (a session opened from a hand-edited script).
 
 ## Evidence
 
@@ -88,7 +153,29 @@ an entry that cannot be read is dropped and reported, never fatal.**
   the `group begin`-without-`group end` truncation are untouched), and
   `a_journal_that_re_mounts_a_plugin_is_applied_not_dropped` (a document walk, whose
   `applied` count is unchanged by per-entry parsing: a gesture is one `Group` command
-  either way). 67 host tests green.
+  either way). They pass with the two below.
+- **From the verification that found the two wedges above** (`cargo test -p host`: 74 lib
+  tests green, plus the session/journal integration binaries):
+  - `a_session_the_applier_refuses_is_not_saved` — a saved session, a spellable edit (so
+    the journal holds a tail), then a `NaN` param committed to the document. `save` is
+    refused, and the message names **both** the edit (`set_param mixer ch0.gain NaN`) and
+    the applier's reason (`must be finite`). `session.txt` is byte-identical to before,
+    `journal.txt` still holds the tail, no temp file exists, and the directory still
+    **loads** with the unsaved edit in it. On the unfixed code the save *succeeds*
+    (`expect_err` panics on `Ok(())`) and the directory it wrote will not open.
+  - `an_undo_that_removes_a_refused_edit_clears_the_report` — a clip id with a space (an
+    `Arrange` op, so it is undoable: a false alarm needs a *removable* subject) is refused
+    by the autosave and named; a later **successful** write (`set_param … 0.5`, not the
+    `Arrange` entry) is journalled and leaves the refusal standing; the **undo** then
+    clears it, a spellable edit after it is autosaved silently, the **redo** brings the
+    report back (so the state is re-derived, not cleared), and the directory loads with
+    nothing in the journal refused. On the unfixed code the undo leaves the report
+    standing for an edit that is no longer in the session.
+  - `a_value_that_cannot_compare_equal_to_itself_does_not_wedge_the_autosave` keeps its
+    subject — the *form* carries a `NaN`, the journal writes it, the replay costs one
+    dropped entry — and its final assertion is now that the save **refuses** it, which is
+    the honest verdict rather than a brick. The test's doc states the split: that is the
+    autosave's half of the rule; `save` holds the stronger one.
 
 ## Alternatives considered
 
@@ -125,12 +212,50 @@ an entry that cannot be read is dropped and reported, never fatal.**
   hand-written list of unspellable commands is a list that rots. The two name checks are
   kept anyway, because refusing at the door is what tells the user *why* their edit is
   not saveable.
+- **A writer-side list of commands the applier will refuse** (a `match` over
+  `HostCommand` next to `apply`, "these are the ones a script cannot carry"). Rejected:
+  the same rot argument as the hand-written unspellable list, one layer up — and it is
+  worse, because it *looks* complete. The writer already has the reader: `from_script` is
+  the definition of "applies", so a save that does not use it is the one place on the
+  platform where a second, stale answer to that question could be maintained.
+- **Refuse the operand at the door instead** — `format_command`/`parse_script` rejecting
+  a `NaN`, as the *clip id* is a plain stem and the *source* a pool id (the
+  [pool-id note](2026-09-29-a-clip-source-is-a-pool-id-not-a-path.md)). Not rejected on
+  merit; that is the right shape for an operand that has an illegal-for-the-log spelling.
+  Rejected as the *whole* fix for two reasons. A `NaN` has **no** legal spelling, so the
+  door cannot be the only line — and the door does not need to be, because the engine's
+  `set_param` already refuses it before the value is logged, which is where a value rule
+  belongs. And the door is unreachable for the general case anyway: this is about any op
+  whose *form* the writer spells and whose *apply* refuses, which is a set nobody can
+  write down. The engine's refusal stays the door; this is the writer's half.
+- **Re-derive the refusal by comparing against the `redo` stack** (`journal_error` holds
+  the entry's text; a history edit checks whether that text is still there) instead of
+  re-running the predicate over the history. Rejected: it needs the fault to carry the
+  entry's identity, which is a second place to keep a report in step with the one the
+  write builds — and it cannot answer the question the re-derivation answers for free: a
+  history that holds two unspellable entries reports the most recent, and undoing *that*
+  one must fall back to the other rather than going silent.
+- **Check the journal too, by applying each entry** (the strongest rule on both write
+  paths). Rejected as a cost, honestly stated: the journal is the control path, once per
+  committed gesture, and applying an entry means building a session — a full walk per
+  gesture, where the round trip is one `parse_script`. The asymmetry is justified instead,
+  by durability: the journal cannot make the directory unopenable (`apply_journal` drops
+  and reports per entry), and the save can, so the save is where the stronger rule earns
+  its cost. If the journal ever learns to apply its entries cheaply, this is the note to
+  supersede.
+- **Clear the refusal on any history edit** instead of re-deriving. Rejected: it is the
+  fix for the false alarm and a *new* lost alarm in the same breath — a `redo` puts the
+  unspellable edit back into the session and the report would not come back with it, so
+  the loss is silent from then on. One rule (the history says what is outstanding) has no
+  gap to reason about; "clear on undo" has two directions to get wrong.
 
 ## Consequences
 
-- A session directory is never made unopenable by its own autosave. An unspellable edit
-  is reported in `journal_error` and dropped from the journal; an unreadable entry in an
-  existing journal costs that entry and is reported in `last_recovery()`.
+- A session directory is never made unopenable by its own autosave **or by its own
+  save**. An unspellable edit is reported in `journal_error` and dropped from the
+  journal; an unreadable entry in an existing journal costs that entry and is reported in
+  `last_recovery()`; and a `save` whose text would not apply is refused by name, with
+  nothing written.
 - A path with whitespace, or a `#` anywhere in it, is now a session that **applies, plays
   and exports, but will not save and will not autosave** — the same verdict `save` has
   always given it, now consistent across both write paths, and visible in one place
@@ -160,5 +285,41 @@ an entry that cannot be read is dropped and reported, never fatal.**
   `SetParam` refuses a non-finite value at the door the way the arrange path already did, and
   `journal_error` carries a `JournalFault` that distinguishes a `Refused` edit from a `Write`
   failure — only the latter is cleared by a later success, so a refusal cannot be erased.
+- **Refined again by the verification of that one.** Three things moved, and the middle one
+  narrows a sentence above:
+  - **`save` no longer writes a directory `load_session` refuses.** A `NaN`/`inf` param in a
+    history is now refused *by name*, and so is any future entry the form spells and the
+    applier declines. The trade is deliberate and is the honest verdict: a session holding
+    one **plays, seeks, exports and autosaves, and will not save** — the same shape of
+    verdict a path with a space has always had, now reached through the applier instead of
+    through the spelling. Refusing to write is not refusing the *edit*: the live session
+    keeps working, and the previous save on disk keeps opening.
+  - **The journal's rule deliberately did not get stronger** — still *reads back as itself*,
+    per entry, so an entry the applier would refuse is journalled and then dropped and
+    reported by the load side. The two write paths answer different questions on purpose:
+    best-effort per entry versus a baseline that must open.
+  - **"A refusal stands until the next `save`" is no longer true, and was never the
+    mechanism.** A `save` cannot succeed on a history holding a refused entry, so it was
+    never going to be the thing that cleared it. The report is **re-derived from the
+    history**: it dies with its edit (`undo`), comes back with it (`redo`), survives every
+    successful write, and is re-read after `save`'s pool re-point — the one case where a
+    save *legitimately* changes the answer, because the journal spells a pool by the
+    absolute path the session used while the save spells the copy inside the directory, so
+    a pool path with a space is unspellable in the journal and fine in a save.
+- **Costs.** `save` now applies the whole script to a fresh session before writing — the
+  work a load does, including the media open and warm-up a `play` in the log performs —
+  against a rebuild an undo or a seek already pays. The re-derivation is one `parse_script`
+  per history entry, and only where a fault could be outstanding: not with no session
+  directory, and not for a `Write` fault. Neither cost is on the render path.
+- **A refused `save` leaves the directory exactly as it was** — the previous `session.txt`,
+  the journal tail, no temp file — so retrying after fixing the offending edit costs the
+  user nothing but the fix.
+- **The shells still read one string for both fault kinds** (`live::HostOutcome`'s
+  `journal_error`), and the TUI's prefix — "autosave failed" — is the wrong words for a
+  refusal, where the autosave *refused on purpose* and the edit is still in the session.
+  Both faults do report a loss of the autosave for an edit, which is what a status line can
+  show, so the field is unchanged and its doc now states what moved. **Owed:** expose the
+  kind (`JournalFault` is private, so a shell cannot branch on it) — an API decision with
+  two shells and a snapshot struct in it, not something to slip in under a bug fix.
 
 *Authored with Space Bunny · OpenCode, 2026-09-29.*

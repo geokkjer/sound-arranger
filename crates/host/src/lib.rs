@@ -1154,14 +1154,21 @@ impl HostSession {
         self.session_dir.as_deref()
     }
 
-    /// Why the last journal write did not happen, if it did not. An edit is never
-    /// *failed* by a journal fault (it is already applied and logged), but autosave must
-    /// not fail silently either.
+    /// Why a journal write did not happen, if one did not. An edit is never *failed* by
+    /// a journal fault (it is already applied and logged), but autosave must not fail
+    /// silently either.
     ///
-    /// A refusal (an edit the `host v1` form cannot carry) **outlives the next
-    /// successful append**: that edit is still in no durable record, and a save would
-    /// refuse the same history, so the report stands until the next `save`. A write
-    /// failure is the file's and the next successful append clears it.
+    /// **One string, two faults, and the message says which** — the field is a
+    /// `JournalFault`, and both variants report a loss of the *autosave* for an edit,
+    /// which is all a shell's status line has to say. They differ in what clears them:
+    ///
+    /// - a **write** failure is the journal file's, and the next successful append (or a
+    ///   `save`, which rewrites the journal) clears it;
+    /// - a **refusal** (an edit the `host v1` form cannot carry) **outlives every
+    ///   successful write**, because that edit is still in no durable record and a save
+    ///   refuses the same history. It does **not** outlive the edit: it is re-derived
+    ///   from the history whenever the history changes (`undo`, `redo`, a seek), so it
+    ///   cannot report an edit that is no longer in the session.
     pub fn journal_error(&self) -> Option<&str> {
         self.journal_error.as_ref().map(JournalFault::message)
     }
@@ -1179,6 +1186,17 @@ impl HostSession {
     /// The script is written atomically (temp + rename) and the journal is reset to
     /// that baseline only after it landed, so a crash mid-save leaves the *previous*
     /// session intact.
+    ///
+    /// **Nothing is written unless the text both reads back and applies.** The file is
+    /// parsed, compared with the history, and then *built* on a fresh session by the
+    /// walk [`HostSession::from_script`] — the one `load_session` runs — so `save`
+    /// cannot produce a directory that will not open. **Every** refusal happens before the
+    /// journal is touched: the journal is the only durable record of the edits since the
+    /// last save, and losing it to a refused save would cost the tail to buy nothing. The
+    /// rule is deliberately stronger than the journal's ([`HostSession::journal_error`]):
+    /// the journal is best-effort and the load side drops and reports an entry it cannot
+    /// apply, while this is the baseline the whole session is rebuilt from and has to
+    /// open.
     pub fn save(&mut self, dir: &std::path::Path) -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("save {}: {e}", dir.display()))?;
         let target_pool = dir.join(POOL_DIR);
@@ -1231,6 +1249,41 @@ impl HostSession {
             );
         }
 
+        // **…and it must not merely parse, it must *apply*.** The rule `save` rests on is
+        // "whatever is written can be read back **and applied**", not "parses to the same
+        // commands": a line can spell a value faithfully and still be refused by the
+        // applier — a `NaN` param, whose only spelling is `NaN` and whose only verdict is
+        // `parameter '…' must be finite`. So the script is **built**, on a fresh session,
+        // by the same walk `load_session` runs (`HostSession::from_script`, the only
+        // difference being a silent MIDI sink, because a save must not open or steal a
+        // device from the session it is saving). Any operand the *form* carries and the
+        // *applier* refuses would otherwise land here as a `session.txt` that
+        // `load_session` refuses — a bricked directory that needs a hand-edit of the text
+        // to recover. The door that stops the value reaching the history in the first
+        // place is the engine's; this is the *writer's* half, and it is the half that
+        // cannot be reasoned about one op at a time.
+        //
+        // **Before anything is written, and before the journal is truncated** — the order
+        // is the point. The journal *is* the autosave: truncating it and then failing
+        // would destroy the tail of edits that are in no other record, to no purpose (the
+        // script they belong to is not being replaced). So every refusal here happens with
+        // the directory exactly as it was: the previous `session.txt` still opens, and the
+        // journal still holds every edit since it was written.
+        if let Err(fault) = HostSession::from_script_with(&check, None, None) {
+            // Name the **edit** and the reason, not an index: the history and the parsed
+            // script are the same commands (the check above just proved it), and the
+            // entry is what the user actually made.
+            let named = match fault.index.checked_sub(1).and_then(|i| self.history.get(i)) {
+                Some(entry) => name_entry(entry, Some(dir)),
+                None => "the session_rate header".to_string(),
+            };
+            return Err(format!(
+                "save: the session text does not apply — refusing to write a session that would \
+                 not open: {named} is refused when the file is read back: {}",
+                fault.reason
+            ));
+        }
+
         let tmp = dir.join("session.txt.tmp");
         std::fs::write(&tmp, text.as_bytes())
             .map_err(|e| format!("save {}: {e}", tmp.display()))?;
@@ -1249,7 +1302,16 @@ impl HostSession {
         std::fs::write(dir.join(JOURNAL_FILE), b"")
             .map_err(|e| format!("save journal in {}: {e}", dir.display()))?;
         self.session_dir = Some(dir.to_path_buf());
-        self.journal_error = None;
+        // A save rewrote the journal, so a **write** fault is over. A **refusal** is the
+        // history's — and the pool re-point above can have *changed* it, because the
+        // journal spells the pool by the absolute path the session used while the save
+        // spells the copy inside the directory (a pool path with a space is unspellable
+        // in the journal and fine in a save). So the report is re-derived from the
+        // history this save just proved openable, not assumed gone.
+        if matches!(self.journal_error, Some(JournalFault::Write(_))) {
+            self.journal_error = None;
+        }
+        self.rederive_journal_fault();
         self.last_recovery = None;
         Ok(())
     }
@@ -1257,11 +1319,17 @@ impl HostSession {
     /// The whole session as a `host v1` script: the state commands that rebuild it,
     /// gestures bracketed, and a pool path **relative to `dir`** when the pool lives
     /// inside it — which is what lets a saved session be moved.
+    ///
+    /// An entry the form cannot express is refused here, in the save's own words, before
+    /// the write — `write_entry` states the fact about the form, the caller says what it
+    /// does about it.
     fn script_text(&self, dir: &std::path::Path) -> Result<String, String> {
         let mut out = String::from("host v1\n");
         out.push_str(&format!("session_rate {}\n", self.engine.clock.sample_rate));
         for entry in &self.history {
-            write_entry(&mut out, entry, Some(dir))?;
+            write_entry(&mut out, entry, Some(dir)).map_err(|e| {
+                format!("save: {e} — refusing to write a session that would lose it")
+            })?;
         }
         Ok(out)
     }
@@ -1370,25 +1438,25 @@ impl HostSession {
         let Some(dir) = self.session_dir.clone() else {
             return;
         };
-        let mut text = String::new();
-        // The journal records *edits*, with the paths the session actually used. A
-        // command with no text form cannot be in the history (a save would have
-        // refused it), so a failure here means nothing to write.
-        if write_entry(&mut text, entry, None).is_err() || text.is_empty() {
-            return;
-        }
+        // The journal records *edits*, with the paths the session actually used (no
+        // session directory), and **what it cannot carry it names**: the predicate is
+        // `entry_fault`, the same one the outstanding report is re-derived from, so the
+        // write and the report can never disagree about what is spellable.
+        //
         // **The journal is read back by `parse_script`, so it is checked the way `save`
         // checks its script** — otherwise the autosave is the one way an operand the
         // word-based form cannot carry (a `play` path with whitespace or a `#`) reaches
         // a session directory, and it takes the *whole* session unopenable with it, not
         // just that edit. So the entry is not written, and the refusal is reported: the
-        // edit stands in the live session and a save would refuse it too.
-        if let Err(why) = entry_round_trips(entry, &text) {
-            self.journal_error = Some(JournalFault::Refused(format!(
-                "journal: {why}, so this edit is not autosaved — it is in the live session and \
-                 nowhere else, and a save refuses the history as well: {}",
-                text.trim()
-            )));
+        // edit stands in the live session, and a save refuses the same history.
+        //
+        // The journal's rule stops at *reads back as itself*, and deliberately does not
+        // go on to *applies*: an entry the session itself would refuse (a value the
+        // engine declines) is written here, and the load side drops it and reports it
+        // per entry. `save` is where the stronger rule lives — the baseline has to open.
+        let mut text = String::new();
+        if let Some(why) = entry_fault(entry, &mut text) {
+            self.journal_error = Some(JournalFault::Refused(refusal_report(&why, &text)));
             return;
         }
         let path = dir.join(JOURNAL_FILE);
@@ -1419,6 +1487,39 @@ impl HostSession {
                 )));
             }
         }
+    }
+
+    /// Re-read the outstanding **refusal** from the history, after the history has
+    /// changed under it (a replay: undo, redo, a seek — and a save's pool re-point).
+    ///
+    /// A refusal is a fact about an *edit*, and the history is what says whether that
+    /// edit is still there. Carried across a rebuild unchanged, it becomes a false alarm
+    /// — the mirror of the lost alarm it replaced, and the one users actually hit: undo
+    /// the offending edit and the session is durable again, yet the status line reads
+    /// "autosave failed" after every subsequent edit, over an edit that is no longer in
+    /// the session. The only thing that used to clear it was the next `save` — which now
+    /// *refuses* a history holding such an entry, so it never would have.
+    ///
+    /// So the report is **re-derived — not latched, and not merely cleared**: an entry
+    /// that is still in the history and still unspellable keeps its report (which is
+    /// what stops a later successful write from erasing it), one that is gone takes it
+    /// with it, and one a **redo** put back brings it back. Two guards keep this honest:
+    ///
+    /// - **no session directory, no report** — there is no autosave to have refused
+    ///   anything. An unspellable edit in a directory-less session is a `save` refusal,
+    ///   and `save` says so by name when it happens.
+    /// - **a write fault stands** — it is the file's, and a history edit is no evidence
+    ///   about a file. (A `save` rewrote the file, so it clears that one itself.)
+    ///
+    /// The scan is one `parse_script` per entry, against a rebuild that has already
+    /// re-applied every one of them — and `save` pays the same scan, so it is not a new
+    /// cost class on the undo path.
+    fn rederive_journal_fault(&mut self) {
+        if self.session_dir.is_none() || matches!(self.journal_error, Some(JournalFault::Write(_)))
+        {
+            return;
+        }
+        self.journal_error = outstanding_refusal(&self.history);
     }
 
     /// Resolve a parsed clip (len 0 = "open the file at apply") to its real
@@ -2401,6 +2502,15 @@ impl std::fmt::Debug for HostSession {
     }
 }
 
+/// A command the document walk **refused**: which one (its index in the script), and
+/// why. A *reader* only needs the reason — that is what `from_script` returns — but a
+/// **writer** has to name the edit it is refusing to write
+/// ([`HostSession::save`](crate::HostSession::save)), and an index alone is not a name.
+struct ScriptFault {
+    index: usize,
+    reason: String,
+}
+
 /// Execute a command script deterministically. Engine commands with an
 /// `at_frame` render up to that frame first, so the log records real frames;
 /// the final `Bounce` writes the master. The same script on fresh sessions
@@ -2420,6 +2530,26 @@ impl HostSession {
     /// rather than applied as an edit — `apply` refuses a *different* rate on a live
     /// session for exactly that reason.
     pub fn from_script(commands: &[HostCommand]) -> Result<Self, String> {
+        // A load *is* the session taking over the machine, so it gets the process's own
+        // MIDI output (a rebuilt session, and a save's self-check, do not — see
+        // `from_script_with`).
+        let (midi_port, midi_out) = midi_out_from_process();
+        Self::from_script_with(commands, midi_out, midi_port).map_err(|fault| fault.reason)
+    }
+
+    /// [`Self::from_script`] over an explicit MIDI output sink, and saying **which**
+    /// command the walk refused rather than only why.
+    ///
+    /// The index is what makes this a *writer's* check: `save` builds its own output
+    /// through here, so its refusal can name the edit that would not apply, and not
+    /// merely the reason it would not. A `None` sink is a silent session — a save
+    /// validates the file, so it must not open a device, and must not take the live
+    /// session's (`load` opens its own because it adopts the session).
+    fn from_script_with(
+        commands: &[HostCommand],
+        midi_out: Option<SharedMidiSink>,
+        midi_port: Option<String>,
+    ) -> Result<Self, ScriptFault> {
         let rate = commands
             .iter()
             .find_map(|cmd| match cmd {
@@ -2428,9 +2558,12 @@ impl HostSession {
             })
             .unwrap_or(DEFAULT_SAMPLE_RATE);
         if rate == 0 {
-            return Err("session_rate must be non-zero".into());
+            return Err(ScriptFault {
+                index: 0,
+                reason: "session_rate must be non-zero".into(),
+            });
         }
-        let mut session = HostSession::new_at(rate);
+        let mut session = HostSession::new_at_with(rate, midi_out, midi_port);
         // **The script is a document, so it is applied as a document walk**
         // ([`Engine::enter_walk`]) — the same mechanism `rebuild` uses, not a second
         // one. An unplaced command renders nothing, so the apply queue never drains
@@ -2443,20 +2576,22 @@ impl HostSession {
         // cannot leave a half-built session walking (and the caller keeps its own
         // session either way: `load_session` only adopts a session that built whole).
         session.engine.enter_walk();
-        let applied = (|| -> Result<(), String> {
-            for cmd in commands {
+        let applied = (|| -> Result<(), (usize, String)> {
+            for (index, cmd) in commands.iter().enumerate() {
                 // `execute`, not `process`: a script built by `process` alone would
                 // have the *state* but an empty history — so a session opened from a
                 // file could not be undone, and saving it again would write only what
                 // happened after the load. (`execute` appends to the journal only when
                 // a session directory is set, and a session being built or loaded has
                 // none.)
-                session.execute(cmd)?;
+                session.execute(cmd).map_err(|e| (index, e))?;
             }
             Ok(())
         })();
         session.engine.leave_walk();
-        applied?;
+        if let Err((index, reason)) = applied {
+            return Err(ScriptFault { index, reason });
+        }
         Ok(session)
     }
 
@@ -2679,7 +2814,11 @@ impl HostSession {
         self.midi_port = from.midi_port.clone();
         self.redo = from.redo.clone();
         self.session_dir = from.session_dir.clone();
+        // …and then **re-read against the history this rebuilt session actually has**,
+        // because that is the session the fault describes: an undo that removed the
+        // offending entry has nothing left to report (`rederive_journal_fault`).
         self.journal_error = from.journal_error.clone();
+        self.rederive_journal_fault();
         self.last_recovery = from.last_recovery.clone();
         self.last_export = from.last_export.clone();
         self.last_drain = from.last_drain;
@@ -2959,18 +3098,21 @@ pub struct RecordingStatus {
     pub channels: usize,
 }
 
-/// Why the last journal write did not happen (see [`HostSession::journal_error`]). The
-/// edit itself is never failed by either — it is already applied and logged — so both
-/// are reported rather than raised; they differ only in what clears them.
+/// Why a journal write did not happen (see [`HostSession::journal_error`]). The edit
+/// itself is never *failed* by either — it is already applied and logged — so both are
+/// reported rather than raised. They differ in **what they belong to and what clears
+/// them**, which is why they are two variants and not one message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum JournalFault {
     /// The entry is **not in the `host v1` text form**, or does not read back as itself,
     /// so it is not written. The edit stands in the live session and a save refuses the
     /// same history — so no later successful append clears this: the edit is still not
-    /// durable anywhere.
+    /// durable anywhere. The report is **re-derived from the history** (`outstanding_refusal`)
+    /// whenever the history changes, so it dies with its subject: undoing the edit clears
+    /// it, and redoing it brings it back.
     Refused(String),
-    /// The **journal file** refused the write or the flush. The next successful append
-    /// proves the file is writable again.
+    /// The **journal file** refused the write or the flush. The next successful append —
+    /// or a save, which rewrites the journal — proves the file is writable again.
     Write(String),
 }
 
@@ -3003,6 +3145,10 @@ pub struct JournalRecovery {
 /// Write one history **entry** (one gesture) as script lines. A multi-command entry
 /// is bracketed with `group begin`/`group end`, so the gesture structure survives a
 /// save (and replays as one undo step).
+///
+/// The refusal is stated as a fact about **the form** and nothing else — what the
+/// caller does about it (a save refuses the write; the journal drops the entry and
+/// reports it) is the caller's own sentence to add.
 fn write_entry(
     out: &mut String,
     entry: &[HostCommand],
@@ -3014,10 +3160,7 @@ fn write_entry(
     }
     for cmd in entry {
         let Some(line) = format_command(cmd, session_dir) else {
-            return Err(format!(
-                "the host v1 text form cannot express {cmd:?} — refusing to write a session that \
-                 would lose it"
-            ));
+            return Err(format!("the host v1 text form cannot express {cmd:?}"));
         };
         out.push_str(&line);
         out.push('\n');
@@ -3099,6 +3242,86 @@ fn entry_round_trips(entry: &[HostCommand], text: &str) -> Result<(), String> {
              made"
         ))
     }
+}
+
+/// Why one history **entry** has no durable record, if it has none — the predicate both
+/// the journal's write and the outstanding report are made of. `text` is cleared and
+/// filled with the entry's lines, so the caller can name the edit it is refusing or
+/// dropping without rendering it twice.
+///
+/// Two faults, in one place, because they clear differently and must not be *decided*
+/// differently: the form has no line for one of the entry's commands, or the lines it
+/// has do not read back as the entry that was made. `None` means the entry is
+/// spellable — the journal can carry it, and a save can write it.
+///
+/// Rendered with **no** session directory, as the journal renders it: the journal
+/// records the paths the session *used*, not the copy inside the session directory, so
+/// a pool path with a space is unspellable here and spellable in a save (which re-points
+/// it at the copy). The report is about what the *autosave* cannot carry.
+fn entry_fault(entry: &[HostCommand], text: &mut String) -> Option<String> {
+    text.clear();
+    match write_entry(text, entry, None) {
+        // A command the form cannot express at all. A `save` refuses such a history by
+        // name, so this is the rare case — but the journal is the one write path that
+        // can meet an entry a save never saw (a session opened from a hand-edited
+        // script), and it is reported rather than skipped in silence.
+        Err(e) => return Some(e),
+        Ok(()) if text.is_empty() => {
+            return Some("it has no line in the host v1 text form".into());
+        }
+        Ok(()) => {}
+    }
+    entry_round_trips(entry, text).err()
+}
+
+/// The report an unspellable entry gets: **why** it is refused and **what** the loss
+/// means. One construction for the write and the re-derivation, so the two can never
+/// describe the same edit differently.
+fn refusal_report(why: &str, text: &str) -> String {
+    let mut out = String::from(why);
+    out.push_str(
+        ", so this edit is not autosaved — it is in the live session and nowhere else, \
+                  and a save refuses the history as well",
+    );
+    if !text.trim().is_empty() {
+        out.push_str(": ");
+        out.push_str(text.trim());
+    }
+    out
+}
+
+/// The **outstanding refusal** in `history`: the most recent entry the `host v1` text
+/// form cannot carry, so has no durable record. `None` when every entry round-trips.
+///
+/// The report is a **property of the history, not a latch** — a latch outlives its
+/// subject. `undo`/`redo` rebuild the session from the history, so an edit that is no
+/// longer in it is no longer lost, and a report naming it would be a false alarm: the
+/// shell's status line would read "autosave failed" after every subsequent edit, over an
+/// edit that is not in the session any more. Re-derived, the rule holds from both sides:
+/// an entry that *is* still there and still unspellable keeps its report (which is what
+/// stops a later successful write from erasing it), and one that is gone takes it with
+/// it.
+fn outstanding_refusal(history: &[Vec<HostCommand>]) -> Option<JournalFault> {
+    let mut text = String::new();
+    history.iter().rev().find_map(|entry| {
+        entry_fault(entry, &mut text).map(|why| JournalFault::Refused(refusal_report(&why, &text)))
+    })
+}
+
+/// How a writer **names** one history entry in a message: the lines it would be written
+/// as, or the command itself when the form has no line for it. The group markers are
+/// dropped — a gesture is named by its members, not by its bracketing.
+fn name_entry(entry: &[HostCommand], session_dir: Option<&std::path::Path>) -> String {
+    let mut text = String::new();
+    if write_entry(&mut text, entry, session_dir).is_err() {
+        return format!("{entry:?}");
+    }
+    let text = text.trim();
+    let text = text
+        .strip_prefix("group begin\n")
+        .and_then(|t| t.strip_suffix("\ngroup end"))
+        .unwrap_or(text);
+    text.replace('\n', "; ")
 }
 
 /// Re-point every `pool` command in the history at `pool` (recursing into gestures).
@@ -8113,6 +8336,13 @@ mod tests {
     /// save of the session failed for good. The `host v1` form spells a `NaN` as `NaN`
     /// and reads it back as `NaN`, so the entry **is** in the form.
     ///
+    /// **This is the autosave's half of the rule, and only that.** The journal's
+    /// predicate is *reads back as itself*, so the entry is written and the loss is
+    /// reported per entry on replay. `save` — the durable baseline — holds the stronger
+    /// rule, *and applies* (see `a_session_the_applier_refuses_is_not_saved`): a `NaN`
+    /// param is refused there by name, which is the honest verdict, because a session
+    /// file carrying it is a file `load_session` cannot open.
+    ///
     /// The `NaN` is committed through `commit_state` because the live path cannot produce
     /// one: `Engine::set_param` refuses a non-finite value before it is logged (the test
     /// below). What is under test is the *guard*, not the door — so the guard must be a
@@ -8183,15 +8413,14 @@ mod tests {
             "and the edit beside it is in the reopened session"
         );
 
-        // The permanent half of the wedge: one such operand made *every* later save
-        // refuse, so a session that has one became unsaveable for good.
-        s.save(&dir)
-            .expect("a NaN operand must not make the session unsaveable");
+        // The permanent half of the wedge is gone too, and gone *honestly*: one such
+        // operand no longer makes every later save refuse for a reason the user cannot
+        // act on — the save now refuses it **by name**, because the file it would write
+        // would not open. (`a_session_the_applier_refuses_is_not_saved` is where that
+        // rule is pinned, along with what the refusal must leave behind.)
         assert!(
-            std::fs::read_to_string(dir.join(SESSION_FILE))
-                .expect("session")
-                .contains("set_param mixer ch0.gain NaN"),
-            "and the saved script carries the operand it was given"
+            s.save(&dir).is_err(),
+            "a baseline the applier would refuse is not written"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -8240,6 +8469,239 @@ mod tests {
             s.journal_error()
         );
         s.save(&dir).expect("and the session still saves");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **`save` must not be able to write a session directory that will not open.** The
+    /// self-check `save` inherited compared the re-parsed script with the history, so it
+    /// answered the *form*'s question — "is this the same session?" — and not the
+    /// reader's. An entry can be spelled faithfully and still be **refused by the
+    /// applier**: `set_param … NaN` is the one spelling a `NaN` has, and the one verdict
+    /// is `parameter '…' must be finite`. So the file parsed, the comparison passed, and
+    /// the platform wrote a `session.txt` that `load_session` refuses — a brick needing
+    /// a hand-edit of its own text, with the journal already truncated.
+    ///
+    /// The rule is now *whatever is written can be read back **and applied***, checked by
+    /// building the session from the script through the walk `load_session` runs. So the
+    /// save is refused, by name, **before anything is written** — and the directory the
+    /// user already had (with the journal's unsaved tail in it) is exactly as it was.
+    #[test]
+    fn a_session_the_applier_refuses_is_not_saved() {
+        let root = std::env::temp_dir().join(format!("host-save-apply-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = session_with_pool("save-apply", &pool);
+        let dir = root.join("song.d");
+        s.save(&dir).expect("save the baseline");
+
+        // A spellable edit, so the journal holds a tail the refused save must not eat.
+        s.execute(&gesture(vec![media::ArrangeOp::Trim {
+            track: "t0".into(),
+            clip: "c0".into(),
+            edge: media::Edge::Start,
+            by_frames: 1_200,
+        }]))
+        .expect("a spellable edit");
+        // …and a value the applier refuses, committed to the document because the live
+        // path cannot produce one (`Engine::set_param` is the door — the test above).
+        s.commit_state(vec![HostCommand::SetParam {
+            plugin: "mixer",
+            param: "ch0.gain",
+            value: f32::NAN,
+            at_frame: None,
+        }]);
+        let script_before = std::fs::read(dir.join(SESSION_FILE)).expect("session");
+        let journal_before = std::fs::read(dir.join(JOURNAL_FILE)).expect("journal");
+        assert!(
+            String::from_utf8_lossy(&journal_before).contains("arrange trim t0 c0 start 1200"),
+            "the tail is the autosave: {}",
+            String::from_utf8_lossy(&journal_before)
+        );
+
+        let refused = s
+            .save(&dir)
+            .expect_err("a script the applier refuses is not written");
+        // **The edit and the reason, both by name** — an index and "the session text
+        // does not apply" would leave the user with no way to act on either.
+        assert!(
+            refused.contains("set_param mixer ch0.gain NaN"),
+            "the refusal names the edit it would not write: {refused}"
+        );
+        assert!(
+            refused.contains("finite") && refused.contains("NaN"),
+            "and the reason the reader would have refused it: {refused}"
+        );
+
+        // **Nothing was written, and nothing was emptied.** The order is the point: the
+        // journal is the only durable record of the edits since the last save, so a save
+        // that fails after truncating it destroys the tail to buy nothing.
+        assert_eq!(
+            std::fs::read(dir.join(SESSION_FILE)).expect("session"),
+            script_before,
+            "the previous session.txt is untouched"
+        );
+        assert_eq!(
+            std::fs::read(dir.join(JOURNAL_FILE)).expect("journal"),
+            journal_before,
+            "and the journal kept the tail it was holding"
+        );
+        assert!(
+            !dir.join("session.txt.tmp").exists(),
+            "not even a temp file: a refused save writes nothing"
+        );
+
+        // The point of the order: the directory the user already had still opens, with
+        // the edit in it. Without this the refused save would have bricked it.
+        let mut loaded = HostSession::new();
+        loaded
+            .load_session(&dir)
+            .expect("a refused save must not leave the directory unopenable");
+        assert_eq!(
+            clip_of(&loaded).src_len,
+            3_600,
+            "and it opens with the unsaved edit, not without it"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A report cannot outlive the edit it names.** The refusal is a fact about an
+    /// *edit*, and `undo`/`redo` rebuild the session from the history — so an edit that
+    /// has been undone is in no durable record because it is **not in the session at
+    /// all**. Carried across the rebuild, the report outlived its subject and the TUI's
+    /// status line read "autosave failed" after every subsequent edit, over an edit that
+    /// was no longer there; the one thing that would have cleared it is the next `save`,
+    /// which now *refuses* a history holding such an entry, so it never would have.
+    ///
+    /// The report is therefore **re-derived from the history** rather than latched, and
+    /// re-derived is not the same as cleared: the *redo* at the end puts the edit back
+    /// into the session, so its report must come back with it.
+    #[test]
+    fn an_undo_that_removes_a_refused_edit_clears_the_report() {
+        let root = std::env::temp_dir().join(format!("host-journal-alarm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = session_with_pool("journal-alarm", &pool);
+        let dir = root.join("song.d");
+        s.save(&dir).expect("save the baseline");
+
+        // A clip id with a space: the timeline takes it, the word-based form cannot spell
+        // it, so the autosave drops the entry and says so. An `Arrange` op, so it is
+        // undoable — the false alarm needs a *removable* subject.
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: media::Clip {
+                    reversed: false,
+                    id: "c 0".into(),
+                    name: None,
+                    source: "s1".into(),
+                    src_start: 0,
+                    src_len: 2_400,
+                    at_frame: 0,
+                    fade_in: 0,
+                    fade_out: 0,
+                    gain: 1.0,
+                    loop_len: None,
+                },
+            },
+            at_frame: None,
+        })
+        .expect("the timeline itself accepts the id");
+        let report = s
+            .journal_error()
+            .expect("the autosave reports what it could not write")
+            .to_string();
+        assert!(
+            report.contains("c 0") && report.contains("not autosaved"),
+            "and it names the edit that is in no durable record: {report}"
+        );
+
+        // A **successful** write must not erase it — half the rule, and the half the
+        // previous change restored. (A `SetParam`, so it is not the `Arrange` entry the
+        // undo below is about.)
+        s.execute(&HostCommand::SetParam {
+            plugin: "mixer",
+            param: "ch0.gain",
+            value: 0.5,
+            at_frame: None,
+        })
+        .expect("a spellable edit");
+        assert!(
+            std::fs::read_to_string(dir.join(JOURNAL_FILE))
+                .expect("journal")
+                .contains("set_param mixer ch0.gain 0.5"),
+            "the autosave carried this one"
+        );
+        assert!(
+            s.journal_error().is_some(),
+            "and the refusal stands beside it: {:?}",
+            s.journal_error()
+        );
+
+        // Undo it: the edit leaves the history, so there is nothing left to report.
+        assert!(s.undo().expect("undo the refused edit"));
+        assert!(
+            s.journal_error().is_none(),
+            "the report cannot outlive the edit it names: {:?}",
+            s.journal_error()
+        );
+
+        // **Re-derived, not latched**: the redo puts the edit back in the session, so
+        // its report must come back with it. (Before the next edit, which clears the
+        // redo stack — a new state change makes an undone branch unreachable.)
+        assert!(s.redo().expect("redo the refused edit"));
+        let back = s
+            .journal_error()
+            .expect("an edit that is in the session again is lost again")
+            .to_string();
+        assert!(
+            back.contains("c 0"),
+            "and it is the same edit's report: {back}"
+        );
+        assert!(s.undo().expect("undo it again"));
+        assert!(
+            s.journal_error().is_none(),
+            "and it dies with its subject again: {:?}",
+            s.journal_error()
+        );
+
+        // …and the next edit is autosaved and silent, which is what the user sees: no
+        // status line at all, rather than a standing "autosave failed".
+        s.execute(&gesture(vec![media::ArrangeOp::Trim {
+            track: "t0".into(),
+            clip: "c0".into(),
+            edge: media::Edge::Start,
+            by_frames: 1_200,
+        }]))
+        .expect("a spellable edit after the undo");
+        let journal = std::fs::read_to_string(dir.join(JOURNAL_FILE)).expect("journal");
+        assert!(
+            journal.contains("arrange trim t0 c0 start 1200"),
+            "the autosave is working again: {journal}"
+        );
+        assert!(
+            s.journal_error().is_none(),
+            "and there is nothing to say about it: {:?}",
+            s.journal_error()
+        );
+
+        // The session directory the whole alarm was about is healthy: it opens, and it
+        // opens with the edits that are in the session.
+        let mut loaded = HostSession::new();
+        loaded.load_session(&dir).expect("load");
+        assert_eq!(
+            loaded.last_recovery().map(|r| r.refused),
+            Some(0),
+            "nothing in the journal needed dropping"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

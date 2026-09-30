@@ -174,9 +174,25 @@ pub struct HostOutcome {
     /// pool (`set_pool`); empty when the pool already fitted.
     pub pool_conformed: Vec<media::Conform>,
     pub mixer_channels: Option<usize>,
-    /// Where the session is saved (`None` until a `save`), and the last journal
-    /// (autosave) failure — so a shell can say what happened to the session file
+    /// Where the session is saved (`None` until a `save`), and why a journal (autosave)
+    /// write did not happen — so a shell can say what happened to the session file
     /// instead of leaving autosave silent.
+    ///
+    /// **One string, two faults, and the field's meaning moved.** It used to be "the
+    /// last journal failure"; it is now "the outstanding refusal, *or* the last write
+    /// failure". A **refusal** (an edit the `host v1` text form cannot carry, so it is
+    /// in the live session and nowhere else) stands until the history loses that edit —
+    /// an `undo`/`redo`/seek re-derives it — so it repeats on every refresh while it is
+    /// true, and clears when it stops being true. A **write** failure (the journal file
+    /// itself) is cleared by the next successful append or by a `save`.
+    ///
+    /// Both say the autosave lost something for an edit, which is what a status line can
+    /// report, so a shell needs no kind of its own — but note that "autosave failed" is
+    /// the wrong words for a refusal, where autosave **refused on purpose** and the edit
+    /// is still in the session. **Owed:** expose the kind (the `JournalFault` the host
+    /// holds is private), so a shell can say which it is. The rule behind both is in
+    /// the journal-line note
+    /// (`.agents/notes/implemented/bug-fix/2026-09-29-a-journal-line-must-be-readable-to-be-written.md`).
     pub session_dir: Option<std::path::PathBuf>,
     pub journal_error: Option<String>,
     /// The take in progress (a live indicator) and the last finished one (a shell
