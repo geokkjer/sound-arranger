@@ -18,8 +18,9 @@
 //! mounts on a machine with no device, sends nothing, and renders
 //! byte-identically (the takes-slice purity rule: the declaration is state,
 //! the sending is a device-bound side effect, never replayed). The host can
-//! empty the slot across a rebuild and refill it after, so a seek sends
-//! nothing while it reconstructs and gear is driven again on the next render.
+//! empty the slot across a rebuild and across an offline render, and refill it
+//! after, so a seek sends nothing while it reconstructs, a `bounce` sends
+//! nothing while it renders, and gear is driven again on the next live render.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -225,6 +226,18 @@ impl ClockOutNode {
         self.overflows.load(Ordering::Relaxed)
     }
 
+    /// Whether the slot currently holds a device — the one question that decides
+    /// whether this block may consume the transport log (see `render`). The lock
+    /// is held only for the check, and the host empties and refills the slot
+    /// between its own commands rather than from inside a render, so the answer
+    /// does not change under the block that read it.
+    fn device_attached(&self) -> bool {
+        self.sink
+            .lock()
+            .expect("the midi.out sink is not poisoned")
+            .is_some()
+    }
+
     /// Push into the scratch, or count the overflow — never grow.
     fn push(&mut self, event: ExternalEvent) {
         if self.scratch.len() < self.scratch.capacity() {
@@ -358,7 +371,19 @@ impl crate::graph::AudioNode for ClockOutNode {
         // flushes here (take-due, not take-exact). A late entry's offset
         // saturates at 0 — the earliest position in the block we can still
         // mean.
-        if let Some(log) = &self.transport {
+        //
+        // **Only a block that can speak drains it.** The log's whole contract is
+        // that a command flushes *late, never lost*, so a block with an empty
+        // slot (the host detaches the device across a rebuild, and across an
+        // offline render) must leave the queue alone: a take that found no device
+        // to send through would drop the command outright, and no later message
+        // restates it — the same loss the bounded `take_due` refuses. The ticks
+        // below are not in that class, because they are computed from
+        // `block.frame` rather than from a queue: a silent block costs nothing
+        // and the next block recomputes its own range.
+        if let Some(log) = &self.transport
+            && self.device_attached()
+        {
             log.take_due(block_end, &mut self.transport_scratch);
             // Index loop: borrowing the scratch immutably while `push` needs
             // `&mut self` fights the borrow checker, and `std::mem::take`
@@ -423,9 +448,10 @@ impl crate::graph::AudioNode for ClockOutNode {
         // One send per block; the offsets carry the exact sub-block positions.
         // The lock is held only for the call, and with a single sender it is
         // uncontended — the real device sink will make this a fast queue push.
-        // An **empty** slot sends nothing: the host detaches the device across
-        // a rebuild, and the node renders its schedule regardless — only the
-        // send is device-bound.
+        // An **empty** slot sends nothing: the host detaches the device across a
+        // rebuild and across an offline render, and the tick schedule is computed
+        // from the block's own frame, so a silent block loses nothing — a queued
+        // transport command is the exception, and it stays queued (above).
         if !self.scratch.is_empty()
             && let Some(device) = self
                 .sink
@@ -879,5 +905,41 @@ mod tests {
             "the detached node sent nothing"
         );
         assert_eq!(node.overflows(), 0);
+    }
+
+    /// A **silent block must not consume the transport log**: the log's contract
+    /// is that a command flushes *late, never lost*, so a block with an empty
+    /// slot leaves the queue alone and the next block that has a device carries
+    /// the command — late, at that block's first frame. The ticks are in no such
+    /// danger (they are computed from the block's own frame range), so silence
+    /// costs the log nothing and the gear no message it would otherwise have
+    /// restated.
+    #[test]
+    fn a_detached_block_keeps_a_queued_transport_command() {
+        let map = TempoMap::new(48_000, 120.0, 4);
+        let log = Arc::new(TransportLog::new());
+        let (sink, recorded) = FakeSink::new();
+        let slot: SharedMidiSink = Arc::new(Mutex::new(Some(Box::new(sink))));
+        let mut node = ClockOutNode::new(Some(slot), Some(log.clone()));
+        log.push(1_000, Transport::Start);
+
+        // The host's detach — the device leaves the slot, the node keeps it —
+        // across blocks that owe the command.
+        let device = node.sink.lock().expect("not poisoned").take();
+        render_range(&mut node, &map, 0, 4_800, crate::graph::BLOCK as u64);
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "the detached blocks sent nothing"
+        );
+
+        // The device goes back — the host's refill, the same box — and the command
+        // that came due while it was away is still queued: late, not lost.
+        *node.sink.lock().expect("not poisoned") = device;
+        render_range(&mut node, &map, 4_800, 9_600, crate::graph::BLOCK as u64);
+        assert_eq!(
+            FakeSink::transport(&recorded),
+            vec![(4_800, "Start")],
+            "the first block with a device flushes the command the silent ones kept"
+        );
     }
 }

@@ -1987,7 +1987,19 @@ impl HostSession {
                 // Offline bounce: render + drain buffered tails. A capped drain
                 // is a *different, truncated* piece, so it fails loud rather than
                 // writing a quietly shortened file.
-                let (out, drain) = self.render_with_drain(*frames)?;
+                //
+                // **A bounce drives no gear**, for the reason `export` gives: an
+                // offline render exists to produce a file, and a `bounce` is the
+                // command a script reaches for when it writes the master. The slot
+                // is empty across the render — the node's ticks are computed from
+                // the block's own frame either way, and its transport tap is left
+                // alone until a block has a device to speak through — and the
+                // device is back before the refusal below, so a capped drain
+                // leaves the live session driving gear as it found it.
+                let device = self.detach_midi();
+                let rendered = self.render_with_drain(*frames);
+                self.restore_midi(device);
+                let (out, drain) = rendered?;
                 if drain.capped {
                     return Err(format!(
                         "bounce drain hit the {MAX_DRAIN_FRAMES}-frame bound with output still pending — the tail is truncated"
@@ -10105,6 +10117,112 @@ mod clock_out_wiring {
         assert!(
             clock_frames(&sends).len() > frames_before.len(),
             "ticks again after the export"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The bounce is the other command that exists to write a file**, so it
+    /// detaches the sink slot across its offline render for the reason the export
+    /// path gives: a render that produces a file drives no gear. Pinned on the
+    /// ticks of the bounce **and of its drain tail** (drain blocks walk the node's
+    /// schedule exactly as timeline blocks do), on the queued transport message an
+    /// offline render would otherwise flush, and on the refill — a bounce that
+    /// emptied the slot for good would silence a live session.
+    #[test]
+    fn a_bounce_sends_nothing_and_the_live_session_resumes_afterwards() {
+        let root = std::env::temp_dir().join(format!("host-bounce-midi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let (sink, sends) = fake_sink();
+        let mut session = HostSession::new_at_with(48_000, Some(sink), Some("fake".into()));
+        session
+            .execute(&HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(0),
+            })
+            .expect("mixer");
+        mount_clock_out(&mut session);
+        session
+            .execute(&HostCommand::Pool { dir: pool })
+            .expect("pool");
+        session
+            .execute(&HostCommand::Arrange {
+                op: media::ArrangeOp::AddTrack { track: "t0".into() },
+                at_frame: None,
+            })
+            .expect("track");
+        session
+            .execute(&HostCommand::Arrange {
+                op: add_clip("c0", 0),
+                at_frame: None,
+            })
+            .expect("clip");
+        // Render once so the clock_out node is mounted and has driven the gear
+        // (mounts apply on the next render, so nothing has been sent yet).
+        session.execute(&HostCommand::TransportPlay).expect("play");
+        session.render(48_000).expect("render one second");
+        let frames_before = clock_frames(&sends);
+        let transport_before = transport_events(&sends);
+        assert!(!frames_before.is_empty(), "the live session drove the gear");
+        assert_eq!(transport_before, vec![(0, "Start")]);
+
+        // A resume at 48 000 is a `Continue`, and nothing has rendered since it
+        // was logged, so the message is still sitting in the tap waiting for the
+        // next block. The bounce would be that next block — and an offline render
+        // is no more entitled to put a transport command on the wire than to put
+        // ticks there.
+        session
+            .execute(&HostCommand::TransportPlay)
+            .expect("resume");
+        assert_eq!(
+            transport_events(&sends),
+            transport_before,
+            "the resume is queued, not yet on the wire"
+        );
+
+        let bounced = root.join("bounce.wav");
+        session
+            .execute(&HostCommand::Bounce {
+                frames: 48_000,
+                path: bounced.clone(),
+            })
+            .expect("bounce");
+        assert!(
+            bounced.exists(),
+            "the bounce still wrote its file — detaching is not skipping the work"
+        );
+        assert_eq!(
+            clock_frames(&sends),
+            frames_before,
+            "the bounce sent no ticks: not for its timeline, not for its drain tail"
+        );
+        assert_eq!(
+            transport_events(&sends),
+            transport_before,
+            "the bounce flushed nothing out of the transport tap"
+        );
+
+        // The slot is refilled after the bounce: gear is driven again, and the
+        // queued `Continue` goes out with the live render rather than having been
+        // swallowed by the bounce.
+        session.render(48_000).expect("render after the bounce");
+        assert!(
+            clock_frames(&sends).len() > frames_before.len(),
+            "ticks again after the bounce"
+        );
+        let after = transport_events(&sends);
+        assert_eq!(
+            after.len(),
+            2,
+            "the queued resume reached the wire after the bounce, not during it: {after:?}"
+        );
+        assert_eq!(
+            after[1].1, "Continue",
+            "and it is the resume's own message, a Continue from a non-zero frame"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

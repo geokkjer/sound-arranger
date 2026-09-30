@@ -68,6 +68,7 @@ suite, the agent-notes verifier, and both shell-spike builds).
 | `5-midi#3` the transport drain allocates on the render path | MAJ | CONFIRMED | `a917a1c` |
 | `2-media-io#1` (also `6-tests#1`, `7-mech#4`) 24-bit recovery truncates | MAJ | CONFIRMED | `74186ec`, `117f2f1` |
 | `2-media-io#2` a crossfade of 0 or 1 samples drops the incoming's first sample | MAJ | CONFIRMED | [fix note](../../.agents/notes/implemented/bug-fix/2026-09-29-a-crossfade-too-short-to-mix-is-a-cut.md) |
+| `2-media-io#3` `Capture::start` never validates `input_rate` | MAJ | CONFIRMED | [fix note](../../.agents/notes/implemented/bug-fix/2026-09-29-a-capture-refuses-a-zero-clock.md) |
 | `6-tests#3` the WAV reader rejects a valid odd-sized metadata chunk | MIN | CONFIRMED | [fix note](../../.agents/notes/implemented/bug-fix/2026-09-29-a-chunk-body-is-skipped-with-its-pad-byte.md) |
 
 Defects the **verification** found, not the original reviewers — all fixed: the euclidean grid walk
@@ -86,8 +87,6 @@ rejected as false; these are real findings left for a next pass, with the reason
 - **`1-engine#3` a finite mount param can put a permanently-NaN oscillator on the bus.** Needs a
   per-plugin parameter-range rule (the ranges exist for `set_param` but not for mount params);
   wiring that is a design change, not a bug fix, and `7-mechanical#6` is the same gap.
-- **`2-media-io#3` `Capture::start` never validates `input_rate`** (zero rate overflows the demux
-  thread in debug). Same class as `4-host#5`, which was fixed; this one needs a capture-side bound.
 - **`3-media-dsp#4` `replace_sources` deletes the previous take before the new material is
   committed** (PARTLY: the stated trigger could not be constructed, the ordering contradiction is
   real). A commit-ordering change in the pool; worth doing with the pool's own tests as the gate.

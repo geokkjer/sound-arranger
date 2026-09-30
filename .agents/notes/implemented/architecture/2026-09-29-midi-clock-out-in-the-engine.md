@@ -39,6 +39,13 @@ inferred from continuity, and nothing is required to be present.**
   so a late transport command lands at offset 0 rather than being lost. The drain is bounded by the
   room that buffer has, so a flood of commands never grows it on the render path — what does not fit
   stays queued and flushes into the next block ([the drain-bound note](../../implemented/bug-fix/2026-09-29-the-transport-drain-is-bounded-by-the-scratch.md)).
+  **The drain is gated on the sink slot holding a device**: a block that cannot send leaves the queue
+  alone, because "flushes late, never lost" is the tap's whole contract and a take that found no
+  device would drop the command outright, with no later message to restate it. That gate is what makes
+  the host's detach safe on this side ([the host note](2026-09-29-midi-clock-out-in-the-host.md): an
+  offline render drives no gear, and a `bounce` between a `play` and its render must not spend the
+  queued command on a render that cannot speak). The ticks need no such gate — they are computed from
+  the block's own frame, so a silent block costs nothing and the next block recomputes its range.
   The *record* of transport is the session log, not this tap; the tap exists to get frames to the wire.
 - **A loud bound on the scratch**: `CLOCK_OUT_CAP` events per block, with the rest counted through
   `overflows()`. Dropping clock is bad; allocating on the render path is worse; a bound that grows
@@ -65,10 +72,19 @@ cannot change the mix.
   the block's own frame is authoritative anyway.
 - **Let the transport tap keep its entries (record rather than drain).** Rejected: the tap is a runtime
   feed, and the session log is already the durable record of `play`/`stop` — two records would drift.
+- **Drain the tap in a block with no device and drop what it found.** Rejected: it turns "send nothing
+  across a rebuild or an offline render" from a silence into a loss, and a `bounce` run between a
+  `play` and its render is enough to trigger it. The tap's contract already says a command flushes
+  late rather than being dropped, so gating the drain on there being a device is that contract honoured
+  rather than a new rule — and the queue is the cheap side of the choice, since nothing but `take_due`
+  ever reads it.
 - **Surface `overflows()` as a context service now.** Deferred to slice B, which is where a shell or the
   host would report it; adding a service with no consumer is speculative.
 - **Emit ticks only when a sink is present.** Rejected: it would make the tick arithmetic untestable
-  without a device and couple generation to transport of the bytes.
+  without a device and couple generation to transport of the bytes. The same reasoning is why the
+  device gate covers the **tap** and not the tick walk: the ticks are still computed with an empty slot
+  (which is what keeps a detached render byte-identical), while the tap is state that only a send can
+  discharge.
 
 ## Consequences
 
@@ -87,5 +103,14 @@ cannot change the mix.
   no consumer yet. And tick 0 coincides with beat 0, so a `Start` at frame 0 shares a block with a
   clock tick; whether real gear tolerates status and clock in the same instant is a hardware question,
   recorded here rather than guessed.
+- The device gate on the drain is pinned where the tap's contract is: a detached block keeps a queued
+  command, and the first block with a device flushes it late
+  (`a_detached_block_keeps_a_queued_transport_command`).
+- **A session with no device at all now leaves the tap growing instead of draining every block** — one
+  entry per `play`/`stop` gesture, tens of bytes each, and nothing ever reads them. The bound is the
+  user's gestures rather than the render, which is the cheap side of the choice: the alternative was
+  dropping the same entries in a session that mounted `clock_out` for the replay case.
 
 *Authored with DeepSeek-V4.1-Flash · DeepSeek Harness, 2026-09-29.*
+
+*Authored with Space Bunny · OpenCode, 2026-09-29.*

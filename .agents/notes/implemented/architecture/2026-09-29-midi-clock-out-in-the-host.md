@@ -27,11 +27,14 @@ jitter figure is asserted.
 - The tap is fed from the **apply** path at the frames `Play`/`Stop` take effect: `Start` only from
   frame 0 — MIDI `Start` means "return to song start", so a resume is `Continue` — and `Stop` on stop.
   Silence on a rebuild comes from the empty slot, never from a special case.
-- **The slot is what makes the conservative decision executable.** Around *every* rebuild render — the
-  seek warm-up, undo/redo replay, and an export's clone plus its offline render — the host empties the
-  slot and restores the device afterwards, with the restore on the failure path too. So a rebuild sends
-  nothing, live playback drives gear, and the rebuilt session shares the same slot `Arc`, which is why
-  the refill is visible to its node.
+- **The slot is what makes the conservative decision executable.** Around *every* render that is not
+  the live transport — the seek warm-up, undo/redo replay, an export's clone, and a `bounce`'s offline
+  render with its drain tail — the host empties the slot and restores the device afterwards, with the
+  restore on the failure path too. So a rebuild and an offline render both send nothing, live playback
+  drives gear, and the rebuilt session shares the same slot `Arc`, which is why the refill is visible
+  to its node. `export` wraps the whole command (`detach` / call / `restore`, so a refusal still
+  refills); the `Bounce` arm wraps **its render** alone, because the file write and the log entry need
+  no device and the capped-drain refusal belongs after the refill.
 - **The far side of a rebuild is where the follower is re-synced.** `Play`/`Stop` are *actions*, not
   state, so they are not in the history and a replay never re-applies them — and each rebuilt session
   gets a brand-new tap. A **seek that moved a playing transport** therefore feeds **the message a
@@ -55,9 +58,16 @@ jitter figure is asserted.
   reason the slot exists: the plugin takes its sink when the mount applies, so a rebuilt node would
   hold `None` permanently — gear would stop being driven after *any* seek.
 - **Give the node a sink once and never change it.** Same defect in a different place.
-- **Let an export drive gear.** Rejected: an offline render exists to produce a file, and driving
-  hardware from it is a side effect nobody asked for. The export path detaches for both its rebuild and
-  its render.
+- **Let an offline render drive gear — an export's clone, or a `bounce`.** Rejected: an offline render
+  exists to produce a file, and driving hardware from it is a side effect nobody asked for. On the wire
+  the bounce was the worse of the two, and for a shape the host documents itself: it begins at the
+  live position, so the queued `Start` a script's `play` left behind reaches gear as *"return to song
+  start"* with the session a second and a half in, followed by a whole bounce's worth of ticks and no
+  `Stop`. The export detaches for both its rebuild and its render; the bounce for its render.
+- **Detach in `process`/`apply` around every command that renders.** Rejected as a shape: it couples
+  the two commands that render offline to a shared wrapper whose list has to be kept true, and a third
+  one (`stretch`, `record`) would be a silent omission. Each render says at its own call site why it
+  must not speak, which is where the next reader looks.
 - **Put the port name in a logged command.** Rejected: machine-specific state in the session log, which
   is exactly what the rig's binding rule keeps out of it.
 - **`midir` from crates.io.** Not possible as-is: 0.10.1 pins `alsa ^0.9`, which hard-conflicts with
@@ -76,9 +86,22 @@ jitter figure is asserted.
 - Verified by the gates (26 suites, clippy `-D warnings`, fmt) and by tests that pin the behaviour
   rather than the intention: **a seek sends nothing while it rebuilds and resumes afterwards**, and
   **re-anchors the follower on the render after it** — `Continue` at a non-zero target, `Start` at
-  frame 0, both ends pinned; an export clone sends nothing; a session with no sink mounts, renders
-  and replays byte-identically; the ticks land at the tempo map's frames with the transport mapped
-  `Start`/`Continue`/`Stop`; and the overflow counter reaches the snapshot.
+  frame 0, both ends pinned; an export clone sends nothing; **a bounce sends nothing** — not a tick of
+  its timeline, not one of its drain tail, and nothing out of the transport tap — while still writing
+  its file, and the live session drives gear again on its very next render; a session with no sink
+  mounts, renders and replays byte-identically; the ticks land at the tempo map's frames with the
+  transport mapped `Start`/`Continue`/`Stop`; and the overflow counter reaches the snapshot.
+- **The detach is only half of the rule, and the halves are one decision.** A silent block must not
+  *consume* the transport tap either, or the bounce would trade a loud wrong message for a silently
+  dropped one: `TransportLog`'s contract is that a command flushes late and is never lost, so the node
+  leaves the queue alone while the slot is empty and the next block that has a device carries the
+  command ([the engine note](2026-09-29-midi-clock-out-in-the-engine.md)). With both halves, a
+  `bounce` between a `play` and its render is harmless — the queued `Continue` leaves with the next
+  live render, rather than being spent on a render that cannot speak.
+- **A pulse-counting follower falls behind across a silent offline render**, and that is the price
+  rather than an oversight: silence and phase cannot both be had from a render that exists to write a
+  file. The same silence already applied to an export; the bounce only made it reachable from the
+  command a script reaches for last.
 - The shell spikes are separate workspaces with their **own committed `Cargo.lock`s**, so a new
   transitive dependency has to be added to each as well. CI caught precisely that — `--locked`
   refusing to update them — while the root workspace passed, which is the class of breakage a
@@ -93,3 +116,5 @@ jitter figure is asserted.
   window, and it was not being followed while iterating.
 
 *Authored with DeepSeek-V4.1-Flash · DeepSeek Harness, 2026-09-29.*
+
+*Authored with Space Bunny · OpenCode, 2026-09-29.*
