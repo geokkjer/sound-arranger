@@ -909,6 +909,35 @@ fn sweep() -> i32 {
         t0.elapsed().as_millis()
     );
 
+    // The owner's order: the app is open and idle, a fader moves, then play.
+    //
+    // This **varies the pre-play delay** on purpose. Sampling a fixed moment twice
+    // is what hid the idle-starve bug for several attempts: a reading taken before
+    // the device thread opens the stream shows `0 -> 0`, which reads as a quiet
+    // device when it is an unopened one. Scaling the delay makes the accrual
+    // arithmetic. Before the pump kept an idle ring fed these three lines read
+    // 15,360 / 59,392 / 116,736 — 48,000 per second of idle, one per frame; they
+    // must read 0 now, and a non-zero value here is the regression.
+    for delay_ms in [300u64, 1200, 2400] {
+        let mut probe = Spike::from_host(HostHandle::spawn_with_audio());
+        let read = |s: &mut Spike| {
+            s.snap = s.host.snapshot();
+            s.snap.audio.as_ref().map(|a| a.underruns)
+        };
+        let at_open = read(&mut probe);
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        // "move the sliders"
+        probe.update(Message::Fader(0, 0.42));
+        probe.update(Message::Fader(1, 0.17));
+        let before_play = read(&mut probe);
+        let _ = probe.host.execute(HostCommand::TransportPlay);
+        std::thread::sleep(Duration::from_millis(250));
+        let after_play = read(&mut probe);
+        println!(
+            "sweep: idle {delay_ms:>4}ms -> play: open {at_open:?}, before play {before_play:?}, after play {after_play:?}"
+        );
+    }
+
     if let Err(e) = spike.host.execute(HostCommand::TransportPlay) {
         eprintln!("sweep: transport play refused: {e}");
         return 1;

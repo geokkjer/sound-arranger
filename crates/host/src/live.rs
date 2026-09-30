@@ -482,6 +482,13 @@ fn run(
             Err(RecvTimeoutError::Timeout) => {}
         }
 
+        if !session.is_playing()
+            && let AudioState::Open(a) = &audio
+        {
+            // Stopped, but the device is still consuming: see `fill_idle`.
+            fill_idle(&a.ring, &a.drops);
+        }
+
         if session.is_playing() {
             match &audio {
                 AudioState::Open(a) => {
@@ -547,6 +554,26 @@ fn fill_audio(
         push_stereo(ring, &samples, session.master_channels(), drops);
     }
     Ok(())
+}
+
+/// Keep the ring topped with **silence** while the transport is stopped.
+///
+/// The output callback starts the moment the stream opens — before the first
+/// `play` — and counts an underrun for every frame it finds missing. With the
+/// ring filled only while playing, a host sitting open at its transport therefore
+/// starved at 48,000 frames/s (measured: 15,360 after 300 ms idle, 59,392 after
+/// 1.2 s, 116,736 after 2.4 s — exactly one per frame per second, before any
+/// playback), and the whole backlog surfaced in the counter. Feeding silence
+/// keeps the device fed so `underruns` means what it says.
+fn fill_idle(ring: &Spsc<f32>, drops: &AtomicU64) {
+    let target = ring.capacity() / 2;
+    let silence = [0.0f32; AUDIO_CHUNK_FRAMES];
+    while ring.len() < target {
+        push_stereo(ring, &silence, 1, drops);
+        if ring.len() >= target {
+            break;
+        }
+    }
 }
 
 /// Push a rendered master block into the stereo output ring: a mono master is
@@ -678,6 +705,47 @@ fn publish(session: &HostSession, shared: &Mutex<Snapshot>, audio: &AudioState) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stopped host keeps the device fed, so an idle transport accrues no
+    /// underruns.
+    ///
+    /// Regression: the ring was filled only while playing, but the output callback
+    /// runs from the moment the stream opens — so a host sitting open at its
+    /// transport starved at 48,000 frames/s. Measured before the fix: 15,360
+    /// underruns after 300 ms idle, 59,392 after 1.2 s, 116,736 after 2.4 s, all
+    /// before any playback.
+    #[test]
+    fn an_idle_host_keeps_the_output_ring_fed() {
+        let ring = Spsc::new(1 << 15);
+        let drops = AtomicU64::new(0);
+        let target = ring.capacity() / 2;
+
+        fill_idle(&ring, &drops);
+
+        // Fed to the target, and a whole number of stereo frames (never half a
+        // frame, which would swap L/R on the next callback).
+        assert!(
+            ring.len() >= target,
+            "an idle ring holds {} samples, below the {target}-sample target",
+            ring.len()
+        );
+        assert_eq!(
+            ring.len() % OUTPUT_CHANNELS as usize,
+            0,
+            "half a frame in the ring"
+        );
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            0,
+            "silence must not count as drops"
+        );
+
+        // Calling it again is a no-op, not an overflow.
+        let before = ring.len();
+        fill_idle(&ring, &drops);
+        assert!(ring.len() >= before, "a second fill emptied the ring");
+        assert!(ring.len() <= ring.capacity(), "the ring overflowed");
+    }
 
     /// The pump advances the clock while playing and holds it still when stopped.
     #[test]
