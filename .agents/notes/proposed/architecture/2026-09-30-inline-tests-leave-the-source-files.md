@@ -91,8 +91,70 @@ slices, tests first because it is the mechanical, risk-free half:
 - **Churn collides with concurrent slices.** These three land in a quiet window, not alongside
   feature work — the worktree discipline keeps checkouts separate but not review bandwidth.
 
+## Slice 1 shipped (2026-09-30) — verified mechanism, and a correction to the numbers
+
+**Slice 1 is done.** The move landed as four parallel Agent Team tasks (one per write scope) with the
+Lead holding a gated verification task. Measured and independently verified after the fact:
+
+| | before | after |
+|---|---|---|
+| `crates/host/src/lib.rs` | 10,435 | **4,854** |
+| `crates/media/src/*.rs` (15 files) | 8,016 | **4,624** |
+| `crates/engine/src/{clock,graph}.rs` + `plugins/*.rs` (6 files) | ~5,700 | ~3,500 |
+| `crates/workflow/src/lib.rs` | 867 | **669** |
+| totals | **24** source files changed: 52 insertions, 12,913 deletions (this note is a 25th file) | **26 new files**, 12,838 lines, under `src/tests/` |
+
+**The #1 acceptance criterion is met**: `cargo test --workspace` is green and every test is preserved
+by identity, not merely by count — 274 `#[test]` functions before and after, zero lost, zero added,
+with `#[ignore]` status unchanged (0/3/1/0 per crate). `cargo fmt --all --check` and
+`cargo clippy --workspace --all-targets -- -D warnings` are green, and both spike workspaces still
+build.
+
+**Correction to this note's own figures.** The table in `## Problem` over-states the inline test
+weight: it computed "inline" as *everything from the first `#[cfg(test)]` to EOF*, which includes a
+test-only helper (`replay_full`, a `#[cfg(test)] fn` that is not inside a module). The true inline-test
+figure for `host/src/lib.rs` is **5,581 lines**, so the correct post-move floor is ~4,854, not the
+~3,100 asserted in acceptance criterion 1 — the criterion's premise was wrong, not the outcome. The
+note's "416 passed at `ea01d0d`" is likewise a snapshot of a since-grown suite; the lib targets now
+carry 271 tests (51/127/84/9) plus the integration and doctest suites.
+
+**The mechanism, now proven rather than assumed.** An inline `#[cfg(test)] mod tests { … }` becomes
+
+```rust
+#[cfg(test)]
+#[path = "tests/<name>.rs"]
+mod tests;
+```
+
+`#[path]` preserves `super` resolution, so `use super::*;` reaches private items exactly as before —
+verified with a canary *before* the migration, because the alternative (`crates/*/tests/`) was rejected
+in `## Alternatives considered` precisely for losing private access. Two non-obvious requirements, both
+found by the team rather than predicted:
+
+- **The moved body must be dedented by 4 spaces.** A file-scope body needs top-level items at column
+  0, and `cargo fmt --all --check` gates on it.
+- **Dedenting is not sufficient.** Freeing four columns makes rustfmt join lines that now fit in 100
+  columns. In six places that needed a canonicalisation beyond whitespace — two dropped trailing
+  commas and one `|i| { expr }` → `|i| expr`. These are semantics-preserving and were accepted, since
+  the fmt gate is mechanical and authoritative; "change no line" was the wrong criterion, and the real
+  one is "no semantic change, fmt green".
+
+**File-naming rule (settled after two wrong attempts).** The extracted file is named
+`<source-stem>[_<module>].rs`: a lone `mod tests` takes the source stem (`record.rs` →
+`tests/record.rs`), a differently-named module appends its name (`wav.rs`'s `mod float_tests` →
+`tests/float_tests.rs`), and the `lib.rs` case uses `tests.rs`. A module-name rule cannot be total —
+fifteen siblings in one directory each declaring `mod tests` would collide on a single file.
+
+**Standing rule (criterion 4) is now enforceable**: `grep -rn "^#\[cfg(test)\]" crates/*/src` returns
+only the `mod …;` declarations plus the one test-only fn, so a re-grown inline mod is visible in one
+command.
+
+Slices 2 and 3 remain unstarted; this note stays `proposed` until the last slice lands (criterion 5).
+
 ## Attribution
 
 Authored with GLM-5.3 · OpenCode, 2026-09-30, at the merge review of `fix/space-bunny-review`; the
 measurements are from `ea01d0d`. The direction is the human's — the refactor is recorded as a future
-decision, deliberately not actioned in the fix run's merge.
+decision, deliberately not actioned in the fix run's merge. Slice 1 was executed and gated the same day
+by a four-member Agent Team under DeepSeek-V4.1-Flash (DeepSeek Harness); the shipped-reality section
+above, including the corrections to this note's own figures, is that run's record.
