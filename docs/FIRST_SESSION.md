@@ -6,8 +6,9 @@
 You don't need to understand Rust, audio programming, or the architecture to do
 this session. You need a working toolchain and fifteen minutes. By the end you
 will have assembled a four-plugin signal chain, bounced it to a WAV file,
-*listened to it*, broken the engine three ways on purpose, and proven its
-central promise — identical input, identical output — with your own `cmp`.
+*listened to it*, broken the engine three ways on purpose, crashed it mid-edit
+and lost nothing, and proven its central promise — identical input, identical
+output — with your own `cmp`.
 
 Everything here runs against the **headless host**: a real binary that exercises
 the full Host API contract with no GUI. Every fancy thing built later (the
@@ -145,6 +146,74 @@ On the trap run that prints `0 nonzero`; on the original it prints `35656
 nonzero`. (The older edition of this guide used `note_len=2400 → 0.25` as the
 trap; in today's chain that parameter is audibly inert — the tone's envelope
 length is `blip_len`, so the trap moved with the code.)
+
+## Step 5 — save it, crash it, recover it
+
+Everything so far lived in one process. A **session directory** makes it survive:
+`save` writes the document itself, and a journal keeps the edits you made after
+the save — so a crash costs at most the write it was in the middle of.
+
+**Save the session.** Append one line to the script (or edit your copy) and rerun:
+
+```text
+save /tmp/hello-session
+```
+
+(keep the bounce line above it). Two files appear: `session.txt` — open it and
+*read* it. It is the script you ran, in the log's own words:
+
+```text
+host v1
+session_rate 48000
+mount euclidean steps=8.0 pulses=5.0
+...
+```
+
+That is the "the log is the document" claim made literal: the session is a
+text file you can read, diff and copy. Beside it sits `journal.txt`, empty —
+the autosave ledger, clean so far.
+
+**Prove the reload.** In a fresh process, load the directory and bounce again:
+
+```text
+host v1
+load /tmp/hello-session
+bounce 96000 /tmp/hello-again.wav
+```
+
+`cmp /tmp/hello.wav /tmp/hello-again.wav` — **identical**. The directory is the
+session; replaying it is byte-exact.
+
+**Now crash it.** The journal is written per edit, so a `kill -9` mid-write can
+leave a torn final line. Simulate that: put two complete edits in the journal
+and one half-written line (note the last line has no newline and stops
+mid-word — exactly what a killed process leaves):
+
+```sh
+printf 'set_param mixer master.gain 0.4 @0\nset_param mixer master.gain 0.5 @0\nset_param mixer master.gai' \
+  > /tmp/hello-session/journal.txt
+```
+
+Load and bounce again, the same way as above. Three things happen, and each is
+visible in the output:
+
+- **The session opens.** Exit code 0. A torn autosave line is *never* fatal —
+  refusing to open a session because its own autosave was interrupted would be
+  the worse failure.
+- **`engine log events: 11`** — the baseline 8, plus both complete journal
+  edits, plus the bounce. Recovery is per gesture: whole entries apply, the torn
+  tail is dropped. One bad line does not take the edits after it anywhere,
+  because there is nothing after it — the journal is append-only.
+- **The edits survived.** `cmp` against the clean reload's WAV: different. Count
+  the peak with the Step 4 snippet: it is **10248** where the clean bounce
+  peaked **16397** — a ratio of exactly 0.625, which is `0.5 / 0.8`: the
+  journaled gain change is *audibly present* in the recovered render. The
+  crash cost nothing but the write it was in the middle of.
+
+The host also counts what happened — applied gestures, torn lines, refused
+entries, and the first refusal's reason (`JournalRecovery`, read through the
+Host API) — but no shell prints that report line yet; the headless binary
+proves the behaviour, the numbers are API surface.
 
 ## Where to go next
 

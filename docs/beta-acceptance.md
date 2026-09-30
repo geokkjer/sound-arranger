@@ -1,7 +1,8 @@
 # Beta acceptance — the checklist
 
-> 🕒 Last verified against commit `971524b` (2026-09-24). If the code has moved on,
-> trust the code and move this line forward.
+> 🕒 Last verified against commit `2f6ad78` (2026-09-30 — §5's crash-recovery items
+> re-verified against the shipped host; the rest checked 2026-09-24). If the code
+> has moved on, trust the code and move this line forward.
 
 This is the checklist a **second person** runs to accept the alpha. The point of
 it is independence: everything below is doable from
@@ -88,7 +89,9 @@ Time: about an hour, plus however long you spend listening.
       `kill -9` the shell. Reopen with **`: load <dir>`** (which replays the
       journal; `--script <file>` reads only the saved baseline); the edit you made
       is there (at worst, the very last gesture is missing), and a torn last line
-      is reported rather than costing the session.
+      costs nothing — the session opens without it. (The host counts what was
+      torn in its recovery record; no shell prints that count yet — the walkthrough
+      with a simulated crash is [FIRST_SESSION.md](FIRST_SESSION.md) Step 5.)
 - [ ] Re-saving does not grow the file: save, reopen, save again, and
       `session.txt` is the same length (and the same bytes) as after the first
       save.
@@ -165,4 +168,6 @@ severity class this project has: include both files and both `session.txt`s.
 
 ---
 
-*Authored with DeepSeek-V4-Flash · DeepSeek Harness, 2026-09-24.*
+*Authored with DeepSeek-V4-Flash · DeepSeek Harness, 2026-09-24; §5's
+crash-recovery items re-verified against `2f6ad78` with GLM-5.3 · OpenCode,
+2026-09-30.*
