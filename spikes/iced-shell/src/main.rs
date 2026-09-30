@@ -1743,7 +1743,8 @@ mod record_mvp {
     fn the_next_take_avoids_the_names_the_pool_holds() {
         let mut spike = Spike::headless();
 
-        // An empty pool starts at one.
+        // An empty pool starts at one. (`next_take_id` reads the published pool,
+        // not the filesystem, so a `--record-check` run's leftovers cannot reach it.)
         spike.snap.pool_ids.clear();
         assert_eq!(spike.next_take_id(), "take-1");
 
@@ -1816,5 +1817,93 @@ mod record_mvp {
         // Past the recorded span it clamps rather than exceeding the bar.
         snap.frame = 5_000;
         assert_eq!(position_fraction(&snap, 1000), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod record_toggle {
+    use super::*;
+
+    /// `o` starts a take when none is running and stops the one that is.
+    ///
+    /// Device-gated rather than mocked: a take needs a real input device, so the
+    /// stop half runs only once a start has succeeded. On a machine with no input
+    /// (CI) it verifies the honest alternative instead — that the refusal is
+    /// surfaced rather than swallowed — and says which branch it took, so a
+    /// skipped assertion cannot read as a pass.
+    #[test]
+    fn the_toggle_starts_then_stops_a_take() {
+        let mut spike = Spike::from_host(HostHandle::spawn_with_audio());
+        assert_eq!(spike.snap.recording, None, "a fresh shell is not recording");
+
+        spike.update(Message::Key(WorkflowKey::Char('o')));
+
+        // The start is a command round trip, so read the host rather than the
+        // repaint the shell has not had yet.
+        let mut started = false;
+        for _ in 0..2_000 {
+            spike.snap = spike.host.snapshot();
+            if spike.snap.recording.is_some() {
+                started = true;
+                break;
+            }
+            if spike.status.starts_with("command refused") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        if !started {
+            assert!(
+                spike.status.starts_with("command refused"),
+                "no take started and nothing was refused: {:?}",
+                spike.status
+            );
+            assert!(
+                spike.snap.recording.is_none(),
+                "the snapshot claims a recording while the start was refused"
+            );
+            eprintln!(
+                "record_toggle: no input device — verified the refusal path instead ({})",
+                spike.status
+            );
+            return;
+        }
+
+        // It started: the status says so, and the same key stops it.
+        assert!(
+            spike.status.contains("recording"),
+            "a started take should say so: {:?}",
+            spike.status
+        );
+        // The expected name comes from the shell's own rule, read *before* the
+        // press: pinning `take-1` here would pass once on a clean pool and fail on
+        // the next run, which is a test that only works the first time.
+        let expected = spike.next_take_id();
+        let take_id = spike.snap.recording.clone().expect("started").take_id;
+        assert_eq!(take_id, expected, "the take is named by `next_take_id`");
+
+        spike.update(Message::Key(WorkflowKey::Char('o')));
+        let mut finished = false;
+        for _ in 0..3_000 {
+            spike.snap = spike.host.snapshot();
+            if spike.snap.recording.is_none() && spike.snap.last_take.is_some() {
+                finished = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            finished,
+            "the second `o` did not finish the take: {:?}",
+            spike.status
+        );
+        let report = spike.snap.last_take.clone().expect("finished");
+        assert_eq!(report.take_id, take_id, "the finished take keeps its id");
+        assert!(
+            !spike.status.starts_with("command refused"),
+            "{:?}",
+            spike.status
+        );
     }
 }

@@ -81,6 +81,12 @@ against the pool the host publishes.**
 - **`--record-check` is the instrument for this verb**, as `--sweep` is for a fader drag: a GUI
   interaction cannot be scripted from outside, so the shell drives itself. It needs an input device, so
   it is not a CI gate — the owner runs it.
+- **The toggle's start-vs-stop decision has a test, device-gated rather than mocked**
+  (`record_toggle::the_toggle_starts_then_stops_a_take`). It reads the host rather than the repaint and
+  asserts the started id equals what `next_take_id` derived — pinning `take-1` would pass once on a
+  clean pool and fail on the next run, which is a test that only works the first time. With no input
+  device (CI) it verifies the refusal path instead and says which branch it took, so a skipped
+  assertion cannot read as a pass.
 - **Two bugs came out of building it, both from the same shape** — acting on state that was not the
   host's: the pool was set *before* `host.load`, which replaces the session wholesale and threw it
   away, and `toggle_record` decided start-vs-stop from the last repaint, so a key press could act on a
