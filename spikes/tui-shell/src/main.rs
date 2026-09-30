@@ -6060,7 +6060,12 @@ mod tests {
             app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
         }
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
-        assert_eq!(app.status, format!(": {line}"), "nothing to report: {}", app.status);
+        assert_eq!(
+            app.status,
+            format!(": {line}"),
+            "nothing to report: {}",
+            app.status
+        );
 
         // A crashed journal: one intact edit, one torn final line (no newline).
         std::fs::write(
