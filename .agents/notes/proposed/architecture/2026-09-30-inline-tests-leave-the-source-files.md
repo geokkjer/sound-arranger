@@ -5,27 +5,32 @@ Status: proposed
 ## Problem
 
 The space-bunny fix run ([disposition](../../../../research/architecture/2026-09-29-space-bunny-review.md))
-landed 26 defects' worth of fixes plus a regression test per defect, and the suite grew from 326 to
+landed its confirmed defects as 34 fix commits (plus three review/index commits), most with a
+regression test, and the suite grew from 326 to
 416 tests. That is exactly the weight a bugfix run should add — but most of it landed **inline**, and
 the raw file sizes now mislead anyone who opens them:
 
 | file | total lines | production | inline `#[cfg(test)]` |
 |---|---|---|---|
-| `crates/host/src/lib.rs` | 10,379 | 3,052 | **7,327 (71%)** |
+| `crates/host/src/lib.rs` | 10,379 | 4,820 | **5,559 (54%)** |
 | `crates/media/src/timeline.rs` | 2,924 | 1,098 | 1,826 |
 | `crates/engine/src/graph.rs` | 2,448 | 1,724 | 724 |
 | `crates/media/src/wav.rs` | 1,250 | 592 | 658 |
 | `crates/engine/src/plugins/clock_out.rs` | 945 | 524 | 421 |
 
 (Measured at `ea01d0d`, the branch tip the merge review gated; `engine/src/render.rs` is the
-counter-example — 1,931 lines, all production, +63% in one run.)
+counter-example — 1,931 lines, all production, +63% in one run. "Production" is everything before a
+file's first test module, not a comment-stripped count: `host/src/lib.rs` has a test-only *method*
+at line 3,053, and treating that marker as the start of the test region would count ~1,770 lines of
+ordinary code as tests.)
 
-`host/src/lib.rs` is the acute case. Its 3,052 production lines already do six jobs — the
+`host/src/lib.rs` is the acute case. Its 4,820 production lines already do six jobs — the
 `HostCommand` enum and dispatch (~340), `HostSession` core including a 444-line `apply` match
 (~1,960), history/replay/undo (~630), journal persistence (~345), script formatting (~330), and
-script parsing (~815) — and then 7,327 lines of tests sit on top in two modules (`mod tests` alone
-is ~5,000 lines). The costs are concrete: navigation (the file's real structure is invisible until
-line 4,821), recompile latency (every touch of the crate recompiles the whole inline suite), and
+script parsing (~815) — and then 5,559 lines of tests sit on top in two modules (`mod tests`, which
+opens at line 4,821, is ~4,985 lines; a second module follows at line 9,806). The costs are concrete:
+navigation (the file's real structure is invisible until line 4,821), recompile latency (every touch
+of the crate recompiles the whole inline suite), and
 review size (a fix near the top produces a diff in a 10k-line file).
 
 ## Proposal

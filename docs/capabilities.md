@@ -20,7 +20,8 @@ the per-slice decisions live in [the notes](../.agents/notes/README.md).
 |---|---|---|
 | **Record** a take from the input device into the pool (stereo, 24-bit material too); the finished take is **declared state** (`take <id> <frames> <dropped> <channels> <at_frame>`), so the session replays without the device | `record <take_id>` / `:record` | `crates/host` tests (incl. `a_take_declaration_replays_without_a_device`), `crates/media/tests/hardware_input.rs` (`--ignored`) |
 | **Import** a WAV: any rate, mono or multi-channel (split per channel) | `--wave <file>`, `pool` | `crates/media/tests/pool.rs` |
-| **Arrange**: cut, copy, cut/copy-paste, append, move, trim, loop, chop, fade, gain | keys `x v y c p P d < > t H L J K g G f F` | the TUI's 54 tests, the host's arrangement tests |
+| **Arrange**: cut, copy, cut/copy-paste, append, move, trim, fade, gain | keys `x v y c p P d < > t H L J K g G f F` | the TUI's 54 tests, the host's arrangement tests |
+| **Arrange, command line only**: loop a region, chop into pieces | `arrange loop_region …` / `arrange chop …` on the `:` line (`LoopRegion`, `ChopClip` — **no key is bound**, in either shell) | `crates/media/src/timeline.rs` tests, `chop` in `crates/host/tests/arranger_commands.rs` |
 | **Tracks**: add, rename, delete (with clips), reorder (the mixer channel follows) | `a R D { }` | `tracks_add_rename_delete_and_reorder` |
 | **Snap**: off → bar → beat → 1/2 → 1/4, with a numbered bar/beat ruler | `b`, `[`/`]` | `crates/media/src/snap.rs`, TUI ruler tests |
 | **Utility transforms**: reverse (a clip property), normalize, invert, silence, trim-to-content | `V U i E T` | `crates/media/src/timeline.rs` tests |
