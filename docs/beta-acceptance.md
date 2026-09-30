@@ -1,6 +1,6 @@
 # Beta acceptance — the checklist
 
-> 🕒 Last verified against commit `2f6ad78` (2026-09-30 — §5's crash-recovery items
+> 🕒 Last verified against commit `ddb03a7` (2026-09-30 — §5's crash-recovery items
 > re-verified against the shipped host; the rest checked 2026-09-24). If the code
 > has moved on, trust the code and move this line forward.
 
@@ -169,5 +169,5 @@ severity class this project has: include both files and both `session.txt`s.
 ---
 
 *Authored with DeepSeek-V4-Flash · DeepSeek Harness, 2026-09-24; §5's
-crash-recovery items re-verified against `2f6ad78` with GLM-5.3 · OpenCode,
+crash-recovery items re-verified against `ddb03a7` with GLM-5.3 · OpenCode,
 2026-09-30.*

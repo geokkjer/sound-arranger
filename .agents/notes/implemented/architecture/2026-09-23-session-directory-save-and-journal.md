@@ -175,6 +175,10 @@ not refuse the write — the reader reports it, as it always did.
   browser / "recent sessions", autosave from the very first edit (today the journal begins at the first
   `save`), and pruning old journal lines once a save has folded them into the script.
 
+*Advanced 2026-09-30: the recovery a load performs is now **reported**, not just counted — the
+terminal shell and the headless binary print the counts beside the load line
+([the note](../feature/2026-09-30-a-load-reports-the-journals-recovery.md)).*
+
 ## Attribution
 
 Authored with DeepSeek-v4-flash · DeepSeek Harness, 2026-09-23.

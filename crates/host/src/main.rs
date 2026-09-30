@@ -62,6 +62,19 @@ fn main() {
         }
     };
 
+    // What a `load` recovered from the session directory's journal: the counts
+    // (applied / torn / refused) and, if anything was refused, its first words.
+    // Printed only when there is a story — a clean load of an empty journal
+    // stays quiet, and the crash case is the one a user needs to see.
+    if script
+        .iter()
+        .any(|c| matches!(c, host::HostCommand::Load { .. }))
+        && let Some(rec) = session.last_recovery()
+        && rec.has_story()
+    {
+        println!("host: {}", rec.describe());
+    }
+
     // Collect the bounce path from the script (the last Bounce command).
     let bounce_path: Option<PathBuf> = script
         .iter()

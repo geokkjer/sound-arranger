@@ -1,6 +1,6 @@
 # First session — make sound in fifteen minutes
 
-> 🕒 Last verified against commit `2f6ad78` (2026-09-30). If the code has moved on,
+> 🕒 Last verified against commit `ddb03a7` (2026-09-30). If the code has moved on,
 > trust the code and move this line forward.
 
 You don't need to understand Rust, audio programming, or the architecture to do
@@ -194,26 +194,38 @@ printf 'set_param mixer master.gain 0.4 @0\nset_param mixer master.gain 0.5 @0\n
   > /tmp/hello-session/journal.txt
 ```
 
-Load and bounce again, the same way as above. Three things happen, and each is
-visible in the output:
+Load and bounce again, the same way as above. The first line of the output is
+new — the report of what the recovery did:
+
+```text
+host: journal: 2 applied, 1 torn, 0 refused
+host: bounced 384044 bytes to /tmp/crashed-recovered.wav
+engine log events: 11
+```
+
+Four things happened, and each is visible:
 
 - **The session opens.** Exit code 0. A torn autosave line is *never* fatal —
   refusing to open a session because its own autosave was interrupted would be
   the worse failure.
-- **`engine log events: 11`** — the baseline 8, plus both complete journal
-  edits, plus the bounce. Recovery is per gesture: whole entries apply, the torn
-  tail is dropped. One bad line does not take the edits after it anywhere,
-  because there is nothing after it — the journal is append-only.
+- **`journal: 2 applied, 1 torn, 0 refused`** — the recovery's own account:
+  both complete edits replayed, the torn tail dropped, nothing refused. The
+  terminal shell says the same thing beside its `: load` line.
+- **`engine log events: 11`** — the baseline 8, plus both journal edits, plus
+  the bounce. Recovery is per gesture: whole entries apply, the torn tail is
+  dropped. One bad line does not take the edits after it anywhere, because
+  there is nothing after it — the journal is append-only.
 - **The edits survived.** `cmp` against the clean reload's WAV: different. Count
   the peak with the Step 4 snippet: it is **10248** where the clean bounce
   peaked **16397** — a ratio of exactly 0.625, which is `0.5 / 0.8`: the
   journaled gain change is *audibly present* in the recovered render. The
   crash cost nothing but the write it was in the middle of.
 
-The host also counts what happened — applied gestures, torn lines, refused
-entries, and the first refusal's reason (`JournalRecovery`, read through the
-Host API) — but no shell prints that report line yet; the headless binary
-proves the behaviour, the numbers are API surface.
+The report line is built from the host's recovery record — applied gestures,
+torn lines, refused entries, and the first refusal's own words — through the
+same read-side discipline as the engine's apply faults: the record is data,
+the sentence is a read. A clean load (an empty journal) has no story and stays
+quiet.
 
 ## Where to go next
 
@@ -235,4 +247,5 @@ proves the behaviour, the numbers are API surface.
 
 *Authored with GLM-5.3 Flash · ZCode, 2026-08-27; re-verified against `7c5a2e7`
 with DeepSeek-V4-Flash · DeepSeek Harness, 2026-09-05; re-verified against
-`2f6ad78` (every output above re-run) with GLM-5.3 · OpenCode, 2026-09-30.*
+`2f6ad78` (every output above re-run) and against `ddb03a7` (step 5's report
+line) with GLM-5.3 · OpenCode, 2026-09-30.*

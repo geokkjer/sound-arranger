@@ -3395,6 +3395,31 @@ pub struct JournalRecovery {
     pub refused_reason: Option<String>,
 }
 
+impl JournalRecovery {
+    /// Whether there is anything to say: at least one journal command applied, was
+    /// torn, or was refused. A load of a cleanly-saved session (an empty journal)
+    /// has no story, and a caller uses this to stay quiet rather than print zeros.
+    pub fn has_story(&self) -> bool {
+        self.applied > 0 || self.torn_lines > 0 || self.refused > 0
+    }
+
+    /// The recovery as one line, built here on the caller's thread — the same
+    /// read-side discipline as [`ApplyFault::describe`]: the record is data, the
+    /// sentence is a read. Counts first (they are the facts), then the first
+    /// refusal's own words, because a refusal worth showing is worth quoting.
+    pub fn describe(&self) -> String {
+        let mut line = format!(
+            "journal: {} applied, {} torn, {} refused",
+            self.applied, self.torn_lines, self.refused
+        );
+        if let Some(reason) = &self.refused_reason {
+            line.push_str(" — first refusal: ");
+            line.push_str(reason);
+        }
+        line
+    }
+}
+
 /// Write one history **entry** (one gesture) as script lines. A multi-command entry
 /// is bracketed with `group begin`/`group end`, so the gesture structure survives a
 /// save (and replays as one undo step).
@@ -8322,6 +8347,37 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The recovery record's one-line form — the wording the shells print beside
+    /// a `load` line. Counts first (they are the facts), then the first refusal's
+    /// own words, because a refusal worth showing is worth quoting. An empty
+    /// journal has no story, and a caller stays quiet rather than print zeros.
+    #[test]
+    fn a_recovery_report_describes_itself() {
+        let clean = JournalRecovery::default();
+        assert!(!clean.has_story(), "an empty journal has no story");
+
+        let torn = JournalRecovery {
+            applied: 2,
+            torn_lines: 1,
+            refused: 0,
+            refused_reason: None,
+        };
+        assert!(torn.has_story());
+        assert_eq!(torn.describe(), "journal: 2 applied, 1 torn, 0 refused");
+
+        let refused = JournalRecovery {
+            applied: 1,
+            torn_lines: 1,
+            refused: 2,
+            refused_reason: Some("arrange add_clip t1 c0 s1 0 48000 … — no track t1".into()),
+        };
+        assert_eq!(
+            refused.describe(),
+            "journal: 1 applied, 1 torn, 2 refused — first refusal: \
+             arrange add_clip t1 c0 s1 0 48000 … — no track t1"
+        );
     }
 
     /// A session's rate is context: `session_rate` round-trips, the loaded session
