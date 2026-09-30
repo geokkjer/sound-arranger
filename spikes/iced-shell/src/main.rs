@@ -47,10 +47,10 @@ use host::HostCommand;
 use host::live::{HostHandle, Snapshot};
 
 use iced::keyboard;
-use iced::widget::{column, container, progress_bar, row, text};
+use iced::widget::{column, container, progress_bar, row, text, vertical_slider};
 use iced::window;
 use iced::{Center, Element, Fill, Length, Subscription, Theme};
-use iced_audio::{DBRange, Gesture, Normal, NormalParam, VSlider, virtual_slider};
+use iced_audio::{DBRange, Normal, NormalParam};
 use workflow::{Action, Key as WorkflowKey, Mode};
 
 /// The demo profile — the `docs/FIRST_SESSION.md` chain, so the meters have
@@ -90,20 +90,6 @@ const FADER: DBRange = DBRange::new(
     Normal::new(0.833),
     DBRange::DEFAULT_SKEW_FACTOR,
 );
-
-/// Fader sensitivity: **one pixel of drag is one pixel of fader travel.**
-/// `iced_audio`'s default (`0.00385` per pixel) is a scroll-wheel rate, not a
-/// fader mapping — over a 150 px fader a full-height drag moved the parameter by
-/// only 0.58, i.e. barely half its range, which reads as a stuck control.
-const FADER_DRAG_SCALAR: f32 = 1.0 / FADER_HEIGHT;
-
-/// The slider config that turns the crate default into a mixer fader.
-fn fader_config() -> virtual_slider::Config {
-    virtual_slider::Config {
-        drag_scalar: FADER_DRAG_SCALAR,
-        ..Default::default()
-    }
-}
 
 /// `set_param` targets as `&'static str` (the command carries static names):
 /// `ch0.gain` … `ch7.gain`, then the master. `MIXER_CHANNELS_MAX` is 8.
@@ -183,7 +169,7 @@ enum Message {
     /// A key press, already translated into the shared workflow's vocabulary.
     Key(WorkflowKey),
     /// A fader gesture: `strip` is the channel (or the master, last).
-    Fader(usize, Gesture),
+    Fader(usize, f32),
 }
 
 impl Spike {
@@ -295,16 +281,8 @@ impl Spike {
     /// A fader gesture: move the widget, then send the host a logged `set_param`
     /// with the gain that position means. The engine smooths the change, so a
     /// drag is a stream of parameter events — which is what automation is.
-    fn gesture(&mut self, index: usize, gesture: Gesture) {
-        let Gesture::Gesturing(normal) = gesture else {
-            // Start/end carry no value; re-read the host so a value the log
-            // disagrees with (a clamp, say) wins.
-            if matches!(gesture, Gesture::GestureEnd) {
-                self.adopt();
-            }
-            return;
-        };
-
+    fn gesture(&mut self, index: usize, normal: f32) {
+        let normal = Normal::new(normal.clamp(0.0, 1.0));
         if let Some(fader) = self.faders.get_mut(index) {
             fader.set(normal);
         }
@@ -595,14 +573,12 @@ impl Spike {
         if index >= self.faders.len() {
             return;
         }
-        self.gesture(
-            index,
-            Gesture::Gesturing(FADER.map_db(if gain > 0.0 {
-                20.0 * gain.log10()
-            } else {
-                f32::NEG_INFINITY
-            })),
-        );
+        let normal = FADER.map_db(if gain > 0.0 {
+            20.0 * gain.log10()
+        } else {
+            f32::NEG_INFINITY
+        });
+        self.gesture(index, normal.as_f32());
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -753,12 +729,12 @@ impl Spike {
                     row![
                         container(progress_bar(0.0..=1.0, meter).vertical())
                             .width(Length::Fixed(16.0))
-                            .height(Length::Fixed(FADER_HEIGHT)),
-                        VSlider::new(*fader)
-                            .on_gesture(move |gesture| Message::Fader(index, gesture))
-                            .config(&fader_config())
-                            .width(Length::Fixed(18.0))
-                            .height(Length::Fixed(FADER_HEIGHT)),
+                            .height(FADER_HEIGHT),
+                        vertical_slider(0.0..=1.0, fader.normal.as_f32(), move |normal| {
+                            Message::Fader(index, normal)
+                        })
+                        .width(18.0)
+                        .height(FADER_HEIGHT),
                     ]
                     .spacing(6),
                     text(label).size(11),
@@ -1146,18 +1122,29 @@ mod tests {
 mod fader_travel {
     use super::*;
 
-    /// A full-height drag must cross the fader's whole range.
+    /// The fader spans the widget's whole range, so a full-height drag is the
+    /// fader's whole travel.
     ///
-    /// Regression: `iced_audio`'s default `drag_scalar` (0.00385/px) is a
-    /// scroll rate, so dragging the fader's full 150 px moved the parameter only
-    /// 0.58 — the control felt stuck and never reached its top.
+    /// Regression: this was `iced_audio`'s *virtual* slider, whose drag was
+    /// relative (`0.00385` of the range per pixel — a scroll rate) **and**
+    /// inverted vertically, so dragging down moved the handle up and the control
+    /// never reached its top. The widget is now iced's own absolute
+    /// `vertical_slider`, whose range is exactly `0.0..=1.0` — the same space
+    /// `Normal` lives in — so the two need no conversion.
     #[test]
-    fn a_full_height_drag_uses_the_whole_range() {
-        let travel = FADER_HEIGHT * FADER_DRAG_SCALAR;
-        assert!(
-            (travel - 1.0).abs() < 1e-6,
-            "a full {FADER_HEIGHT} px drag covers {travel:.3} of the range, not all of it"
-        );
+    fn the_fader_range_is_the_sliders_whole_range() {
+        for normal in [0.0f32, 0.25, 0.5, 0.833, 1.0] {
+            let n = Normal::new(normal);
+            let round_tripped = FADER.map_db(FADER.unmap_to_db(n)).as_f32();
+            assert!(
+                (round_tripped - normal).abs() < 1e-5,
+                "normal {normal} round-trips to {round_tripped}"
+            );
+        }
+        // The slider is fed `fader.normal.as_f32()` directly, so the range the
+        // widget is given must be the unit interval.
+        assert_eq!(FADER.unmap_to_db(Normal::new(0.0)), -60.0);
+        assert_eq!(FADER.unmap_to_db(Normal::new(1.0)), 12.0);
     }
 
     /// Every part of the throw has to be usable, including the top.

@@ -2,6 +2,14 @@
 
 Status: implemented
 
+> **Superseded (2026-09-30, same day).** This note's fix was shipped and then reverted: on
+> hands-on use the fader was *still* wrong, because the real cause was different. `iced_audio`'s
+> `VSlider` is a **relative, vertically inverted drag control**, and no `drag_scalar` can make it
+> behave like a fader. The console now uses iced's own absolute `vertical_slider`.
+> [The replacement note](2026-09-30-iced-console-fader-is-not-a-drag-control.md) is the decision, and
+> this one's central claim — `fader_config()`, pinned by `fader_travel::a_full_height_drag_uses_the_whole_range`
+> — no longer describes the code, because the virtual slider and that test are gone.
+
 ## Problem
 
 Hands-on use of the iced spike reported the mixer sliders as "almost broken — they could only move a
