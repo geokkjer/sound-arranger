@@ -44,9 +44,10 @@ pub mod value;
 pub use clock::{Clock, Scheduler, TempoMap};
 pub use ctx::Context;
 pub use graph::{
-    AudioInputs, AudioNode, BLOCK, CAP_EVENTS, Direction, EUCLIDEAN_MAX_STEPS, EUCLIDEAN_STEP_CAP,
-    EuclideanGen, EventBuf, Gain, Graph, MERGE_CAP, Node, NodeIO, NodeId, NodeKind, NoteEvent,
-    Port, RenderBlock, RenderMode, ScaleGen, SignalKind, Sine, ToneGen, Trigger,
+    AudioInputs, AudioNode, BLOCK, CAP_EVENTS, ConnectClass, ConnectRefusal, Direction,
+    EUCLIDEAN_MAX_STEPS, EUCLIDEAN_STEP_CAP, EuclideanGen, EventBuf, Gain, Graph, MERGE_CAP, Node,
+    NodeIO, NodeId, NodeKind, NoteEvent, Port, RenderBlock, RenderMode, ScaleGen, SignalKind, Sine,
+    ToneGen, Trigger,
 };
 pub use log::{Event, SessionLog};
 pub use plugins::{
@@ -56,7 +57,7 @@ pub use plugins::{
     PluginApi, Rhythm, Scale, TONE_PARAMS, Tone, Transport, TransportLog, euclid, mixer_factory,
 };
 pub use render::{
-    ApplyFault, DrainOutcome, DrainPolicy, Engine, MAX_APPLY_FAULTS, MAX_DRAIN_FRAMES,
-    MIN_TEMPO_BPM, OpHandler, PluginFactory, SchedEvent,
+    ApplyFault, ApplyFaultReason, DrainOutcome, DrainPolicy, Engine, MAX_APPLY_FAULTS,
+    MAX_DRAIN_FRAMES, MIN_TEMPO_BPM, OpHandler, PluginFactory, SchedEvent,
 };
 pub use value::{OpMsg, Value};

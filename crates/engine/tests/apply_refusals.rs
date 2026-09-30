@@ -153,10 +153,12 @@ fn a_scheduled_mount_the_plugin_refuses_is_reported_and_frees_the_name() {
     assert_eq!(faults.len(), 1, "exactly the refused mount: {faults:?}");
     assert_eq!(faults[0].plugin, "euclidean");
     assert_eq!(faults[0].at_frame, 0, "the frame the log stamped");
+    // `describe()` is the **read** side: the record holds the plugin's message as
+    // data and the line is built here, on the control side, where a host reads it.
+    let described = faults[0].describe();
     assert!(
-        faults[0].reason.contains("steps"),
-        "and the plugin's own refusal, verbatim: {}",
-        faults[0].reason
+        described.contains("steps"),
+        "and the plugin's own refusal, verbatim: {described}"
     );
     assert_eq!(e.apply_faults_dropped(), 0, "one fault, none dropped");
     assert!(e.is_degraded(), "the session is not what its log says");
@@ -345,21 +347,21 @@ fn a_patch_the_engine_cannot_make_at_apply_is_reported_and_does_not_panic() {
 
     // **The report.** A fault like any other: named after the cord's source plugin,
     // stamped with the frame the *log* carried, and carrying the cord as the log
-    // spells it plus the reason. The session is degraded — the audio is not what the
-    // document says.
+    // spells it plus the reason. The sentence is built by `describe()`, on the
+    // control side — the record itself is a class and four `&'static str`s. The
+    // session is degraded — the audio is not what the document says.
     let faults = e.apply_faults();
     assert_eq!(faults.len(), 1, "exactly the cord: {faults:?}");
     assert_eq!(faults[0].plugin, "tone", "the cord's source plugin");
     assert_eq!(faults[0].at_frame, 0, "the frame the log stamped");
+    let described = faults[0].describe();
     assert!(
-        faults[0].reason.contains("tone.audio → mixer.ch0"),
-        "the cord, as the log spells it: {}",
-        faults[0].reason
+        described.contains("tone.audio → mixer.ch0"),
+        "the cord, as the log spells it: {described}"
     );
     assert!(
-        faults[0].reason.contains("destination is not mounted"),
-        "and why: {}",
-        faults[0].reason
+        described.contains("destination is not mounted"),
+        "and why: {described}"
     );
     assert_eq!(e.apply_faults_dropped(), 0, "one fault, none dropped");
     assert!(e.is_degraded());

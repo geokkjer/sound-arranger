@@ -10,9 +10,15 @@
 //!   (sample-accurate lifecycle; a refused mutation is never logged);
 //! - rendering is a pure function of the log: `same log ⇒ byte-identical bounce`
 //!   (determinism is tested, including mid-session changes and patches);
-//! - the render loop never allocates on contract-abiding paths (enforced by a
-//!   counting-allocator test); the only allocation is the misuse-only `parked`
-//!   push when an arrangement op reaches the render stack;
+//! - the render loop allocates **nothing in steady state** (enforced by a
+//!   counting-allocator test), and a *misuse* path adds only the `parked` push
+//!   (an arrangement op reaching the render stack): a recorded apply fault — a
+//!   refused mount or a refused cord — costs **no allocation at all**, because
+//!   the list's storage is reserved for its whole bound at `Engine::new` and the
+//!   record is data (a `&'static str` class, borrowed identities, or a message
+//!   that already existed), never a sentence. The sentence is
+//!   [`ApplyFault::describe`], built on the control side when a host reads the
+//!   list;
 //! - **nothing logged is ever silently dropped** — an arrangement op that
 //!   reaches the render stack is parked for the control side (`flush_scheduled`
 //!   drains it), never discarded; the live run and a replay of the same log
@@ -30,7 +36,10 @@
 //!   endpoint is still queued, so a cord `Graph::connect` would refuse is refused
 //!   at call time and never logged; a cord that *is* refused at apply is recorded
 //!   as a fault, so neither build reports a backward cord by asserting and neither
-//!   renders a channel nothing feeds in silence.
+//!   renders a channel nothing feeds in silence. The refusal is recorded **without
+//!   allocating** — the graph answers with a `&'static str` class
+//!   ([`crate::graph::ConnectClass`]) and the fault carries the cord as the log
+//!   spells it.
 
 use std::collections::{HashMap, HashSet};
 
@@ -128,6 +137,11 @@ pub const MAX_DRAIN_FRAMES: usize = 48_000 * 60;
 /// shows a thousand refusals without holding a thousand strings. 64 is far more
 /// than a session should ever accumulate — one is already a fault — and small
 /// enough that keeping them costs nothing.
+///
+/// **The storage is reserved up front** (`Engine::new`, the control side), so the
+/// bound is also the capacity: recording a refusal on the render path writes
+/// into storage that is already there and never reallocates, which is what lets a
+/// fault be recorded at all on a path that may not allocate.
 pub const MAX_APPLY_FAULTS: usize = 64;
 
 /// A scheduled mutation the engine could not apply: the log says this plugin mounts
@@ -140,6 +154,12 @@ pub const MAX_APPLY_FAULTS: usize = 64;
 /// session is degraded. The log event is **not** withdrawn: the log is the document,
 /// so a refusal is reported beside it rather than erased from it, and a replay of
 /// the same log refuses at the same frame and records the same fault.
+///
+/// **Recorded as data, never as a sentence.** A fault is written on the render
+/// path, and the render path does not allocate, so the reason is
+/// [`ApplyFaultReason`] — a class and borrowed identities, or a message that
+/// already existed — and the human-readable line is built by
+/// [`Self::describe`], on the **control** side, when a host reads the list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyFault {
     /// The plugin the log asked to mount, or — for a refused cord — the cord's
@@ -149,9 +169,79 @@ pub struct ApplyFault {
     /// The frame the **log** stamped the event with — not the frame the refusal
     /// was noticed at, which a late flush or a warm-up seek can move.
     pub at_frame: u64,
-    /// The plugin's own refusal, or the graph's for a cord, verbatim — behind the
-    /// mutation the log spells out, so the message names what to change.
-    pub reason: String,
+    /// What refused, in the shape the refusing side can produce without
+    /// allocating. See [`ApplyFaultReason`].
+    pub reason: ApplyFaultReason,
+}
+
+/// Why an apply was refused — **data, not a sentence**, because the record is
+/// written on the render path.
+///
+/// There are two kinds of answer, and the shape follows what the refuser can
+/// hand over without allocating:
+///
+/// - **a rule's own classification** — the engine's ("this endpoint is not
+///   mounted") and the graph's ([`crate::graph::ConnectClass`], whose class is a
+///   `&'static str`) — is a `&'static str` beside identities the log already
+///   holds, so recording it moves nothing: [`Self::Cord`];
+/// - **a plugin's own words** — `Plugin::apply` is `Result<_, String>`, so a
+///   plugin that refuses has already built a sentence and the engine's job is to
+///   carry it, not to build a second one: [`Self::Given`]. The allocation behind
+///   it is the plugin's, made before the engine saw it.
+///
+/// The line a host shows is [`ApplyFault::describe`], on the caller's thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyFaultReason {
+    /// A plugin's own refusal, from its fallible `apply` — **moved, verbatim,
+    /// never formatted here**, so recording costs the engine nothing.
+    ///
+    /// This is the mount path's shape, and it is the one allocation the engine
+    /// cannot remove: `Plugin::apply` returns `Result<_, String>`, so a plugin
+    /// that refuses words its own refusal, on the render thread, before the
+    /// engine is in the picture. The engine declines to add a second one — and
+    /// [`ApplyFault::describe`] quotes this message rather than rebuilding it.
+    Given(String),
+    /// A cord the engine or the graph refused: a `&'static str` class and the
+    /// cord exactly as the log spells it — two `(plugin, port)` pairs, all
+    /// `&'static str`.
+    ///
+    /// Nothing here allocates, and nothing is copied: the identities are the
+    /// log's own, so the fault names the cord the way the document does rather
+    /// than the way the graph counts nodes.
+    Cord {
+        /// Which rule refused, as a `&'static str` — a phrase with no
+        /// punctuation of its own, because the sentence is built on read.
+        class: &'static str,
+        /// The cord's source, as the log spells it.
+        from: (&'static str, &'static str),
+        /// The cord's destination, as the log spells it.
+        to: (&'static str, &'static str),
+    },
+}
+
+impl ApplyFault {
+    /// The fault as a human-readable line, **built here, now, on the caller's
+    /// thread** — the control side, where a host reads the list and prints it.
+    ///
+    /// This is the only place the sentence exists: the record carries the class
+    /// and the identities (or a message that was already built), so nothing on
+    /// the render path has to format anything. The line names the plugin, the
+    /// frame the **log** stamped, and the reason beside the mutation the log
+    /// spells out, so it says what to change.
+    ///
+    /// Allocating here is the point, not an accident: this is a read.
+    pub fn describe(&self) -> String {
+        let reason = match &self.reason {
+            ApplyFaultReason::Given(message) => message.clone(),
+            ApplyFaultReason::Cord { class, from, to } => {
+                format!(
+                    "patch {}.{} → {}.{} refused: {class}",
+                    from.0, from.1, to.0, to.1
+                )
+            }
+        };
+        format!("{} @{}: {reason}", self.plugin, self.at_frame)
+    }
 }
 
 /// The slowest tempo [`Engine::set_tempo`] accepts: 1e-3 bpm, where a quarter
@@ -307,11 +397,11 @@ pub struct Engine {
     /// stamped, not the frame the flush happened on.
     parked: Vec<(u64, SchedEvent)>,
     /// Scheduled mounts a plugin's `apply` refused, oldest first (see
-    /// [`Self::apply_faults`]). Bounded by [`MAX_APPLY_FAULTS`]; the rest are
-    /// counted in `apply_faults_dropped`. Never cleared: a fault is a standing
-    /// fact about the session, not work to be done later (the opposite of
-    /// `parked`), and it is written from the apply path — the misuse path, which
-    /// is allowed to allocate.
+    /// [`Self::apply_faults`]). Bounded by [`MAX_APPLY_FAULTS`], and its
+    /// storage **reserved for the whole bound at [`Self::new`]** so a record
+    /// written from the apply path never reallocates; the rest are counted in
+    /// `apply_faults_dropped`. Never cleared: a fault is a standing fact about
+    /// the session, not work to be done later (the opposite of `parked`).
     apply_faults: Vec<ApplyFault>,
     /// How many refusals the bound in [`MAX_APPLY_FAULTS`] could not hold.
     apply_faults_dropped: usize,
@@ -347,7 +437,10 @@ impl Engine {
             walks: Vec::new(),
             op_handlers: HashMap::new(),
             parked: Vec::new(),
-            apply_faults: Vec::new(),
+            // The control side pays for the whole bound once, so the apply path
+            // can record a fault (the misuse path, which still may not allocate)
+            // by writing into storage that already exists — see `apply_faults`.
+            apply_faults: Vec::with_capacity(MAX_APPLY_FAULTS),
             apply_faults_dropped: 0,
         }
     }
@@ -829,6 +922,12 @@ impl Engine {
     /// audio is not what its log says is one a host can mark degraded, rather than
     /// a destination channel that is silently never fed. Replay reproduces the
     /// same refusal, so a loaded session says the same thing a played one does.
+    ///
+    /// **Nothing here formats.** An endpoint that is gone is a `&'static str`
+    /// class and the cord's own `&'static str` identities; the graph's own
+    /// refusal is a [`crate::graph::ConnectRefusal`], of which only its
+    /// `&'static str` class is kept. The line a host prints is
+    /// [`ApplyFault::describe`], built on read.
     fn apply_patch(
         &mut self,
         from: (&'static str, &'static str),
@@ -853,28 +952,38 @@ impl Engine {
             ));
             return;
         };
-        if let Err(e) = self.graph.connect(from_node, from.1, to_node, to.1) {
-            self.record_apply_fault(Self::patch_fault(from, to, at_frame, &e));
+        if let Err(refusal) = self.graph.try_connect(from_node, from.1, to_node, to.1) {
+            self.record_apply_fault(Self::patch_fault(
+                from,
+                to,
+                at_frame,
+                refusal.class.as_str(),
+            ));
         }
     }
 
-    /// The fault a scheduled patch's apply leaves behind. The cord is named the way
-    /// the log spells it (the graph's own message speaks of nodes, which a host
-    /// cannot resolve back to a plugin), and the reason is the refusal verbatim.
+    /// The fault a scheduled patch's apply leaves behind — whatever refused it.
+    /// The cord is named the way the log spells it, because a class is phrased in
+    /// the graph's terms (nodes, ports, counts) and a host cannot resolve a node
+    /// index back to a plugin; the reason is that `&'static str` class beside the
+    /// cord's four `&'static str` identities, so building this fault copies nothing
+    /// and allocates nothing, and [`ApplyFault::describe`] turns it into the line on
+    /// the control side.
+    ///
+    /// The three classes are the engine's two "this endpoint is not mounted"
+    /// answers and whatever `try_connect` classified the cord as, so a refused
+    /// cord is one record shape whether the engine or the graph said no.
     fn patch_fault(
         from: (&'static str, &'static str),
         to: (&'static str, &'static str),
         at_frame: u64,
-        reason: &str,
+        class: &'static str,
     ) -> ApplyFault {
         ApplyFault {
             // The source plugin: the cord's origin is what a user has to move.
             plugin: from.0,
             at_frame,
-            reason: format!(
-                "patch {}.{} → {}.{} refused: {reason}",
-                from.0, from.1, to.0, to.1
-            ),
+            reason: ApplyFaultReason::Cord { class, from, to },
         }
     }
 
@@ -1345,11 +1454,16 @@ impl Engine {
                 // `apply_mount` has already undone what the refused apply touched,
                 // so the session is not wedged: the name is free again and the
                 // next mount of it succeeds.
+                //
+                // The refusal is **moved** (`ApplyFaultReason::Given`), not copied
+                // and not formatted: `Plugin::apply` is `Result<_, String>`, so
+                // the message — and the allocation behind it — is the plugin's,
+                // made before the engine saw it. The engine adds nothing.
                 if let Err(reason) = self.apply_mount(plugin, &params) {
                     self.record_apply_fault(ApplyFault {
                         plugin,
                         at_frame,
-                        reason,
+                        reason: ApplyFaultReason::Given(reason),
                     });
                 }
             }
@@ -1426,11 +1540,17 @@ impl Engine {
     }
 
     /// Record a scheduled mutation the engine could not apply — a mount a plugin's
-    /// `apply` refused, or a cord the graph refused. Bounded by
+    /// `apply` refused, or a cord the engine or the graph refused. Bounded by
     /// [`MAX_APPLY_FAULTS`]: past it the fault is **counted** rather than kept
     /// ([`Self::apply_faults_dropped`]), the same "the bound is reported, not
     /// hidden" discipline as [`DrainOutcome::capped`] and the euclidean's
     /// `euclidean.drops`.
+    ///
+    /// **This write allocates nothing**: the list's storage is the whole bound,
+    /// reserved at [`Self::new`] (the control side), and the fault that arrives is
+    /// data — a `&'static str` class with borrowed identities, or a message that
+    /// already existed. That is the whole reason [`ApplyFault`] has no sentence in
+    /// it: the render path may not build one.
     fn record_apply_fault(&mut self, fault: ApplyFault) {
         if self.apply_faults.len() < MAX_APPLY_FAULTS {
             self.apply_faults.push(fault);
@@ -1440,8 +1560,8 @@ impl Engine {
     }
 
     /// Every apply the engine could not perform, oldest first — a mount the log
-    /// asked for and the plugin refused, or a cord the graph refused, with the frame
-    /// the log stamped and the refusal verbatim.
+    /// asked for and the plugin refused, or a cord the engine or the graph
+    /// refused, with the frame the log stamped and the reason as data.
     ///
     /// **Never drained, and never cleared.** A fault is a standing fact about the
     /// session — the audio is not what the log says — so a shell that polls this
@@ -1449,6 +1569,10 @@ impl Engine {
     /// [`Self::flush_scheduled`], which drains `parked` because a parked op is work
     /// still to be done). Bounded by [`MAX_APPLY_FAULTS`]; what did not fit is
     /// [`Self::apply_faults_dropped`].
+    ///
+    /// A host shows a fault with [`ApplyFault::describe`], which formats the line
+    /// **on this side of the boundary** — the list itself holds no sentence,
+    /// because it is written on the render path.
     pub fn apply_faults(&self) -> &[ApplyFault] {
         &self.apply_faults
     }

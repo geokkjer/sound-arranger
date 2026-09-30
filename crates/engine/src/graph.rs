@@ -933,6 +933,144 @@ struct PatchCord {
     kind: SignalKind,
 }
 
+/// **Which** rule refused a cord — the graph's own classification, a `Copy`
+/// value with no borrowed or owned data in it.
+///
+/// This is what a caller that cannot allocate records (the render path's
+/// `apply_patch`, via [`crate::ApplyFault`]): a `&'static str` naming the rule,
+/// to be read as data on the audio thread and turned into a sentence wherever a
+/// message is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectClass {
+    /// The `from` node is not in the graph.
+    UnknownFromNode,
+    /// The `to` node is not in the graph.
+    UnknownToNode,
+    /// A cord runs forward only: the source's node must precede the
+    /// destination's. The graph interpreter walks nodes in order, so a backward
+    /// cord is a cycle the walk cannot enter.
+    Backward,
+    /// The source node has no such port.
+    NoFromPort,
+    /// The destination node has no such port.
+    NoToPort,
+    /// The source port is not an `Out` or the destination is not an `In`.
+    Direction,
+    /// The two ports carry different [`SignalKind`]s.
+    KindMismatch,
+    /// A control input already has its one driver (Phase 1's single-driver
+    /// rule; audio and the event kinds fan in).
+    ControlDriven,
+    /// An audio cord carries one channel count; these two disagree.
+    ChannelMismatch,
+}
+
+impl ConnectClass {
+    /// The class as a `&'static str` — the whole of what an allocation-free
+    /// record needs, and a sentence on its own for a reader who holds the
+    /// identities beside it. `Display` ([`ConnectRefusal`]) adds the port names
+    /// and counts.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ConnectClass::UnknownFromNode => "connect: unknown 'from' node",
+            ConnectClass::UnknownToNode => "connect: unknown 'to' node",
+            ConnectClass::Backward => "connect: patch cords must go forward (topological order)",
+            ConnectClass::NoFromPort => "no port on the source node",
+            ConnectClass::NoToPort => "no port on the destination node",
+            ConnectClass::Direction => {
+                "connect: the source port must be an Out port and the destination an In port"
+            }
+            ConnectClass::KindMismatch => "connect: signal kind mismatch between the two ports",
+            ConnectClass::ControlDriven => "connect: control inputs are single-driver in phase 1",
+            ConnectClass::ChannelMismatch => {
+                "connect: audio channel mismatch between the two ports"
+            }
+        }
+    }
+}
+
+/// A refused [`Graph::connect`], **as data**: which rule refused
+/// ([`ConnectClass`]) plus the identities the refusal was about — the two node
+/// indices and the two port names the caller passed, all borrowed from the
+/// call. `Copy`, and built without allocating, because the caller on the render
+/// path records it as a fault rather than printing it.
+///
+/// The node indices are `None` for a node that is not in the graph (the class
+/// then says which one), and the port pair is `None` until both ports have been
+/// found (the classes before that are about a *node*, not about a port). The
+/// message a control-side caller reads is [`Display`](std::fmt::Display).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectRefusal<'a> {
+    /// Which rule refused.
+    pub class: ConnectClass,
+    /// The source port name the caller asked for.
+    pub from_port: &'a str,
+    /// The destination port name the caller asked for.
+    pub to_port: &'a str,
+    /// The source node's index, if the graph holds it.
+    pub from_node: Option<usize>,
+    /// The destination node's index, if the graph holds it.
+    pub to_node: Option<usize>,
+    /// The two ports, once both are found — what a direction, kind or
+    /// channel-count refusal quotes.
+    pub ports: Option<(Port, Port)>,
+}
+
+impl std::fmt::Display for ConnectRefusal<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (from_port, to_port) = (self.from_port, self.to_port);
+        match (self.class, self.ports) {
+            (ConnectClass::NoFromPort, _) => {
+                write!(
+                    f,
+                    "no port '{from_port}' on node {}",
+                    self.source_node_label()
+                )
+            }
+            (ConnectClass::NoToPort, _) => {
+                write!(f, "no port '{to_port}' on node {}", self.dest_node_label())
+            }
+            (ConnectClass::Direction, _) => write!(
+                f,
+                "connect: '{from_port}' must be an Out port and '{to_port}' an In port"
+            ),
+            (ConnectClass::KindMismatch, Some((out, in_))) => write!(
+                f,
+                "connect: signal kind mismatch — '{from_port}' is {:?}, '{to_port}' is {:?}",
+                out.kind, in_.kind
+            ),
+            (ConnectClass::ChannelMismatch, Some((out, in_))) => write!(
+                f,
+                "connect: audio channel mismatch — '{from_port}' is {}ch, '{to_port}' is {}ch",
+                out.channels(),
+                in_.channels()
+            ),
+            (class, _) => f.write_str(class.as_str()),
+        }
+    }
+}
+
+impl ConnectRefusal<'_> {
+    /// The source node's index as a message names it. Only the two "no such
+    /// port" classes reach this, and neither can be reached before both nodes
+    /// were found, so the `?` is the totality `Display` owes rather than a case
+    /// that occurs.
+    fn source_node_label(&self) -> String {
+        match self.from_node {
+            Some(idx) => idx.to_string(),
+            None => "?".to_string(),
+        }
+    }
+
+    /// The destination node's index, as [`Self::source_node_label`].
+    fn dest_node_label(&self) -> String {
+        match self.to_node {
+            Some(idx) => idx.to_string(),
+            None => "?".to_string(),
+        }
+    }
+}
+
 /// The graph value + interpreter: a patch bay over typed ports.
 pub struct Graph {
     nodes: Vec<Node>,
@@ -1095,6 +1233,11 @@ impl Graph {
     /// allowed for audio (summed per input port) and events (merged); control
     /// inputs are single-driver in Phase 1. Audio `In` ports may be many per
     /// node (the mixer's channels); other kinds stay one-per-node.
+    ///
+    /// **This is [`Self::try_connect`] plus a sentence.** The rule lives in
+    /// `try_connect`, so the render path (the engine's `apply_patch`, which may
+    /// not allocate) and this control-side signature cannot drift apart; only the
+    /// wording of a refusal is added here.
     pub fn connect(
         &mut self,
         from: NodeId,
@@ -1102,29 +1245,98 @@ impl Graph {
         to: NodeId,
         to_port: &str,
     ) -> Result<(), String> {
-        let fi = self.index_of(from).ok_or("connect: unknown 'from' node")?;
-        let ti = self.index_of(to).ok_or("connect: unknown 'to' node")?;
+        self.try_connect(from, from_port, to, to_port)
+            .map_err(|refusal| refusal.to_string())
+    }
+
+    /// [`Self::connect`] without the message: a refusal is **data** — a `Copy`
+    /// classification and borrowed identities — so a caller on the render path
+    /// can record one without building a `String`. A control-side caller that
+    /// wants the sentence calls [`Self::connect`].
+    ///
+    /// The classification is the graph's own, never a second copy of the rule:
+    /// this is where the forward-order line, the port lookup, the direction, the
+    /// kind, the single-driver control check and the channel-count check live.
+    pub fn try_connect<'p>(
+        &mut self,
+        from: NodeId,
+        from_port: &'p str,
+        to: NodeId,
+        to_port: &'p str,
+    ) -> Result<(), ConnectRefusal<'p>> {
+        // The identities every refusal can name: the two nodes (where known) and
+        // the two port names (always — they are the caller's own borrows, and a
+        // message without them is not one a user can act on).
+        let nodes = (self.index_of(from), self.index_of(to));
+        let (Some(fi), Some(ti)) = nodes else {
+            return Err(ConnectRefusal {
+                class: if nodes.0.is_none() {
+                    ConnectClass::UnknownFromNode
+                } else {
+                    ConnectClass::UnknownToNode
+                },
+                from_port,
+                to_port,
+                from_node: nodes.0,
+                to_node: nodes.1,
+                ports: None,
+            });
+        };
         if fi >= ti {
-            return Err("connect: patch cords must go forward (topological order)".into());
+            return Err(ConnectRefusal {
+                class: ConnectClass::Backward,
+                from_port,
+                to_port,
+                from_node: Some(fi),
+                to_node: Some(ti),
+                ports: None,
+            });
         }
-        let from_port_idx = self.nodes[fi]
-            .port_index(from_port)
-            .ok_or_else(|| format!("no port '{from_port}' on node {fi}"))?;
-        let to_port_idx = self.nodes[ti]
-            .port_index(to_port)
-            .ok_or_else(|| format!("no port '{to_port}' on node {ti}"))?;
+        let Some(from_port_idx) = self.nodes[fi].port_index(from_port) else {
+            return Err(ConnectRefusal {
+                class: ConnectClass::NoFromPort,
+                from_port,
+                to_port,
+                from_node: Some(fi),
+                to_node: Some(ti),
+                ports: None,
+            });
+        };
+        let Some(to_port_idx) = self.nodes[ti].port_index(to_port) else {
+            return Err(ConnectRefusal {
+                class: ConnectClass::NoToPort,
+                from_port,
+                to_port,
+                from_node: Some(fi),
+                to_node: Some(ti),
+                ports: None,
+            });
+        };
         let out_port = self.nodes[fi].ports[from_port_idx];
         let in_port = self.nodes[ti].ports[to_port_idx];
+        // Both ports' own facts, resolved once: a direction, kind or channel
+        // refusal quotes them, and `class` alone is the whole of what a fault
+        // record needs.
+        let ports = Some((out_port, in_port));
         if out_port.direction != Direction::Out || in_port.direction != Direction::In {
-            return Err(format!(
-                "connect: '{from_port}' must be an Out port and '{to_port}' an In port"
-            ));
+            return Err(ConnectRefusal {
+                class: ConnectClass::Direction,
+                from_port,
+                to_port,
+                from_node: Some(fi),
+                to_node: Some(ti),
+                ports,
+            });
         }
         if out_port.kind != in_port.kind {
-            return Err(format!(
-                "connect: signal kind mismatch — '{from_port}' is {:?}, '{to_port}' is {:?}",
-                out_port.kind, in_port.kind
-            ));
+            return Err(ConnectRefusal {
+                class: ConnectClass::KindMismatch,
+                from_port,
+                to_port,
+                from_node: Some(fi),
+                to_node: Some(ti),
+                ports,
+            });
         }
         if in_port.kind == SignalKind::Control
             && self
@@ -1132,18 +1344,28 @@ impl Graph {
                 .iter()
                 .any(|c| c.to.0 == ti && c.kind == SignalKind::Control)
         {
-            return Err("connect: control inputs are single-driver in phase 1".into());
+            return Err(ConnectRefusal {
+                class: ConnectClass::ControlDriven,
+                from_port,
+                to_port,
+                from_node: Some(fi),
+                to_node: Some(ti),
+                ports,
+            });
         }
         // Audio cords must also match channel count: a cord carries one count, so a
         // stereo→mono (or mono→stereo) cord would silently read the interleaved buffer
         // as mono — refuse loud instead. (Stereo cords themselves are supported since
         // the master-bus slice: equal counts copy interleaved, sample for sample.)
         if in_port.kind == SignalKind::Audio && out_port.channels() != in_port.channels() {
-            return Err(format!(
-                "connect: audio channel mismatch — '{from_port}' is {}ch, '{to_port}' is {}ch",
-                out_port.channels(),
-                in_port.channels()
-            ));
+            return Err(ConnectRefusal {
+                class: ConnectClass::ChannelMismatch,
+                from_port,
+                to_port,
+                from_node: Some(fi),
+                to_node: Some(ti),
+                ports,
+            });
         }
         let to_scratch = if in_port.kind == SignalKind::Audio {
             self.audio_in_ports[ti]

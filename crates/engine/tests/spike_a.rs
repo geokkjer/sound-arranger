@@ -1224,3 +1224,77 @@ fn render_path_does_not_allocate() {
         "the render path must not allocate (engine invariant)"
     );
 }
+
+/// **A refused cord is recorded without allocating** — the render-path invariant
+/// applied to the fault [`Engine::apply_patch`] leaves behind, which is the one
+/// place this engine used to build a sentence on the audio thread (`format!`
+/// into the fault's reason).
+///
+/// The refusal is reachable, not contrived: a destination unmounted at the
+/// cord's *own* frame, which the frame-ordered queue applies first (FIFO within
+/// a frame), so the cord arrives with an endpoint that is gone. The record is
+/// data — a `&'static str` class beside the cord's four `&'static str`
+/// identities — and the list's storage is the whole bound, reserved at
+/// `Engine::new` (outside the measured region), so the second refusal in here
+/// proves the recording does not grow it either.
+///
+/// The line a host prints is built on the **control** side, by
+/// `describe()` — after the measurement, and deliberately so: a read is allowed
+/// to allocate; a render is not.
+#[test]
+fn a_refused_cord_on_the_render_path_records_without_allocating() {
+    let mut e = engine();
+    e.mount("tone", &[]).expect("the tone mounts");
+    e.mount("mixer", &[]).expect("the mixer mounts");
+    e.patch(("tone", "audio"), ("mixer", "ch0"))
+        .expect("at call time the mixer is mounted and the cord is forward");
+    // Prime: the two mounts and the cord apply, so the measured region below
+    // holds the refusal and nothing else.
+    let _prime = e.render(BLOCK);
+    assert!(
+        e.apply_faults().is_empty(),
+        "a cord that applied is not a fault: {:?}",
+        e.apply_faults()
+    );
+
+    // The destination goes away at the same frame the cords are scheduled for,
+    // and is *scheduled* first — so both cords are logged and scheduled while
+    // the mixer still reads as mounted, and both are refused at apply.
+    e.unmount("mixer")
+        .expect("the mixer's go-away is scheduled");
+    for _ in 0..2 {
+        e.patch(("tone", "audio"), ("mixer", "ch0"))
+            .expect("at call time the mixer is still mounted and the cord is forward");
+    }
+    let mut out = vec![0.0f32; 8192]; // allocated before measuring
+
+    ALLOCS.store(0, Ordering::Relaxed);
+    MEASURING.with(|m| m.set(true));
+    e.render_into(&mut out);
+    MEASURING.with(|m| m.set(false));
+
+    assert_eq!(
+        ALLOCS.load(Ordering::Relaxed),
+        0,
+        "a fault recorded on the render path must not allocate (engine invariant)"
+    );
+
+    // The refusal is still *loud*: recorded in this build, with the cord named
+    // as the log spells it, and the session degraded.
+    let faults = e.apply_faults();
+    assert_eq!(faults.len(), 2, "both refused cords: {faults:?}");
+    for fault in faults {
+        assert_eq!(fault.plugin, "tone", "the cord's source plugin");
+        let described = fault.describe();
+        assert!(
+            described.contains("tone.audio → mixer.ch0"),
+            "the cord, as the log spells it: {described}"
+        );
+        assert!(
+            described.contains("destination is not mounted"),
+            "and why: {described}"
+        );
+    }
+    assert_eq!(e.apply_faults_dropped(), 0, "two faults, none dropped");
+    assert!(e.is_degraded(), "and the session says so");
+}

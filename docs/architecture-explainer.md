@@ -1,6 +1,6 @@
 # sound-arranger: from architecture up
 
-> 🕒 Last verified against commit `dd5b6f8` (2026-09-30). If the code has moved on,
+> 🕒 Last verified against commit `a917a1c` (2026-09-29). If the code has moved on,
 > trust the code and move this line forward.
 
 > A plain-English (mostly) tour of the Rust code, for a developer with roughly six
@@ -578,6 +578,17 @@ a hard rule; "never hide a bug from the user either" is the same rule seen from
 the other side, which is why it is a *recorded* fault (`apply_faults()`,
 `is_degraded()`) rather than a `debug_assert!` — a debug assert compiles away in
 release, and release is the build a user runs.
+
+The record is careful about the *other* half of that rule, because it is written
+on the render path: an `ApplyFault` holds **data**, not a sentence — which rule
+refused (a `&'static str` class, from the engine or from the graph), the frame the
+log stamped, and the cord's plugin/port names as `&'static str`s — and the list's
+storage is reserved for its whole bound when the engine is built, so *recording* a
+refusal costs no allocation at all. The line a host prints is
+`ApplyFault::describe()`, built **on the control side, when the host reads the
+list**: the read may allocate, the render may not. A refused *mount* is the one
+message that is still a `String`, because `Plugin::apply` returns
+`Result<_, String>` — the plugin wrote it, and the engine carries it.
 
 The common log-order error is caught earlier than that, at the keyboard:
 `validate_patch` also asks whether the cord runs *forward* in node order (the
