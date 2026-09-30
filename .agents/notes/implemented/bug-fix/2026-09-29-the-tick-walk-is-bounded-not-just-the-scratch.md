@@ -55,7 +55,15 @@ same walk reachable from the fast side, plus three claims that did not survive c
 
 - **`TempoMap::frame_at` saturates.** An unreachable beat answers `u64::MAX` — "past the end of time" —
   instead of a real frame. Every frame-walking caller now terminates on it. This also removes an
-  `expect("tempo map never empty")` from a path the render thread reaches.
+  `expect("tempo map never empty")` from a path the render thread reaches. **The saturation is the
+  whole contract now, not one arm of it:** the sum that places a beat inside a segment is
+  `saturating_add` too, and the doc states that the frame domain is *total* (every `f64` beat answers,
+  nothing panics) and monotone in the beat. An independent verification of this fix found the sum
+  unchecked twenty lines under the saturation — a debug panic on the render thread, and in release a
+  frame near zero for a beat past the end of time — so the invariant this note claims held for the
+  render path did not, in exactly the function it names. That correction is the
+  [frame-at totality note](./2026-09-29-frame-at-is-total-the-sum-saturates-too.md), and it is what
+  the "no step overflows" half of this decision rests on.
 - **The emit loop is bounded by `CLOCK_OUT_CAP` ticks, and the rest is counted exactly.** The cap moves
   from the scratch to the walk: after the cap the node stops walking and `fetch_add`s the block's
   remaining tick count. The count is exact, so `overflows` keeps meaning "exactly how many ticks this
@@ -154,6 +162,17 @@ separately.
   (the uncapped downward walk, with a trigger map that never returns uncapped), both clock-out module
   tests; and `an_absurd_fast_tempo_renders_the_next_block` in `tests/clock_out.rs`, which reaches the
   same defect through the API a user touches — `set_tempo(1e300, 4)` — and renders four blocks.
+- **The claim that no step overflows needed one more fix to be true, and it was not only about the
+  walk.** `TempoMap::frame_at`'s own `start_frame + frames` was unchecked, so the invariant this note
+  states — *the render path terminates without panicking* — was false in the very function it names as
+  one of the three bounds. The [frame-at totality note](./2026-09-29-frame-at-is-total-the-sum-saturates-too.md)
+  saturates that sum (and `Clock::advance`'s), adds
+  `frame_at_saturates_the_sum_when_a_seek_puts_a_tempo_near_the_top`,
+  `advance_saturates_at_the_top_of_the_frame_range` and `frame_at_is_total_over_the_beat_domain`
+  beside the other `TempoMap` tests, and records the two render-path `block.frame + len` sums in
+  `ClockOutNode::render` and `EuclideanGen::render` that it found and deliberately did not fix — so a
+  seek near the top of the range is survivable in the tempo map and in the clock, but **not yet end to
+  end**: "no panic after a seek near `u64::MAX`" is a stated open item, not a shipped property.
 - The render path stays allocation-free: `due_ticks_from` allocates nothing and runs only on a block
   that already exceeded the cap, so the counting-allocator tests
   (`render_path_does_not_allocate`, `render_path_does_not_allocate_with_latency`) are unaffected — they
