@@ -1,6 +1,6 @@
 # First session — make sound in fifteen minutes
 
-> 🕒 Last verified against commit `7c5a2e7` (2026-09-05). If the code has moved on,
+> 🕒 Last verified against commit `2f6ad78` (2026-09-30). If the code has moved on,
 > trust the code and move this line forward.
 
 You don't need to understand Rust, audio programming, or the architecture to do
@@ -10,16 +10,16 @@ will have assembled a four-plugin signal chain, bounced it to a WAV file,
 central promise — identical input, identical output — with your own `cmp`.
 
 Everything here runs against the **headless host**: a real binary that exercises
-the full Host API contract with no GUI. Every fancy thing built later (the Tauri
-shell, the timeline) drives this same contract.
+the full Host API contract with no GUI. Every fancy thing built later (the
+terminal and iced shells, the arranger timeline) drives this same contract.
 
 ## Before you start
 
 You need the Rust toolchain and `node` on `PATH` (see the
-[dev environment](../README.md#dev-environment)), then prove the toolchain:
+[dev environment](../README.md#development)), then prove the toolchain:
 
 ```sh
-cargo test -p engine          # ~56 core tests, should pass in about a second
+cargo test -p engine          # ~130 core tests, should pass in about a second
 ```
 
 ## Step 1 — assemble a profile from four plugins
@@ -57,12 +57,13 @@ cargo run -q -p host -- /tmp/hello.script
 Expected output:
 
 ```text
-host: bounced 192044 bytes to /tmp/hello.wav
-engine log events: 8
+host: bounced 384044 bytes to /tmp/hello.wav
+engine log events: 9
 media commands: 1
 underruns: 0
 deferred splices: 0
 master out node: Some(NodeId(3))
+drain tail frames: 0
 ```
 
 Play the WAV in any audio player. You should hear a syncopated 5-pulses-in-
@@ -76,14 +77,23 @@ core's patch bay; none of them are special-cased anywhere in the engine.
 
 Each line of the output is an invariant made visible:
 
-- **`engine log events: 8`** — four mounts, three patches, one param change: all
-  logged with their absolute frame. *The log is the session.* Nothing else was
-  consulted to produce the sound.
+- **`bounced 384044 bytes`** — 96 000 frames of **stereo** 16-bit audio (the
+  mixer's master bus is two channels) plus a 44-byte WAV header: 96 000 × 2 × 2
+  + 44. The byte count is the arithmetic of the format, not a mystery number.
+- **`engine log events: 9`** — four mounts, three patches, one param change, and
+  the bounce itself (a media command is logged too, so a replay reproduces the
+  whole session): all logged with their absolute frame. *The log is the
+  session.* Nothing else was consulted to produce the sound.
 - **`underruns: 0`** — every media reader kept ahead of the render clock. A
   nonzero count means disk/threads lost the race and zeros were emitted instead
   of samples (audible as gaps).
 - **`master out node: Some(NodeId(3))`** — the mixer claimed the master bus when
   it mounted. Mount order mattered.
+- **`drain tail frames: 0`** — after the last scheduled frame the render drained
+  nothing extra. A nonzero tail is the *good* outcome of a bounce that ends on
+  a ringing effect: the tail is rendered, counted, and reported rather than cut.
+  A ` (CAPPED)` suffix would say the drain hit its bound and stopped early —
+  reported, never hidden.
 
 ## Step 3 — prove the central promise
 
@@ -104,8 +114,10 @@ trustworthy later.
 ## Step 4 — break it three ways on purpose
 
 **A. Unknown name at parse time.** Add `mount reverb` above the bounce line and
-rerun. Refused instantly with the registry listed (there is no reverb plugin):
-exit code **2**, nothing rendered. Unknown words fail *before* anything executes.
+rerun. Refused instantly with the registry listed (`unknown plugin 'reverb'
+(registry: euclidean, scale, tone, mixer, master, clock_out)` — six plugins,
+and still no reverb): exit code **2**, nothing rendered. Unknown words fail
+*before* anything executes.
 
 **B. Using something before mounting it.** Delete the `mount mixer` line, keep
 everything else. Now `patch tone.audio mixer.ch0` has no endpoint and
@@ -114,19 +126,25 @@ scheduled nor mounted`). Crucially, *every event up to the refusal stays logged
 and the refused one does not* — bad commands can't corrupt history.
 
 **C. The units trap** (I hit this writing this guide — it's real): change
-`note_len=2400` to `note_len=0.25`. The bounce succeeds and produces **silence**.
+`blip_len=1800` to `blip_len=0.25`. The bounce succeeds and produces **silence**.
 Length parameters are measured in **sample frames**, not seconds — `0.25`
-truncates to zero frames, so every note is zero-length. Audio params have units;
-a plugin's declared ranges live in its `ParamDef` table (see `note_len` in
-`crates/engine/src/plugins/scale.rs`). Silent-but-valid output is always worth
-sampling-counting:
+truncates to zero frames, so every blip is zero-length. Audio params have units;
+a plugin's declared ranges live in its `ParamDef` table (see `blip_len` in
+`crates/engine/src/plugins/tone.rs`). Silent-but-valid output is always worth
+sample-counting — the file is 16-bit stereo, so unpack signed 16-bit samples at
+a 2-byte stride:
 
 ```sh
 python3 -c "
 import struct
 d=open('/tmp/hello.wav','rb').read()
-print(sum(1 for i in range(44,len(d),4) if struct.unpack('<f',d[i:i+4])[0]!=0.0),'nonzero')"
+print(sum(1 for i in range(44,len(d),2) if struct.unpack('<h',d[i:i+2])[0]!=0),'nonzero')"
 ```
+
+On the trap run that prints `0 nonzero`; on the original it prints `35656
+nonzero`. (The older edition of this guide used `note_len=2400 → 0.25` as the
+trap; in today's chain that parameter is audibly inert — the tone's envelope
+length is `blip_len`, so the trap moved with the code.)
 
 ## Where to go next
 
@@ -147,4 +165,5 @@ print(sum(1 for i in range(44,len(d),4) if struct.unpack('<f',d[i:i+4])[0]!=0.0)
 ---
 
 *Authored with GLM-5.3 Flash · ZCode, 2026-08-27; re-verified against `7c5a2e7`
-with DeepSeek-V4-Flash · DeepSeek Harness, 2026-09-05.*
+with DeepSeek-V4-Flash · DeepSeek Harness, 2026-09-05; re-verified against
+`2f6ad78` (every output above re-run) with GLM-5.3 · OpenCode, 2026-09-30.*
