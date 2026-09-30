@@ -111,11 +111,12 @@ From `apply_patch`:
 
 ```rust
 let Some(&from_node) = self.node_of.get(from.0) else {
-    debug_assert!(
-        false,
-        "patch endpoint '{}' not mounted at apply (log-order error)",
-        from.0
-    );
+    self.record_apply_fault(Self::patch_fault(
+        from,
+        to,
+        at_frame,
+        "its source is not mounted",
+    ));
     return;
 };
 ```

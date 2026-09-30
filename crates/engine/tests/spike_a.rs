@@ -184,6 +184,103 @@ fn patch_type_mismatch_refused() {
     assert!(err.contains("unknown plugin 'ghost'"), "got: {err}");
 }
 
+/// A cord the **graph** will refuse is refused here, before it is logged. `connect`
+/// runs a cord from an earlier node to a later one, and a plugin's node lands in
+/// the order its mount applied — so mounting the sink first and patching a source
+/// into it is a document entry that can never become audio. `validate_patch` used
+/// to check existence, direction, kind and channel count, and not order: the patch
+/// was logged, `connect` returned `Err` at apply, and the only report was a
+/// `debug_assert!` — a silent unfed channel in the build a user runs, a panic on
+/// the audio thread in the other.
+#[test]
+fn a_backward_patch_is_refused_before_it_is_logged() {
+    let mut e = engine();
+    // Sink first: the mixer takes node 0, the tone node 1.
+    e.mount("mixer", &[]).unwrap();
+    e.mount("tone", &[("gain", 0.25)]).unwrap();
+    let err = e
+        .patch(("tone", "audio"), ("mixer", "ch0"))
+        .expect_err("a cord must go forward in node order");
+    assert!(err.contains("must go forward"), "got: {err}");
+    assert!(
+        err.contains("mount 'mixer' first"),
+        "and the refusal names the fix: {err}"
+    );
+
+    // **Never logged, never scheduled.** The document must not carry a mutation the
+    // engine would skip, or a replay of this log would diverge from this session.
+    assert_eq!(
+        e.log.len(),
+        2,
+        "the two mounts and nothing else: {:?}",
+        e.log.events()
+    );
+    assert!(
+        !e.log
+            .events()
+            .iter()
+            .any(|ev| matches!(ev, Event::Patch { .. })),
+        "no patch event was written"
+    );
+    assert!(
+        !e.is_degraded(),
+        "a refusal at call time is an Err, not a session fault"
+    );
+
+    // The same shape after a re-mount, which is where the hazard hides: the name
+    // goes back and comes back at the *end*, so the source is behind the sink again.
+    e.unmount("tone")
+        .expect("the tone is scheduled, so it unmounts");
+    let _ = e.render(1); // the unmount applies, and the name is free
+    e.mount("tone", &[("gain", 0.25)])
+        .expect("a re-mount is a first instance again");
+    let err = e
+        .patch(("tone", "audio"), ("mixer", "ch0"))
+        .expect_err("a re-mounted source is still behind the sink");
+    assert!(err.contains("must go forward"), "got: {err}");
+
+    // Forward order is untouched: the rule is the graph's, not a blanket refusal of
+    // mixer patches. (Queued or applied, the source's node precedes the sink's.)
+    let mut e = engine();
+    e.mount("tone", &[]).unwrap();
+    e.mount("mixer", &[]).unwrap();
+    e.patch(("tone", "audio"), ("mixer", "ch0"))
+        .expect("a source mounted before its sink is forward");
+}
+
+/// A **recorded** log carrying a backward cord is refused at load, in the same words
+/// the live path speaks. The engine cannot read back a document whose cord the
+/// graph will refuse, and a load that dropped the cord quietly would render a
+/// session the file does not describe.
+#[test]
+fn a_log_carrying_a_backward_cord_is_refused_at_load() {
+    let mut log = SessionLog::new();
+    for (plugin, params) in [("mixer", vec![]), ("tone", vec![("gain", 0.25)])] {
+        log.push(Event::Mount {
+            plugin,
+            params,
+            at_frame: 0,
+        });
+    }
+    log.push(Event::Patch {
+        from_plugin: "tone",
+        from_port: "audio",
+        to_plugin: "mixer",
+        to_port: "ch0",
+        at_frame: 0,
+    });
+
+    let mut e = engine();
+    let err = e
+        .replay_from(&log)
+        .expect_err("a log whose cord the graph refuses is not a log to read");
+    assert!(err.contains("must go forward"), "got: {err}");
+    assert!(
+        err.contains("mount 'mixer' first"),
+        "and the refusal names the fix: {err}"
+    );
+}
+
 /// Patching is logged; replay reproduces the identical signal (determinism
 /// holds under the port model).
 #[test]

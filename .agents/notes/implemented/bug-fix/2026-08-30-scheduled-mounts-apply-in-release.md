@@ -60,5 +60,11 @@ After this, `cargo test -p engine --release` fully passes (previously 5 failures
   what is *not* decided there is this note's own open question, which stands: whether the fallibility
   belongs in `validate_mount` instead, so a mount a plugin would refuse is never logged at all. The
   engine now *survives* a refusal; it does not yet *prevent* one.
+- **The `Patch` arm has followed the same road (2026-09-29)** — a cord the graph refuses
+  at apply is a recorded `ApplyFault` too, not a `debug_assert!`, so a release build
+  reports a channel it could not feed instead of rendering it silent (the
+  [logged-patch note](./2026-09-29-a-logged-patch-is-a-patch-the-graph-will-make.md)).
+  That note also answers the *prevent* half for cords: a patch whose order the graph
+  will refuse is now refused in `validate_patch` and never logged.
 
 *Authored with deepseek-v4-flash-vision-exp · DeepSeek Harness, 2026-08-30.*

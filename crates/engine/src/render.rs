@@ -23,7 +23,14 @@
 //!   cannot dry-run, so [`Engine::apply_mount`] is a transaction: on `Err` the
 //!   engine's own bookkeeping is never written, the graph is put back, and the
 //!   refusal is **recorded** ([`Engine::apply_faults`], bounded) rather than
-//!   asserted, so a host can see it and mark the session degraded.
+//!   asserted, so a host can see it and mark the session degraded;
+//! - **a logged patch is a patch the graph will make** — [`Engine::validate_patch`]
+//!   answers the graph's forward-order rule (the source's node must precede the
+//!   destination's) from the graph itself, or from the mount queue's order while an
+//!   endpoint is still queued, so a cord `Graph::connect` would refuse is refused
+//!   at call time and never logged; a cord that *is* refused at apply is recorded
+//!   as a fault, so neither build reports a backward cord by asserting and neither
+//!   renders a channel nothing feeds in silence.
 
 use std::collections::{HashMap, HashSet};
 
@@ -123,23 +130,27 @@ pub const MAX_DRAIN_FRAMES: usize = 48_000 * 60;
 /// enough that keeping them costs nothing.
 pub const MAX_APPLY_FAULTS: usize = 64;
 
-/// A scheduled mount the engine could not apply: the log says this plugin mounts
-/// at this frame, and the plugin's `apply` refused.
+/// A scheduled mutation the engine could not apply: the log says this plugin mounts
+/// (or that this cord is patched) at this frame, and the plugin's `apply` — or the
+/// graph — refused.
 ///
-/// **A fault, not a diagnostic.** Two things that ought to agree — the log and
-/// the plugin — do not, so the engine records it in *every* build (the previous
-/// report was a `debug_assert!`, which release compiles away) and the session is
-/// degraded. The log event is **not** withdrawn: the log is the document, so a
-/// refusal is reported beside it rather than erased from it, and a replay of the
-/// same log refuses at the same frame and records the same fault.
+/// **A fault, not a diagnostic.** Two things that ought to agree — the log and the
+/// plugin or the graph — do not, so the engine records it in *every* build (the
+/// previous report was a `debug_assert!`, which release compiles away) and the
+/// session is degraded. The log event is **not** withdrawn: the log is the document,
+/// so a refusal is reported beside it rather than erased from it, and a replay of
+/// the same log refuses at the same frame and records the same fault.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyFault {
-    /// The plugin name the log asked to mount.
+    /// The plugin the log asked to mount, or — for a refused cord — the cord's
+    /// source plugin, the one a user has to move; the destination is named in
+    /// [`Self::reason`].
     pub plugin: &'static str,
-    /// The frame the **log** stamped the mount with — not the frame the refusal
+    /// The frame the **log** stamped the event with — not the frame the refusal
     /// was noticed at, which a late flush or a warm-up seek can move.
     pub at_frame: u64,
-    /// The plugin's own refusal, verbatim, so the message names what to change.
+    /// The plugin's own refusal, or the graph's for a cord, verbatim — behind the
+    /// mutation the log spells out, so the message names what to change.
     pub reason: String,
 }
 
@@ -274,6 +285,14 @@ pub struct Engine {
     disposers: HashMap<&'static str, Disposer>,
     /// plugins whose mount is queued but not yet applied.
     scheduled: HashSet<&'static str>,
+    /// plugin name → the sequence number its live mount was **scheduled** with,
+    /// one per `mount` call (a re-mount takes a fresh, higher one). A queued mount
+    /// has no node to ask about its place in the graph, and `validate_patch` needs
+    /// one to answer the forward-order question before the log takes the patch —
+    /// see [`Self::graph_rank`].
+    mount_seq: HashMap<&'static str, usize>,
+    /// The next sequence number [`Self::mount_seq`] hands out.
+    next_mount_seq: usize,
     /// The **document walks** in force, innermost last (see [`Self::enter_walk`]).
     /// Non-empty exactly while a caller re-issues a recorded document — a session
     /// log, a host's command history, a session script — onto this engine.
@@ -323,6 +342,8 @@ impl Engine {
             node_of: HashMap::new(),
             disposers: HashMap::new(),
             scheduled: HashSet::new(),
+            mount_seq: HashMap::new(),
+            next_mount_seq: 0,
             walks: Vec::new(),
             op_handlers: HashMap::new(),
             parked: Vec::new(),
@@ -435,7 +456,23 @@ impl Engine {
         );
         self.scheduled.insert(name);
         self.scheduled_params.insert(name, params.to_vec());
+        // The place this mount will take in the graph's order, recorded with the
+        // rest of the reservation: a patch that arrives before it applies asks
+        // `graph_rank`, and the queue is frame-ordered and FIFO within a frame, so
+        // schedule order is apply order.
+        self.take_mount_seq(name);
         Ok(())
+    }
+
+    /// Give a queued mount its place in the graph's order — one write path for the
+    /// live [`Self::mount`] and for a replayed document, so a replayed cord cannot
+    /// be checked for forward order against a different order than a live one.
+    /// A re-mount takes a **fresh** number: the name is appended again, behind
+    /// whatever has applied since.
+    fn take_mount_seq(&mut self, name: &'static str) {
+        let seq = self.next_mount_seq;
+        self.next_mount_seq += 1;
+        self.mount_seq.insert(name, seq);
     }
 
     /// Synchronous, side-effect-free validation: known plugin, declared services
@@ -609,6 +646,7 @@ impl Engine {
                 // `replay_from` refused the log that carries it.
                 self.scheduled.remove(name);
                 self.scheduled_params.remove(name);
+                self.mount_seq.remove(name);
                 self.undo_a_refused_apply(watermark, bus);
                 return Err(refusal);
             }
@@ -701,6 +739,20 @@ impl Engine {
         if !(self.scheduled.contains(tp) || self.node_of.contains_key(tp)) {
             return Err(format!("plugin '{tp}' is neither scheduled nor mounted"));
         }
+        // The graph's forward-order rule, asked **before** the log takes the patch
+        // rather than at apply: `graph.connect` refuses a cord whose source does not
+        // precede its destination, and a cord it will refuse must never be logged
+        // (a logged mutation that never happens is a silent one — the destination
+        // channel is never fed and nothing says so).
+        if let (Some(from_rank), Some(to_rank)) = (self.graph_rank(fp), self.graph_rank(tp))
+            && from_rank >= to_rank
+        {
+            return Err(format!(
+                "patch: patch cords must go forward in node order — '{tp}' is mounted before \
+                 '{fp}' (a queued mount lands behind every node already in the graph), so mount \
+                 '{tp}' first"
+            ));
+        }
         // The surface the plugin currently offers — the applied instance's, or the one
         // a queued mount's factory derives from its params. The catalog is nominal.
         let from_ports = self.ports_of(fp);
@@ -745,34 +797,84 @@ impl Engine {
         Ok(())
     }
 
-    /// Apply a patch at its scheduled frame. Never panics: if an endpoint is
-    /// not mounted (a log-order error) or the graph refuses the cord (forward
-    /// order, single-driver control), the intent stays in the log and the
-    /// refusal is asserted in debug — no audio-thread crash, no silent
-    /// divergence (replay reproduces the same refused state).
+    /// Where a plugin's node sits — or, for a queued mount, where it will sit — in
+    /// the graph's forward order. `None` for a name the engine holds no order for
+    /// (neither mounted nor carrying a scheduled mount's sequence), which the
+    /// caller reads as "no answer", never as a refusal.
+    ///
+    /// A **mounted** plugin's answer is exact: its node's own index, asked of the
+    /// graph. A **queued** mount has no node yet, and every plugin in the tree
+    /// appends one in its `apply` — `Graph::insert_before` is the tool for a node
+    /// that must *precede* an existing one, and it is not reachable from
+    /// [`Self::patch`], whose endpoints are always plugins the engine itself
+    /// mounted. So a queued mount lands after every applied node, and two queued
+    /// mounts land in the order their mounts were scheduled (which is the order
+    /// they apply in: the queue is frame-ordered, FIFO within a frame).
+    ///
+    /// Both readings share one scale — applied nodes rank `0..nodes.len()`, a
+    /// queued mount ranks `nodes.len() + seq` — so the forward-order question is a
+    /// single `>=` and needs no case analysis.
+    fn graph_rank(&self, name: &str) -> Option<usize> {
+        if let Some(&node) = self.node_of.get(name) {
+            return self.graph.nodes().iter().position(|n| n.id == node);
+        }
+        let seq = *self.mount_seq.get(name)?;
+        Some(self.graph.nodes().len().saturating_add(seq))
+    }
+
+    /// Apply a patch at its scheduled frame. Never panics: if an endpoint is not
+    /// mounted (a log-order error) or the graph refuses the cord (forward order,
+    /// single-driver control), the intent stays in the log and the refusal is
+    /// **recorded** as an [`ApplyFault`] — loud in every build, so a session whose
+    /// audio is not what its log says is one a host can mark degraded, rather than
+    /// a destination channel that is silently never fed. Replay reproduces the
+    /// same refusal, so a loaded session says the same thing a played one does.
     fn apply_patch(
         &mut self,
         from: (&'static str, &'static str),
         to: (&'static str, &'static str),
+        at_frame: u64,
     ) {
         let Some(&from_node) = self.node_of.get(from.0) else {
-            debug_assert!(
-                false,
-                "patch endpoint '{}' not mounted at apply (log-order error)",
-                from.0
-            );
+            self.record_apply_fault(Self::patch_fault(
+                from,
+                to,
+                at_frame,
+                "its source is not mounted",
+            ));
             return;
         };
         let Some(&to_node) = self.node_of.get(to.0) else {
-            debug_assert!(
-                false,
-                "patch endpoint '{}' not mounted at apply (log-order error)",
-                to.0
-            );
+            self.record_apply_fault(Self::patch_fault(
+                from,
+                to,
+                at_frame,
+                "its destination is not mounted",
+            ));
             return;
         };
         if let Err(e) = self.graph.connect(from_node, from.1, to_node, to.1) {
-            debug_assert!(false, "scheduled patch refused at apply: {e}");
+            self.record_apply_fault(Self::patch_fault(from, to, at_frame, &e));
+        }
+    }
+
+    /// The fault a scheduled patch's apply leaves behind. The cord is named the way
+    /// the log spells it (the graph's own message speaks of nodes, which a host
+    /// cannot resolve back to a plugin), and the reason is the refusal verbatim.
+    fn patch_fault(
+        from: (&'static str, &'static str),
+        to: (&'static str, &'static str),
+        at_frame: u64,
+        reason: &str,
+    ) -> ApplyFault {
+        ApplyFault {
+            // The source plugin: the cord's origin is what a user has to move.
+            plugin: from.0,
+            at_frame,
+            reason: format!(
+                "patch {}.{} → {}.{} refused: {reason}",
+                from.0, from.1, to.0, to.1
+            ),
         }
     }
 
@@ -857,6 +959,7 @@ impl Engine {
     fn apply_unmount(&mut self, name: &'static str) {
         self.scheduled.remove(name);
         self.scheduled_params.remove(name);
+        self.mount_seq.remove(name);
         self.mounted_ports.remove(name);
         self.mounted_params.remove(name);
         self.node_of.remove(name);
@@ -1122,9 +1225,14 @@ impl Engine {
                     // records them: a patch or a parameter change arriving before
                     // this mount applies must be validated against the surface the
                     // queued instance *will* have (`ports_of`/`params_of` ask
-                    // `scheduled_params`), not against the nominal catalog.
+                    // `scheduled_params`), not against the nominal catalog — and the
+                    // queued mount's place in the graph's order (`graph_rank` asks
+                    // `mount_seq`, written by the same `take_mount_seq` the live
+                    // path writes), so a replayed cord is refused for a backward
+                    // order exactly as a live one is.
                     self.scheduled.insert(plugin);
                     self.scheduled_params.insert(plugin, params.clone());
+                    self.take_mount_seq(plugin);
                 }
                 Event::ScheduleUnmount { plugin, at_frame } => {
                     if let Some(live) = self.walks.last_mut() {
@@ -1250,7 +1358,7 @@ impl Engine {
                 from_port,
                 to_plugin,
                 to_port,
-            } => self.apply_patch((from_plugin, from_port), (to_plugin, to_port)),
+            } => self.apply_patch((from_plugin, from_port), (to_plugin, to_port), at_frame),
             SchedEvent::SetTempo {
                 bpm,
                 beats_per_bar,
@@ -1317,7 +1425,8 @@ impl Engine {
         self.node_of.get(plugin).copied()
     }
 
-    /// Record a scheduled mount a plugin's `apply` refused. Bounded by
+    /// Record a scheduled mutation the engine could not apply — a mount a plugin's
+    /// `apply` refused, or a cord the graph refused. Bounded by
     /// [`MAX_APPLY_FAULTS`]: past it the fault is **counted** rather than kept
     /// ([`Self::apply_faults_dropped`]), the same "the bound is reported, not
     /// hidden" discipline as [`DrainOutcome::capped`] and the euclidean's
@@ -1331,8 +1440,8 @@ impl Engine {
     }
 
     /// Every apply the engine could not perform, oldest first — a mount the log
-    /// asked for and the plugin refused, with the frame the log stamped and the
-    /// plugin's own reason.
+    /// asked for and the plugin refused, or a cord the graph refused, with the frame
+    /// the log stamped and the refusal verbatim.
     ///
     /// **Never drained, and never cleared.** A fault is a standing fact about the
     /// session — the audio is not what the log says — so a shell that polls this

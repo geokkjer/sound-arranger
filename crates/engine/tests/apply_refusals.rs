@@ -1,5 +1,5 @@
-//! The engine's apply path: a mount the log validated and a plugin's `apply` then
-//! refused.
+//! The engine's apply path: a mutation the log validated and the plugin or the graph
+//! then refused — a mount whose `apply` returns `Err`, a cord whose endpoint is gone.
 //!
 //! `Euclidean::apply` is the first `apply` in the tree that can return `Err` — it
 //! re-checks the `steps` bound because the struct's fields are public, so an
@@ -17,7 +17,8 @@
 //!
 //! So `apply_mount` is a transaction (nothing is written until the apply has
 //! succeeded, the graph is put back on a refusal) and the refusal is *recorded* in
-//! [`ApplyFault`] rather than asserted.
+//! [`ApplyFault`] rather than asserted — the same answer the cord path gets, where
+//! `apply_patch` used to `debug_assert!` and release said nothing at all.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -61,6 +62,24 @@ fn engine_with_a_doored_euclidean() -> Engine {
         euclidean_without_a_door,
         plugins::euclidean::EUCLIDEAN_PORTS,
         &[],
+    );
+    e
+}
+
+/// A tone and a mixer — the two the cord tests wire (`tone.audio` → `mixer.ch0`).
+fn engine_with_a_tone_and_a_mixer() -> Engine {
+    let mut e = Engine::new(SR, 120.0, 4);
+    e.register_factory(
+        "tone",
+        plugins::tone_factory,
+        plugins::tone::TONE_PORTS,
+        plugins::tone::TONE_PARAMS,
+    );
+    e.register_factory(
+        "mixer",
+        plugins::mixer_factory,
+        plugins::mixer::MIXER_PORTS,
+        plugins::mixer::MIXER_PARAMS,
     );
     e
 }
@@ -292,4 +311,71 @@ fn a_replayed_log_refuses_at_the_same_frame_with_the_same_fault() {
         "and reports the same fault, at the same frame"
     );
     assert!(replayed.is_degraded(), "a loaded session is degraded too");
+}
+
+/// The same discipline on the **cord** path: a scheduled patch whose endpoint is gone
+/// when the cord applies. It is reachable — the destination's unmount is scheduled at
+/// the same frame the cord is, and the queue is FIFO within a frame, so the unmount
+/// applies first — and it is *not* reachable by validation, which sees the mixer still
+/// mounted and the cord forward. The only report used to be a `debug_assert!` inside
+/// `render_block`: a panic on the audio thread in a debug build, and a destination
+/// channel nothing feeds — with nothing said — in the build a user runs.
+#[test]
+fn a_patch_the_engine_cannot_make_at_apply_is_reported_and_does_not_panic() {
+    let mut e = engine_with_a_tone_and_a_mixer();
+    e.mount("tone", &[]).expect("the tone mounts");
+    e.mount("mixer", &[]).expect("the mixer mounts");
+    e.schedule_unmount("mixer", 0)
+        .expect("the mixin's go-away is scheduled");
+    e.patch(("tone", "audio"), ("mixer", "ch0"))
+        .expect("at call time the mixer is mounted and the cord is forward");
+    assert_eq!(
+        e.log.len(),
+        4,
+        "so the cord is in the document: {:?}",
+        e.log.events()
+    );
+
+    let rendered = render_tolerating_an_unfixed_engine(&mut e, BLOCK);
+    assert_eq!(
+        rendered.len(),
+        BLOCK,
+        "a refused cord does not wedge the loop"
+    );
+
+    // **The report.** A fault like any other: named after the cord's source plugin,
+    // stamped with the frame the *log* carried, and carrying the cord as the log
+    // spells it plus the reason. The session is degraded — the audio is not what the
+    // document says.
+    let faults = e.apply_faults();
+    assert_eq!(faults.len(), 1, "exactly the cord: {faults:?}");
+    assert_eq!(faults[0].plugin, "tone", "the cord's source plugin");
+    assert_eq!(faults[0].at_frame, 0, "the frame the log stamped");
+    assert!(
+        faults[0].reason.contains("tone.audio → mixer.ch0"),
+        "the cord, as the log spells it: {}",
+        faults[0].reason
+    );
+    assert!(
+        faults[0].reason.contains("destination is not mounted"),
+        "and why: {}",
+        faults[0].reason
+    );
+    assert_eq!(e.apply_faults_dropped(), 0, "one fault, none dropped");
+    assert!(e.is_degraded());
+
+    // And a **loaded** session says the same thing: the fault is a function of the
+    // log, so a host shows one report whether the session was played or opened.
+    let mut loaded = engine_with_a_tone_and_a_mixer();
+    loaded
+        .replay_from(&e.log)
+        .expect("a log whose cord is refused is still a log the engine can read");
+    let loaded_audio = render_tolerating_an_unfixed_engine(&mut loaded, BLOCK);
+    assert_eq!(loaded_audio, rendered, "and the same audio");
+    assert_eq!(
+        loaded.apply_faults(),
+        e.apply_faults(),
+        "and the same fault, at the same frame"
+    );
+    assert!(loaded.is_degraded(), "a loaded session is degraded too");
 }
