@@ -56,28 +56,32 @@ suite, the agent-notes verifier, and both shell-spike builds).
 | `1-engine#1` replay cannot read a re-mounting log | CRIT | CONFIRMED | `8bd5a82`, `fe9ab1e`, `18c6f9e` |
 | `1-engine#2` a patch is logged that the graph will refuse | MAJ | CONFIRMED | `e330241`, alloc `6c2c1f6` |
 | `1-engine#4` a queued onset indexes past its ring | MAJ | CONFIRMED | `fc032b8` |
-| `3-media-dsp#1` a fade sum wraps `u64` | CRIT | PARTLY (core confirmed) | `307aaad`, `8dd72b0`, `dc86b55` |
+| `3-media-dsp#1` a fade sum wraps `u64` | CRIT | PARTLY (core confirmed) | `307aaad` |
 | `3-media-dsp#2` split/chop leave an unplayable clip | CRIT | CONFIRMED | `c5b44b7`, `676bea7` |
 | `3-media-dsp#3` a clip source escapes the pool | MAJ | CONFIRMED | `aacc472` |
-| `3-media-dsp#6` chop has no bound on its piece count | MAJ | CONFIRMED | `c5b44b7` + the bound in `676bea7` |
-| `4-host#2` one bad journal line makes a session unopenable | MAJ | CONFIRMED | `0241677`, `8dd72b0`, `dc86b55` |
+| `3-media-dsp#6` chop has no bound on its piece count | MAJ | CONFIRMED | `3eab8f7` |
+| `4-host#2` one bad journal line makes a session unopenable | MAJ | CONFIRMED | `0241677`, `8dd72b0`, `dc86b55`, `d21b3c2` |
+| `4-host#3` a failed undo/redo desynchronises the history | MAJ | CONFIRMED | `0f4bc64` |
 | `4-host#5` a take's channel count aborts the process | MAJ | CONFIRMED | `0f290a2` |
 | `4-host#6` a refused live load wipes the session | MAJ | CONFIRMED | `34abe57` |
 | `5-midi#1` the tick walk hangs the render thread | CRIT | CONFIRMED | `5acac32`, `639c2de` |
 | `5-midi#2` a seek never re-syncs the follower | MAJ | CONFIRMED | `62eb94c` |
 | `5-midi#3` the transport drain allocates on the render path | MAJ | CONFIRMED | `a917a1c` |
+| `5-midi#5` an offline bounce drives the gear | MAJ | CONFIRMED | `c44f263` |
 | `2-media-io#1` (also `6-tests#1`, `7-mech#4`) 24-bit recovery truncates | MAJ | CONFIRMED | `74186ec`, `117f2f1` |
-| `2-media-io#2` a crossfade of 0 or 1 samples drops the incoming's first sample | MAJ | CONFIRMED | [fix note](../../.agents/notes/implemented/bug-fix/2026-09-29-a-crossfade-too-short-to-mix-is-a-cut.md) |
-| `2-media-io#3` `Capture::start` never validates `input_rate` | MAJ | CONFIRMED | [fix note](../../.agents/notes/implemented/bug-fix/2026-09-29-a-capture-refuses-a-zero-clock.md) |
-| `6-tests#3` the WAV reader rejects a valid odd-sized metadata chunk | MIN | CONFIRMED | [fix note](../../.agents/notes/implemented/bug-fix/2026-09-29-a-chunk-body-is-skipped-with-its-pad-byte.md) |
+| `2-media-io#2` a crossfade of 0 or 1 samples drops the incoming's first sample | MAJ | CONFIRMED | `6e834f8` |
+| `2-media-io#3` `Capture::start` never validates `input_rate` | MAJ | CONFIRMED | `aefe129` |
+| `6-tests#3` the WAV reader rejects a valid odd-sized metadata chunk | MIN | CONFIRMED | `e981f81` |
 
 Defects the **verification** found, not the original reviewers — all fixed: the euclidean grid walk
 was unbounded (`6814cfc`) and its pattern-size invariant was breakable from safe code (`069d27a`);
 a refused `apply` left state behind and was silent in release (`218eee6`); the host's rebuild and
 `load_session` carried the replay defect (`fe9ab1e`, `18c6f9e`); `frame_at`'s segment sum could
-overflow (`dd5b6f8`); one `NaN` operand wedged the autosave forever (`8dd72b0`); `save` wrote a
-session it could not reopen (`dc86b55`); `recover` *inflated* a foreign WAV with a trailing chunk
-(`117f2f1`); an apply fault allocated on the audio path (`6c2c1f6`).
+overflow (`dd5b6f8`); one `NaN` operand wedged the autosave forever (`8dd72b0`) — and the fix for
+that then wrote a `save` directory it could not reopen (`dc86b55`) and, once corrected, briefly made
+`save` run the session it was validating (`d21b3c2`); `recover` *inflated* a foreign WAV with a
+trailing chunk (`117f2f1`); an apply fault allocated on the audio path (`6c2c1f6`).
+
 
 ## Deferred, with reason
 
@@ -97,15 +101,11 @@ rejected as false; these are real findings left for a next pass, with the reason
   A resource-cost issue; the fix is architectural (share or lazily mount readers).
 - **`4-host#1` `wire_pending` resolves the mixer as `graph.out_node`** (PARTLY: the failure is real,
   the stated route is not). Needs the host to track the mixer node independently of the bus owner.
-- **`4-host#3` a failed `undo`/`redo` mutates `history`/`redo` before the fallible rebuild.**
-  Desynchronises the history from the applied state; a rollback on the rebuild path.
 - **`4-host#4` `unmount mixer` leaves the arranger wiring stale** (a remounted mixer gets no inputs,
   orphaned nodes keep reading files). Needs the unmount path to release the cords it created.
 - **`5-midi#4` the sink's `dropped_events`/`dropped_bytes` are unreachable in the product.** The
   host boxes the sink into a trait object, so the counters cannot be read; needs an accessor on the
   seam rather than a concrete-type downcast.
-- **`5-midi#5` `Bounce` renders with the sink attached**, so an offline bounce (and its drain tail)
-  drives gear. The slot mechanism exists; the bounce path does not empty it.
 - **`5-midi#6` / `7-mechanical#7` the clock-out node takes two mutexes and two `expect`s on the
   render path.** PARTLY: reachable only through the slot the host fills on the control side. Worth
   revisiting when the sink seam loses its `Mutex`.
