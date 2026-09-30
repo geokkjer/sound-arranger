@@ -174,9 +174,25 @@ pub struct HostOutcome {
     /// pool (`set_pool`); empty when the pool already fitted.
     pub pool_conformed: Vec<media::Conform>,
     pub mixer_channels: Option<usize>,
-    /// Where the session is saved (`None` until a `save`), and the last journal
-    /// (autosave) failure — so a shell can say what happened to the session file
+    /// Where the session is saved (`None` until a `save`), and why a journal (autosave)
+    /// write did not happen — so a shell can say what happened to the session file
     /// instead of leaving autosave silent.
+    ///
+    /// **One string, two faults, and the field's meaning moved.** It used to be "the
+    /// last journal failure"; it is now "the outstanding refusal, *or* the last write
+    /// failure". A **refusal** (an edit the `host v1` text form cannot carry, so it is
+    /// in the live session and nowhere else) stands until the history loses that edit —
+    /// an `undo`/`redo`/seek re-derives it — so it repeats on every refresh while it is
+    /// true, and clears when it stops being true. A **write** failure (the journal file
+    /// itself) is cleared by the next successful append or by a `save`.
+    ///
+    /// Both say the autosave lost something for an edit, which is what a status line can
+    /// report, so a shell needs no kind of its own — but note that "autosave failed" is
+    /// the wrong words for a refusal, where autosave **refused on purpose** and the edit
+    /// is still in the session. **Owed:** expose the kind (the `JournalFault` the host
+    /// holds is private), so a shell can say which it is. The rule behind both is in
+    /// the journal-line note
+    /// (`.agents/notes/implemented/bug-fix/2026-09-29-a-journal-line-must-be-readable-to-be-written.md`).
     pub session_dir: Option<std::path::PathBuf>,
     pub journal_error: Option<String>,
     /// The take in progress (a live indicator) and the last finished one (a shell
@@ -395,24 +411,46 @@ fn run(
             Ok(Request::Load(commands, reply)) => {
                 // `from_script` honours a `session_rate` line, so a loaded session
                 // runs at the rate it was saved at.
-                let mut applied = Ok(());
-                let fresh = match HostSession::from_script(&commands) {
-                    Ok(fresh) => fresh,
-                    Err(e) => {
-                        applied = Err(e);
-                        HostSession::new()
+                //
+                // **A refused script leaves the live session alone.** The candidate is
+                // built first and adopted only once it built whole, so a typo, a
+                // missing pool or an unparseable command costs the caller an `Err`
+                // and nothing else — the arrangement, the pool binding, the history
+                // and the transport are still the ones the shell is driving, and the
+                // actor keeps publishing them. This is the same rule
+                // `load_session` follows (`*self = loaded` is its last statement).
+                match HostSession::from_script(&commands) {
+                    Ok(mut fresh) => {
+                        // A load replaces the session, which would drop a take in
+                        // progress. Stop it properly first — the take is finalized
+                        // (its WAV + peaks land in the pool) and reported, the way
+                        // `replay_to_kind` does it for a seek — and hand the report
+                        // to the session that survives, which is where the shell
+                        // reads it. `stop_recording` keeps the report even when
+                        // finalizing complained, so it is read from the session
+                        // rather than from the result.
+                        if session.recording().is_some() {
+                            let _ = session.stop_recording();
+                            if let Some(take) = session.last_take().cloned() {
+                                fresh.status_take(&take);
+                            }
+                        }
+                        let outcome = build_outcome(&fresh);
+                        session = fresh;
+                        anchor = None;
+                        // A load is a fresh, stopped session: clear any buffered audio.
+                        if let AudioState::Open(a) = &audio {
+                            let _ = a.handle.pause();
+                            while a.ring.try_pop().is_some() {}
+                        }
+                        let _ = reply.send(Ok(outcome));
+                        publish(&session, &shared, &audio);
                     }
-                };
-                let outcome = applied.map(|()| build_outcome(&fresh));
-                session = fresh;
-                anchor = None;
-                // A load is a fresh, stopped session: clear any buffered audio.
-                if let AudioState::Open(a) = &audio {
-                    let _ = a.handle.pause();
-                    while a.ring.try_pop().is_some() {}
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                        publish(&session, &shared, &audio);
+                    }
                 }
-                let _ = reply.send(outcome);
-                publish(&session, &shared, &audio);
             }
             Ok(Request::Outcome(reply)) => {
                 let _ = reply.send(build_outcome(&session));
@@ -711,6 +749,44 @@ mod tests {
         let second = host.load(&script).expect("re-load starts a fresh session");
         assert_eq!(second.mixer_channels, Some(2));
         assert!(second.summary.contains("underruns: 0"));
+        host.shutdown();
+    }
+
+    /// A `load` that **fails** leaves the live session alone: the script is built
+    /// before it is adopted, so a refused command costs the caller an `Err` and
+    /// not the session the shell is driving.
+    #[test]
+    fn a_refused_load_keeps_the_live_session() {
+        let host = HostHandle::spawn();
+        let script = crate::parse_script("host v1\nmount mixer channels=2 @0\n").expect("parse");
+        host.load(&script).expect("the first load");
+        host.execute(HostCommand::TransportPlay).expect("play");
+
+        // Parses, but the mixer refuses a fractional channel count — a typo in a
+        // live script, the shape a shell's editor produces.
+        let broken =
+            crate::parse_script("host v1\nmount mixer channels=2.5 @0\n").expect("it parses");
+        let err = host
+            .load(&broken)
+            .expect_err("a refused script is an error");
+        assert!(err.contains("whole number"), "the refusal says why: {err}");
+
+        // The session on top of the refusal is the one that was there: the mixer
+        // is still mounted and the transport kept running. An empty session would
+        // report no mixer and a stopped playhead.
+        let after = host.outcome().expect("the host is still serving");
+        assert_eq!(
+            after.mixer_channels,
+            Some(2),
+            "the live session survived the refused load"
+        );
+        assert!(
+            host.snapshot().playing,
+            "the refused load did not stop the transport"
+        );
+        // …and it is still a working host: a good load replaces it as before.
+        let reloaded = host.load(&script).expect("a good load still replaces");
+        assert_eq!(reloaded.mixer_channels, Some(2));
         host.shutdown();
     }
 

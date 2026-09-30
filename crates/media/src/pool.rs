@@ -6,8 +6,9 @@
 //! Sources are immutable *post-finalize*; `Pool::recover` only finalizes crashed
 //! takes (patches the header + truncates a torn tail) and *derives* missing
 //! `.peaks` — it never mutates a well-formed source. A clip references a source by
-//! its stem id (`take_id.ch{N}`); the arranger's `PoolResolver`/`Pool::path_for`
-//! maps that id to its `.wav` path.
+//! its stem id (`take_id.ch{N}`); the arranger's `PoolResolver` maps that id to its
+//! `.wav` path, and [`Pool::resolver`] is the guarded way a host builds one
+//! ([`Pool::path_for`] is the lookup itself).
 //!
 //! **The pool is session-owned material at the session rate.** Material enters
 //! through [`Pool::import`] (which converts a foreign rate once, at the boundary)
@@ -21,6 +22,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -43,8 +45,12 @@ pub struct PoolSource {
     /// (`Pool::conform` expands it).
     pub channels: u16,
     pub peaks_missing: bool,
-    /// Whether the take is formally well-formed (a crashed, un-finalized take is
-    /// `false` — it shows its recoverable length until `Pool::recover` runs).
+    /// Whether the take needs no crash recovery — every frame its header declares
+    /// is present (`false` is a take short of its own declaration, which shows its
+    /// recoverable length until `Pool::recover` runs). A file that merely holds
+    /// *more* than it declares — a trailing `LIST`/`INFO` chunk, the RIFF pad byte
+    /// after odd-length 24-bit data — is a well-formed source, not a crashed take,
+    /// and is `true`.
     pub finalized: bool,
 }
 
@@ -150,7 +156,11 @@ pub struct Pool {
 /// should-fix 5). Also refuses **whitespace**: a pool source id has to be nameable in
 /// the space-separated `host v1` log, so an id with a space could exist on disk but
 /// never be named back (the panel marks such a stem; nothing can address it).
-fn valid_id(id: &str) -> bool {
+///
+/// `pub` because the rule belongs to the pool and a caller cannot re-derive it: a
+/// host resolves clip sources through [`Pool::resolver`], and the value model
+/// refuses a clip whose `source` is not one (a clip source is a pool id, not a path).
+pub fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && !id.contains('/')
         && !id.contains('\\')
@@ -188,6 +198,22 @@ impl Pool {
         }
         let p = self.dir.join(format!("{id}.wav"));
         p.is_file().then_some(p)
+    }
+
+    /// A [`PoolResolver`](crate::PoolResolver) over this pool — the guarded
+    /// [`Pool::path_for`] lookup, for handing to the arranger.
+    ///
+    /// **A host resolves a clip source through the pool, never by joining an id onto
+    /// the pool directory itself.** A clip's `source` is an arbitrary token in the
+    /// `host v1` log (`add_clip <track> <clip> <source> …`) and a `Clip` is
+    /// `Deserialize`, so it is user-craftable: `dir.join("../../elsewhere.wav")`
+    /// reaches any readable WAV, and it is then streamed through the arranger into
+    /// bounces and exports. The guard is here, so the seam the arranger takes is here
+    /// too — a `PoolResolver` built by hand can still be unguarded, but nothing in the
+    /// platform builds one any more.
+    pub fn resolver(&self) -> crate::PoolResolver {
+        let pool = self.clone();
+        Arc::new(move |id| pool.path_for(id))
     }
 
     /// Enumerate the pool sources (`.wav` files, sorted by filename for a
@@ -236,9 +262,12 @@ impl Pool {
 
     /// Recover crashed takes (finalize un-finalized `.wav`s) and rebuild missing
     /// or corrupt `.peaks` sidecars. Never mutates a well-formed source (other
-    /// than deriving its missing peaks). Per-source failures are reported, not
-    /// fatal. **Ordering is load-bearing:** finalize a source's take *before*
-    /// rebuilding its peaks, so the peak frame count matches the recovered take.
+    /// than deriving its missing peaks): only a take *short of its own
+    /// declaration* is a recovery candidate, and `WavWriter::recover` shortens
+    /// what it recovers — a file with bytes after its data chunk is left untouched.
+    /// Per-source failures are reported, not fatal. **Ordering is load-bearing:**
+    /// finalize a source's take *before* rebuilding its peaks, so the peak frame
+    /// count matches the recovered take.
     pub fn recover(&self) -> Result<Recovery, String> {
         let index = self.list()?;
         // carry list()'s unreadable sources through as recovery failures
@@ -248,7 +277,9 @@ impl Pool {
         };
 
         for src in &index.sources {
-            // Finalize a crashed take: the header still declares placeholder sizes.
+            // Finalize a crashed take: the header declares more audio than the file
+            // holds (the placeholder it was written with). A file that holds more
+            // than it declares is not a candidate — `finalized` is true for it.
             if !src.finalized {
                 match WavWriter::recover(&src.wav) {
                     Ok(frames) => report.finalized.push((src.id.clone(), frames)),
@@ -465,7 +496,9 @@ impl Pool {
         // A mono file: resampled, or copied byte for byte when it already fits
         // (no re-quantization) — both through a temporary name, then committed,
         // so a failure cannot leave a torn source. The id means this file, so any
-        // channel sources an earlier multi-channel import left under it go.
+        // channel sources an earlier multi-channel import left under it go — all
+        // of them, `ch0` included, because this import writes `{id}.wav` and no
+        // `{id}.ch{k}` (a mono keep-count of 0).
         let converted = from_rate != session_rate;
         let tmp = dest.with_extension("converting");
         let frames_out = if converted {
@@ -483,7 +516,7 @@ impl Pool {
             }
             frames_in
         };
-        self.replace_sources(&id, 1);
+        self.replace_sources(&id, 0);
         if let Err(e) = fs::rename(&tmp, &dest) {
             let _ = fs::remove_file(&tmp);
             return Err(format!(
@@ -565,10 +598,13 @@ impl Pool {
 
     /// Remove the sources an earlier import left under `id`: the whole-file
     /// source itself, and every `{id}.ch{k}` channel at or beyond
-    /// `keep_channels`. **Importing replaces the id** — without this, a stereo
-    /// file imported over a stem that held a 5.1 take (or a mono source) would
-    /// leave the old material addressable, and a clip on that id would keep
-    /// playing audio the user just replaced.
+    /// `keep_channels` — the number of `{id}.ch{k}` names this import is about
+    /// to write (a multi-channel import overwrites `ch0..channels-1`; a **mono**
+    /// import writes none, so it passes `0` and every sibling of an earlier split
+    /// goes with it). **Importing replaces the id** — without this, a stereo file
+    /// imported over a stem that held a 5.1 take (or a mono source) would leave
+    /// the old material addressable, and a clip on that id would keep playing
+    /// audio the user just replaced.
     ///
     /// Called only once the new material is safely written, so a failed import
     /// changes nothing. A filesystem error here is ignored: `list` reports what

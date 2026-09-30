@@ -3,10 +3,14 @@
 //! Writer: 16-bit PCM mono/stereo, placeholder sizes written *before* any
 //! audio and patched on [`WavWriter::finalize`] — so a take is
 //! crash-recoverable from the first byte: [`WavWriter::recover`] rescans the
-//! data chunk and patches the header of a file that died mid-write. Reader:
-//! 16-bit PCM and 32-bit float, mono or stereo (stereo → channel 0; the
-//! Phase-0 graph is mono). `hound` stays the Phase-1 upgrade if format edge
-//! cases (WAVEFORMATEXTENSIBLE, 24-bit, …) bite (Spike B note, Alternatives).
+//! data chunk and patches the header of a file that died mid-write. A crashed
+//! take is *short of its own declaration*, and recovery can only shorten a file:
+//! bytes after a data chunk (a trailing `LIST`/`INFO` chunk, the RIFF pad byte
+//! after odd-length 24-bit data) are another tool's business, not audio to
+//! declare. Reader: 16-bit PCM and 32-bit float, mono or stereo (stereo →
+//! channel 0; the Phase-0 graph is mono). `hound` stays the Phase-1 upgrade if
+//! format edge cases (WAVEFORMATEXTENSIBLE, 24-bit, …) bite (Spike B note,
+//! Alternatives).
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -44,8 +48,16 @@ struct Header {
 }
 
 impl Header {
+    /// Bytes one sample occupies, from the bit depth the header declares. Never
+    /// inferred from an "is this float?" test: 24-bit PCM is *three* bytes a
+    /// sample, and describing a recovered 24-bit take at two truncated it to
+    /// two thirds while returning the frame count the file no longer held.
+    fn bytes_per_sample(&self) -> u16 {
+        self.bits / 8
+    }
+
     fn block_align(&self) -> u64 {
-        self.channels as u64 * (self.bits / 8) as u64
+        self.channels as u64 * self.bytes_per_sample() as u64
     }
 }
 
@@ -86,8 +98,11 @@ fn parse_header(reader: &mut (impl Read + Seek)) -> Result<Header, String> {
                 .read_exact(&mut body[..n])
                 .map_err(|e| format!("fmt chunk: {e}"))?;
             if size > 40 {
+                // The overshoot skips a body like any other chunk, so it carries
+                // the same pad byte.
+                let pad = size & 1;
                 reader
-                    .seek(SeekFrom::Current(size as i64 - n as i64))
+                    .seek(SeekFrom::Current(size as i64 - n as i64 + pad as i64))
                     .map_err(|e| e.to_string())?;
             }
             let format = u16::from_le_bytes([body[0], body[1]]);
@@ -132,8 +147,14 @@ fn parse_header(reader: &mut (impl Read + Seek)) -> Result<Header, String> {
             ));
             break; // data is the last chunk for files we write; a reader may re-seek
         } else {
+            // RIFF pads an odd-sized chunk body to a word boundary. Skipping only
+            // the body leaves the reader on the pad byte, reads `[pad, 'd','a']`
+            // as the next tag, and loses every chunk from there on — so a valid
+            // foreign WAV with a `LIST`/`cue `/`bext` before `data` was refused
+            // with "missing data chunk".
+            let pad = size & 1;
             reader
-                .seek(SeekFrom::Current(size as i64))
+                .seek(SeekFrom::Current(size as i64 + pad as i64))
                 .map_err(|e| e.to_string())?;
         }
     }
@@ -396,17 +417,52 @@ impl WavWriter {
     /// Recover a take that died mid-write (no `finalize` ran): rescan the data
     /// chunk, patch both size fields, and return the frame count recovered.
     /// Works because the header with placeholders is written before any audio.
+    ///
+    /// **Recovery shortens a file; it never lengthens one.** What it salvages is a
+    /// take that is *short of its own declaration* — the header claims more audio
+    /// than the file holds, which is the evidence a write died (the `0xFFFF_FFFF`
+    /// placeholder [`write_header`] puts up front, or a size patched for the full
+    /// take before the last flush landed).
+    ///
+    /// Bytes *after* the declared data are a **legal** shape, not a crash: a
+    /// trailing `LIST`/`INFO`/`fact`/`cue` chunk, or the RIFF pad byte after
+    /// odd-length 24-bit data. No take this crate wrote ever declares less than it
+    /// wrote, so such a file is one another tool owns, and counting its metadata
+    /// as frames would re-declare that metadata as a user's take. It is therefore
+    /// **refused** and left byte for byte as it was — and [`Self::is_finalized`]
+    /// does not offer it to the pool's crash pass in the first place.
     pub fn recover(path: &Path) -> Result<u64, String> {
         let mut file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let h = parse_header(&mut file)?;
         let file_len = file.metadata().map_err(|e| e.to_string())?.len();
-        let actual_bytes = file_len.saturating_sub(h.data_offset);
-        let frames = actual_bytes / h.block_align();
+        let declared_end = h.data_offset + h.data_bytes as u64;
+        if declared_end < file_len {
+            return Err(format!(
+                "{}: the data chunk ends at byte {declared_end} but the file is {file_len} \
+                 bytes — the {extra} trailing bytes are a chunk or a pad byte, not a crashed \
+                 take, so it is left alone",
+                path.display(),
+                extra = file_len - declared_end
+            ));
+        }
+        // What a salvage keeps: the whole frames the file *holds*, capped by what
+        // it declares and floored to a frame boundary. That cap is the structural
+        // half of "recovery never grows a file" — the size computed below is at
+        // most what is on disk, so `set_len` can only drop a torn tail.
+        let held_bytes = file_len.saturating_sub(h.data_offset);
+        let frames = held_bytes.min(h.data_bytes as u64) / h.block_align();
         // Patch a *frame-aligned* size: a torn tail from a crash mid-flush is
         // truncated away so the recovered file is formally well-formed
         // (kimi review finding 7). Refuse a take that would overflow the u32
-        // size field rather than writing a corrupt small header (>4 GiB).
-        let data_bytes = data_bytes(frames, h.channels, h.bits == 32)?;
+        // size field rather than writing a corrupt small header (>4 GiB). The
+        // sample width is the header's own (`bits / 8`) — the same term
+        // `block_align` uses — so a 24-bit take is described at three bytes a
+        // sample and survives recovery whole.
+        let data_bytes = data_bytes(frames, h.channels, h.bytes_per_sample())?;
+        debug_assert!(
+            h.data_offset + data_bytes <= file_len,
+            "a salvage is bounded by the bytes the file holds"
+        );
         let mut f = File::options()
             .write(true)
             .open(path)
@@ -425,14 +481,25 @@ impl WavWriter {
         Ok(frames)
     }
 
-    /// Whether a file is formally well-formed (its declared data size exactly
-    /// matches the bytes after the data header) — i.e. a crashed take whose
-    /// placeholder size was never patched returns `false` (the pool recovers it).
+    /// Whether a file needs no crash recovery: **the file holds at least every
+    /// frame it declares** (`data_offset + data_bytes <= file_len`). A take that
+    /// is *short of its own declaration* reports `false` and is what the pool's
+    /// crash pass recovers — the `0xFFFF_FFFF` placeholder [`write_header`] writes
+    /// before any audio, or a header patched for more audio than the write reached.
+    ///
+    /// A file that holds *more* than it declares is `true`, and that is the whole
+    /// point: a trailing `LIST`/`INFO`/`fact`/`cue` chunk and the RIFF pad byte
+    /// after odd-length 24-bit data are legal RIFF, so "the declared size is not
+    /// the file length" is the *absence* of a shape, never the evidence of a
+    /// crash — and it is not evidence in that direction, because the trailing bytes
+    /// are not audio. No take this crate wrote ever declares less than it wrote, so
+    /// a file in that state belongs to another tool and is left alone;
+    /// [`Self::recover`] refuses it outright if it is called directly.
     pub fn is_finalized(path: &Path) -> Result<bool, String> {
         let mut file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let h = parse_header(&mut file)?;
         let file_len = file.metadata().map_err(|e| e.to_string())?.len();
-        Ok(h.data_offset + h.data_bytes as u64 == file_len)
+        Ok(h.data_offset + h.data_bytes as u64 <= file_len)
     }
 }
 
@@ -485,7 +552,8 @@ fn patch_sizes(
     channels: u16,
     float: bool,
 ) -> Result<(), String> {
-    let data_bytes = data_bytes(frames, channels, float)?;
+    let bytes_per_sample: u16 = if float { 4 } else { 2 };
+    let data_bytes = data_bytes(frames, channels, bytes_per_sample)?;
     let data_bytes = data_bytes as u32;
     w.seek(SeekFrom::Start(RIFF_SIZE_POS))
         .map_err(|e| e.to_string())?;
@@ -498,15 +566,16 @@ fn patch_sizes(
     Ok(())
 }
 
-/// The RIFF data-chunk size, or `Err` if it would exceed the u32 field — a take
+/// The RIFF data-chunk size for a take of `frames` at a sample width of
+/// `bytes_per_sample` (a *width*, not a format flag — a 24-bit take is three
+/// bytes a sample), or `Err` if it would exceed the u32 field — a take
 /// that big must not silently truncate to a corrupt small header (the pool
 /// records long live jams; ~6.2 h mono float @48 kHz crosses 4 GiB). RF64 is the
 /// longer-term answer; for now a >4 GiB take fails loud.
-fn data_bytes(frames: u64, channels: u16, float: bool) -> Result<u64, String> {
-    let bytes_per_sample: u64 = if float { 4 } else { 2 };
+fn data_bytes(frames: u64, channels: u16, bytes_per_sample: u16) -> Result<u64, String> {
     let data_bytes = frames
         .checked_mul(channels as u64)
-        .and_then(|b| b.checked_mul(bytes_per_sample))
+        .and_then(|b| b.checked_mul(bytes_per_sample as u64))
         .ok_or("take length overflows the WAV size arithmetic")?;
     // The RIFF size field is `36 + data_bytes (+ 1 pad byte if data_bytes is odd,
     // since WAV chunks are word-aligned)` — both must fit u32. `-37` (not `-36`)
@@ -524,6 +593,7 @@ fn data_bytes(frames: u64, channels: u16, float: bool) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem;
 
     fn tmp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("media-wav-{name}-{}.wav", std::process::id()))
@@ -721,6 +791,188 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A **genuinely crashed take** — the header declares more audio than the file
+    /// holds — is still the case `recover` exists for, and it recovers exactly as
+    /// before: every frame that landed is kept, the torn tail is cut at a frame
+    /// boundary, and the file gets *shorter*, never longer.
+    ///
+    /// The fixture is a real writer's take (placeholder header, no `finalize`, so
+    /// the declared size is `0xFFFF_FFFF` — far longer than the file) with the
+    /// last flush torn off, leaving a partial frame.
+    #[test]
+    fn a_crashed_take_that_is_short_of_its_own_declaration_recovers() {
+        let path = tmp("short-of-declaration");
+        let n = 1234u64;
+        {
+            let mut w = WavWriter::create(&path, 48_000, 1).unwrap();
+            w.write(&vec![0.5; n as usize]).unwrap();
+            w.flush().unwrap();
+            mem::forget(w); // suppress Drop's best-effort finalize — the crash
+        }
+        // A torn tail: the last 3 bytes are a partial frame the flush never
+        // completed, so the file holds 1232 whole frames and half of the next.
+        let written = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(written, 44 + n * 2);
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(written - 3).unwrap();
+        drop(file);
+        let torn = std::fs::metadata(&path).unwrap().len();
+        let kept = (torn - 44) / 2;
+        assert_eq!(kept, n - 2, "the fixture lost a partial frame");
+
+        assert!(
+            !WavWriter::is_finalized(&path).unwrap(),
+            "a take short of its own declaration is not finalized"
+        );
+        let recovered = WavWriter::recover(&path).unwrap();
+        assert_eq!(
+            recovered, kept,
+            "every whole frame that landed is recovered"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            44 + kept * 2,
+            "the torn partial frame is cut, and the file is no longer than it was"
+        );
+        assert!(
+            torn < written,
+            "and recovery never grew what was on disk ({torn} < {written})"
+        );
+        assert!(WavWriter::is_finalized(&path).unwrap());
+        let mut r = WavReader::open(&path).unwrap();
+        assert_eq!(r.total_frames(), kept);
+        let mut back = vec![0.0f32; kept as usize];
+        assert_eq!(r.read_into(&mut back), kept as usize);
+        assert!(back.iter().all(|s| (*s - 0.5).abs() < 1e-3));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A **foreign** WAV carrying a trailing `LIST`/`INFO` chunk is not a crashed
+    /// take, and `recover` must not turn its metadata into audio. Every other tool
+    /// that writes a WAV (a DAW export, `ffmpeg`, Audacity) may append `LIST`/
+    /// `INFO`/`fact`/`cue` chunks *after* the data chunk; the file then holds more
+    /// than its data chunk declares.
+    ///
+    /// The pre-fix `is_finalized` was `declared_end == file_len`, so this file read
+    /// as unfinalized, and `recover`'s rescan counted the trailing bytes as audio:
+    /// the header was rewritten to declare them, `set_len` could not shrink the
+    /// file (there was nothing to cut), and `is_finalized` then reported the
+    /// inflated file as good. The metadata became part of the user's take.
+    #[test]
+    fn a_trailing_chunk_is_neither_crashed_nor_audio() {
+        let path = tmp("trailing-chunk");
+        let n = 1_000u64;
+        // A DAW-shaped 16-bit mono file: 2000 audio bytes at 44, then a 28-byte
+        // `LIST` chunk at 2044. (The writer is dropped before the read: its
+        // `finalize` patch is still in the `BufWriter` until then.)
+        {
+            let mut w = WavWriter::create(&path, 48_000, 1).unwrap();
+            w.write(&vec![0.5; n as usize]).unwrap();
+            w.finalize().unwrap();
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        let info = b"INFOISFTthisisatool\x00";
+        let mut list = Vec::new();
+        list.extend_from_slice(b"LIST");
+        list.extend_from_slice(&(info.len() as u32).to_le_bytes());
+        list.extend_from_slice(info);
+        bytes.extend_from_slice(&list);
+        // And the RIFF size the foreign tool wrote counts the chunk too.
+        let riff = ((bytes.len() - 8) as u32).to_le_bytes();
+        bytes[4..8].copy_from_slice(&riff);
+        std::fs::write(&path, &bytes).unwrap();
+        let file_len = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(file_len, 2072, "2000 audio bytes + a 28-byte LIST chunk");
+
+        assert!(
+            WavWriter::is_finalized(&path).unwrap(),
+            "holding a trailing chunk is legal RIFF, not an unfinalized take"
+        );
+        let before = std::fs::read(&path).unwrap();
+        let refused = WavWriter::recover(&path)
+            .expect_err("recovery must refuse a file whose data chunk is not the file's tail");
+        assert!(
+            refused.contains("trailing") || refused.contains("left alone"),
+            "the refusal must say why: {refused}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a refused recovery must not touch a single byte"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            file_len,
+            "and must never grow the file"
+        );
+
+        // The audio the reader sees is the take and nothing else: 1000 frames, not
+        // the 13 the `LIST` chunk's bytes would have become.
+        let mut r = WavReader::open(&path).unwrap();
+        assert_eq!(r.total_frames(), n);
+        let mut back = vec![0.0f32; n as usize];
+        assert_eq!(r.read_into(&mut back), n as usize);
+        assert!(back.iter().all(|s| (*s - 0.5).abs() < 1e-3));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A **foreign WAV with an odd-sized chunk before `data`** is valid RIFF: the
+    /// pad byte is what puts the next chunk on a word boundary, and a conforming
+    /// writer emits it. The chunk walk skipped a body *without* its pad, so the
+    /// reader landed on the pad byte, read `[pad, 'd','a']` as the next tag, and
+    /// `parse_header` reported "missing data chunk" — a valid file refused with no
+    /// diagnostic about alignment, so `Pool::list` filed it in `errors` and
+    /// `import` failed. The writer never emits such a chunk, which is why no
+    /// round-trip test could see it — this file is hand-spliced.
+    #[test]
+    fn an_odd_sized_chunk_before_data_is_skipped_with_its_pad_byte() {
+        let path = tmp("odd-chunk-before-data");
+        let n = 1_000u64;
+        {
+            let mut w = WavWriter::create(&path, 48_000, 1).unwrap();
+            w.write(&vec![0.5; n as usize]).unwrap();
+            w.finalize().unwrap();
+        }
+        // Splice an 11-byte `LIST`/`INFO` chunk — the odd-length tag other tools
+        // write routinely — and its pad byte in front of the `data` tag at 36.
+        let body = b"INFOISFTav\x00";
+        assert_eq!(body.len() % 2, 1, "an odd length is what needs the pad");
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(b"LIST");
+        chunk.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        chunk.extend_from_slice(body);
+        chunk.push(0); // the RIFF pad byte, so `data` starts word-aligned
+        let mut bytes = std::fs::read(&path).unwrap();
+        let tail = bytes.split_off(36); // the `data` tag, its size, the audio
+        bytes.extend_from_slice(&chunk);
+        bytes.extend_from_slice(&tail);
+        // And the RIFF size the foreign tool wrote counts the chunk and its pad.
+        let riff = ((bytes.len() - 8) as u32).to_le_bytes();
+        bytes[4..8].copy_from_slice(&riff);
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            44 + chunk.len() as u64 + n * 2,
+            "2000 audio bytes + the LIST chunk and its pad"
+        );
+
+        let mut r = WavReader::open(&path)
+            .expect("an odd-sized chunk before `data` is not a reason to refuse a file");
+        assert_eq!(r.sample_rate(), 48_000);
+        assert_eq!(r.total_frames(), n);
+        let mut back = vec![0.0f32; n as usize];
+        assert_eq!(r.read_into(&mut back), n as usize);
+        assert!(back.iter().all(|s| (*s - 0.5).abs() < 1e-3));
+
+        // The pool's crash pass asks the same question of this file, through the
+        // same walk — it is a well-formed take that happens to carry metadata.
+        assert!(
+            WavWriter::is_finalized(&path).unwrap(),
+            "the chunk walk must reach the data chunk for the recovery predicate too"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn rejects_garbage() {
         let path = tmp("garbage");
@@ -772,31 +1024,27 @@ mod float_tests {
     /// truncate to a corrupt small header (>4 GiB — the pool records long jams).
     #[test]
     fn data_bytes_guard_refuses_oversized_take() {
-        // mono float: data_bytes = frames * 4. The RIFF field is `36 + data_bytes
-        // (+1 pad if odd)`; the guard is `> u32::MAX - 37` (conservative, covers
-        // the odd-data pad even though our writers always produce even data_bytes).
+        // mono float: data_bytes = frames * 4, i.e. 4 bytes per sample. The RIFF
+        // field is `36 + data_bytes (+1 pad if odd)`; the guard is
+        // `> u32::MAX - 37` (conservative, covers the odd-data pad even though our
+        // writers always produce even data_bytes).
         let ok_frames = (u32::MAX as u64 - 37) / 4; // data_bytes just under the bound
         assert!(
-            data_bytes(ok_frames, 1, true).is_ok(),
+            data_bytes(ok_frames, 1, 4).is_ok(),
             "just under the boundary is ok"
         );
         let err_frames = ok_frames + 1; // data_bytes just over
         assert!(
-            data_bytes(err_frames, 1, true).is_err(),
+            data_bytes(err_frames, 1, 4).is_err(),
             "just over the boundary must refuse"
         );
     }
 
     /// Write a 24-bit PCM WAV by hand (the writer only does 16-bit/float — 24-bit is
-    /// what *other* tools write, which is why the reader must accept it).
+    /// what *other* tools write, which is why the reader must accept it). No pad
+    /// byte: see [`write_pcm24_padded`] for the conforming odd-length shape.
     fn write_pcm24(path: &Path, rate: u32, channels: u16, samples: &[f32]) {
-        let data: Vec<u8> = samples
-            .iter()
-            .flat_map(|s| {
-                let v = (s.clamp(-1.0, 1.0) * 8_388_607.0).round() as i32;
-                [v as u8, (v >> 8) as u8, (v >> 16) as u8]
-            })
-            .collect();
+        let data = pcm24_bytes(samples);
         let mut file = Vec::new();
         file.extend_from_slice(b"RIFF");
         file.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
@@ -812,6 +1060,43 @@ mod float_tests {
         file.extend_from_slice(&(data.len() as u32).to_le_bytes());
         file.extend_from_slice(&data);
         std::fs::write(path, file).expect("write pcm24");
+    }
+
+    /// 24-bit samples as little-endian three-byte integers, `i24` the width a 24-bit
+    /// file is described at.
+    fn pcm24_bytes(samples: &[f32]) -> Vec<u8> {
+        samples
+            .iter()
+            .flat_map(|s| {
+                let v = (s.clamp(-1.0, 1.0) * 8_388_607.0).round() as i32;
+                [v as u8, (v >> 8) as u8, (v >> 16) as u8]
+            })
+            .collect()
+    }
+
+    /// A 24-bit PCM WAV **with the RIFF pad byte** — what a conforming writer emits
+    /// when the data chunk has an odd length (5 frames of `i24` is 15 bytes), and
+    /// what this crate's writer does not emit. The file is one byte longer than its
+    /// data chunk declares, and the pad byte is not audio.
+    fn write_pcm24_padded(path: &Path, rate: u32, samples: &[f32]) {
+        let data = pcm24_bytes(samples);
+        assert_eq!(data.len() % 2, 1, "an odd length is what needs the pad");
+        let mut file = Vec::new();
+        file.extend_from_slice(b"RIFF");
+        file.extend_from_slice(&((36 + data.len() + 1) as u32).to_le_bytes());
+        file.extend_from_slice(b"WAVEfmt ");
+        file.extend_from_slice(&16u32.to_le_bytes());
+        file.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        file.extend_from_slice(&1u16.to_le_bytes()); // mono
+        file.extend_from_slice(&rate.to_le_bytes());
+        file.extend_from_slice(&(rate * 3).to_le_bytes());
+        file.extend_from_slice(&3u16.to_le_bytes());
+        file.extend_from_slice(&24u16.to_le_bytes());
+        file.extend_from_slice(b"data");
+        file.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        file.extend_from_slice(&data);
+        file.push(0); // the pad byte, so the next chunk would start word-aligned
+        std::fs::write(path, file).expect("write padded pcm24");
     }
 
     /// 24-bit PCM is what other tools write: it must read back exactly (sign extension
@@ -854,6 +1139,111 @@ mod float_tests {
         file.extend_from_slice(&0u32.to_le_bytes());
         std::fs::write(&bad, file).expect("write bad");
         assert!(WavReader::open(&bad).is_err(), "32-bit PCM is refused");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The RIFF pad byte after odd-length data is not a crashed take.** A
+    /// conforming writer pads an odd-length data chunk to a word boundary, so a
+    /// 24-bit file with an odd frame count is *one byte longer* than its data chunk
+    /// declares — a legal shape, not an unfinished write. The pre-fix
+    /// `is_finalized` was `declared_end == file_len`, so it read `false`, and the
+    /// pool's crash pass then ran `recover` on a file this crate never wrote: the
+    /// rescan counted the pad byte as audio, `set_len` cut it off, and the header
+    /// was rewritten. This must be refused, byte for byte, and the pad byte must
+    /// survive.
+    #[test]
+    fn a_riff_pad_byte_after_odd_data_is_neither_crashed_nor_audio() {
+        let dir = std::env::temp_dir().join(format!("wav24-pad-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("t24-pad.wav");
+        let samples: [f32; 5] = [0.0, 0.5, -0.5, 1.0, -1.0]; // 5 × 3 = 15 bytes, odd
+        write_pcm24_padded(&path, 48_000, &samples);
+        let file_len = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(file_len, 60, "44 header + 15 audio + 1 pad byte");
+
+        assert!(
+            WavWriter::is_finalized(&path).unwrap(),
+            "the pad byte is legal RIFF, not an unfinalized take"
+        );
+        let before = std::fs::read(&path).unwrap();
+        WavWriter::recover(&path)
+            .expect_err("recovery must refuse a file whose only extra byte is a pad byte");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a refused recovery must not touch a single byte"
+        );
+
+        // The reader still sees the five frames, and not a sixth cut in half by
+        // the pad byte.
+        let mut r = WavReader::open(&path).unwrap();
+        assert_eq!(r.total_frames(), samples.len() as u64);
+        let mut back = vec![0.0f32; samples.len()];
+        assert_eq!(r.read_into(&mut back), samples.len());
+        for (got, want) in back.iter().zip(samples) {
+            assert!((got - want).abs() < 1e-5, "24-bit sample {got} != {want}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A crashed **24-bit** take recovers to its full length: `recover` describes
+    /// the file at the width the header declares (three bytes a sample), not at a
+    /// float-or-16-bit guess. The first draft passed `h.bits == 32` as a "float"
+    /// flag, so a 24-bit take was described at 2 bytes a sample — `set_len` kept
+    /// two thirds of the audio, `recover` still returned the *pre*-truncation
+    /// frame count (so `Pool::recover` reported frames the file no longer held),
+    /// and `is_finalized` then hid the loss forever.
+    #[test]
+    fn a_twenty_four_bit_take_recovers_to_its_full_length() {
+        let dir = std::env::temp_dir().join(format!("wav24-recover-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("t24-crash.wav");
+        let samples: [f32; 6] = [0.0, 0.5, -0.5, 1.0, -1.0, 0.25];
+        write_pcm24(&path, 48_000, 1, &samples);
+
+        // The header a crashed take is left with: the placeholder size `write_header`
+        // writes before any audio, so `is_finalized` is false and the pool's crash
+        // pass calls `recover`.
+        let mut bytes = std::fs::read(&path).expect("read the fixture");
+        bytes[40..44].copy_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&path, &bytes).expect("write the crashed fixture");
+        assert!(
+            !WavWriter::is_finalized(&path).unwrap(),
+            "the fixture must look like a crashed take"
+        );
+        let audio = bytes[44..].to_vec();
+        assert_eq!(audio.len(), samples.len() * 3, "3 bytes a 24-bit sample");
+
+        let n = samples.len() as u64;
+        assert_eq!(
+            WavWriter::recover(&path).unwrap(),
+            n,
+            "the recovered count is the file's own frames"
+        );
+
+        // The take survived whole: the audio bytes are untouched, and the header now
+        // declares them at their real width.
+        let bytes = std::fs::read(&path).expect("read the recovered file");
+        assert_eq!(&bytes[44..], &audio[..], "no audio byte was truncated away");
+        assert_eq!(
+            u32::from_le_bytes(bytes[40..44].try_into().unwrap()),
+            (n * 3) as u32,
+            "the data size is 3 bytes a sample, not 2"
+        );
+        assert!(WavWriter::is_finalized(&path).unwrap());
+
+        // …and the reader agrees with the report: every frame, at its own value.
+        let mut r = WavReader::open(&path).unwrap();
+        assert_eq!(r.total_frames(), n);
+        let mut back = vec![0.0f32; n as usize];
+        assert_eq!(r.read_into(&mut back), n as usize);
+        for (got, want) in back.iter().zip(samples) {
+            assert!(
+                (got - want).abs() < 1e-5,
+                "recovered 24-bit sample {got} != {want}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

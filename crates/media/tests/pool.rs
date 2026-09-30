@@ -105,6 +105,41 @@ fn recover_rebuilds_missing_peaks() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// **The resolver a host hands the arranger is the guarded lookup.** A clip's `source`
+/// is an arbitrary token in the `host v1` log, so a resolver that joins the id onto the
+/// pool directory itself turns `../escape` into `<pool>/../escape.wav`: a readable file
+/// outside the pool, streamed into whatever the session renders. `Pool::resolver`
+/// delegates to `path_for`, so a crafted id resolves to *nothing*.
+#[test]
+fn resolver_refuses_an_id_that_is_not_a_plain_pool_id() {
+    let root = tmp_dir("resolver-escape");
+    let dir = root.join("pool");
+    std::fs::create_dir_all(&dir).unwrap();
+    write_finalized(&dir, "take-5", 1_000, 48_000, 0.1);
+    // A readable WAV one level *above* the pool: what the escaping id would reach.
+    write_finalized(&root, "escape", 1_000, 48_000, 0.9);
+    assert!(
+        dir.join("../escape.wav").is_file(),
+        "the escape target exists"
+    );
+
+    let pool = Pool::open(&dir).unwrap();
+    let resolve = pool.resolver();
+    assert_eq!(
+        resolve("take-5"),
+        Some(dir.join("take-5.wav")),
+        "a plain id resolves to the pool's own file"
+    );
+    for bad in ["../escape", "..", "sub/take-5", "take 5", ""] {
+        assert!(
+            resolve(bad).is_none(),
+            "'{bad}' is not a plain pool id, so it resolves to nothing"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn path_for_maps_stem_to_wav() {
     let dir = tmp_dir("path");
@@ -340,6 +375,58 @@ fn a_narrower_import_removes_the_older_channels() {
         );
     }
 
+    let _ = std::fs::remove_dir_all(&src_dir);
+    let _ = std::fs::remove_dir_all(&pool_dir);
+}
+
+/// Importing a **mono** file over a stem a split left as `{id}.ch0`,
+/// `{id}.ch1` replaces the id outright: the new material lands as `{id}.wav`, so
+/// *every* channel of the old take is stale — `ch0` included, which a keep-count
+/// of 1 (the mono channel count) did not reach. Left in place, a clip on
+/// `jam.ch0` — an id the pool itself handed out — keeps playing the left channel
+/// of the take the user just replaced.
+#[test]
+fn a_mono_import_removes_the_older_split_channels() {
+    let first_dir = tmp_dir("mono-over-split-first");
+    let src_dir = tmp_dir("mono-over-split-src");
+    let pool_dir = tmp_dir("mono-over-split-pool");
+    write_stereo(&first_dir, "jam", 4800, 48_000, 0.25, -0.5); // the replaced take
+    write_finalized(&src_dir, "jam", 2400, 48_000, 0.75); // the new, unrelated mono take
+
+    let pool = Pool::open(&pool_dir).unwrap();
+    let split = pool.import(&first_dir.join("jam.wav"), 48_000).unwrap();
+    assert_eq!(split.ids(), vec!["jam.ch0", "jam.ch1"]);
+
+    let done = pool.import(&src_dir.join("jam.wav"), 48_000).unwrap();
+    assert_eq!(done.ids(), vec!["jam"]);
+
+    let index = pool.list().unwrap();
+    assert_eq!(index.errors, Vec::new());
+    let ids: Vec<&str> = index.sources.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["jam"],
+        "the replaced take's channels must not survive the import"
+    );
+    for stale in [
+        "jam.ch0.wav",
+        "jam.ch1.wav",
+        "jam.ch0.peaks",
+        "jam.ch1.peaks",
+    ] {
+        assert!(
+            !pool_dir.join(stale).exists(),
+            "{stale} outlived the import that replaced it"
+        );
+    }
+    let (audio, rate, frames) = read_all(&pool_dir.join("jam.wav"));
+    assert_eq!((rate, frames), (48_000, 2400));
+    assert!(
+        audio.iter().all(|s| (s - 0.75).abs() < 1e-6),
+        "jam.wav must hold the new mono take"
+    );
+
+    let _ = std::fs::remove_dir_all(&first_dir);
     let _ = std::fs::remove_dir_all(&src_dir);
     let _ = std::fs::remove_dir_all(&pool_dir);
 }
@@ -732,6 +819,76 @@ fn conform_brings_a_hand_filled_pool_to_the_session_rate() {
     let again = pool.conform(48_000).unwrap();
     assert!(again.converted.is_empty());
     assert!(again.errors.is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A **foreign** WAV in the pool directory — one another tool wrote, carrying a
+/// `LIST`/`INFO` chunk after its data — is a well-formed source, and the crash
+/// pass must leave it exactly as it found it. This is the shape that reaches a pool
+/// for real: `import` copies a rate-matching mono file byte for byte, so a DAW
+/// export lands verbatim.
+///
+/// The pre-fix `is_finalized` was `declared_end == file_len`, so the trailing chunk
+/// read as an unfinalized take, `Pool::recover` called `WavWriter::recover` on it,
+/// and the rescan counted the chunk's bytes as audio: the header was patched to
+/// declare 13 extra frames of `LISTINFOISFT…` and the peaks were baked over them.
+/// The pool's own module doc promised it "never mutates a well-formed source", and
+/// that did not hold for any WAV this crate did not write.
+#[test]
+fn a_foreign_source_with_a_trailing_chunk_is_left_alone() {
+    let dir = tmp_dir("foreign-chunk");
+    let path = dir.join("daw-export.ch0.wav");
+    let frames = 1_000u64;
+
+    // 2000 bytes of 16-bit audio at 44, then a 28-byte `LIST` chunk at 2044 —
+    // the header declares the audio, as a foreign writer's does. (The writer is
+    // dropped before the read: its `finalize` patch is still in the `BufWriter`.)
+    {
+        let mut w = WavWriter::create(&path, 48_000, 1).unwrap();
+        w.write(&vec![0.5f32; frames as usize]).unwrap();
+        w.finalize().unwrap();
+    }
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend_from_slice(b"LIST");
+    bytes.extend_from_slice(&20u32.to_le_bytes()); // "INFOISFT" + payload
+    bytes.extend_from_slice(b"INFOISFTthisisatool\x00");
+    let riff = ((bytes.len() - 8) as u32).to_le_bytes();
+    bytes[4..8].copy_from_slice(&riff);
+    std::fs::write(&path, &bytes).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert_eq!(before.len(), 2_072);
+
+    let pool = Pool::open(&dir).unwrap();
+    let index = pool.list().unwrap();
+    assert_eq!(index.errors, Vec::<(PathBuf, String)>::new());
+    let src = &index.sources[0];
+    assert!(src.finalized, "a trailing chunk is not a crashed take");
+    assert_eq!(
+        src.frames, frames,
+        "and its frames are the take's, not the chunk's"
+    );
+
+    let report = pool.recover().unwrap();
+    assert_eq!(report.errors, Vec::<(PathBuf, String)>::new());
+    assert!(
+        report.finalized.is_empty(),
+        "no take to finalize: {:?}",
+        report.finalized
+    );
+    // The peaks are still derived — that is the pass's other job, and it is
+    // derived from the take, not from a rewrite of it.
+    assert_eq!(report.rebuilt_peaks, vec!["daw-export.ch0".to_string()]);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "a well-formed foreign source is not mutated by the crash pass"
+    );
+    let (_, _, peak_frames, rate, _) = PeakFile::read(&dir.join("daw-export.ch0.peaks")).unwrap();
+    assert_eq!((peak_frames, rate), (frames, 48_000));
+    let (audio, _, read_frames) = read_all(&path);
+    assert_eq!(read_frames, frames);
+    assert!(audio.iter().all(|s| (*s - 0.5).abs() < 1e-3));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

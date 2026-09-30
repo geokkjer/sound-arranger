@@ -9,6 +9,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use engine::*;
@@ -184,13 +185,111 @@ fn patch_type_mismatch_refused() {
     assert!(err.contains("unknown plugin 'ghost'"), "got: {err}");
 }
 
+/// A cord the **graph** will refuse is refused here, before it is logged. `connect`
+/// runs a cord from an earlier node to a later one, and a plugin's node lands in
+/// the order its mount applied — so mounting the sink first and patching a source
+/// into it is a document entry that can never become audio. `validate_patch` used
+/// to check existence, direction, kind and channel count, and not order: the patch
+/// was logged, `connect` returned `Err` at apply, and the only report was a
+/// `debug_assert!` — a silent unfed channel in the build a user runs, a panic on
+/// the audio thread in the other.
+#[test]
+fn a_backward_patch_is_refused_before_it_is_logged() {
+    let mut e = engine();
+    // Sink first: the mixer takes node 0, the tone node 1.
+    e.mount("mixer", &[]).unwrap();
+    e.mount("tone", &[("gain", 0.25)]).unwrap();
+    let err = e
+        .patch(("tone", "audio"), ("mixer", "ch0"))
+        .expect_err("a cord must go forward in node order");
+    assert!(err.contains("must go forward"), "got: {err}");
+    assert!(
+        err.contains("mount 'mixer' first"),
+        "and the refusal names the fix: {err}"
+    );
+
+    // **Never logged, never scheduled.** The document must not carry a mutation the
+    // engine would skip, or a replay of this log would diverge from this session.
+    assert_eq!(
+        e.log.len(),
+        2,
+        "the two mounts and nothing else: {:?}",
+        e.log.events()
+    );
+    assert!(
+        !e.log
+            .events()
+            .iter()
+            .any(|ev| matches!(ev, Event::Patch { .. })),
+        "no patch event was written"
+    );
+    assert!(
+        !e.is_degraded(),
+        "a refusal at call time is an Err, not a session fault"
+    );
+
+    // The same shape after a re-mount, which is where the hazard hides: the name
+    // goes back and comes back at the *end*, so the source is behind the sink again.
+    e.unmount("tone")
+        .expect("the tone is scheduled, so it unmounts");
+    let _ = e.render(1); // the unmount applies, and the name is free
+    e.mount("tone", &[("gain", 0.25)])
+        .expect("a re-mount is a first instance again");
+    let err = e
+        .patch(("tone", "audio"), ("mixer", "ch0"))
+        .expect_err("a re-mounted source is still behind the sink");
+    assert!(err.contains("must go forward"), "got: {err}");
+
+    // Forward order is untouched: the rule is the graph's, not a blanket refusal of
+    // mixer patches. (Queued or applied, the source's node precedes the sink's.)
+    let mut e = engine();
+    e.mount("tone", &[]).unwrap();
+    e.mount("mixer", &[]).unwrap();
+    e.patch(("tone", "audio"), ("mixer", "ch0"))
+        .expect("a source mounted before its sink is forward");
+}
+
+/// A **recorded** log carrying a backward cord is refused at load, in the same words
+/// the live path speaks. The engine cannot read back a document whose cord the
+/// graph will refuse, and a load that dropped the cord quietly would render a
+/// session the file does not describe.
+#[test]
+fn a_log_carrying_a_backward_cord_is_refused_at_load() {
+    let mut log = SessionLog::new();
+    for (plugin, params) in [("mixer", vec![]), ("tone", vec![("gain", 0.25)])] {
+        log.push(Event::Mount {
+            plugin,
+            params,
+            at_frame: 0,
+        });
+    }
+    log.push(Event::Patch {
+        from_plugin: "tone",
+        from_port: "audio",
+        to_plugin: "mixer",
+        to_port: "ch0",
+        at_frame: 0,
+    });
+
+    let mut e = engine();
+    let err = e
+        .replay_from(&log)
+        .expect_err("a log whose cord the graph refuses is not a log to read");
+    assert!(err.contains("must go forward"), "got: {err}");
+    assert!(
+        err.contains("mount 'mixer' first"),
+        "and the refusal names the fix: {err}"
+    );
+}
+
 /// Patching is logged; replay reproduces the identical signal (determinism
 /// holds under the port model).
 #[test]
 fn patching_is_logged_and_replayable() {
     let mut e1 = engine();
     mount_chain(&mut e1);
-    e1.schedule_unmount("euclidean", 1_200_000);
+    e1.schedule_unmount("euclidean", 1_200_000)
+        .expect("scheduled unmount");
     e1.set_tempo(96.0, 4).unwrap();
     let a = e1.render(2 * 48_000);
     let log = e1.log.clone();
@@ -214,7 +313,8 @@ fn replay_is_exact_for_mid_session_tempo_change() {
     mount_chain(&mut e1);
     let first = l(&e1.render(2 * 48_000));
     e1.set_tempo(240.0, 4).unwrap();
-    e1.schedule_unmount("euclidean", 3 * 48_000);
+    e1.schedule_unmount("euclidean", 3 * 48_000)
+        .expect("scheduled unmount");
     let second = l(&e1.render(2 * 48_000));
     let log = e1.log.clone();
 
@@ -297,9 +397,10 @@ fn unmount_is_sample_accurate() {
     // Unmount the whole chain: stopping the *generator* would leave the tone's
     // running blip tail to ring out (the audio teardown protocol — ramp /
     // flush — is deferred; Spike B). Removing the chain is exact.
-    e.schedule_unmount("euclidean", at);
-    e.schedule_unmount("scale", at);
-    e.schedule_unmount("tone", at);
+    e.schedule_unmount("euclidean", at)
+        .expect("scheduled unmount");
+    e.schedule_unmount("scale", at).expect("scheduled unmount");
+    e.schedule_unmount("tone", at).expect("scheduled unmount");
     let out = l(&e.render((at + 64) as usize));
 
     assert!(
@@ -322,9 +423,10 @@ fn unmount_removes_contribution() {
     let mut e = engine();
     mount_chain(&mut e);
     let bar = 2 * 48_000;
-    e.schedule_unmount("euclidean", bar);
-    e.schedule_unmount("scale", bar);
-    e.schedule_unmount("tone", bar);
+    e.schedule_unmount("euclidean", bar)
+        .expect("scheduled unmount");
+    e.schedule_unmount("scale", bar).expect("scheduled unmount");
+    e.schedule_unmount("tone", bar).expect("scheduled unmount");
     let out = l(&e.render(bar as usize + 4096));
     assert!(out[..bar as usize].iter().any(|s| *s != 0.0));
     assert!(out[bar as usize..].iter().all(|s| *s == 0.0));
@@ -350,6 +452,253 @@ fn remount_reproduces_identical_signal() {
     let again = e2.render(2 * 48_000);
 
     assert_eq!(first, again, "re-mount must reproduce the exact signal");
+}
+
+/// A log the engine itself writes replays. The `remount_reproduces_identical_signal`
+/// shape — `Mount p … ScheduleUnmount p … Mount p` — is what the live engine produces
+/// (the name is released when the unmount *applies*), so refusing it would mean the
+/// engine writes logs it cannot read back: the session fails to load at all, before
+/// any audio is rendered.
+///
+/// Regression: `replay_from` validated each `Mount` against the *engine's* scheduling
+/// state, which a replay never drains, so the second mount of a name was refused as a
+/// second instance. Rendered here in the same call boundaries as the live run, because
+/// the mixer unmount/remount changes the master width and such an event parks to a
+/// render-call boundary.
+#[test]
+fn replay_accepts_a_log_that_re_mounts_a_plugin() {
+    let mut e = engine();
+    mount_chain(&mut e);
+    let mut live = e.render(2 * 48_000);
+    e.unmount("euclidean").unwrap();
+    e.unmount("scale").unwrap();
+    e.unmount("tone").unwrap();
+    e.unmount("mixer").unwrap();
+    live.extend(e.render(2 * 48_000)); // the unmounted window: no bus owner, so mono
+    mount_chain(&mut e);
+    live.extend(e.render(2 * 48_000));
+    let log = e.log.clone();
+
+    let mut replayed = engine();
+    replayed
+        .replay_from(&log)
+        .expect("a log that re-mounts a plugin must replay");
+    let mut out = replayed.render(2 * 48_000);
+    out.extend(replayed.render(2 * 48_000));
+    out.extend(replayed.render(2 * 48_000));
+
+    assert_eq!(
+        out.len(),
+        live.len(),
+        "the replay must land the same widths"
+    );
+    assert_eq!(
+        out, live,
+        "the replayed remount must render byte-identically"
+    );
+}
+
+/// **`replay_from` refuses a target that already has plugins.** The doc's
+/// precondition ("must be a *fresh* engine") was carried by the one-instance guard
+/// alone, and the guard's lifecycle is the log's now — so the `disposers` half of
+/// that check fell away with the rest of the engine-state check. A replay onto a
+/// dirty engine is not refused: the log's `Mount p` would apply a *second* instance
+/// over the first, and `apply_mount`'s `node_of`/`disposers` insert would overwrite
+/// it — the first instance's node stays in the graph and its disposer is dropped with
+/// its entry. A silent leak, so the replay says so instead.
+///
+/// The queued half is refused too: nothing has rendered, so a mount that is still
+/// waiting to apply is pre-existing state just as much as an applied one.
+#[test]
+fn replay_onto_an_engine_that_already_has_plugins_is_refused() {
+    // A log that mounts the whole chain — what a fresh replay is given.
+    let mut e = engine();
+    mount_chain(&mut e);
+    let _ = e.render(48_000);
+    let log = e.log.clone();
+
+    // The target has already **applied** `tone`.
+    let mut dirty = engine();
+    mount_chain(&mut dirty);
+    let _ = dirty.render(48_000);
+    let err = dirty
+        .replay_from(&log)
+        .expect_err("a replay onto a mounted engine must be refused");
+    assert!(
+        err.contains("fresh engine")
+            && ["euclidean", "scale", "tone", "mixer"]
+                .iter()
+                .any(|p| err.contains(&format!("'{p}'"))),
+        "the refusal names the precondition and a plugin already on the engine: {err}"
+    );
+
+    // …and the target has merely **queued** it (nothing rendered, so the mount has
+    // not applied): the same refusal, because the same second instance would be
+    // applied over the first.
+    let mut queued = engine();
+    mount_chain(&mut queued);
+    let err = queued
+        .replay_from(&log)
+        .expect_err("a replay onto an engine with a queued mount must be refused");
+    assert!(err.contains("fresh engine"), "{err}");
+
+    // The refused replay left nothing behind: no event was scheduled or logged, and
+    // the engine still renders its own (unreplayed) session.
+    assert_eq!(
+        queued.render(4_096).len(),
+        4_096 * 2,
+        "the refused replay left the engine as it was"
+    );
+
+    // And the fresh case still replays — the precondition is the only new refusal.
+    let mut fresh = engine();
+    fresh.replay_from(&log).expect("a fresh engine replays");
+}
+
+/// **A frame-inverted document is refused, not applied.** The walk tracked the
+/// lifecycle in *log* order while the apply queue drains in *frame* order, so a log
+/// reading `Mount p@0, Unmount p@96_000, Mount p@0` was admitted: at apply both mounts
+/// pop before the unmount, `apply_mount` runs twice for one name, and the first
+/// instance's node stays in the graph while its disposer is dropped unrun.
+///
+/// The engine itself writes that log whenever a caller places the clock back before
+/// a scheduled lifecycle frame (`Engine::seek`), so this is the real shape, not a
+/// hand-built one. The rule is refusal — a loud `Err` naming the plugin and the two
+/// frames — because the alternative (a self-healing apply that disposes the instance
+/// it finds) would render something the log does not say and hide the log-order
+/// error. No panic either way: a refusal is a `Result`, on every build.
+#[test]
+fn replay_refuses_a_log_whose_mounts_are_not_in_frame_order() {
+    let mut e = engine();
+    e.mount("tone", &[]).unwrap();
+    let _ = e.render(1); // the first instance applies
+    e.schedule_unmount("tone", 96_000)
+        .expect("scheduled unmount");
+    let _ = e.render(96_000); // …past 96_000, so the unmount is due
+    let _ = e.render(1); // an event on a block's end frame applies in the next call
+    e.seek(0); // …and the clock goes back *before* it
+    e.mount("tone", &[])
+        .expect("a re-mount, stamped at frame 0");
+    let log = e.log.clone();
+
+    // The log really is the inverted triple, so the refusal below is about the
+    // engine's rule and not about an accident in the fixture.
+    let frames: Vec<u64> = log
+        .events()
+        .iter()
+        .filter_map(|ev| match ev {
+            Event::Mount {
+                plugin: "tone",
+                at_frame,
+                ..
+            } => Some(*at_frame),
+            Event::ScheduleUnmount {
+                plugin: "tone",
+                at_frame,
+            } => Some(*at_frame),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        frames,
+        vec![0, 96_000, 0],
+        "the live path wrote Mount@0, Unmount@96_000, Mount@0"
+    );
+
+    let mut fresh = engine();
+    let err = fresh
+        .replay_from(&log)
+        .expect_err("a frame-inverted document must be refused");
+    assert!(
+        err.contains("'tone'") && err.contains("frame order"),
+        "the refusal names the plugin and the rule: {err}"
+    );
+    // The refused event left no trace: the two events the replay had already
+    // accepted are all that is scheduled, nothing was applied, and the engine
+    // renders its own silence rather than an orphaned instance.
+    assert_eq!(
+        fresh.log.events().len(),
+        2,
+        "a refused event is never logged: {:?}",
+        fresh.log.events()
+    );
+    assert!(
+        fresh.graph.nodes().is_empty(),
+        "nothing was applied: {} node(s)",
+        fresh.graph.nodes().len()
+    );
+    assert!(
+        fresh.render(4_096).iter().all(|s| *s == 0.0),
+        "the refused replay left the engine rendering its own (empty) session"
+    );
+
+    // The **frame-ordered** triple is still accepted — the rule is order, not a ban
+    // on re-mounts. `replay_accepts_a_log_that_re_mounts_a_plugin` is the audio
+    // proof; this is the boundary.
+    let mut ordered = engine();
+    ordered.mount("tone", &[]).unwrap();
+    ordered
+        .schedule_unmount("tone", 48_000)
+        .expect("scheduled unmount");
+    let _ = ordered.render(48_001); // the unmount is due…
+    // …and with no mixer mounted the tone owns the bus, so its unmount is a width
+    // change and parks to the next control-side flush. The name is released when
+    // the unmount *applies*, so the flush is what frees it.
+    ordered.flush_scheduled();
+    ordered
+        .mount("tone", &[])
+        .expect("a re-mount after the unmount's frame");
+    let mut target = engine();
+    target
+        .replay_from(&ordered.log.clone())
+        .expect("a frame-ordered re-mount replays");
+    let _ = target.render(4_096);
+    assert_eq!(
+        target.graph.nodes().len(),
+        1,
+        "one instance, one node — the ordered triple is a re-mount, not a second mount"
+    );
+}
+
+/// **A walk speaks only for the names the document spoke for.** The doc claimed a
+/// walk "never loses the target's own state" while seeding itself from a snapshot
+/// taken at entry — a snapshot that goes stale the moment the target's own state
+/// moves, so the property was neither true nor checkable. The walk is now a *view of
+/// the document*: for a name it has not mentioned, the target's own state answers.
+///
+/// That half is what keeps a walk from overwriting a live instance, and it is pinned
+/// here so the doc cannot rot. The other half — a walk may not mount onto a target
+/// from outside the document — is a caller obligation (the engine has no way to see
+/// it), and `Engine::seek`'s doc says so.
+#[test]
+fn a_walk_answers_for_the_documents_names_only() {
+    let mut target = engine();
+    mount_chain(&mut target);
+    let _ = target.render(48_000); // the chain is applied
+
+    target.enter_walk();
+    // A document that mounts a name the target holds is refused: the walk does not
+    // speak for `tone`, so the target's applied instance does.
+    let err = target
+        .mount("tone", &[])
+        .expect_err("a walk must not mount over an instance the target holds");
+    assert!(err.contains("already mounted"), "{err}");
+
+    // A document that unmounts it *first* is a replacement, not a second instance —
+    // the frame rule puts the teardown before the re-mount (both at the current
+    // frame here, and equal frames apply in the order they were scheduled).
+    target.unmount("tone").expect("the document unmounts it");
+    target
+        .mount("tone", &[])
+        .expect("a replacement is a re-mount, not a second instance");
+    target.leave_walk();
+
+    // Leaving the walk hands the question back to the engine: the name the document
+    // left mounted is now the engine's own, so a live mount is refused again.
+    let err = target
+        .mount("tone", &[])
+        .expect_err("off the walk the engine answers for itself");
+    assert!(err.contains("already mounted"), "{err}");
 }
 
 /// Spatial composability, static half: a consumer plugin declares `rhythm`,
@@ -837,18 +1186,31 @@ fn render_path_does_not_allocate() {
     mount_chain(&mut e);
     // The clock generator is portless and sinkless here — its per-block
     // scratch is preallocated, so steady-state clocking must also allocate
-    // nothing (midi-clock-out note, acceptance 5).
+    // nothing (midi-clock-out note, acceptance 5). The **transport tap** is
+    // provided as well and fed past the scratch cap, because a drain that grew
+    // its buffer would allocate here and nowhere else: with no log in the
+    // context, `take_due` is never entered.
     e.register_factory(
         "clock_out",
         plugins::clock_out_factory,
         plugins::clock_out::CLOCK_OUT_PORTS,
         &[],
     );
+    let transport: plugins::SharedTransportLog = Arc::new(plugins::TransportLog::new());
+    e.ctx
+        .provide(plugins::clock_out::TRANSPORT_KEY, transport.clone());
     e.mount("clock_out", &[]).unwrap();
-    e.schedule_unmount("euclidean", 100_000);
+    e.schedule_unmount("euclidean", 100_000)
+        .expect("scheduled unmount");
     // Prime: applying the mounts/patches allocates on the control side
     // (factories, boxes, service table). The measured region must be free.
     let _prime = e.render(512);
+    // Fed after the prime, so the commands are due inside the measured region:
+    // 200 is well over the 64-entry transport scratch, and nothing renders
+    // between them — which is how a stopped host accumulates them.
+    for i in 0..200u64 {
+        transport.push(600 + i, plugins::Transport::Stop);
+    }
     let mut out = vec![0.0f32; 8192]; // allocated before measuring
 
     ALLOCS.store(0, Ordering::Relaxed);
@@ -861,4 +1223,78 @@ fn render_path_does_not_allocate() {
         0,
         "the render path must not allocate (engine invariant)"
     );
+}
+
+/// **A refused cord is recorded without allocating** — the render-path invariant
+/// applied to the fault [`Engine::apply_patch`] leaves behind, which is the one
+/// place this engine used to build a sentence on the audio thread (`format!`
+/// into the fault's reason).
+///
+/// The refusal is reachable, not contrived: a destination unmounted at the
+/// cord's *own* frame, which the frame-ordered queue applies first (FIFO within
+/// a frame), so the cord arrives with an endpoint that is gone. The record is
+/// data — a `&'static str` class beside the cord's four `&'static str`
+/// identities — and the list's storage is the whole bound, reserved at
+/// `Engine::new` (outside the measured region), so the second refusal in here
+/// proves the recording does not grow it either.
+///
+/// The line a host prints is built on the **control** side, by
+/// `describe()` — after the measurement, and deliberately so: a read is allowed
+/// to allocate; a render is not.
+#[test]
+fn a_refused_cord_on_the_render_path_records_without_allocating() {
+    let mut e = engine();
+    e.mount("tone", &[]).expect("the tone mounts");
+    e.mount("mixer", &[]).expect("the mixer mounts");
+    e.patch(("tone", "audio"), ("mixer", "ch0"))
+        .expect("at call time the mixer is mounted and the cord is forward");
+    // Prime: the two mounts and the cord apply, so the measured region below
+    // holds the refusal and nothing else.
+    let _prime = e.render(BLOCK);
+    assert!(
+        e.apply_faults().is_empty(),
+        "a cord that applied is not a fault: {:?}",
+        e.apply_faults()
+    );
+
+    // The destination goes away at the same frame the cords are scheduled for,
+    // and is *scheduled* first — so both cords are logged and scheduled while
+    // the mixer still reads as mounted, and both are refused at apply.
+    e.unmount("mixer")
+        .expect("the mixer's go-away is scheduled");
+    for _ in 0..2 {
+        e.patch(("tone", "audio"), ("mixer", "ch0"))
+            .expect("at call time the mixer is still mounted and the cord is forward");
+    }
+    let mut out = vec![0.0f32; 8192]; // allocated before measuring
+
+    ALLOCS.store(0, Ordering::Relaxed);
+    MEASURING.with(|m| m.set(true));
+    e.render_into(&mut out);
+    MEASURING.with(|m| m.set(false));
+
+    assert_eq!(
+        ALLOCS.load(Ordering::Relaxed),
+        0,
+        "a fault recorded on the render path must not allocate (engine invariant)"
+    );
+
+    // The refusal is still *loud*: recorded in this build, with the cord named
+    // as the log spells it, and the session degraded.
+    let faults = e.apply_faults();
+    assert_eq!(faults.len(), 2, "both refused cords: {faults:?}");
+    for fault in faults {
+        assert_eq!(fault.plugin, "tone", "the cord's source plugin");
+        let described = fault.describe();
+        assert!(
+            described.contains("tone.audio → mixer.ch0"),
+            "the cord, as the log spells it: {described}"
+        );
+        assert!(
+            described.contains("destination is not mounted"),
+            "and why: {described}"
+        );
+    }
+    assert_eq!(e.apply_faults_dropped(), 0, "two faults, none dropped");
+    assert!(e.is_degraded(), "and the session says so");
 }

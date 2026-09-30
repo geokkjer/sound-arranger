@@ -20,6 +20,8 @@
 //! fixed-capacity (enforced by a counting-allocator test).
 
 use std::f64::consts::TAU;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::clock::TempoMap;
 
@@ -451,13 +453,148 @@ impl AudioNode for Gain {
     }
 }
 
+/// The hard bound on **grid steps** one [`EuclideanGen`] block walks — the
+/// euclidean node's counterpart to the clock-out node's `CLOCK_OUT_CAP`, and for
+/// the same reason. The block's grid is a *pure function of the tempo*: the step
+/// index of the block's last frame comes from `beat_at`, and at an absurd tempo
+/// the `f64 → i64` cast of that index saturates at `i64::MAX`, so the walk
+/// `[s0, s1)` is ~9.2e18 steps long **on the first block at frame 0**. That is a
+/// permanent render-thread hang, not a panic, and no bound on the event buffer
+/// prevents it: the cost is the iteration, and the body `continue`s on the
+/// pattern check long before it would push.
+///
+/// Eight steps per frame is where the grid becomes finer than the block's own
+/// resolution — `frame_at` rounds to whole frames, so from there on several
+/// steps share every frame and their offsets are indistinguishable. At the
+/// default four pulses per beat and a 512-frame block that is ~1.2e5 bpm
+/// (a sixteenth note every 0.125 ms), and a quarter of it at sixteen pulses per
+/// beat. Everything below that is walked whole, so the audible output is
+/// unchanged for every tempo a person could mean; what is left is **counted**,
+/// not walked ([`EuclideanGen::drops`]).
+pub const EUCLIDEAN_STEP_CAP: u64 = BLOCK as u64 * 8;
+
+/// The hard bound on a euclidean **pattern's length** — one `bool` per step, and
+/// the node holds three copies of it (its own, the plugin's clone, the
+/// `rhythm` service's). Distinct from [`EUCLIDEAN_STEP_CAP`], which bounds one
+/// block's *walk*.
+///
+/// It exists because the walk bound did not bound this: a mount param is
+/// checked for finiteness and nothing else, and `steps: get("steps", 8.0) as
+/// u32` saturates, so `mount euclidean steps=4294967295` reached
+/// `vec![false; n]` and asked the render thread for ~4 GB — three times over —
+/// from a 30-byte script line. 4096 steps is far past any rhythm a person
+/// writes (a bar of 64th notes in 4/4 is 64) and it keeps the pattern a page of
+/// memory. The number lives here, once: the node asserts it, and the plugin
+/// names it in the refusal a mount param gets.
+pub const EUCLIDEAN_MAX_STEPS: u32 = 4096;
+
 /// Opaque tier: the euclidean generator as a node. Pure function of the block
 /// and the tempo map: emits `out("triggers")` sample-accurately. No voice —
 /// patch the triggers into whatever you like.
+///
+/// **The fields are private and the constructor is the only way in**, because
+/// two invariants live here and neither can be enforced after the fact:
+///
+/// - `pattern` is indexed `step % steps.max(1)`, so it must be exactly
+///   `steps.max(1)` long — a shorter one is an out-of-bounds index **on the
+///   render thread**;
+/// - `steps` is bounded by [`EUCLIDEAN_MAX_STEPS`], because the pattern is one
+///   `bool` per step and a nonsense length is a multi-megabyte allocation.
+///
+/// A public `steps` would let a caller reintroduce the first (`n.steps = 64`
+/// after a valid `new`) with nothing to stop it, so the shape is the fix rather
+/// than a convention. Read them back with [`Self::steps`],
+/// [`Self::pulses_per_beat`] and [`Self::pattern`].
+///
+/// ```
+/// let node = engine::EuclideanGen::new(8, 4, vec![false; 8]);
+/// assert_eq!((node.steps(), node.pattern().len()), (8, 8));
+/// ```
+///
+/// The verifier's reproduction of the first invariant, kept as a test — it does
+/// not compile, which is the point:
+///
+/// ```compile_fail
+/// let mut node = engine::EuclideanGen::new(8, 4, vec![false; 8]);
+/// node.steps = 64; // E0616, private field
+/// ```
 pub struct EuclideanGen {
-    pub steps: u32,
-    pub pulses_per_beat: u32,
-    pub pattern: Vec<bool>,
+    steps: u32,
+    pulses_per_beat: u32,
+    pattern: Vec<bool>,
+    /// Grid steps a block did not evaluate because its walk hit
+    /// [`EUCLIDEAN_STEP_CAP`] (or because the trigger buffer was already full,
+    /// which no further push could have used). Behind a shared atomic so the
+    /// plugin can **publish** the live count while the render path only ever
+    /// increments — a counter is not worth a lock in a block. The `euclidean`
+    /// plugin publishes it under
+    /// [`EUCLIDEAN_DROPS_KEY`](crate::plugins::euclidean::EUCLIDEAN_DROPS_KEY).
+    drops: Arc<AtomicU64>,
+}
+
+impl EuclideanGen {
+    /// Build a node with its own drop counter, for a caller that mounts it
+    /// directly. Reads the count back with [`Self::drops`].
+    ///
+    /// **Panics** if `steps` is over [`EUCLIDEAN_MAX_STEPS`] or if `pattern` is
+    /// not exactly `steps.max(1)` long. Both refusals are loud and immediate:
+    /// the alternative is a node that allocates gigabytes, or that indexes out
+    /// of bounds, on a thread that cannot afford either.
+    pub fn new(steps: u32, pulses_per_beat: u32, pattern: Vec<bool>) -> Self {
+        Self::with_drop_counter(steps, pulses_per_beat, pattern, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// Build a node against an **existing** counter — the plugin's form, which
+    /// publishes the same `Arc` into the context so a reader outside the graph
+    /// sees the live count. Same two refusals as [`Self::new`].
+    pub fn with_drop_counter(
+        steps: u32,
+        pulses_per_beat: u32,
+        pattern: Vec<bool>,
+        drops: Arc<AtomicU64>,
+    ) -> Self {
+        assert!(
+            steps <= EUCLIDEAN_MAX_STEPS,
+            "euclidean steps is {steps}, over the {EUCLIDEAN_MAX_STEPS}-step limit — the pattern \
+             is one bool per step, and a larger one is a multi-megabyte allocation before the \
+             first block is rendered",
+        );
+        assert_eq!(
+            pattern.len() as u64,
+            steps.max(1) as u64,
+            "the euclidean pattern is indexed by `step % steps` — it must be exactly \
+             `steps.max(1)` long",
+        );
+        EuclideanGen {
+            steps,
+            pulses_per_beat,
+            pattern,
+            drops,
+        }
+    }
+
+    /// Steps in one pattern revolution.
+    pub fn steps(&self) -> u32 {
+        self.steps
+    }
+
+    /// Pattern subdivisions per beat (4 = sixteenth notes).
+    pub fn pulses_per_beat(&self) -> u32 {
+        self.pulses_per_beat
+    }
+
+    /// The pattern, exactly `steps.max(1)` long.
+    pub fn pattern(&self) -> &[bool] {
+        &self.pattern
+    }
+
+    /// Grid steps this node did not evaluate, over every block it has rendered.
+    /// Zero at any tempo a person could mean; nonzero means the block's grid was
+    /// denser than [`EUCLIDEAN_STEP_CAP`] and part of it went unwalked — a loud
+    /// bound, never a silent truncation.
+    pub fn drops(&self) -> u64 {
+        self.drops.load(Ordering::Relaxed)
+    }
 }
 
 impl AudioNode for EuclideanGen {
@@ -483,18 +620,65 @@ impl AudioNode for EuclideanGen {
         let b1 = block.tempo.beat_at(block.frame + len.saturating_sub(1)) + step_beats;
         let s0 = (b0 / step_beats).floor() as i64;
         let s1 = (b1 / step_beats).ceil() as i64;
-        for step in s0..s1 {
-            if step < 0 {
-                continue;
+        // The block's **whole** grid, in closed form: how many steps a walk of
+        // `[s0, s1)` would visit, known without visiting any of them. The
+        // `f64 → i64` casts above saturate (they do not wrap), so at an absurd
+        // tempo this is honestly "as many as there are" rather than a negative
+        // or a wrapped one — which is what makes the count of what the walk
+        // *skipped* exact below.
+        let grid = s1.saturating_sub(s0).max(0) as u64;
+        // The pattern's **own** length, not `steps.max(1)`: the constructor
+        // asserts the two agree, but indexing by the length means the render
+        // path cannot go out of bounds even if some future edit moved the
+        // assert. A render-thread index must be right by construction.
+        let stride = self.pattern.len() as u64;
+        let mut step = s0;
+        let mut walked = 0u64;
+        while step < s1 {
+            if step >= 0 {
+                let index = step as u64;
+                if self.pattern[(index % stride) as usize] {
+                    // **A known per-step cost, deliberately not redesigned
+                    // here:** `TempoMap::frame_at` walks the tempo map's
+                    // segments from the first, so a pulse costs one scan —
+                    // O(segments), not O(1). The loose bound is
+                    // `EUCLIDEAN_STEP_CAP × segments` per block; the measured
+                    // one is far under it, because only pattern-*true* steps
+                    // reach this line and the full-buffer stop below ends the
+                    // walk at `CAP_EVENTS` pulses. Instrumented on a 512-frame
+                    // block at 1e9 bpm with an all-true 8-step pattern: 32
+                    // calls, whatever the tempo. Making `frame_at` O(log n) is a
+                    // `clock` change (prefix sums on push), not a node-local
+                    // one, and it is the map's other reader's problem too.
+                    let frame = block.tempo.frame_at(index as f64 * step_beats);
+                    if frame >= block.frame && frame < block.frame + len {
+                        out_triggers.push((frame - block.frame) as u32);
+                    }
+                }
             }
-            let step = step as u64;
-            if !self.pattern[(step % self.steps.max(1) as u64) as usize] {
-                continue;
+            walked += 1;
+            // Bounded both ways, and both are sound. The cap is the one that
+            // matters: `grid` is the tempo's, and no tempo may hold the render
+            // thread in this loop. The full buffer is the cheaper stop — a push
+            // into it would be refused, so the emitted triggers are identical
+            // either way, and stopping there keeps this node from ever being the
+            // source of a silently refused push.
+            if walked >= EUCLIDEAN_STEP_CAP || out_triggers.is_full() {
+                break;
             }
-            let frame = block.tempo.frame_at(step as f64 * step_beats);
-            if frame >= block.frame && frame < block.frame + len {
-                out_triggers.push((frame - block.frame) as u32);
-            }
+            // Saturating rather than `+ 1`: `s1` is itself a saturating cast, so
+            // the loop condition is what stops the walk, and an unchecked
+            // increment past `i64::MAX` must not be how that happens.
+            step = step.saturating_add(1);
+        }
+        // What the walk did not take, counted exactly — `drops` means "grid steps
+        // this block did not evaluate", not "steps that would have sounded" (a
+        // pattern position that is false emits nothing by design). A block whose
+        // grid fits the cap adds nothing, so the count stays zero at any sane
+        // tempo.
+        let skipped = grid.saturating_sub(walked);
+        if skipped > 0 {
+            self.drops.fetch_add(skipped, Ordering::Relaxed);
         }
     }
 }
@@ -587,7 +771,13 @@ impl ToneGen {
 
     fn schedule(&mut self, offset: u32, len: u32, freq: f32) {
         if self.pending_count < MAX_PENDING {
-            let at = self.pending_head + self.pending_count;
+            // The queue is a **ring**, so the write index wraps: `head + count`
+            // alone is only in range while every block starts with the head back
+            // at 0 (the end-of-block clear in `render` is what keeps that true),
+            // and a render-thread index must not lean on a second invariant it
+            // cannot see. Wrapping puts the write in range whatever head and
+            // count are.
+            let at = (self.pending_head + self.pending_count) % MAX_PENDING;
             self.pending[at] = (offset, len.max(1), freq);
             self.pending_count += 1;
         }
@@ -639,7 +829,7 @@ impl AudioNode for ToneGen {
                         len,
                     });
                 }
-                self.pending_head += 1;
+                self.pending_head = (self.pending_head + 1) % MAX_PENDING;
                 self.pending_count -= 1;
             }
             let mut s = 0.0f32;
@@ -659,9 +849,15 @@ impl AudioNode for ToneGen {
             }
             *sample = s;
         }
-        if self.pending_count == 0 {
-            self.pending_head = 0;
-        }
+        // Nothing queued outlives the block it was queued for. Every onset the
+        // loop above drained had an offset inside `out`, so whatever is left was
+        // offset at or past the block's last sample and this block could never
+        // reach it. Clearing it here is what makes the queue honest **across**
+        // blocks: the head used to return to 0 only when the queue emptied by
+        // itself, so one note at `offset >= frames` parked it, and the next
+        // block's write walked off the end of the array.
+        self.pending_count = 0;
+        self.pending_head = 0;
     }
 
     fn set_param(&mut self, name: &str, value: f32) {
@@ -735,6 +931,144 @@ struct PatchCord {
     from: (usize, usize),
     to: (usize, usize),
     kind: SignalKind,
+}
+
+/// **Which** rule refused a cord — the graph's own classification, a `Copy`
+/// value with no borrowed or owned data in it.
+///
+/// This is what a caller that cannot allocate records (the render path's
+/// `apply_patch`, via [`crate::ApplyFault`]): a `&'static str` naming the rule,
+/// to be read as data on the audio thread and turned into a sentence wherever a
+/// message is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectClass {
+    /// The `from` node is not in the graph.
+    UnknownFromNode,
+    /// The `to` node is not in the graph.
+    UnknownToNode,
+    /// A cord runs forward only: the source's node must precede the
+    /// destination's. The graph interpreter walks nodes in order, so a backward
+    /// cord is a cycle the walk cannot enter.
+    Backward,
+    /// The source node has no such port.
+    NoFromPort,
+    /// The destination node has no such port.
+    NoToPort,
+    /// The source port is not an `Out` or the destination is not an `In`.
+    Direction,
+    /// The two ports carry different [`SignalKind`]s.
+    KindMismatch,
+    /// A control input already has its one driver (Phase 1's single-driver
+    /// rule; audio and the event kinds fan in).
+    ControlDriven,
+    /// An audio cord carries one channel count; these two disagree.
+    ChannelMismatch,
+}
+
+impl ConnectClass {
+    /// The class as a `&'static str` — the whole of what an allocation-free
+    /// record needs, and a sentence on its own for a reader who holds the
+    /// identities beside it. `Display` ([`ConnectRefusal`]) adds the port names
+    /// and counts.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ConnectClass::UnknownFromNode => "connect: unknown 'from' node",
+            ConnectClass::UnknownToNode => "connect: unknown 'to' node",
+            ConnectClass::Backward => "connect: patch cords must go forward (topological order)",
+            ConnectClass::NoFromPort => "no port on the source node",
+            ConnectClass::NoToPort => "no port on the destination node",
+            ConnectClass::Direction => {
+                "connect: the source port must be an Out port and the destination an In port"
+            }
+            ConnectClass::KindMismatch => "connect: signal kind mismatch between the two ports",
+            ConnectClass::ControlDriven => "connect: control inputs are single-driver in phase 1",
+            ConnectClass::ChannelMismatch => {
+                "connect: audio channel mismatch between the two ports"
+            }
+        }
+    }
+}
+
+/// A refused [`Graph::connect`], **as data**: which rule refused
+/// ([`ConnectClass`]) plus the identities the refusal was about — the two node
+/// indices and the two port names the caller passed, all borrowed from the
+/// call. `Copy`, and built without allocating, because the caller on the render
+/// path records it as a fault rather than printing it.
+///
+/// The node indices are `None` for a node that is not in the graph (the class
+/// then says which one), and the port pair is `None` until both ports have been
+/// found (the classes before that are about a *node*, not about a port). The
+/// message a control-side caller reads is [`Display`](std::fmt::Display).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectRefusal<'a> {
+    /// Which rule refused.
+    pub class: ConnectClass,
+    /// The source port name the caller asked for.
+    pub from_port: &'a str,
+    /// The destination port name the caller asked for.
+    pub to_port: &'a str,
+    /// The source node's index, if the graph holds it.
+    pub from_node: Option<usize>,
+    /// The destination node's index, if the graph holds it.
+    pub to_node: Option<usize>,
+    /// The two ports, once both are found — what a direction, kind or
+    /// channel-count refusal quotes.
+    pub ports: Option<(Port, Port)>,
+}
+
+impl std::fmt::Display for ConnectRefusal<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (from_port, to_port) = (self.from_port, self.to_port);
+        match (self.class, self.ports) {
+            (ConnectClass::NoFromPort, _) => {
+                write!(
+                    f,
+                    "no port '{from_port}' on node {}",
+                    self.source_node_label()
+                )
+            }
+            (ConnectClass::NoToPort, _) => {
+                write!(f, "no port '{to_port}' on node {}", self.dest_node_label())
+            }
+            (ConnectClass::Direction, _) => write!(
+                f,
+                "connect: '{from_port}' must be an Out port and '{to_port}' an In port"
+            ),
+            (ConnectClass::KindMismatch, Some((out, in_))) => write!(
+                f,
+                "connect: signal kind mismatch — '{from_port}' is {:?}, '{to_port}' is {:?}",
+                out.kind, in_.kind
+            ),
+            (ConnectClass::ChannelMismatch, Some((out, in_))) => write!(
+                f,
+                "connect: audio channel mismatch — '{from_port}' is {}ch, '{to_port}' is {}ch",
+                out.channels(),
+                in_.channels()
+            ),
+            (class, _) => f.write_str(class.as_str()),
+        }
+    }
+}
+
+impl ConnectRefusal<'_> {
+    /// The source node's index as a message names it. Only the two "no such
+    /// port" classes reach this, and neither can be reached before both nodes
+    /// were found, so the `?` is the totality `Display` owes rather than a case
+    /// that occurs.
+    fn source_node_label(&self) -> String {
+        match self.from_node {
+            Some(idx) => idx.to_string(),
+            None => "?".to_string(),
+        }
+    }
+
+    /// The destination node's index, as [`Self::source_node_label`].
+    fn dest_node_label(&self) -> String {
+        match self.to_node {
+            Some(idx) => idx.to_string(),
+            None => "?".to_string(),
+        }
+    }
 }
 
 /// The graph value + interpreter: a patch bay over typed ports.
@@ -878,6 +1212,19 @@ impl Graph {
         id
     }
 
+    /// The id the next [`add_node`](Self::add_node) or
+    /// [`insert_before`](Self::insert_before) will hand out.
+    ///
+    /// Ids come from a monotonic counter and are never reused, so a caller that
+    /// snapshots this can afterwards name **exactly** the nodes a later
+    /// `add_node`/`insert_before` added — wherever in the graph they landed, which
+    /// a node *count* cannot do (`insert_before` shifts every later node up). That
+    /// is how the engine rolls the graph back when a plugin's `apply` registers a
+    /// node and then refuses (`Engine::apply_mount`).
+    pub fn next_id(&self) -> u64 {
+        self.next_id
+    }
+
     pub fn set_out(&mut self, id: NodeId) {
         self.out_node = Some(id);
     }
@@ -886,6 +1233,11 @@ impl Graph {
     /// allowed for audio (summed per input port) and events (merged); control
     /// inputs are single-driver in Phase 1. Audio `In` ports may be many per
     /// node (the mixer's channels); other kinds stay one-per-node.
+    ///
+    /// **This is [`Self::try_connect`] plus a sentence.** The rule lives in
+    /// `try_connect`, so the render path (the engine's `apply_patch`, which may
+    /// not allocate) and this control-side signature cannot drift apart; only the
+    /// wording of a refusal is added here.
     pub fn connect(
         &mut self,
         from: NodeId,
@@ -893,29 +1245,98 @@ impl Graph {
         to: NodeId,
         to_port: &str,
     ) -> Result<(), String> {
-        let fi = self.index_of(from).ok_or("connect: unknown 'from' node")?;
-        let ti = self.index_of(to).ok_or("connect: unknown 'to' node")?;
+        self.try_connect(from, from_port, to, to_port)
+            .map_err(|refusal| refusal.to_string())
+    }
+
+    /// [`Self::connect`] without the message: a refusal is **data** — a `Copy`
+    /// classification and borrowed identities — so a caller on the render path
+    /// can record one without building a `String`. A control-side caller that
+    /// wants the sentence calls [`Self::connect`].
+    ///
+    /// The classification is the graph's own, never a second copy of the rule:
+    /// this is where the forward-order line, the port lookup, the direction, the
+    /// kind, the single-driver control check and the channel-count check live.
+    pub fn try_connect<'p>(
+        &mut self,
+        from: NodeId,
+        from_port: &'p str,
+        to: NodeId,
+        to_port: &'p str,
+    ) -> Result<(), ConnectRefusal<'p>> {
+        // The identities every refusal can name: the two nodes (where known) and
+        // the two port names (always — they are the caller's own borrows, and a
+        // message without them is not one a user can act on).
+        let nodes = (self.index_of(from), self.index_of(to));
+        let (Some(fi), Some(ti)) = nodes else {
+            return Err(ConnectRefusal {
+                class: if nodes.0.is_none() {
+                    ConnectClass::UnknownFromNode
+                } else {
+                    ConnectClass::UnknownToNode
+                },
+                from_port,
+                to_port,
+                from_node: nodes.0,
+                to_node: nodes.1,
+                ports: None,
+            });
+        };
         if fi >= ti {
-            return Err("connect: patch cords must go forward (topological order)".into());
+            return Err(ConnectRefusal {
+                class: ConnectClass::Backward,
+                from_port,
+                to_port,
+                from_node: Some(fi),
+                to_node: Some(ti),
+                ports: None,
+            });
         }
-        let from_port_idx = self.nodes[fi]
-            .port_index(from_port)
-            .ok_or_else(|| format!("no port '{from_port}' on node {fi}"))?;
-        let to_port_idx = self.nodes[ti]
-            .port_index(to_port)
-            .ok_or_else(|| format!("no port '{to_port}' on node {ti}"))?;
+        let Some(from_port_idx) = self.nodes[fi].port_index(from_port) else {
+            return Err(ConnectRefusal {
+                class: ConnectClass::NoFromPort,
+                from_port,
+                to_port,
+                from_node: Some(fi),
+                to_node: Some(ti),
+                ports: None,
+            });
+        };
+        let Some(to_port_idx) = self.nodes[ti].port_index(to_port) else {
+            return Err(ConnectRefusal {
+                class: ConnectClass::NoToPort,
+                from_port,
+                to_port,
+                from_node: Some(fi),
+                to_node: Some(ti),
+                ports: None,
+            });
+        };
         let out_port = self.nodes[fi].ports[from_port_idx];
         let in_port = self.nodes[ti].ports[to_port_idx];
+        // Both ports' own facts, resolved once: a direction, kind or channel
+        // refusal quotes them, and `class` alone is the whole of what a fault
+        // record needs.
+        let ports = Some((out_port, in_port));
         if out_port.direction != Direction::Out || in_port.direction != Direction::In {
-            return Err(format!(
-                "connect: '{from_port}' must be an Out port and '{to_port}' an In port"
-            ));
+            return Err(ConnectRefusal {
+                class: ConnectClass::Direction,
+                from_port,
+                to_port,
+                from_node: Some(fi),
+                to_node: Some(ti),
+                ports,
+            });
         }
         if out_port.kind != in_port.kind {
-            return Err(format!(
-                "connect: signal kind mismatch — '{from_port}' is {:?}, '{to_port}' is {:?}",
-                out_port.kind, in_port.kind
-            ));
+            return Err(ConnectRefusal {
+                class: ConnectClass::KindMismatch,
+                from_port,
+                to_port,
+                from_node: Some(fi),
+                to_node: Some(ti),
+                ports,
+            });
         }
         if in_port.kind == SignalKind::Control
             && self
@@ -923,18 +1344,28 @@ impl Graph {
                 .iter()
                 .any(|c| c.to.0 == ti && c.kind == SignalKind::Control)
         {
-            return Err("connect: control inputs are single-driver in phase 1".into());
+            return Err(ConnectRefusal {
+                class: ConnectClass::ControlDriven,
+                from_port,
+                to_port,
+                from_node: Some(fi),
+                to_node: Some(ti),
+                ports,
+            });
         }
         // Audio cords must also match channel count: a cord carries one count, so a
         // stereo→mono (or mono→stereo) cord would silently read the interleaved buffer
         // as mono — refuse loud instead. (Stereo cords themselves are supported since
         // the master-bus slice: equal counts copy interleaved, sample for sample.)
         if in_port.kind == SignalKind::Audio && out_port.channels() != in_port.channels() {
-            return Err(format!(
-                "connect: audio channel mismatch — '{from_port}' is {}ch, '{to_port}' is {}ch",
-                out_port.channels(),
-                in_port.channels()
-            ));
+            return Err(ConnectRefusal {
+                class: ConnectClass::ChannelMismatch,
+                from_port,
+                to_port,
+                from_node: Some(fi),
+                to_node: Some(ti),
+                ports,
+            });
         }
         let to_scratch = if in_port.kind == SignalKind::Audio {
             self.audio_in_ports[ti]
@@ -1811,6 +2242,207 @@ mod tests {
         assert!(
             err.contains("channel mismatch") && err.contains("2ch") && err.contains("1ch"),
             "the refusal names both counts: {err}"
+        );
+    }
+
+    /// Render one block through a graph holding one euclidean node, and hand back
+    /// the drop counter the node shares. The node is a trigger-only source, so the
+    /// graph has no bus owner and the block renders as silence — the walk is the
+    /// whole subject.
+    fn euclid_walk_block(
+        map: &TempoMap,
+        frame: u64,
+        pattern: Vec<bool>,
+        steps: u32,
+    ) -> Arc<AtomicU64> {
+        let drops = Arc::new(AtomicU64::new(0));
+        let mut g = Graph::new();
+        g.add_node(
+            NodeKind::Opaque(Box::new(EuclideanGen::with_drop_counter(
+                steps,
+                4,
+                pattern,
+                drops.clone(),
+            ))),
+            vec![],
+        );
+        let mut out = [0.0f32; BLOCK];
+        g.render(
+            &mut out,
+            RenderBlock {
+                frame,
+                sample_rate: 48_000,
+                tempo: map,
+                mode: RenderMode::Timeline,
+            },
+        );
+        drops
+    }
+
+    /// The euclidean walk was the length of the block's **grid**, and the grid is
+    /// a pure function of the tempo: at 1e300 bpm the block's last beat is
+    /// 1.77e296, its cast to a step index saturates at `i64::MAX`, and the walk
+    /// from step 0 was 9.2e18 steps — on the very first block, at frame 0. The
+    /// body `continue`s on the pattern check long before it would emit, so
+    /// `frame_at`'s saturation could not save it: the cost was the iteration and
+    /// `render` never returned. The walk is now capped and the rest of the grid
+    /// is *counted*, exactly.
+    #[test]
+    fn an_absurd_tempo_does_not_wedge_the_step_walk() {
+        // A pattern with no pulse in it, so the walk's only possible stop is the
+        // cap: the counts below are about the walk and about nothing else.
+        let map = TempoMap::new(48_000, 1e300, 4);
+        let drops = euclid_walk_block(&map, 0, vec![false; 8], 8);
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            i64::MAX as u64 - EUCLIDEAN_STEP_CAP,
+            "the block walked exactly the cap and counted the other 9.2e18"
+        );
+
+        // A grid that fits the cap is walked whole and counts nothing, so the bound
+        // changes no audible output at any tempo a person could mean: 120 bpm with
+        // four pulses per beat is 4 steps per block.
+        let map = TempoMap::new(48_000, 120.0, 4);
+        let drops = euclid_walk_block(&map, 0, vec![false; 8], 8);
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            0,
+            "a sane grid drops nothing"
+        );
+    }
+
+    /// The same defect one order of magnitude below the saturation: a grid of
+    /// 1e9 bpm holds 709 724 steps in one 512-frame block, and uncapped the
+    /// block walked every one of them. The walk stops at the cap and the rest of
+    /// the grid is counted **exactly** — `walked + counted == the block's whole
+    /// grid` — with the trigger buffer out of the picture (a pattern with no
+    /// pulse in it, so nothing could fill the buffer and stop the walk early).
+    #[test]
+    fn a_dense_grid_does_not_run_away_in_one_block() {
+        let map = TempoMap::new(48_000, 1.0e9, 4);
+        let drops = euclid_walk_block(&map, 0, vec![false; 8], 8);
+        // 511 frames at 1e9 bpm is 177 430.556 beats, +1/4 beat, /1/4 beat per step
+        // → 709 724 steps in the block's grid.
+        assert_eq!(drops.load(Ordering::Relaxed), 709_724 - EUCLIDEAN_STEP_CAP);
+    }
+
+    /// The length invariant is **not** enforced by the constructor alone: a
+    /// public `steps` field could be reassigned after the assert, and the very
+    /// next block would index a 64-step modulo into an 8-long pattern — a panic
+    /// on the render thread, from safe code. The fields are private now, so
+    /// the constructor is the only way in, and the node's own read is back by
+    /// the pattern's own length. The accessors are the whole read surface.
+    #[test]
+    fn a_node_is_built_through_its_constructor_and_read_through_accessors() {
+        let node = EuclideanGen::new(8, 4, vec![false; 8]);
+        assert_eq!(node.steps(), 8);
+        assert_eq!(node.pulses_per_beat(), 4);
+        assert_eq!(node.pattern().len(), 8);
+        // `steps = 0` is the degenerate form the `max(1)` exists for: one step,
+        // a one-long pattern, and a walk that indexes within bounds.
+        let degenerate = EuclideanGen::new(0, 4, vec![false; 1]);
+        assert_eq!(degenerate.steps(), 0);
+        assert_eq!(degenerate.pattern().len(), 1);
+    }
+
+    /// A pattern that does not match `steps` is refused at construction, with a
+    /// message that says why the two are one thing.
+    #[test]
+    #[should_panic(expected = "indexed by `step % steps`")]
+    fn a_pattern_shorter_than_its_steps_is_refused() {
+        EuclideanGen::new(8, 4, vec![false; 4]);
+    }
+
+    /// The pattern is one `bool` per step and the node is built on the render
+    /// thread's call stack, so a nonsense length is refused **before** the
+    /// allocation — loudly, and naming the limit, so a 30-byte script line
+    /// cannot ask for a gigabyte.
+    #[test]
+    #[should_panic(expected = "over the 4096-step limit")]
+    fn an_absurd_step_count_is_refused_before_it_is_allocated() {
+        EuclideanGen::new(EUCLIDEAN_MAX_STEPS + 1, 4, Vec::new());
+    }
+
+    /// Render one block of `notes` into `out` through a bare [`ToneGen`] — the
+    /// view a note consumer gets, with no graph around it.
+    fn tone_block(node: &mut ToneGen, notes: &[NoteEvent], out: &mut [f32], frame: u64) {
+        let map = tempo();
+        let io = NodeIO {
+            audio_in: &[],
+            audio_ins: AudioInputs::none(),
+            audio_in_count: 0,
+            audio_out_channels: 1,
+            frames: out.len(),
+            control_in: 0.0,
+            triggers_in: &[],
+            notes_in: notes,
+        };
+        let mut control = 0.0f32;
+        let mut triggers = EventBuf::new();
+        let mut out_notes = EventBuf::new();
+        node.render(
+            &io,
+            out,
+            &mut control,
+            &mut triggers,
+            &mut out_notes,
+            RenderBlock {
+                frame,
+                sample_rate: 48_000,
+                tempo: &map,
+                mode: RenderMode::Timeline,
+            },
+        );
+    }
+
+    /// A note at `offset == frames` is a **legal `EventBuf` payload** and nothing
+    /// forbids one: `EventBuf` bounds capacity, never offsets. The tone's
+    /// pending-onset queue is a ring of [`MAX_PENDING`], the per-sample loop
+    /// reaches only `0..out.len()`, and the head used to return to 0 **only when
+    /// the queue emptied by itself** — so such a note was queued and never
+    /// drained, the head stayed parked, and the next block's write at
+    /// `head + count` indexed past the end of the array: an out-of-bounds panic
+    /// on the render thread.
+    #[test]
+    fn an_onset_past_the_block_does_not_outlive_its_block() {
+        const FRAMES: usize = 64;
+        let inside = NoteEvent {
+            offset: 0,
+            pitch: 0.0,
+            velocity: 1.0,
+            duration: 4,
+        };
+        let mut node = ToneGen::new(0.25, 4);
+
+        // Block A: one note the block can reach, then a pool's worth of notes
+        // offset past its last sample.
+        let mut notes = vec![inside];
+        for _ in 0..MAX_PENDING {
+            notes.push(NoteEvent {
+                offset: FRAMES as u32,
+                ..inside
+            });
+        }
+        let mut a = [0.0f32; FRAMES];
+        tone_block(&mut node, &notes, &mut a, 0);
+        assert!(
+            a[1] > 0.0,
+            "the in-block note still sounds: the first sample is sin(0), the second is not"
+        );
+        assert_eq!(
+            (node.pending_head, node.pending_count),
+            (0, 0),
+            "nothing queued outlives the block it was queued for"
+        );
+
+        // Block B: one ordinary note. Unfixed, the write at `pending[8]` panicked
+        // here — and with the queue merely *bounded* instead of cleared, this
+        // block would be silent.
+        let mut b = [0.0f32; FRAMES];
+        tone_block(&mut node, &[inside], &mut b, FRAMES as u64);
+        assert!(
+            b[1] > 0.0,
+            "the next block's note sounds: the queue is empty, not full of undrained entries"
         );
     }
 }

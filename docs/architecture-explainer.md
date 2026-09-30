@@ -1,6 +1,6 @@
 # sound-arranger: from architecture up
 
-> 🕒 Last verified against commit `52b7c09` (2026-09-27). If the code has moved on,
+> 🕒 Last verified against commit `a917a1c` (2026-09-29). If the code has moved on,
 > trust the code and move this line forward.
 
 > A plain-English (mostly) tour of the Rust code, for a developer with roughly six
@@ -406,7 +406,11 @@ first, sinks last), and feedback loops (a delay feeding itself) are not
 expressible yet. The benefit: the interpreter is dead simple and the render is a
 linear sweep. That's a classic Rust-honesty trade — the constraint is *enforced in
 the type of the operation's result* (`Result<(), String>`) and documented, rather
-than being a hidden assumption.
+than being a hidden assumption. The engine does not wait for the graph to find out
+whether you got the order right: `Engine::validate_patch` (§4.2) answers the same
+question from the graph's own node indices, so a cord that would run backward is
+refused with a `Result` at the call site instead of being logged and then dropped
+at apply.
 
 Fan-in is also exercised here: **many producers may connect to one input port**, and
 audio is *summed per port* (which is exactly what a mixer needs — its channels are
@@ -566,11 +570,32 @@ yields the golden property: **the same log renders byte-identical audio**, which
 the tests prove by bouncing twice and comparing bytes.
 
 There's a subtle honesty in `apply_patch` and `apply_event`: if an endpoint isn't
-mounted at apply time (a "log-order error" that validation should have caught),
-the code `debug_assert!(false, ...)` and *returns* rather than panicking — the
-intent stays in the log, replay reproduces the same refused state, and no
-audio-thread crash happens. "Never panic on the audio thread, even on a bug" is a
-hard rule.
+mounted at apply time (a "log-order error" that validation could not see coming),
+the code *records* the refusal as an `ApplyFault` and returns rather than
+panicking — the intent stays in the log, replay reproduces the same refusal, and
+no audio-thread crash happens. "Never panic on the audio thread, even on a bug" is
+a hard rule; "never hide a bug from the user either" is the same rule seen from
+the other side, which is why it is a *recorded* fault (`apply_faults()`,
+`is_degraded()`) rather than a `debug_assert!` — a debug assert compiles away in
+release, and release is the build a user runs.
+
+The record is careful about the *other* half of that rule, because it is written
+on the render path: an `ApplyFault` holds **data**, not a sentence — which rule
+refused (a `&'static str` class, from the engine or from the graph), the frame the
+log stamped, and the cord's plugin/port names as `&'static str`s — and the list's
+storage is reserved for its whole bound when the engine is built, so *recording* a
+refusal costs no allocation at all. The line a host prints is
+`ApplyFault::describe()`, built **on the control side, when the host reads the
+list**: the read may allocate, the render may not. A refused *mount* is the one
+message that is still a `String`, because `Plugin::apply` returns
+`Result<_, String>` — the plugin wrote it, and the engine carries it.
+
+The common log-order error is caught earlier than that, at the keyboard:
+`validate_patch` also asks whether the cord runs *forward* in node order (the
+graph's rule), answering from the graph's own node index for a mounted endpoint
+and from the order the mounts were queued for one that has not applied yet. A
+patch the graph would refuse is therefore refused at call time and never enters
+the log.
 
 ---
 

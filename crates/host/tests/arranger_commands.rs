@@ -302,6 +302,112 @@ fn edit_then_rewire_replays_byte_identically() {
     let _ = std::fs::remove_dir_all(&out_dir);
 }
 
+/// **The bus going away takes the arranger wiring with it, and a re-mount gets it
+/// back.** `unmount mixer` cleared the host's player-side mixer state but not the
+/// arranger's, and the mixer's own disposer removes only the mixer node — so every
+/// `ArrangerNode` stayed mounted with its cords dropped, `arrange_dirty` stayed
+/// `false`, and the re-mounted bus was never wired: the bounce after the re-mount
+/// was **silent with no error**, while the orphaned readers kept rendering and
+/// reading their pool files for the rest of the session.
+///
+/// The window with no bus is a shape of the session's own timeline (`mount
+/// mixer` / `unmount mixer` / `mount mixer` is a session the platform records), so
+/// it renders the silence a bus-less session renders — silently here, and the
+/// arrangement is wired again the moment a bus is back.
+#[test]
+fn a_remounted_mixer_is_rewired_and_leaves_no_orphan_nodes() {
+    let pool = tmp_dir("remountbus");
+    // The clip outlasts both 4 000-frame renders: a re-wired arranger anchors its
+    // readers at the transport frame, so a clip that had already ended would read as
+    // silence for the right reason.
+    write_ramp(&pool, "s1", 16_000, 257);
+    let out_dir = tmp_dir("remountbusout");
+    let mount_mixer = || HostCommand::Mount {
+        plugin: "mixer",
+        params: vec![("channels", 2.0)],
+        at_frame: Some(0),
+    };
+
+    let mut s = HostSession::new();
+    s.execute(&mount_mixer()).unwrap();
+    s.execute(&HostCommand::Pool { dir: pool.clone() }).unwrap();
+    s.execute(&HostCommand::Arrange {
+        op: ArrangeOp::AddTrack { track: "t0".into() },
+        at_frame: Some(0),
+    })
+    .unwrap();
+    s.execute(&HostCommand::Arrange {
+        op: ArrangeOp::AddClip {
+            track: "t0".into(),
+            clip: clip("c0", 0, 16_000),
+        },
+        at_frame: Some(0),
+    })
+    .unwrap();
+
+    // The first render wires the arranger and plays it.
+    let a = out_dir.join("a.wav");
+    s.execute(&HostCommand::Bounce {
+        frames: 4000,
+        path: a.clone(),
+    })
+    .unwrap();
+    assert!(
+        read_channel(&a, 0).iter().any(|s| s.abs() > 1e-4),
+        "the wired arrangement plays"
+    );
+    assert_eq!(
+        s.engine_ref().graph.nodes().len(),
+        2,
+        "the graph is the mixer and the one arranger — nothing else"
+    );
+
+    // The bus goes away. The host retires the wiring with it — and the render that
+    // applies the unmount releases the name, which is what lets the re-mount through.
+    s.execute(&HostCommand::Unmount {
+        plugin: "mixer",
+        at_frame: None,
+    })
+    .unwrap();
+    let window = s
+        .render(16)
+        .expect("a bus-less window renders silence, not a refusal");
+    assert!(
+        window.iter().all(|s| *s == 0.0),
+        "…and what it renders is the silence of a session with no bus"
+    );
+    assert_eq!(
+        s.engine_ref().graph.nodes().len(),
+        0,
+        "the arranger went with the bus — an orphan renders into nothing and reads \
+         its pool file for the rest of the session"
+    );
+
+    // …and the re-mount re-wires: the arrangement is dirty, so the next render
+    // rebuilds it into the new bus.
+    s.execute(&mount_mixer())
+        .expect("the unmount applied, so the name is free");
+    let b = out_dir.join("b.wav");
+    s.execute(&HostCommand::Bounce {
+        frames: 4000,
+        path: b.clone(),
+    })
+    .expect("a re-mounted bus renders the arrangement");
+    assert_eq!(
+        s.engine_ref().graph.nodes().len(),
+        2,
+        "the re-mounted bus is wired again"
+    );
+    assert!(
+        read_channel(&b, 0).iter().any(|s| s.abs() > 1e-4),
+        "the re-mounted bus carries the arrangement — this bounce was silent \
+         (and error-free) before the wiring was retired with the bus"
+    );
+
+    let _ = std::fs::remove_dir_all(&pool);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
 fn clip(id: &str, at: u64, len: u64) -> Clip {
     Clip {
         reversed: false,
@@ -584,6 +690,181 @@ fn text_format_arrange_ops_parse() {
     assert!(host::parse_script("host v1\narrange loop_region t0 c0 4294967296\n").is_err());
 }
 
+/// **A fade pair whose sum overflows `u64` is refused, from the wire in.** The
+/// text format takes both fade operands as raw `u64` with no bound and no
+/// `frame_operand` to snap, so `arrange set_clip_fade t0 c0 18446744073709551615
+/// 1` parses and reaches the value model. `u64::MAX + 1` wraps to 0, which used
+/// to pass the length check — a release build logged the op and rendered the clip
+/// at gain 0 for every sample (silent while the log claimed otherwise), and a
+/// debug build panicked inside the editor's timeline lock, poisoning every later
+/// `arrangement()`. The script must be refused loudly, and the session must
+/// still be readable afterwards.
+#[test]
+fn a_fade_pair_whose_sum_overflows_u64_is_refused_by_a_script() {
+    let pool = tmp_dir("fadeoverflow");
+    write_source(&pool, "s1", 8000);
+    let overflowing = format!(
+        "host v1\n\
+         mount mixer channels=2 @0\n\
+         pool {}\n\
+         arrange add_track t0 @0\n\
+         arrange add_clip t0 c0 s1 0 4000 0 0 0 1.0 @0\n\
+         arrange set_clip_fade t0 c0 18446744073709551615 1 @0\n",
+        pool.display()
+    );
+    // The parse itself succeeds: the wire schema carries the operands, and the
+    // refusal is the value model's (a parse error would blame the wrong layer).
+    let cmds = host::parse_script(&overflowing).expect("the operands are plain u64");
+    assert_eq!(cmds.len(), 5);
+    let err = host::run_script(&cmds).expect_err("a wrapped fade sum must be refused");
+    assert!(
+        err.contains("fades"),
+        "the refusal names the fade rule, got: {err}"
+    );
+
+    // `add_clip` carries the same pair (words 7/8) and is refused the same way.
+    let add_overflowing = format!(
+        "host v1\n\
+         mount mixer channels=2 @0\n\
+         pool {}\n\
+         arrange add_track t0 @0\n\
+         arrange add_clip t0 c0 s1 0 4000 0 18446744073709551615 1 1.0 @0\n",
+        pool.display()
+    );
+    let err = host::run_script(&host::parse_script(&add_overflowing).expect("parses"))
+        .expect_err("an add_clip whose fades overflow must be refused");
+    assert!(
+        err.contains("fades"),
+        "the refusal names the fade rule, got: {err}"
+    );
+
+    // A legal pair over the same clip is still accepted, so the guard is the
+    // fade rule and not a blanket refusal of large operands.
+    let legal = format!(
+        "host v1\n\
+         mount mixer channels=2 @0\n\
+         pool {}\n\
+         arrange add_track t0 @0\n\
+         arrange add_clip t0 c0 s1 0 4000 0 0 0 1.0 @0\n\
+         arrange set_clip_fade t0 c0 4000 0 @0\n",
+        pool.display()
+    );
+    let sess = host::run_script(&host::parse_script(&legal).expect("parses"))
+        .expect("a fade pair within the clip length applies");
+    assert_eq!(
+        sess.arrangement()
+            .expect("a legal fade must snapshot")
+            .tracks[0]
+            .clips[0]
+            .fade_in,
+        4000,
+        "the legal fade pair is in the value"
+    );
+
+    let _ = std::fs::remove_dir_all(&pool);
+}
+
+/// **The two-keypress sequence that used to make a track unplayable, end to end.**
+/// `f` at the clip's end sets a *full-length* fade-in (the shell caps it at
+/// `src_len - fade_out`, and the pair is legal: `4000 + 0 <= 4000`); `x` then
+/// razor-splits at an earlier frame. The split zeroed the seam fades but kept the
+/// inherited ones on halves a fraction of the original length, so it held a clip the
+/// model refuses — and `ArrangerNode::new` refuses the **whole track** over one clip,
+/// so the *bounce* failed and nothing on the track played. The split caps the fades
+/// to the halves they land on, so the sequence renders.
+#[test]
+fn a_razor_split_of_a_full_length_fade_still_bounces_audio() {
+    let pool = tmp_dir("spliffade");
+    write_ramp(&pool, "s1", 8000, 257);
+    let out_dir = tmp_dir("spliffadeout");
+    let out = out_dir.join("a.wav");
+
+    let script_text = format!(
+        "host v1\nmount mixer channels=2 @0\npool {}\narrange add_track t0 @0\narrange add_clip t0 c0 s1 0 4000 0 0 0 1.0 @0\narrange set_clip_fade t0 c0 4000 0 @0\narrange razor_split t0 c0 cL cR 1200 @0\nbounce 4000 {}\n",
+        pool.display(),
+        out.display()
+    );
+    let cmds = host::parse_script(&script_text).expect("script parses");
+    // The bounce is the assertion that matters: `bounce` renders through
+    // `wire_arranger`, which builds an `ArrangerNode` per track and returns the
+    // refusal as an `Err`. On the unfixed value this line failed with
+    // "arranger: clip 'cL' fades exceed the clip length".
+    let sess = run_script(&cmds).expect("a split of a fading clip must still bounce");
+
+    let timeline = sess.arrangement().expect("the arrangement must snapshot");
+    let ids: Vec<_> = timeline.tracks[0]
+        .clips
+        .iter()
+        .map(|c| c.id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["cL", "cR"], "the split produced two halves");
+    for c in &timeline.tracks[0].clips {
+        media::timeline::validate_clip(c)
+            .unwrap_or_else(|e| panic!("clip '{}' is invalid: {e}", c.id));
+    }
+    assert_eq!(
+        timeline.tracks[0].clips[0].fade_in, 1200,
+        "the fade-in is capped to the left half, not the whole clip"
+    );
+
+    let mut r = media::WavReader::open(&out).unwrap();
+    // `read_into` de-interleaves and yields channel 0 (L), so `audio[f]` is frame `f`
+    // of the bounce — not a raw interleaved sample index.
+    let mut audio = vec![0.0f32; r.total_frames() as usize];
+    let n = r.read_into(&mut audio);
+    assert!(
+        audio[..n].iter().any(|s| s.abs() > 1e-4),
+        "the split halves render audio"
+    );
+
+    // **The fade is proved by its gain, not by a sample being non-zero.** The mix is
+    // scaled by a constant on the way out (a mono source spread across the stereo bus),
+    // so these assertions compare *frames that read the same source value*, which
+    // cancels that constant exactly and leaves the per-clip gain.
+    //
+    // The ramp source repeats every 257 frames. `cL` (frames 0..1200, `src_start` 0,
+    // `fade_in` 1200 after the cap) reads the same source value at frames 500 and 757 as
+    // `cR` (frames 1200..4000, `src_start` 1200, no fades) does at frame 1271: all three
+    // are `243 / 257`, because 500 ≡ 757 ≡ 1271 ≡ 243 (mod 257). So a left sample over
+    // that right sample **is** the fade's gain at that frame — and the fades that would
+    // fail are named: an uncapped 4000-frame fade gives 0.125 and 0.189, a cap of 600
+    // gives 0.833 and 1.0, and a dropped fade gives 1.0 and 1.0. The old assertions
+    // (`audio[0]` quiet, `audio[1000] > 0.05`) were satisfied by all three, because the
+    // ramp is 0 at frame 0 whatever the gain, and any fade shorter than 1000 frames is
+    // fully open by frame 1000.
+    let reference = audio[1_271];
+    assert!(
+        reference > 1e-3,
+        "the reference frame is a real sample, got {reference}"
+    );
+    // The right half plays its source at a *constant* gain — the seam the split made is
+    // hard, and that is what makes `reference` the denominator it is used as: frames
+    // 1271 and 1298 read `243/257` and `13/257` of the ramp, both unfaded.
+    let (probe, want_ratio) = (
+        1_298u64,
+        source_value(1_298, 257) / source_value(1_271, 257),
+    );
+    assert!(
+        (audio[probe as usize] / reference - want_ratio).abs() < 0.01,
+        "the right half is unfaded, so two of its frames are at the ratio of their \
+         source values ({want_ratio}); got {}",
+        audio[probe as usize] / reference
+    );
+    // The left half's fade, sampled twice inside the window: linear gains `f / 1200`
+    // (the renderer ramps `off / fade_in`), so the ratio pins both the cap and the shape.
+    for (frame, want_gain) in [(500usize, 500.0 / 1200.0), (757, 757.0 / 1200.0)] {
+        let got = audio[frame] / reference;
+        assert!(
+            (got - want_gain).abs() < 0.01,
+            "inside the 1200-frame fade: frame {frame} is at gain {want_gain}, got {got} \
+             — that is a fade of a different length than the capped one"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&pool);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
 #[test]
 fn arrangement_bounces_audio_and_replays_byte_identically() {
     let pool = tmp_dir("audio");
@@ -738,7 +1019,11 @@ fn chop_text_format_splits_a_clip_and_renders() {
     assert_eq!(timeline.tracks[0].clips.len(), 4, "chop 4 -> four pieces");
     assert_eq!(timeline.tracks[0].clips[0].id, "pre.0");
     assert_eq!(timeline.tracks[0].clips[3].id, "pre.3");
-    assert_eq!(timeline.tracks[0].clips.last().unwrap().end(), 4000);
+    assert_eq!(
+        timeline.tracks[0].clips.last().unwrap().end(),
+        Some(4000),
+        "the four pieces tile the clip's 4000-frame span"
+    );
 
     let mut r = media::WavReader::open(&out).unwrap();
     let mut audio = vec![0.0f32; r.total_frames() as usize];

@@ -17,6 +17,11 @@ were disabled chrome. A destructive-feeling editor without undo is not usable fo
   it, pushes `(position, command)` onto `redo`, and rebuilds. A `Mount`/`Pool`/`SetTempo` is session
   *setup*, not an edit: undoing one would tear the graph down under every panel. `can_undo` is
   therefore "history contains an `Arrange`", not "history is non-empty".
+- **A refused rebuild undoes the undo.** Both stacks describe the candidate session while it is
+  being built, so the edit goes back where it came from when the replay is refused — a rebuild is
+  fallible for reasons that have nothing to do with the edit (a pool directory that moved, a deleted
+  clip). `Err` means "no edit was applied"
+  ([note](../bug-fix/2026-09-29-a-refused-undo-changes-nothing.md)).
 - **Redo re-inserts at the remembered index.** The op goes back at its original history position (not
   appended), so the reconstruction order — and every later command that depended on the frame
   arithmetic — is faithful. `redo.pop()` is LIFO, matching the undo order.

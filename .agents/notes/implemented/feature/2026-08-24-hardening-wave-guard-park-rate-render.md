@@ -11,10 +11,13 @@ plays pitch-shifted with no diagnostic), and #6 (`render()` panicked on a data-d
 
 ## Decision
 
-- **`wav.rs`** — a `data_bytes(frames, channels, float) -> Result<u64>` helper does
+- **`wav.rs`** — a `data_bytes(frames, channels, bytes_per_sample) -> Result<u64>` helper does
   `checked_mul` and refuses `> u32::MAX - 37` (the RIFF size field is `36 + data_bytes (+1
   pad if odd)`; `-37` covers the pad conservatively). Used by both `patch_sizes` (finalize)
-  and `recover`. A take that big fails loud instead of writing a corrupt small header.
+  and `recover`. A take that big fails loud instead of writing a corrupt small header. The third
+  parameter is a sample **width**, not a format flag — the
+  [recovery-width bug-fix note](../bug-fix/2026-09-29-recovery-uses-the-headers-sample-width.md)
+  records why a float/16-bit guess truncated a recovered 24-bit take.
 - **`stream.rs`** — the reader thread now **parks at EOF** (sleeps while holding its Arc
   clones) until the player's `Drop` sets `stop` — so a retired player's ring frees on the
   reader's own exit, off the audio thread (before, `self.cur = Some(finished.incoming)`
@@ -36,6 +39,8 @@ plays pitch-shifted with no diagnostic), and #6 (`render()` panicked on a data-d
   conservative bound. Our writers always produce even `data_bytes`, but the guard is strict.
 - **Clamp-and-recover instead of refusing a > u32 take** — rejected for now (RF64 is the real
   answer; refusing is honest).
+- **Keep `data_bytes`'s parameter a format flag** — rejected by the 2026-09-29 review fix above: a
+  flag cannot express 24-bit, so recovery described such a take at 2 bytes a sample.
 - **Disposal queue for the retire free** — the fully-uniform fix (covers the mid-read race
   too) but allocates on the render path (a no-alloc tension); deferred as a dedicated look.
 - **`render()` keeps `.expect`** — rejected (kimi): a data-driven error (unmount-mixer-after-

@@ -40,7 +40,16 @@ be moved, and a save that only wrote the log would leave the audio behind.
   (`HostSession::last_recovery()` reports how many lines were dropped). That covers both shapes a crash
   can cut — a partial final line, and a cut *inside* a gesture (one member on disk, no `group end`) —
   and the second is why the rule is per **entry** rather than per line: a gesture cut mid-write is
-  dropped whole, never half-applied. A journal write failure never fails the edit (it is already applied
+  dropped whole, never half-applied. The same rule covers an entry the `host v1` form cannot **parse**,
+  and the write side is held to it: a journal line is read back by `parse_script` before it is written,
+  so an edit the word-based form cannot spell is reported in `journal_error` and left out rather than
+  landing as a file that will not open (the
+  [journal read-back fix](../bug-fix/2026-09-29-a-journal-line-must-be-readable-to-be-written.md)).
+  The report is **re-derived from the history** rather than latched, so it dies with its edit on an
+  `undo` and comes back with it on a `redo`, and it is only made for an entry that **neither**
+  durable record can carry — a `pool` line the journal spells by absolute path but a save spells
+  relative is in the baseline, so a save into a directory whose path holds a space reports nothing.
+  A journal write failure never fails the edit (it is already applied
   and logged) — it is recorded in `journal_error()` instead of being silent.
 - **The text form now goes both ways.** `format_command` / `format_arrange` are the inverse of the
   parser (`fmt_f32` prints the shortest form that parses back to the same bits); **a pure action has no
@@ -92,15 +101,27 @@ the tests**, all now fixed with regression tests:
    same tolerance covers it, the script is `sync_all`ed before the rename, and the ordering is
    documented.
 
-Two refinements came out of the same review: `save` now **verifies its own output** (it parses the text
-back and compares it to the history, refusing a lossy save — an id with whitespace, or a region play,
-is refused rather than written) and `copy_pool` skips a file only when size *and* mtime match. The
+Two refinements came out of the same review: `save` now **verifies its own output** and `copy_pool`
+skips a file only when size *and* mtime match. The
 review's A1 verdict was clean apart from a comment that overstated the fold-then-apply invariant.
-The full review, verbatim, with the disposition and the debt it leaves open (journal `fsync`, non-strict
-arity for `pool`/`save`/`load`, a hand-edited malformed journal line) is
+The full review, verbatim, with the disposition and the debt it leaves open (journal `fsync`,
+non-strict arity for `pool`/`save`/`load`) is
 [`research/architecture/2026-09-23-alpha-slice-gate-glm-standin.md`](../../../../research/architecture/2026-09-23-alpha-slice-gate-glm-standin.md);
 the designated gate stays **owed** for A1 and A2, with the retry order in
 [the gate archive](../../../../research/architecture/2026-09-23-kimi-gate-alpha-slices.md).
+
+**What "verifies its own output" came to mean** (the
+[journal read-back fix](../bug-fix/2026-09-29-a-journal-line-must-be-readable-to-be-written.md),
+which grew three times and is where the reasoning lives). `save` checks three things about the
+text it is about to write, all before a byte is written and in particular before the journal is
+truncated: it **parses**; it **reads back as the history** (refusing a lossy save — an id with
+whitespace, or a region play, is refused rather than written); and it is **walked on a dry run**,
+so every value in it passes the applier's own doors (a `NaN` param is refused by name, with the
+edit and the reason). The walk is a *mode*, not a second list of checks: it runs the ordinary
+apply path with the I/O stood down, so the doors are the reader's own code and the check opens no
+file, spawns no thread and renders nothing. What a save refuses is therefore a property of the
+**document**; a file that has moved off this machine is a property of the **machine**, and it does
+not refuse the write — the reader reports it, as it always did.
 
 ## Alternatives considered
 

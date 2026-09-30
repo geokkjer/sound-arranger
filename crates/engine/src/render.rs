@@ -10,16 +10,38 @@
 //!   (sample-accurate lifecycle; a refused mutation is never logged);
 //! - rendering is a pure function of the log: `same log ⇒ byte-identical bounce`
 //!   (determinism is tested, including mid-session changes and patches);
-//! - the render loop never allocates on contract-abiding paths (enforced by a
-//!   counting-allocator test); the only allocation is the misuse-only `parked`
-//!   push when an arrangement op reaches the render stack;
+//! - the render loop allocates **nothing in steady state** (enforced by a
+//!   counting-allocator test), and a *misuse* path adds only the `parked` push
+//!   (an arrangement op reaching the render stack): a recorded apply fault — a
+//!   refused mount or a refused cord — costs **no allocation at all**, because
+//!   the list's storage is reserved for its whole bound at `Engine::new` and the
+//!   record is data (a `&'static str` class, borrowed identities, or a message
+//!   that already existed), never a sentence. The sentence is
+//!   [`ApplyFault::describe`], built on the control side when a host reads the
+//!   list;
 //! - **nothing logged is ever silently dropped** — an arrangement op that
 //!   reaches the render stack is parked for the control side (`flush_scheduled`
 //!   drains it), never discarded; the live run and a replay of the same log
 //!   therefore cannot diverge on skipped work (see the control→render handoff
-//!   decision note, 2026-08-27).
+//!   decision note, 2026-08-27);
+//! - **a failed apply changes nothing, and is reported in every build** — a
+//!   plugin's `apply` is fallible and the one step [`Engine::validate_mount`]
+//!   cannot dry-run, so [`Engine::apply_mount`] is a transaction: on `Err` the
+//!   engine's own bookkeeping is never written, the graph is put back, and the
+//!   refusal is **recorded** ([`Engine::apply_faults`], bounded) rather than
+//!   asserted, so a host can see it and mark the session degraded;
+//! - **a logged patch is a patch the graph will make** — [`Engine::validate_patch`]
+//!   answers the graph's forward-order rule (the source's node must precede the
+//!   destination's) from the graph itself, or from the mount queue's order while an
+//!   endpoint is still queued, so a cord `Graph::connect` would refuse is refused
+//!   at call time and never logged; a cord that *is* refused at apply is recorded
+//!   as a fault, so neither build reports a backward cord by asserting and neither
+//!   renders a channel nothing feeds in silence. The refusal is recorded **without
+//!   allocating** — the graph answers with a `&'static str` class
+//!   ([`crate::graph::ConnectClass`]) and the fault carries the cord as the log
+//!   spells it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::clock::{Clock, Scheduler};
 use crate::graph::{BLOCK, Graph, NodeId, Port, RenderBlock, RenderMode, SignalKind};
@@ -106,6 +128,224 @@ pub struct DrainOutcome {
 /// reported, not hidden).
 pub const MAX_DRAIN_FRAMES: usize = 48_000 * 60;
 
+/// The default bound on [`Engine::apply_faults`]: how many apply-time refusals
+/// the engine keeps before it counts the rest.
+///
+/// A bound rather than a silent cap, like [`MAX_DRAIN_FRAMES`] and
+/// [`DrainOutcome::capped`]: the refusals past the bound are *counted* in
+/// [`Engine::apply_faults_dropped`], so a session that refuses a thousand mounts
+/// shows a thousand refusals without holding a thousand strings. 64 is far more
+/// than a session should ever accumulate — one is already a fault — and small
+/// enough that keeping them costs nothing.
+///
+/// **The storage is reserved up front** (`Engine::new`, the control side), so the
+/// bound is also the capacity: recording a refusal on the render path writes
+/// into storage that is already there and never reallocates, which is what lets a
+/// fault be recorded at all on a path that may not allocate.
+pub const MAX_APPLY_FAULTS: usize = 64;
+
+/// A scheduled mutation the engine could not apply: the log says this plugin mounts
+/// (or that this cord is patched) at this frame, and the plugin's `apply` — or the
+/// graph — refused.
+///
+/// **A fault, not a diagnostic.** Two things that ought to agree — the log and the
+/// plugin or the graph — do not, so the engine records it in *every* build (the
+/// previous report was a `debug_assert!`, which release compiles away) and the
+/// session is degraded. The log event is **not** withdrawn: the log is the document,
+/// so a refusal is reported beside it rather than erased from it, and a replay of
+/// the same log refuses at the same frame and records the same fault.
+///
+/// **Recorded as data, never as a sentence.** A fault is written on the render
+/// path, and the render path does not allocate, so the reason is
+/// [`ApplyFaultReason`] — a class and borrowed identities, or a message that
+/// already existed — and the human-readable line is built by
+/// [`Self::describe`], on the **control** side, when a host reads the list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyFault {
+    /// The plugin the log asked to mount, or — for a refused cord — the cord's
+    /// source plugin, the one a user has to move; the destination is named in
+    /// [`Self::reason`].
+    pub plugin: &'static str,
+    /// The frame the **log** stamped the event with — not the frame the refusal
+    /// was noticed at, which a late flush or a warm-up seek can move.
+    pub at_frame: u64,
+    /// What refused, in the shape the refusing side can produce without
+    /// allocating. See [`ApplyFaultReason`].
+    pub reason: ApplyFaultReason,
+}
+
+/// Why an apply was refused — **data, not a sentence**, because the record is
+/// written on the render path.
+///
+/// There are two kinds of answer, and the shape follows what the refuser can
+/// hand over without allocating:
+///
+/// - **a rule's own classification** — the engine's ("this endpoint is not
+///   mounted") and the graph's ([`crate::graph::ConnectClass`], whose class is a
+///   `&'static str`) — is a `&'static str` beside identities the log already
+///   holds, so recording it moves nothing: [`Self::Cord`];
+/// - **a plugin's own words** — `Plugin::apply` is `Result<_, String>`, so a
+///   plugin that refuses has already built a sentence and the engine's job is to
+///   carry it, not to build a second one: [`Self::Given`]. The allocation behind
+///   it is the plugin's, made before the engine saw it.
+///
+/// The line a host shows is [`ApplyFault::describe`], on the caller's thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyFaultReason {
+    /// A plugin's own refusal, from its fallible `apply` — **moved, verbatim,
+    /// never formatted here**, so recording costs the engine nothing.
+    ///
+    /// This is the mount path's shape, and it is the one allocation the engine
+    /// cannot remove: `Plugin::apply` returns `Result<_, String>`, so a plugin
+    /// that refuses words its own refusal, on the render thread, before the
+    /// engine is in the picture. The engine declines to add a second one — and
+    /// [`ApplyFault::describe`] quotes this message rather than rebuilding it.
+    Given(String),
+    /// A cord the engine or the graph refused: a `&'static str` class and the
+    /// cord exactly as the log spells it — two `(plugin, port)` pairs, all
+    /// `&'static str`.
+    ///
+    /// Nothing here allocates, and nothing is copied: the identities are the
+    /// log's own, so the fault names the cord the way the document does rather
+    /// than the way the graph counts nodes.
+    Cord {
+        /// Which rule refused, as a `&'static str` — a phrase with no
+        /// punctuation of its own, because the sentence is built on read.
+        class: &'static str,
+        /// The cord's source, as the log spells it.
+        from: (&'static str, &'static str),
+        /// The cord's destination, as the log spells it.
+        to: (&'static str, &'static str),
+    },
+}
+
+impl ApplyFault {
+    /// The fault as a human-readable line, **built here, now, on the caller's
+    /// thread** — the control side, where a host reads the list and prints it.
+    ///
+    /// This is the only place the sentence exists: the record carries the class
+    /// and the identities (or a message that was already built), so nothing on
+    /// the render path has to format anything. The line names the plugin, the
+    /// frame the **log** stamped, and the reason beside the mutation the log
+    /// spells out, so it says what to change.
+    ///
+    /// Allocating here is the point, not an accident: this is a read.
+    pub fn describe(&self) -> String {
+        let reason = match &self.reason {
+            ApplyFaultReason::Given(message) => message.clone(),
+            ApplyFaultReason::Cord { class, from, to } => {
+                format!(
+                    "patch {}.{} → {}.{} refused: {class}",
+                    from.0, from.1, to.0, to.1
+                )
+            }
+        };
+        format!("{} @{}: {reason}", self.plugin, self.at_frame)
+    }
+}
+
+/// The slowest tempo [`Engine::set_tempo`] accepts: 1e-3 bpm, where a quarter
+/// note lasts 60 000 s — 16.7 hours. Nothing musical is that slow (a whole note
+/// over a minute is ~50× above the floor), so the floor excludes only nonsense.
+///
+/// The lower end of the range is not a matter of taste but of what the tempo map
+/// can express. [`crate::clock::TempoMap::frame_at`] covers the final
+/// open-ended segment with `u64::MAX` frames at `bpm`, so a segment spans
+/// `u64::MAX × bpm / 60 / sample_rate` beats — at 48 kHz that falls under one
+/// 24-PPQN tick (1/24 beat) below ~6.5e-15 bpm, and every tick after the first
+/// then resolves to the segment's start frame instead of its own. The floor sits
+/// some 1.5e11× above that point, so a `u64` frame range is never the binding
+/// constraint: `u64::MAX` frames at 48 kHz is ~1.2e7 years, and the timeline
+/// itself is never the thing that runs out.
+///
+/// Refusing below the floor is the honest answer — a tick the map cannot place is
+/// a tick MIDI clock has nothing to say about — and the render path's own bounds
+/// ([`crate::clock::TempoMap::frame_at`] saturating, the clock-out node's capped
+/// walk) hold for a log that carries one anyway.
+pub const MIN_TEMPO_BPM: f64 = 1e-3;
+
+/// What one **document** has said about a plugin's name — the one-instance-per-name
+/// bookkeeping, and *who owns it* is the whole question.
+///
+/// A **live command** asks the engine's scheduling state (`disposers` + `scheduled`),
+/// because a render applies what it queues and so that state is current. A
+/// **document walk** — [`Engine::enter_walk`], the recorded state of a session
+/// re-issued onto an engine — cannot: nothing renders during the walk, so the apply
+/// queue never drains and a name whose unmount the document schedules would still
+/// read as mounted. The lifecycle belongs to the document while it is being applied,
+/// exactly as it belongs to the engine between renders.
+///
+/// **A walk records the names the document has spoken for, and nothing else.** A name
+/// it has not mentioned is still the engine's business
+/// ([`Engine::holds_instance_of`]), so the walk is a view of the document rather than
+/// a snapshot of the target taken at entry — a snapshot goes stale the moment the
+/// target's own state moves, and a stale view is how a walk loses state it was
+/// supposed to protect. Two consequences, both load-bearing:
+///
+/// - a document that unmounts a name the target holds **replaces** that instance.
+///   That is the point: the document says the plugin goes away and comes back, and
+///   the frame rule below is what guarantees the teardown applies first.
+/// - a document that mounts a name the target holds, without unmounting it first, is
+///   refused like any other second instance — the target's own state answers for a
+///   name the document has not spoken for.
+///
+/// The frame each event carries is the frame the scheduler will apply it at, and a
+/// document's lifecycle for one name must be in **frame** order: `Mount p@a,
+/// Unmount p@b, Mount p@c` is only re-mountable if `a ≤ b ≤ c`. Frame-inverted
+/// otherwise (the scheduler sorts by frame, so the second mount would apply *before*
+/// the unmount: two `apply_mount`s for one name, the first node orphaned and its
+/// disposer dropped unrun). [`Engine::frame_inverted`] is that refusal — loud, at the
+/// walk, so replay, load and rebuild all inherit it.
+struct Live {
+    spoken: HashMap<&'static str, Instance>,
+}
+
+/// One name's document-side lifecycle: in force, and the frame of the last thing the
+/// document said about it.
+#[derive(Clone)]
+struct Instance {
+    /// Is the name in force? An unmount sets this false, a mount true.
+    live: bool,
+    /// The frame of this document's most recent lifecycle event for the name.
+    at_frame: u64,
+}
+
+impl Live {
+    /// The **document's** answer for `name`, or `None` when the document has not
+    /// spoken for it — in which case the name is the engine's business, not the
+    /// document's (see [`Engine::holds_instance_of`]).
+    fn in_force(&self, name: &str) -> Option<bool> {
+        self.spoken.get(name).map(|instance| instance.live)
+    }
+
+    /// A mount takes the name at `at_frame`. The caller has already refused a second
+    /// instance ([`Engine::validate_mount`]), so the only thing left to answer is
+    /// whether the document is going *backwards* in time.
+    fn mount(&mut self, name: &'static str, at_frame: u64) -> Result<(), String> {
+        self.record(name, at_frame, true)
+    }
+
+    /// An unmount gives the name back — the document says the plugin goes away, so a
+    /// later mount of the same name in the same document is a **re-mount**, not a
+    /// second instance. This mirrors `apply_unmount`, which is where the live path
+    /// releases the name. It records even for a name the document never mounted: the
+    /// *target* may hold that name, and the document is the one saying it goes away.
+    fn unmount(&mut self, name: &'static str, at_frame: u64) -> Result<(), String> {
+        self.record(name, at_frame, false)
+    }
+
+    /// The one write path: refuse a document that goes back in time, else record.
+    fn record(&mut self, name: &'static str, at_frame: u64, live: bool) -> Result<(), String> {
+        if let Some(prev) = self.spoken.get(name)
+            && prev.at_frame > at_frame
+        {
+            return Err(Engine::frame_inverted(name, prev.at_frame, at_frame));
+        }
+        self.spoken.insert(name, Instance { live, at_frame });
+        Ok(())
+    }
+}
+
 /// The assembled minimal core.
 pub struct Engine {
     pub clock: Clock,
@@ -134,13 +374,37 @@ pub struct Engine {
     node_of: HashMap<&'static str, NodeId>,
     disposers: HashMap<&'static str, Disposer>,
     /// plugins whose mount is queued but not yet applied.
-    scheduled: std::collections::HashSet<&'static str>,
+    scheduled: HashSet<&'static str>,
+    /// plugin name → the sequence number its live mount was **scheduled** with,
+    /// one per `mount` call (a re-mount takes a fresh, higher one). A queued mount
+    /// has no node to ask about its place in the graph, and `validate_patch` needs
+    /// one to answer the forward-order question before the log takes the patch —
+    /// see [`Self::graph_rank`].
+    mount_seq: HashMap<&'static str, usize>,
+    /// The next sequence number [`Self::mount_seq`] hands out.
+    next_mount_seq: usize,
+    /// The **document walks** in force, innermost last (see [`Self::enter_walk`]).
+    /// Non-empty exactly while a caller re-issues a recorded document — a session
+    /// log, a host's command history, a session script — onto this engine.
+    walks: Vec<Live>,
     /// registered plugin-message handlers, keyed by op (closed-core dispatch).
     op_handlers: HashMap<&'static str, OpHandler>,
     /// Arrangement ops that reached the render stack (a host that rendered
     /// without flushing) — parked for the control side; `flush_scheduled`
-    /// applies them FIFO before the due queue. Nothing logged is dropped.
-    parked: Vec<SchedEvent>,
+    /// applies them FIFO before the due queue. Nothing logged is dropped. The
+    /// frame each one was scheduled at rides with it, because a parked mount
+    /// applies at the *next* flush and its fault must still name the frame the log
+    /// stamped, not the frame the flush happened on.
+    parked: Vec<(u64, SchedEvent)>,
+    /// Scheduled mounts a plugin's `apply` refused, oldest first (see
+    /// [`Self::apply_faults`]). Bounded by [`MAX_APPLY_FAULTS`], and its
+    /// storage **reserved for the whole bound at [`Self::new`]** so a record
+    /// written from the apply path never reallocates; the rest are counted in
+    /// `apply_faults_dropped`. Never cleared: a fault is a standing fact about
+    /// the session, not work to be done later (the opposite of `parked`).
+    apply_faults: Vec<ApplyFault>,
+    /// How many refusals the bound in [`MAX_APPLY_FAULTS`] could not hold.
+    apply_faults_dropped: usize,
 }
 
 impl Engine {
@@ -167,9 +431,17 @@ impl Engine {
             scheduled_params: HashMap::new(),
             node_of: HashMap::new(),
             disposers: HashMap::new(),
-            scheduled: std::collections::HashSet::new(),
+            scheduled: HashSet::new(),
+            mount_seq: HashMap::new(),
+            next_mount_seq: 0,
+            walks: Vec::new(),
             op_handlers: HashMap::new(),
             parked: Vec::new(),
+            // The control side pays for the whole bound once, so the apply path
+            // can record a fault (the misuse path, which still may not allocate)
+            // by writing into storage that already exists — see `apply_faults`.
+            apply_faults: Vec::with_capacity(MAX_APPLY_FAULTS),
+            apply_faults_dropped: 0,
         }
     }
 
@@ -188,6 +460,66 @@ impl Engine {
         self.params_table.insert(name, params);
     }
 
+    /// Enter a **document walk**: from here until [`Self::leave_walk`], the
+    /// one-instance-per-name rule for every name **the document has spoken for** is
+    /// answered by the document's own lifecycle rather than by the engine's
+    /// scheduling state.
+    ///
+    /// A walk is for re-issuing a *recorded* document onto this engine — a session
+    /// log ([`Self::replay_from`]), a host's command history, a session script. Nothing
+    /// renders during one, so the apply queue never drains, and the engine's own view
+    /// would refuse a `mount … unmount … mount` sequence the live path accepts (it
+    /// releases the name when the unmount *applies*). The document is the authority
+    /// over the names it speaks for, exactly as the engine is between renders.
+    ///
+    /// **What a walk guarantees** (all of it enforced, all of it here):
+    ///
+    /// - every mount, unmount and re-mount of a name the document issued is
+    ///   accounted for, so `mount … unmount … mount` is a re-mount;
+    /// - a document that mounts a name the engine already holds, without unmounting
+    ///   it first, is refused — the walk does not speak for a name the document never
+    ///   mentioned, so the engine's own state answers and a second instance cannot be
+    ///   applied over a live one;
+    /// - a document whose lifecycle frames for one name are not in order is refused
+    ///   with [`Self::frame_inverted`], so a walk can never leave an orphaned node or
+    ///   a dropped disposer behind.
+    ///
+    /// **What a caller must guarantee.** A walk is not a sandbox: the engine cannot
+    /// tell *which* caller issued a command inside one, so entering a walk is the
+    /// assertion that **everything issued until [`Self::leave_walk`] is one document**.
+    /// Two ways to break that, both the caller's to avoid:
+    ///
+    /// - issuing state of your own while the walk is in force. It joins the
+    ///   document's lifecycle; if it contradicts what the document says, the frame
+    ///   rule refuses the whole walk — which is the safe outcome, but the message
+    ///   names a document the caller did not write.
+    /// - **placing the clock backwards** ([`Self::seek`]) inside a walk, so a later
+    ///   event is stamped before an earlier one. The walk refuses the document that
+    ///   results; the caller that caused it is the one to hear about it.
+    ///
+    /// Walks stack, and a nested walk starts from the document state it is nested in.
+    /// **Pair every `enter_walk` with a `leave_walk`**, and put no `?` between them: a
+    /// path that returns early leaves the engine answering from a half-applied
+    /// document. (There is no guard type for this — a guard would have to borrow the
+    /// engine, which is the very thing being mutated inside the walk — so it is a
+    /// discipline, and every in-tree caller scopes it deliberately.)
+    pub fn enter_walk(&mut self) {
+        let live = match self.walks.last() {
+            Some(outer) => Live {
+                spoken: outer.spoken.clone(),
+            },
+            None => Live {
+                spoken: HashMap::new(),
+            },
+        };
+        self.walks.push(live);
+    }
+
+    /// Leave a document walk, restoring the walk it was nested in (or none).
+    pub fn leave_walk(&mut self) {
+        self.walks.pop();
+    }
+
     /// Mount a plugin at the current frame: validated synchronously (fail-loud),
     /// logged with its frame, then applied by the render loop at that frame.
     pub fn mount(
@@ -197,6 +529,12 @@ impl Engine {
     ) -> Result<(), String> {
         self.validate_mount(name, params)?;
         let at_frame = self.clock.frame();
+        if let Some(live) = self.walks.last_mut() {
+            // The document takes the name at the frame the scheduler will apply it
+            // at; its own unmount gives it back. The frame order is checked here, so
+            // a document that goes back in time is refused rather than walked.
+            live.mount(name, at_frame)?;
+        }
         self.log.push(Event::Mount {
             plugin: name,
             params: params.to_vec(),
@@ -211,7 +549,23 @@ impl Engine {
         );
         self.scheduled.insert(name);
         self.scheduled_params.insert(name, params.to_vec());
+        // The place this mount will take in the graph's order, recorded with the
+        // rest of the reservation: a patch that arrives before it applies asks
+        // `graph_rank`, and the queue is frame-ordered and FIFO within a frame, so
+        // schedule order is apply order.
+        self.take_mount_seq(name);
         Ok(())
+    }
+
+    /// Give a queued mount its place in the graph's order — one write path for the
+    /// live [`Self::mount`] and for a replayed document, so a replayed cord cannot
+    /// be checked for forward order against a different order than a live one.
+    /// A re-mount takes a **fresh** number: the name is appended again, behind
+    /// whatever has applied since.
+    fn take_mount_seq(&mut self, name: &'static str) {
+        let seq = self.next_mount_seq;
+        self.next_mount_seq += 1;
+        self.mount_seq.insert(name, seq);
     }
 
     /// Synchronous, side-effect-free validation: known plugin, declared services
@@ -221,11 +575,36 @@ impl Engine {
         name: &'static str,
         params: &[(&'static str, f32)],
     ) -> Result<(), String> {
-        if self.disposers.contains_key(name) || self.scheduled.contains(name) {
-            return Err(format!(
-                "plugin '{name}' is already mounted (one instance per name in spike A.5)"
-            ));
+        if self.holds_instance_of(name) {
+            return Err(Self::already_mounted(name));
         }
+        self.validate_mount_declaration(name, params)
+    }
+
+    /// "Is one instance of `name` already in force?" — the one-instance-per-name
+    /// question, asked of whoever owns the lifecycle. In a **document walk** the
+    /// document owns the names it has spoken for (an unmount releases the name, so a
+    /// later mount is a re-mount); for every other name the live path's own view
+    /// answers — applied, or queued to apply. A walk never answers for a name the
+    /// document has not mentioned, which is what keeps a walk from *losing* the
+    /// target's state as well as from contradicting it.
+    fn holds_instance_of(&self, name: &str) -> bool {
+        if let Some(live) = self.walks.last()
+            && let Some(in_force) = live.in_force(name)
+        {
+            return in_force;
+        }
+        self.disposers.contains_key(name) || self.scheduled.contains(name)
+    }
+
+    /// The lifecycle-free half of [`Self::validate_mount`]. [`Self::replay_from`]
+    /// calls this directly, because there "one instance per name" is a question
+    /// about the **log's** lifecycle, not about this engine's scheduling state.
+    fn validate_mount_declaration(
+        &self,
+        name: &'static str,
+        params: &[(&'static str, f32)],
+    ) -> Result<(), String> {
         // Mount params get a finiteness check (GLM-5.3 #9): `set_param` has one,
         // but a `mount ... NaN` would otherwise reach the plugin's apply silently.
         for (pname, v) in params {
@@ -251,6 +630,70 @@ impl Engine {
         Ok(())
     }
 
+    /// The refusal the "one instance per name" rule speaks in, from the live
+    /// engine, from a document walk and from a replay alike.
+    fn already_mounted(name: &str) -> String {
+        format!("plugin '{name}' is already mounted (one instance per name in spike A.5)")
+    }
+
+    /// The refusal a **frame-inverted document** speaks in, from every walk alike.
+    ///
+    /// The apply queue is frame-ordered, the log is not: `Mount p@a, Unmount p@b,
+    /// Mount p@c` with `c ≤ b` or `b < a` delivers the second mount *before* the
+    /// unmount that frees the name, so `apply_mount` runs twice for one name — the
+    /// first instance's node stays in the graph and its disposer is dropped with its
+    /// entry. The walk is the one place that sees the whole document, so it refuses
+    /// here rather than repairing the log behind the caller's back: a loud `Err`
+    /// names the document, where a self-healing apply would silently render
+    /// something else than the log says.
+    fn frame_inverted(name: &str, previous: u64, next: u64) -> String {
+        format!(
+            "plugin '{name}' goes back to frame {next} after frame {previous} — a document's \
+             mounts and unmounts must be in frame order (the scheduler applies in frame order, so \
+             an inverted triple mounts '{name}' twice and orphans the first instance)"
+        )
+    }
+
+    /// The refusal a **replay onto a non-fresh engine** speaks in. `replay_from`'s
+    /// contract is a fresh engine, and the reason is this: replaying a log that
+    /// mounts a name the target already holds would apply a *second* instance —
+    /// `node_of`/`disposers` overwrite the first, whose node stays in the graph and
+    /// whose disposer is dropped with it. A loud `Err` beats a silent leak.
+    fn replay_needs_fresh_engine(name: &str) -> String {
+        format!(
+            "replay: plugin '{name}' is already mounted on this engine — replay_from needs a \
+             fresh engine (the replayed log owns every mount; a second instance would overwrite \
+             the applied node and drop its disposer)"
+        )
+    }
+
+    /// Apply a mount: build the instance, let it register, and **commit** — or,
+    /// on a refusal, leave the engine exactly as it was.
+    ///
+    /// `apply` is fallible and this is the one step [`Self::validate_mount`]
+    /// cannot dry-run (it calls `inject()`, never `apply`), so a mount that the
+    /// log accepted can still be refused here. The euclidean plugin's `apply` is
+    /// the first that can: its `steps` bound is re-checked at apply because its
+    /// fields are public and an instance can be hand-assembled without the
+    /// factory's door. When that happens the engine must not be left holding a
+    /// name it never mounted — `scheduled` kept, the name refused as a second
+    /// instance for the rest of the session, and `replay_from` refusing the log.
+    ///
+    /// So it is a **transaction**. Nothing the mount *adds* is written until the
+    /// apply has succeeded: the mounted surfaces are captured first (they are the
+    /// instance's answer to "what did you actually mount", which a refused
+    /// instance has no answer to), and the node, its disposer and those surfaces
+    /// are committed together below. On `Err` the engine keeps only what it had —
+    /// the reservation `mount` took is released, so the name reads as free again
+    /// rather than wedged for the rest of the session — and
+    /// [`Self::undo_a_refused_apply`] puts the **graph** back too, since an
+    /// `apply` that added a node and *then* refused would otherwise orphan it with
+    /// no disposer able to remove it (the euclidean's refusal precedes its
+    /// `add_node`, so this is the belt to that suspenders).
+    ///
+    /// A *successful* apply whose name is already mounted still overwrites the
+    /// first instance's `node_of`/`disposers` — a log that says so is refused by
+    /// the walk ([`Self::frame_inverted`]) before it can be applied.
     fn apply_mount(
         &mut self,
         name: &'static str,
@@ -262,12 +705,16 @@ impl Engine {
             .ok_or_else(|| format!("unknown plugin '{name}'"))?;
         let mut plugin = factory(params)?;
         let id = plugin.id();
-        // Capture the **mounted** surface before applying: it is the instance's answer
-        // to "what did you actually mount", and every later patch and parameter
-        // validation reads it in preference to the registered catalog.
-        self.mounted_ports.insert(name, plugin.mounted_ports());
-        self.mounted_params.insert(name, plugin.mounted_params());
-        let (node, disposer) = {
+        // Captured, **not** recorded: an instance that refuses has mounted nothing,
+        // so its surface must not answer a patch or a parameter change.
+        let mounted_ports = plugin.mounted_ports();
+        let mounted_params = plugin.mounted_params();
+        // The graph as it was, for the same reason. `NodeId`s come from a
+        // monotonic counter, so "what this apply added" is exactly "the ids at or
+        // above the watermark" — wherever `insert_before` put them.
+        let watermark = self.graph.next_id();
+        let bus = self.graph.out_node;
+        let applied = {
             let Engine {
                 ctx,
                 scheduler,
@@ -281,13 +728,59 @@ impl Engine {
                 graph,
                 clock,
             };
-            plugin.apply(&mut api)?
+            plugin.apply(&mut api)
         };
+        let (node, disposer) = match applied {
+            Ok(mounted) => mounted,
+            Err(refusal) => {
+                // The reservation goes back with the graph. This is the wedge: a
+                // name left in `scheduled` reads as mounted to every later
+                // `validate_mount`, so the session could never mount it again and
+                // `replay_from` refused the log that carries it.
+                self.scheduled.remove(name);
+                self.scheduled_params.remove(name);
+                self.mount_seq.remove(name);
+                self.undo_a_refused_apply(watermark, bus);
+                return Err(refusal);
+            }
+        };
+        // Commit. Every write the mount makes is below this line.
+        self.mounted_ports.insert(name, mounted_ports);
+        self.mounted_params.insert(name, mounted_params);
         self.scheduled.remove(name);
         self.scheduled_params.remove(name);
         self.node_of.insert(id, node);
         self.disposers.insert(id, disposer);
         Ok(())
+    }
+
+    /// Put the **graph** back the way a refused `apply` found it: every node the
+    /// failed apply added is removed, and the master-bus claim goes back to
+    /// whoever held it (`remove_node` only clears the claim, it does not hand it
+    /// on). The engine's own maps need no counterpart — `apply_mount` writes none
+    /// of them until the apply has succeeded.
+    ///
+    /// **Additions and the claim, not everything**: a plugin that *removed* a node,
+    /// or provided a context service, before it refused has already broken the
+    /// contract below, and neither is restorable from here — the graph would need
+    /// its whole node list rebuilt, and `Context` holds `Box<dyn Any>`. Both are
+    /// [`Plugin::apply`]'s half of the deal: **an `Err` means nothing changed**,
+    /// stated there the way [`OpHandler`] states its own.
+    fn undo_a_refused_apply(&mut self, watermark: u64, bus: Option<NodeId>) {
+        let added: Vec<NodeId> = self
+            .graph
+            .nodes()
+            .iter()
+            .map(|n| n.id)
+            .filter(|id| id.0 >= watermark)
+            .collect();
+        for id in added {
+            self.graph.remove_node(id);
+        }
+        self.graph.out_node = match bus {
+            Some(id) if self.graph.nodes().iter().any(|n| n.id == id) => Some(id),
+            _ => None,
+        };
     }
 
     /// Patch two plugins' ports at the current frame. Validated synchronously
@@ -339,6 +832,20 @@ impl Engine {
         if !(self.scheduled.contains(tp) || self.node_of.contains_key(tp)) {
             return Err(format!("plugin '{tp}' is neither scheduled nor mounted"));
         }
+        // The graph's forward-order rule, asked **before** the log takes the patch
+        // rather than at apply: `graph.connect` refuses a cord whose source does not
+        // precede its destination, and a cord it will refuse must never be logged
+        // (a logged mutation that never happens is a silent one — the destination
+        // channel is never fed and nothing says so).
+        if let (Some(from_rank), Some(to_rank)) = (self.graph_rank(fp), self.graph_rank(tp))
+            && from_rank >= to_rank
+        {
+            return Err(format!(
+                "patch: patch cords must go forward in node order — '{tp}' is mounted before \
+                 '{fp}' (a queued mount lands behind every node already in the graph), so mount \
+                 '{tp}' first"
+            ));
+        }
         // The surface the plugin currently offers — the applied instance's, or the one
         // a queued mount's factory derives from its params. The catalog is nominal.
         let from_ports = self.ports_of(fp);
@@ -383,46 +890,128 @@ impl Engine {
         Ok(())
     }
 
-    /// Apply a patch at its scheduled frame. Never panics: if an endpoint is
-    /// not mounted (a log-order error) or the graph refuses the cord (forward
-    /// order, single-driver control), the intent stays in the log and the
-    /// refusal is asserted in debug — no audio-thread crash, no silent
-    /// divergence (replay reproduces the same refused state).
+    /// Where a plugin's node sits — or, for a queued mount, where it will sit — in
+    /// the graph's forward order. `None` for a name the engine holds no order for
+    /// (neither mounted nor carrying a scheduled mount's sequence), which the
+    /// caller reads as "no answer", never as a refusal.
+    ///
+    /// A **mounted** plugin's answer is exact: its node's own index, asked of the
+    /// graph. A **queued** mount has no node yet, and every plugin in the tree
+    /// appends one in its `apply` — `Graph::insert_before` is the tool for a node
+    /// that must *precede* an existing one, and it is not reachable from
+    /// [`Self::patch`], whose endpoints are always plugins the engine itself
+    /// mounted. So a queued mount lands after every applied node, and two queued
+    /// mounts land in the order their mounts were scheduled (which is the order
+    /// they apply in: the queue is frame-ordered, FIFO within a frame).
+    ///
+    /// Both readings share one scale — applied nodes rank `0..nodes.len()`, a
+    /// queued mount ranks `nodes.len() + seq` — so the forward-order question is a
+    /// single `>=` and needs no case analysis.
+    fn graph_rank(&self, name: &str) -> Option<usize> {
+        if let Some(&node) = self.node_of.get(name) {
+            return self.graph.nodes().iter().position(|n| n.id == node);
+        }
+        let seq = *self.mount_seq.get(name)?;
+        Some(self.graph.nodes().len().saturating_add(seq))
+    }
+
+    /// Apply a patch at its scheduled frame. Never panics: if an endpoint is not
+    /// mounted (a log-order error) or the graph refuses the cord (forward order,
+    /// single-driver control), the intent stays in the log and the refusal is
+    /// **recorded** as an [`ApplyFault`] — loud in every build, so a session whose
+    /// audio is not what its log says is one a host can mark degraded, rather than
+    /// a destination channel that is silently never fed. Replay reproduces the
+    /// same refusal, so a loaded session says the same thing a played one does.
+    ///
+    /// **Nothing here formats.** An endpoint that is gone is a `&'static str`
+    /// class and the cord's own `&'static str` identities; the graph's own
+    /// refusal is a [`crate::graph::ConnectRefusal`], of which only its
+    /// `&'static str` class is kept. The line a host prints is
+    /// [`ApplyFault::describe`], built on read.
     fn apply_patch(
         &mut self,
         from: (&'static str, &'static str),
         to: (&'static str, &'static str),
+        at_frame: u64,
     ) {
         let Some(&from_node) = self.node_of.get(from.0) else {
-            debug_assert!(
-                false,
-                "patch endpoint '{}' not mounted at apply (log-order error)",
-                from.0
-            );
+            self.record_apply_fault(Self::patch_fault(
+                from,
+                to,
+                at_frame,
+                "its source is not mounted",
+            ));
             return;
         };
         let Some(&to_node) = self.node_of.get(to.0) else {
-            debug_assert!(
-                false,
-                "patch endpoint '{}' not mounted at apply (log-order error)",
-                to.0
-            );
+            self.record_apply_fault(Self::patch_fault(
+                from,
+                to,
+                at_frame,
+                "its destination is not mounted",
+            ));
             return;
         };
-        if let Err(e) = self.graph.connect(from_node, from.1, to_node, to.1) {
-            debug_assert!(false, "scheduled patch refused at apply: {e}");
+        if let Err(refusal) = self.graph.try_connect(from_node, from.1, to_node, to.1) {
+            self.record_apply_fault(Self::patch_fault(
+                from,
+                to,
+                at_frame,
+                refusal.class.as_str(),
+            ));
+        }
+    }
+
+    /// The fault a scheduled patch's apply leaves behind — whatever refused it.
+    /// The cord is named the way the log spells it, because a class is phrased in
+    /// the graph's terms (nodes, ports, counts) and a host cannot resolve a node
+    /// index back to a plugin; the reason is that `&'static str` class beside the
+    /// cord's four `&'static str` identities, so building this fault copies nothing
+    /// and allocates nothing, and [`ApplyFault::describe`] turns it into the line on
+    /// the control side.
+    ///
+    /// The three classes are the engine's two "this endpoint is not mounted"
+    /// answers and whatever `try_connect` classified the cord as, so a refused
+    /// cord is one record shape whether the engine or the graph said no.
+    fn patch_fault(
+        from: (&'static str, &'static str),
+        to: (&'static str, &'static str),
+        at_frame: u64,
+        class: &'static str,
+    ) -> ApplyFault {
+        ApplyFault {
+            // The source plugin: the cord's origin is what a user has to move.
+            plugin: from.0,
+            at_frame,
+            reason: ApplyFaultReason::Cord { class, from, to },
         }
     }
 
     /// Schedule an unmount at an absolute frame — the scheduling queue driving
     /// lifecycle, sample-accurately.
-    pub fn schedule_unmount(&mut self, name: &'static str, at_frame: u64) {
+    ///
+    /// Fallible for one reason: in a **document walk** the unmount is half of a
+    /// lifecycle, and a document whose unmount lands *before* the mount it ends
+    /// cannot be read back (it would apply two instances — see
+    /// [`Self::frame_inverted`]). Off the walk it cannot fail: the live path has no
+    /// document to contradict, which is why `schedule_unmount` was infallible until
+    /// the walk needed it to speak.
+    pub fn schedule_unmount(&mut self, name: &'static str, at_frame: u64) -> Result<(), String> {
+        if let Some(live) = self.walks.last_mut() {
+            // In a **document walk** the name is free from here: the document says
+            // the plugin goes away, so a later mount in the same document is a
+            // re-mount. On the live path the release still happens at apply
+            // (`apply_unmount`), which is why the same-tick `mount → unmount →
+            // mount` window stays refused there.
+            live.unmount(name, at_frame)?;
+        }
         self.log.push(Event::ScheduleUnmount {
             plugin: name,
             at_frame,
         });
         self.scheduler
             .schedule(at_frame, SchedEvent::Unmount { plugin: name });
+        Ok(())
     }
 
     /// Unmount at the current frame. Fail-loud: an unknown plugin is refused
@@ -433,8 +1022,7 @@ impl Engine {
             return Err(format!("plugin '{name}' is neither scheduled nor mounted"));
         }
         let at_frame = self.clock.frame();
-        self.schedule_unmount(name, at_frame);
-        Ok(())
+        self.schedule_unmount(name, at_frame)
     }
 
     /// The ports a plugin offers **now**, in preference order: the applied instance's
@@ -471,13 +1059,20 @@ impl Engine {
         self.params_table.get(name).copied().unwrap_or(&[]).to_vec()
     }
 
-    /// Apply an unmount: run the disposer (reversible effects). Idempotent.
+    /// Apply an unmount: run the disposer (reversible effects). Idempotent, and
+    /// **total**: the name leaves every lifecycle map whether or not a disposer
+    /// was found, so the maps describe what is mounted and never what was. A
+    /// disposer-less entry cannot be built by the apply path any more (a mount
+    /// that fails records neither `node_of` nor `disposers`), so the clears are
+    /// unconditional rather than a courtesy of the disposer being present.
     fn apply_unmount(&mut self, name: &'static str) {
         self.scheduled.remove(name);
+        self.scheduled_params.remove(name);
+        self.mount_seq.remove(name);
         self.mounted_ports.remove(name);
         self.mounted_params.remove(name);
+        self.node_of.remove(name);
         if let Some(disposer) = self.disposers.remove(name) {
-            self.node_of.remove(name);
             let Engine {
                 ctx,
                 scheduler,
@@ -493,11 +1088,18 @@ impl Engine {
     }
 
     /// A tempo change at the current frame (sample-accurate: applied by the
-    /// render loop at that frame). Fail-loud: a non-finite or non-positive
-    /// tempo is refused and never logged (kimi review finding 10).
+    /// render loop at that frame). Fail-loud: a non-finite, non-positive, or
+    /// sub-floor tempo is refused and never logged (kimi review finding 10;
+    /// the floor is [`MIN_TEMPO_BPM`]).
     pub fn set_tempo(&mut self, bpm: f64, beats_per_bar: u32) -> Result<(), String> {
         if !bpm.is_finite() || bpm <= 0.0 {
             return Err(format!("tempo must be finite and positive, got {bpm}"));
+        }
+        if bpm < MIN_TEMPO_BPM {
+            return Err(format!(
+                "tempo must be at least {MIN_TEMPO_BPM} bpm \
+                 (a quarter note taking 16.7 hours), got {bpm}"
+            ));
         }
         let at_frame = self.clock.frame();
         self.log.push(Event::SetTempo {
@@ -660,10 +1262,50 @@ impl Engine {
         Ok(())
     }
 
-    /// Replay a log onto this engine. Must be a *fresh* engine: every event is
-    /// scheduled at its recorded frame and applied by the render loop — nothing
-    /// is applied eagerly, so the timeline reproduces exactly.
+    /// Replay a log onto this engine. Must be a *fresh* engine — enforced, and
+    /// loudly refused otherwise: every event is scheduled at its recorded frame and
+    /// applied by the render loop, so nothing is applied eagerly and the timeline
+    /// reproduces exactly. A log's mounts are the *only* mounts the engine may have
+    /// after a replay; a name the target already holds would be applied twice, and
+    /// the second `apply_mount` would overwrite the first instance's `node_of` entry
+    /// and drop its disposer, leaving its node in the graph forever.
+    ///
+    /// The one-instance-per-name rule itself is a fact about the **log's** lifecycle,
+    /// so it is tracked here as a document walk rather than read off `self.scheduled`:
+    /// a replay applies nothing (nothing renders yet), so a name whose unmount the
+    /// log schedules stays in `scheduled` for the whole walk — and the
+    /// `mount … unmount … mount` shape the live engine produces (it releases the
+    /// name when the unmount *applies*) would be refused as a second instance. The
+    /// engine writes such logs; it must be able to read them.
+    ///
+    /// The walk also **refuses a frame-inverted log**
+    /// ([`Self::frame_inverted`]): a log whose mount/unmount frames for one name are
+    /// not in order would apply that name twice and orphan an instance, so it is a
+    /// loud `Err` naming the frames rather than a silent leak. A refused replay
+    /// leaves the target with the events it had already scheduled and nothing
+    /// applied — the contract is a fresh engine, which the caller then discards.
     pub fn replay_from(&mut self, log: &SessionLog) -> Result<(), String> {
+        // The fresh-engine precondition, spoken by the engine rather than assumed: an
+        // applied plugin *or* a queued one (nothing has rendered, so both are
+        // pre-existing state) means the target is not a clean slate.
+        let applied = self.disposers.keys().next().copied();
+        let queued = self.scheduled.iter().next().copied();
+        if let Some(name) = applied.or(queued) {
+            return Err(Self::replay_needs_fresh_engine(name));
+        }
+        // A walk, entered and left around the loop below: the log's lifecycle owns
+        // "is this name live?" for the duration, exactly as the host's command
+        // history does when a session is rebuilt. Nothing may return between the
+        // two calls, or the engine would answer from a half-walked document.
+        self.enter_walk();
+        let result = self.replay_events(log);
+        self.leave_walk();
+        result
+    }
+
+    /// The walk of [`Self::replay_from`]: every event scheduled at its recorded
+    /// frame, the lifecycle owned by the log, the engine's own log repopulated.
+    fn replay_events(&mut self, log: &SessionLog) -> Result<(), String> {
         for event in log.events() {
             match event {
                 Event::Mount {
@@ -671,7 +1313,16 @@ impl Engine {
                     params,
                     at_frame,
                 } => {
-                    self.validate_mount(plugin, params)?;
+                    if self.holds_instance_of(plugin) {
+                        return Err(Self::already_mounted(plugin));
+                    }
+                    self.validate_mount_declaration(plugin, params)?;
+                    // Before anything is scheduled or logged: the frame the
+                    // scheduler will apply this mount at, checked against the
+                    // document's own order, so a refused event leaves no trace.
+                    if let Some(live) = self.walks.last_mut() {
+                        live.mount(plugin, *at_frame)?;
+                    }
                     self.scheduler.schedule(
                         *at_frame,
                         SchedEvent::Mount {
@@ -679,9 +1330,23 @@ impl Engine {
                             params: params.clone(),
                         },
                     );
+                    // Both halves of the apply queue's view, as the live `mount`
+                    // records them: a patch or a parameter change arriving before
+                    // this mount applies must be validated against the surface the
+                    // queued instance *will* have (`ports_of`/`params_of` ask
+                    // `scheduled_params`), not against the nominal catalog — and the
+                    // queued mount's place in the graph's order (`graph_rank` asks
+                    // `mount_seq`, written by the same `take_mount_seq` the live
+                    // path writes), so a replayed cord is refused for a backward
+                    // order exactly as a live one is.
                     self.scheduled.insert(plugin);
+                    self.scheduled_params.insert(plugin, params.clone());
+                    self.take_mount_seq(plugin);
                 }
                 Event::ScheduleUnmount { plugin, at_frame } => {
+                    if let Some(live) = self.walks.last_mut() {
+                        live.unmount(plugin, *at_frame)?;
+                    }
                     self.scheduler
                         .schedule(*at_frame, SchedEvent::Unmount { plugin });
                 }
@@ -764,7 +1429,12 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_event(&mut self, event: SchedEvent) {
+    /// Apply one scheduled event. `at_frame` is the frame the **log** stamped the
+    /// event with, carried in from the call site rather than read off the clock:
+    /// the queue is frame-ordered, but an event can be delivered late (a warm-up
+    /// seek, a flush after the fact), and a fault report has to name the frame the
+    /// document says, not the frame the engine noticed.
+    fn apply_event(&mut self, event: SchedEvent, at_frame: u64) {
         match event {
             SchedEvent::Unmount { plugin } => self.apply_unmount(plugin),
             SchedEvent::Mount { plugin, params } => {
@@ -773,16 +1443,28 @@ impl Engine {
                 // *no-op in release* (debug_assert! never evaluates its
                 // argument), so no scheduled mount was ever applied there and
                 // the engine rendered silence on every mounted path — a
-                // release-only bug. Now always applied. Like the sibling arms,
-                // an `apply` failure is a log-order error (the mount was
-                // validated against a registered plugin at schedule time) that
-                // is debug-asserted and skipped in release, where replay
-                // reproduces the same state. `apply` is the one step
-                // `validate_mount` can't dry-run (it calls `inject()`, not
-                // `apply`), so "a scheduled mount must apply" is enforced by
-                // tests, not the type system.
-                if let Err(e) = self.apply_mount(plugin, &params) {
-                    debug_assert!(false, "scheduled mount must apply (log was validated): {e}");
+                // release-only bug (the 2026-08-30 note).
+                //
+                // A refusal is **recorded, not asserted**: `apply` is fallible by
+                // design (the euclidean plugin's `apply` re-checks its `steps`
+                // bound, because its fields are public and an instance can be
+                // hand-assembled without the factory's door), so "the log and the
+                // plugin disagree" is a fault a user must be able to see — and a
+                // `debug_assert!` is invisible in release, the build that ships.
+                // `apply_mount` has already undone what the refused apply touched,
+                // so the session is not wedged: the name is free again and the
+                // next mount of it succeeds.
+                //
+                // The refusal is **moved** (`ApplyFaultReason::Given`), not copied
+                // and not formatted: `Plugin::apply` is `Result<_, String>`, so
+                // the message — and the allocation behind it — is the plugin's,
+                // made before the engine saw it. The engine adds nothing.
+                if let Err(reason) = self.apply_mount(plugin, &params) {
+                    self.record_apply_fault(ApplyFault {
+                        plugin,
+                        at_frame,
+                        reason: ApplyFaultReason::Given(reason),
+                    });
                 }
             }
             SchedEvent::Patch {
@@ -790,7 +1472,7 @@ impl Engine {
                 from_port,
                 to_plugin,
                 to_port,
-            } => self.apply_patch((from_plugin, from_port), (to_plugin, to_port)),
+            } => self.apply_patch((from_plugin, from_port), (to_plugin, to_port), at_frame),
             SchedEvent::SetTempo {
                 bpm,
                 beats_per_bar,
@@ -855,6 +1537,62 @@ impl Engine {
     /// is the mixer — the bus only points at the mixer while the mixer is mounted.
     pub fn node_of(&self, plugin: &'static str) -> Option<NodeId> {
         self.node_of.get(plugin).copied()
+    }
+
+    /// Record a scheduled mutation the engine could not apply — a mount a plugin's
+    /// `apply` refused, or a cord the engine or the graph refused. Bounded by
+    /// [`MAX_APPLY_FAULTS`]: past it the fault is **counted** rather than kept
+    /// ([`Self::apply_faults_dropped`]), the same "the bound is reported, not
+    /// hidden" discipline as [`DrainOutcome::capped`] and the euclidean's
+    /// `euclidean.drops`.
+    ///
+    /// **This write allocates nothing**: the list's storage is the whole bound,
+    /// reserved at [`Self::new`] (the control side), and the fault that arrives is
+    /// data — a `&'static str` class with borrowed identities, or a message that
+    /// already existed. That is the whole reason [`ApplyFault`] has no sentence in
+    /// it: the render path may not build one.
+    fn record_apply_fault(&mut self, fault: ApplyFault) {
+        if self.apply_faults.len() < MAX_APPLY_FAULTS {
+            self.apply_faults.push(fault);
+        } else {
+            self.apply_faults_dropped += 1;
+        }
+    }
+
+    /// Every apply the engine could not perform, oldest first — a mount the log
+    /// asked for and the plugin refused, or a cord the engine or the graph
+    /// refused, with the frame the log stamped and the reason as data.
+    ///
+    /// **Never drained, and never cleared.** A fault is a standing fact about the
+    /// session — the audio is not what the log says — so a shell that polls this
+    /// cannot consume the evidence by looking at it (the opposite of
+    /// [`Self::flush_scheduled`], which drains `parked` because a parked op is work
+    /// still to be done). Bounded by [`MAX_APPLY_FAULTS`]; what did not fit is
+    /// [`Self::apply_faults_dropped`].
+    ///
+    /// A host shows a fault with [`ApplyFault::describe`], which formats the line
+    /// **on this side of the boundary** — the list itself holds no sentence,
+    /// because it is written on the render path.
+    pub fn apply_faults(&self) -> &[ApplyFault] {
+        &self.apply_faults
+    }
+
+    /// How many refusals the bound in [`MAX_APPLY_FAULTS`] could not hold. Zero on
+    /// any healthy session; non-zero means the fault list is a *sample*, so a host
+    /// must say "N refused applies" rather than "these are all of them".
+    pub fn apply_faults_dropped(&self) -> usize {
+        self.apply_faults_dropped
+    }
+
+    /// Whether the session is **degraded**: something the log scheduled could not
+    /// be applied, so the audio is not what the document says. A shell shows this
+    /// rather than rendering a playhead over a session that is missing a plugin.
+    ///
+    /// Sticky for the life of the engine, like the fault list itself: a re-render
+    /// cannot undo a mount that never happened, and a poll that drained the flag
+    /// would let a shell clear it by looking.
+    pub fn is_degraded(&self) -> bool {
+        !self.apply_faults.is_empty() || self.apply_faults_dropped > 0
     }
 
     /// Plugin names providing an `Out` port of the given kind — the dropdown
@@ -936,6 +1674,19 @@ impl Engine {
     /// replay would have ([`Clock::seek_to`] explains the contract); a node whose reads
     /// are a pure function of the block frame needs nothing. The host's
     /// `SEEK_WARMUP_FRAMES` is that run-in, and its tests prove the equality.
+    ///
+    /// **A footgun, stated because it is a footgun:** moving the clock *backwards*
+    /// across a scheduled lifecycle event lets a later event be stamped before an
+    /// earlier one — `mount p; render; schedule_unmount p @f1; render; seek(0);
+    /// mount p` writes `Mount p@0, Unmount p@f1, Mount p@0`, and the scheduler (which
+    /// is frame-ordered) then applies two `Mount`s for one name and orphans the first
+    /// instance. A document walk **refuses** such a log when it is read back
+    /// ([`Self::frame_inverted`]) — loudly, which is the right outcome, but the caller
+    /// that placed the clock backwards is the one to hear about it. Every in-tree
+    /// caller places the clock forward on a session whose queue it is about to
+    /// rebuild; a caller that seeks an already-running engine backwards owns the
+    /// lifecycle it breaks. (`Clock` is a public field, so this is a stated obligation
+    /// rather than an enforced one — there is nothing to enforce it *with*.)
     pub fn seek(&mut self, frame: u64) {
         self.clock.seek_to(frame);
     }
@@ -1082,15 +1833,15 @@ impl Engine {
     /// stack (the reference host materializes scheduled mounts before wiring
     /// cords; kimi review finding 5: no discarded block).
     pub fn flush_scheduled(&mut self) {
-        for event in std::mem::take(&mut self.parked) {
-            self.apply_event(event);
+        for (at_frame, event) in std::mem::take(&mut self.parked) {
+            self.apply_event(event, at_frame);
         }
         while let Some(frame) = self.scheduler.peek_frame() {
             if frame > self.clock.frame() {
                 break;
             }
             let event = self.scheduler.pop().expect("peeked");
-            self.apply_event(event);
+            self.apply_event(event, frame);
         }
     }
 
@@ -1120,48 +1871,45 @@ impl Engine {
             if next == f1 {
                 break;
             }
-            loop {
-                let frame = self.scheduler.peek_frame();
-                match frame {
-                    Some(f) if f <= next => {
-                        let event = self.scheduler.pop().expect("peeked");
-                        if matches!(&event, SchedEvent::Arrangement { .. }) {
-                            // Arrangement ops apply on the CONTROL side
-                            // (flush_scheduled), never on the render stack: a
-                            // media handler reconciles readers (threads, file
-                            // I/O), which must not run on the audio thread.
-                            // A host that reaches one here failed to flush
-                            // before rendering — PARK the op (never drop it):
-                            // it stays pending for the next flush_scheduled,
-                            // so nothing logged is ever lost and live/replay
-                            // cannot diverge (previously this path dropped
-                            // the op in release while replay would still
-                            // apply it). The debug assert keeps the contract
-                            // violation loud in development.
-                            self.parked.push(event);
-                            debug_assert!(
-                                false,
-                                "an arrangement op reached the render stack; flush_scheduled before rendering"
-                            );
-                            continue;
-                        }
-                        if self.changes_master_width(&event) {
-                            // A master-*width* change (the mixer mounts/unmounts
-                            // and thus the bus owner's channel count changes)
-                            // cannot apply mid-call: the output buffer was sized
-                            // for the width at the call's start, so a mid-call
-                            // change would silently split the frame count
-                            // (replay would advance the clock wrong). PARK it —
-                            // it takes effect at the next flush (render-call
-                            // boundary), keeping the width constant per call and
-                            // render a pure function of (log, call boundaries).
-                            self.parked.push(event);
-                            continue;
-                        }
-                        self.apply_event(event);
-                    }
-                    _ => break,
+            while let Some(f) = self.scheduler.peek_frame() {
+                if f > next {
+                    break;
                 }
+                let event = self.scheduler.pop().expect("peeked");
+                if matches!(&event, SchedEvent::Arrangement { .. }) {
+                    // Arrangement ops apply on the CONTROL side
+                    // (flush_scheduled), never on the render stack: a
+                    // media handler reconciles readers (threads, file
+                    // I/O), which must not run on the audio thread.
+                    // A host that reaches one here failed to flush
+                    // before rendering — PARK the op (never drop it):
+                    // it stays pending for the next flush_scheduled,
+                    // so nothing logged is ever lost and live/replay
+                    // cannot diverge (previously this path dropped
+                    // the op in release while replay would still
+                    // apply it). The debug assert keeps the contract
+                    // violation loud in development.
+                    self.parked.push((f, event));
+                    debug_assert!(
+                        false,
+                        "an arrangement op reached the render stack; flush_scheduled before rendering"
+                    );
+                    continue;
+                }
+                if self.changes_master_width(&event) {
+                    // A master-*width* change (the mixer mounts/unmounts
+                    // and thus the bus owner's channel count changes)
+                    // cannot apply mid-call: the output buffer was sized
+                    // for the width at the call's start, so a mid-call
+                    // change would silently split the frame count
+                    // (replay would advance the clock wrong). PARK it —
+                    // it takes effect at the next flush (render-call
+                    // boundary), keeping the width constant per call and
+                    // render a pure function of (log, call boundaries).
+                    self.parked.push((f, event));
+                    continue;
+                }
+                self.apply_event(event, f);
             }
         }
         debug_assert_eq!(written, out.len());

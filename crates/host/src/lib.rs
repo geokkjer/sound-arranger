@@ -503,9 +503,11 @@ pub struct HostSession {
     /// effect. Provided under `"transport"` **always** — it is pure
     /// bookkeeping (a queue of frames), no device — so a session mounts
     /// `clock_out` identically with and without gear attached. Fed from the
-    /// **apply** path, so a replayed command re-feeds the tap identically; the
-    /// sink's absence is what makes a replay silent, never a special case
-    /// here.
+    /// **apply** path, which is where a command's frame is known; a rebuild
+    /// gets a **fresh** log and does not replay `Play`/`Stop` (they are
+    /// actions, not state), so the one other feed is the seek's own re-anchor
+    /// in [`Self::replay_to_kind`]. Silence on a replay comes from the sink's
+    /// absence, never from a special case here.
     transport: Arc<TransportLog>,
     /// The MIDI output sink **slot** — always present, containing the device
     /// when the process asked for one (`--midi-out`/`DSH_MIDI_OUT`, see
@@ -565,6 +567,14 @@ pub struct HostSession {
     wired_tracks: std::collections::HashMap<String, engine::NodeId>,
     /// the arrangement value changed since last wiring (re-wire before render).
     arrange_dirty: bool,
+    /// The bus went away **while the arrangement was wired**, so the wiring was
+    /// retired with it and the session now owes a bus. This is what separates the
+    /// two bus-less cases `wire_arranger` has to answer differently: a session that
+    /// unmounts the mixer mid-piece and mounts it again later is rendering a window
+    /// of its own timeline — silence there, then the wiring rebuilt on the next bus —
+    /// while an arrangement with no bus *anywhere* is a session that cannot render,
+    /// and says so. Cleared by the reconcile that answers the debt.
+    arranger_awaiting_bus: bool,
     /// Whether the transport is running. The live runtime reads this; the
     /// offline reference host only records it (`Bounce` renders regardless).
     playing: bool,
@@ -591,9 +601,13 @@ pub struct HostSession {
     /// The session directory, when the session has one (`Save`/`Load`): the journal
     /// — the autosave — is appended here.
     session_dir: Option<PathBuf>,
-    /// The last journal write failure. A failed *append* never fails the edit (the
-    /// edit is already applied and logged), but it must not be silent.
-    journal_error: Option<String>,
+    /// Why the last journal write did not happen, if it did not. The two kinds are kept
+    /// apart because they **clear differently**: a *write* failure belongs to the file,
+    /// and the next successful append proves the file is writable again; a *refusal*
+    /// belongs to the entry, and no later write makes that edit durable — so it stands
+    /// until the next [`HostSession::save`], which rewrites the journal from a history
+    /// that can then be spelled in full.
+    journal_error: Option<JournalFault>,
     /// What the last `Load` recovered from the journal.
     last_recovery: Option<JournalRecovery>,
     /// The media intent value (pool dir, player, splices, bounce records). The
@@ -603,6 +617,27 @@ pub struct HostSession {
     /// Interns runtime media strings (paths) to `&'static str` for the log
     /// (spike scale — a serialized log would use a string table).
     media_intern: Interner,
+    /// **This session is being built to check a document, not to be used** — the
+    /// dry-run mode [`HostSession::save`] validates its own output in, and the
+    /// reason it is a *mode* rather than a separate list of checks: the value
+    /// doors a reader would meet must be the **same code** the reader runs
+    /// (`Engine::set_param`'s finiteness, the timeline's operand rules, the
+    /// mixer's channel count), or the writer keeps a second answer to "does this
+    /// apply?" and it rots.
+    ///
+    /// So the whole apply path runs, for real, on a throwaway session — and the
+    /// three places whose work is **not about the document** stand down. A
+    /// validating walk therefore opens no media file, spawns no reader thread,
+    /// warms no decoder, writes no pool and renders no frames: what it still
+    /// asks is every question that is about the *document* (does this value pass
+    /// the applier's door, is this mixer mounted, is this op legal in this
+    /// arrangement), and what it stops asking is every question that is about
+    /// *this machine's copy of the material* — a `play` file that has moved, a
+    /// decoder that would not warm, an arranger node that would not build. Those
+    /// are runtime conditions: a session is not invalid because its material is
+    /// not where it was, and a save that refused on them would break saving for
+    /// sessions that work.
+    validating: bool,
 }
 
 impl HostSession {
@@ -714,6 +749,7 @@ impl HostSession {
             sources: Vec::new(),
             wired_tracks: std::collections::HashMap::new(),
             arrange_dirty: false,
+            arranger_awaiting_bus: false,
             playing: false,
             last_drain: DrainOutcome::default(),
             history: Vec::new(),
@@ -723,6 +759,7 @@ impl HostSession {
             session_dir: None,
             journal_error: None,
             last_recovery: None,
+            validating: false,
         }
     }
 
@@ -742,12 +779,10 @@ impl HostSession {
         // A file that cannot be converted is reported, not fatal: it stays at its
         // own rate and the arranger names it if a clip reads it.
         self.pool_conformed = pool.conform(self.engine.clock.sample_rate)?.converted;
-        let resolver_dir = dir.clone();
-        let resolver: media::PoolResolver = std::sync::Arc::new(move |id| {
-            let p = resolver_dir.join(format!("{id}.wav"));
-            p.is_file().then_some(p)
-        });
-        self.pool_resolver = Some(resolver);
+        // The pool's own guarded lookup, not a `join` of the id onto the dir: a
+        // clip's `source` is a token in the log, so it can carry `../` and would
+        // otherwise read a WAV from outside the pool.
+        self.pool_resolver = Some(pool.resolver());
         self.pool_dir = Some(dir);
         Ok(())
     }
@@ -757,6 +792,22 @@ impl HostSession {
     /// fact about the load — the pool is not converted again afterwards.
     pub fn pool_conformed(&self) -> &[media::Conform] {
         &self.pool_conformed
+    }
+
+    /// Adopt a pool **without conforming it** — the door half of [`Self::set_pool`],
+    /// for a dry run (`validating`). Same validation (the path must be a directory,
+    /// which is what the reader will ask when it opens the file) and the same guarded
+    /// resolver, so every arrangement op behind it still sees a pool; the *write* is
+    /// what stands down. `conform` reads every source's header and rewrites the ones
+    /// at a foreign rate, so a save that ran it would read the whole pool and write
+    /// into the session directory it is in the middle of publishing. No verdict is
+    /// lost: a source that cannot be converted is reported, not fatal, so adopting a
+    /// pool for real never refuses a document over its material either.
+    fn note_pool(&mut self, dir: PathBuf) -> Result<(), String> {
+        let pool = media::Pool::open(&dir)?; // validate it exists as a directory
+        self.pool_resolver = Some(pool.resolver());
+        self.pool_dir = Some(dir);
+        Ok(())
     }
 
     /// The pool source listing (id, frame count, sample rate, peaks), for the
@@ -1152,11 +1203,23 @@ impl HostSession {
         self.session_dir.as_deref()
     }
 
-    /// The last journal write failure, if any. An edit is never *failed* by a
-    /// journal error (it is already applied and logged), but autosave must not fail
+    /// Why a journal write did not happen, if one did not. An edit is never *failed* by
+    /// a journal fault (it is already applied and logged), but autosave must not fail
     /// silently either.
+    ///
+    /// **One string, two faults, and the message says which** — the field is a
+    /// `JournalFault`, and both variants report a loss of the *autosave* for an edit,
+    /// which is all a shell's status line has to say. They differ in what clears them:
+    ///
+    /// - a **write** failure is the journal file's, and the next successful append (or a
+    ///   `save`, which rewrites the journal) clears it;
+    /// - a **refusal** (an edit the `host v1` form cannot carry) **outlives every
+    ///   successful write**, because that edit is still in no durable record and a save
+    ///   refuses the same history. It does **not** outlive the edit: it is re-derived
+    ///   from the history whenever the history changes (`undo`, `redo`, a seek), so it
+    ///   cannot report an edit that is no longer in the session.
     pub fn journal_error(&self) -> Option<&str> {
-        self.journal_error.as_deref()
+        self.journal_error.as_ref().map(JournalFault::message)
     }
 
     /// What the last [`HostSession::load_session`] recovered from the journal.
@@ -1172,6 +1235,28 @@ impl HostSession {
     /// The script is written atomically (temp + rename) and the journal is reset to
     /// that baseline only after it landed, so a crash mid-save leaves the *previous*
     /// session intact.
+    ///
+    /// **Nothing is written unless the text both reads back and is one the applier
+    /// accepts.** The file is parsed, compared with the history, and then walked on a
+    /// fresh session by [`HostSession::from_script`] — the walk `load_session` runs — so
+    /// `save` cannot produce a directory the reader refuses over a *value*. **Every**
+    /// refusal happens before the journal is touched: the journal is the only durable
+    /// record of the edits since the last save, and losing it to a refused save would
+    /// cost the tail to buy nothing. The rule is deliberately stronger than the
+    /// journal's ([`HostSession::journal_error`]): the journal is best-effort and the load
+    /// side drops and reports an entry it cannot apply, while this is the baseline the
+    /// whole session is rebuilt from and has to open.
+    ///
+    /// **The walk is a dry run, and that is the whole correction to how this check was
+    /// built first.** The rule is about the *document*: a value the form spells
+    /// faithfully and the applier refuses (`set_param … NaN`, a param out of range, an op
+    /// illegal in this arrangement) is a file no reader will open. It is **not** about
+    /// this machine's copy of the material: a `play` whose file has moved, a decoder
+    /// that would not warm, an arranger node that would not build — those are runtime
+    /// conditions, and a save that failed on them broke sessions that work. So the
+    /// check opens no file, spawns no thread, writes no pool and renders no frames; see
+    /// [`HostSession::validating`] for the three places that stands down and why each is
+    /// material rather than document.
     pub fn save(&mut self, dir: &std::path::Path) -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("save {}: {e}", dir.display()))?;
         let target_pool = dir.join(POOL_DIR);
@@ -1193,7 +1278,10 @@ impl HostSession {
         // and compare it to the history before writing anything. A command the text
         // form cannot express (a path with whitespace, a region play, a future op)
         // refuses the save instead of writing a file that opens as a *different*
-        // session.
+        // session. The comparison is the same *serialised* one `journal_append` uses
+        // (`same_commands`): an `f32` operand that cannot compare equal to itself (a
+        // `NaN`) is in the form, and comparing it with `PartialEq` refused every save of
+        // the session for good — the wedge the autosave half of this rule shared.
         let mut check = parse_script(&text).map_err(|e| {
             format!(
                 "save: the session text does not parse ({e}) — refusing to write a lossy session"
@@ -1214,11 +1302,48 @@ impl HostSession {
             })
             .collect();
         // The first parsed command is the `session_rate` header.
-        if check.get(1..).unwrap_or(&[]) != expected.as_slice() {
+        if !same_commands(check.get(1..).unwrap_or(&[]), &expected) {
             return Err(
                 "save: the session text does not round-trip — refusing to write a lossy session"
                     .into(),
             );
+        }
+
+        // **…and it must not merely parse, it must be one the *applier* accepts.** The
+        // rule `save` rests on is "whatever is written can be read back **and every value
+        // in it passes the reader's own door**", not "parses to the same commands": a line
+        // can spell a value faithfully and still be refused — a `NaN` param, whose only
+        // spelling is `NaN` and whose only verdict is `parameter '…' must be finite`. So
+        // the script is walked, on a fresh session, by the same walk `load_session` runs
+        // (`HostSession::from_script`), in its **dry-run** mode: the value doors are the
+        // reader's own code (the engine's `set_param`, the timeline's op rules, the
+        // mixer's channel count) rather than a writer-side list that would rot, and the
+        // material is left alone. Any operand the *form* carries and the *applier* refuses
+        // would otherwise land here as a `session.txt` that `load_session` refuses — a
+        // bricked directory that needs a hand-edit of the text to recover. The door that
+        // stops the value reaching the history in the first place is the engine's; this is
+        // the *writer's* half, and it is the half that cannot be reasoned about one op at a
+        // time.
+        //
+        // **Before anything is written, and before the journal is truncated** — the order
+        // is the point. The journal *is* the autosave: truncating it and then failing
+        // would destroy the tail of edits that are in no other record, to no purpose (the
+        // script they belong to is not being replaced). So every refusal here happens with
+        // the directory exactly as it was: the previous `session.txt` still opens, and the
+        // journal still holds every edit since it was written.
+        if let Err(fault) = HostSession::from_script_with(&check, None, None, true) {
+            // Name the **edit** and the reason, not an index: the history and the parsed
+            // script are the same commands (the check above just proved it), and the
+            // entry is what the user actually made.
+            let named = match fault.index.checked_sub(1).and_then(|i| self.history.get(i)) {
+                Some(entry) => name_entry(entry, Some(dir)),
+                None => "the session_rate header".to_string(),
+            };
+            return Err(format!(
+                "save: the session text does not apply — refusing to write a session that would \
+                 not open: {named} is refused when the file is read back: {}",
+                fault.reason
+            ));
         }
 
         let tmp = dir.join("session.txt.tmp");
@@ -1239,7 +1364,19 @@ impl HostSession {
         std::fs::write(dir.join(JOURNAL_FILE), b"")
             .map_err(|e| format!("save journal in {}: {e}", dir.display()))?;
         self.session_dir = Some(dir.to_path_buf());
-        self.journal_error = None;
+        // A save rewrote the journal, so a **write** fault is over. A **refusal** is the
+        // history's, and this save has just answered the question it rests on: `script_text`
+        // rendered **every** entry in the baseline's own spelling and the round trip read
+        // them all back, so every entry is now in `session.txt` and none of them is "in the
+        // live session and nowhere else". That is why the report is re-derived below rather
+        // than cleared by fiat — the re-derivation now comes out empty **for a reason**, and
+        // the pool re-point above (which rewrites the `pool` line to a relative path, so a
+        // session directory whose own path holds a space spells it fine) is part of that
+        // reason.
+        if matches!(self.journal_error, Some(JournalFault::Write(_))) {
+            self.journal_error = None;
+        }
+        self.rederive_journal_fault();
         self.last_recovery = None;
         Ok(())
     }
@@ -1247,11 +1384,17 @@ impl HostSession {
     /// The whole session as a `host v1` script: the state commands that rebuild it,
     /// gestures bracketed, and a pool path **relative to `dir`** when the pool lives
     /// inside it — which is what lets a saved session be moved.
+    ///
+    /// An entry the form cannot express is refused here, in the save's own words, before
+    /// the write — `write_entry` states the fact about the form, the caller says what it
+    /// does about it.
     fn script_text(&self, dir: &std::path::Path) -> Result<String, String> {
         let mut out = String::from("host v1\n");
         out.push_str(&format!("session_rate {}\n", self.engine.clock.sample_rate));
         for entry in &self.history {
-            write_entry(&mut out, entry, Some(dir))?;
+            write_entry(&mut out, entry, Some(dir)).map_err(|e| {
+                format!("save: {e} — refusing to write a session that would lose it")
+            })?;
         }
         Ok(out)
     }
@@ -1307,21 +1450,49 @@ impl HostSession {
             return Ok(report);
         }
 
-        let commands = parse_script(&format!("host v1\n{}\n", lines.join("\n")))?;
-        for cmd in &commands {
-            // A journal entry the session refuses (a stale journal from a crash in the
-            // save's window, or a pool that moved) is **dropped and reported**, never
-            // fatal.
-            match self.execute(cmd) {
-                Ok(()) => report.applied += 1,
+        // **The journal is replayed entry by entry**, and an entry the `host v1` form
+        // cannot parse is **dropped and reported** like a refused one. Parsing the whole
+        // tail as one text made a single unspellable line (a hand-edited journal, a
+        // write from another host) a `load` that fails — the session on top of it lost
+        // as well, which is the one failure an autosave must never cause.
+        //
+        // **The journal is a document too, so it is applied as one** — the same walk
+        // `from_script` and `rebuild` use. A journal is written by the live path, where
+        // a re-mount is legal because the name was released when the unmount *applied*;
+        // replaying those lines back to back renders nothing between them, so unwalked
+        // the re-mount was refused and **the edit was dropped** (reported as `refused`,
+        // so the session opened without it — a silent loss of the user's work).
+        //
+        // A refused entry is still dropped and reported, never fatal, and the walk is
+        // left unconditionally so one bad entry cannot leave the session walking.
+        self.engine.enter_walk();
+        for entry in journal_entries(&lines) {
+            let commands = match parse_script(&format!("host v1\n{entry}")) {
+                Ok(commands) => commands,
                 Err(e) => {
                     report.refused += 1;
                     if report.refused_reason.is_none() {
                         report.refused_reason = Some(e);
                     }
+                    continue;
+                }
+            };
+            for cmd in &commands {
+                // A journal entry the session refuses (a stale journal from a crash in
+                // the save's window, or a pool that moved) is **dropped and reported**,
+                // never fatal.
+                match self.execute(cmd) {
+                    Ok(()) => report.applied += 1,
+                    Err(e) => {
+                        report.refused += 1;
+                        if report.refused_reason.is_none() {
+                            report.refused_reason = Some(e);
+                        }
+                    }
                 }
             }
         }
+        self.engine.leave_walk();
         Ok(report)
     }
 
@@ -1332,11 +1503,25 @@ impl HostSession {
         let Some(dir) = self.session_dir.clone() else {
             return;
         };
+        // The journal records *edits*, with the paths the session actually used (no
+        // session directory), and **what it cannot carry it names**: the predicate is
+        // `entry_fault`, the same one the outstanding report is re-derived from, so the
+        // write and the report can never disagree about what is spellable.
+        //
+        // **The journal is read back by `parse_script`, so it is checked the way `save`
+        // checks its script** — otherwise the autosave is the one way an operand the
+        // word-based form cannot carry (a `play` path with whitespace or a `#`) reaches
+        // a session directory, and it takes the *whole* session unopenable with it, not
+        // just that edit. So the entry is not written, and the refusal is reported: the
+        // edit stands in the live session, and a save refuses the same history.
+        //
+        // The journal's rule stops at *reads back as itself*, and deliberately does not
+        // go on to *applies*: an entry the session itself would refuse (a value the
+        // engine declines) is written here, and the load side drops it and reports it
+        // per entry. `save` is where the stronger rule lives — the baseline has to open.
         let mut text = String::new();
-        // The journal records *edits*, with the paths the session actually used. A
-        // command with no text form cannot be in the history (a save would have
-        // refused it), so a failure here means nothing to write.
-        if write_entry(&mut text, entry, None).is_err() || text.is_empty() {
+        if let Some(why) = entry_fault(entry, None, &mut text) {
+            self.journal_error = Some(JournalFault::Refused(refusal_report(&why, &text)));
             return;
         }
         let path = dir.join(JOURNAL_FILE);
@@ -1350,9 +1535,59 @@ impl HostSession {
                 file.flush()
             });
         match result {
-            Ok(()) => self.journal_error = None,
-            Err(e) => self.journal_error = Some(format!("journal {}: {e}", path.display())),
+            // A **write** failure is the journal file's, so a later successful append
+            // proves the file is writable again and clears it. A **refusal** is this
+            // entry's and is deliberately *not* cleared here: the edit that could not be
+            // written is still not durable anywhere, and a save refuses it too, so a
+            // later success must not erase the report of what was lost.
+            Ok(()) => {
+                if matches!(&self.journal_error, Some(JournalFault::Write(_))) {
+                    self.journal_error = None;
+                }
+            }
+            Err(e) => {
+                self.journal_error = Some(JournalFault::Write(format!(
+                    "journal {}: {e}",
+                    path.display()
+                )));
+            }
         }
+    }
+
+    /// Re-read the outstanding **refusal** from the history, after the history has
+    /// changed under it (a replay: undo, redo, a seek — and a save's pool re-point).
+    ///
+    /// A refusal is a fact about an *edit*, and the history is what says whether that
+    /// edit is still there. Carried across a rebuild unchanged, it becomes a false alarm
+    /// — the mirror of the lost alarm it replaced, and the one users actually hit: undo
+    /// the offending edit and the session is durable again, yet the status line reads
+    /// "autosave failed" after every subsequent edit, over an edit that is no longer in
+    /// the session. The only thing that used to clear it was the next `save` — which now
+    /// *refuses* a history holding such an entry, so it never would have.
+    ///
+    /// So the report is **re-derived — not latched, and not merely cleared**: an entry
+    /// that is still in the history and still in no durable record keeps its report (which
+    /// is what stops a later successful write from erasing it), one that is gone takes it
+    /// with it, and one a **redo** put back brings it back. Two guards keep this honest:
+    ///
+    /// - **no session directory, no report** — there is no autosave to have refused
+    ///   anything. An unspellable edit in a directory-less session is a `save` refusal,
+    ///   and `save` says so by name when it happens.
+    /// - **a write fault stands** — it is the file's, and a history edit is no evidence
+    ///   about a file. (A `save` rewrote the file, so it clears that one itself.)
+    ///
+    /// The scan is one `parse_script` per entry (two for the entries the journal cannot
+    /// spell, the second asking the save's spelling), against a rebuild that has already
+    /// re-applied every one of them — and `save` pays the same scan, so it is not a new
+    /// cost class on the undo path.
+    fn rederive_journal_fault(&mut self) {
+        if self.session_dir.is_none() || matches!(self.journal_error, Some(JournalFault::Write(_)))
+        {
+            return;
+        }
+        // The session directory is the one this method's own guard has just established.
+        let dir = self.session_dir.as_deref().expect("checked above");
+        self.journal_error = outstanding_refusal(&self.history, dir);
     }
 
     /// Resolve a parsed clip (len 0 = "open the file at apply") to its real
@@ -1388,7 +1623,16 @@ impl HostSession {
                 param,
                 value,
                 ..
-            } => self.engine.set_param(plugin, param, *value),
+            } => {
+                // **The finiteness rule is the engine's**, and this arm routes to it: a
+                // non-finite value is refused (`parameter '<name>' must be finite, got
+                // NaN`) before it is logged, so it never reaches the history, the
+                // journal or a saved session. The host keeps no second copy — the engine's
+                // `set_param` already speaks for every command in this match, and two
+                // rules for one value is one that drifts
+                // (`a_non_finite_param_is_refused_at_the_door_and_leaves_nothing_behind`).
+                self.engine.set_param(plugin, param, *value)
+            }
             HostCommand::SetTempo {
                 bpm, beats_per_bar, ..
             } => self.engine.set_tempo(*bpm, *beats_per_bar),
@@ -1403,20 +1647,39 @@ impl HostSession {
                     self.player_underruns = None;
                     self.player_deferred = None;
                     self.mixer_channels = None;
+                    // …and the **arranger wiring goes with the bus**: the mixer's
+                    // disposer removes only the mixer node, so every `ArrangerNode`
+                    // would otherwise stay mounted with its cords dropped — rendering
+                    // into nothing, reading its pool file every block, and still
+                    // counted by `underruns()`. Only a *wired* arrangement marks the
+                    // session as owing a bus (see `arranger_awaiting_bus`): that is
+                    // what makes a re-mount reconcile, and what turns a bus-less
+                    // window of the timeline into silence rather than a refusal.
+                    let was_wired = !self.wired_tracks.is_empty();
+                    self.retire_arranger_wiring();
+                    if was_wired {
+                        self.arrange_dirty = true;
+                        self.arranger_awaiting_bus = true;
+                    }
                 }
                 r
             }
             HostCommand::TransportPlay => {
                 // Feed the transport tap from the **apply** path, at the frame
                 // the command takes effect (the clock's current position, where
-                // the next render starts) — a replayed command re-feeds the tap
-                // identically, and the sink's absence is what makes a replay
-                // silent. `Start` when play begins from the start of the
+                // the next render starts). The sink's absence is what makes a
+                // replay silent. `Start` when play begins from the start of the
                 // timeline, `Continue` when it resumes from a non-zero
                 // position: on the wire, MIDI `Start` tells a follower to
                 // return to its song start, so a play from frame 0 is the only
                 // one whose position that agrees with; every other play
                 // resumes from where we are, which is what `Continue` means.
+                //
+                // A `play` is an **action**, not state (`is_state`), so a
+                // rebuild never re-applies it and never re-feeds this — which is
+                // why the tap lives on the session rather than in the history,
+                // and why a seek feeds its own re-anchor instead
+                // ([`Self::replay_to_kind`]).
                 let frame = self.engine.clock.frame();
                 let transport = if frame == 0 {
                     engine::Transport::Start
@@ -1448,7 +1711,19 @@ impl HostSession {
                 if self.player_mailbox.is_some() {
                     return Err("the reference host plays one clip at a time".into());
                 }
-                let clip = Self::resolve_clip(clip)?;
+                // **The doors above are the document's; the file is not** (see
+                // `validating`). Opening the WAV to resolve a whole-file region and
+                // starting the reader are facts about the *material*: a `play` whose
+                // file has moved, or whose ring cannot warm, is a runtime condition
+                // and a save must not refuse the session over it. A dry run asks the
+                // document's question — the mixer, the channel, one player at a time —
+                // and records the state a later `splice` in the same script reads,
+                // without opening anything.
+                let clip = if self.validating {
+                    clip.clone()
+                } else {
+                    Self::resolve_clip(clip)?
+                };
                 let intent = PlayerIntent {
                     path: clip.path.to_string_lossy().into_owned(),
                     start: clip.start,
@@ -1456,9 +1731,15 @@ impl HostSession {
                     channel: *channel,
                 };
                 // Open + warm before logging, so a bad path never enters the log
-                // (a refused command is never logged).
-                let player = FilePlayer::start(clip, DEFAULT_RING_CAPACITY)?;
-                Self::warm_player(&player, DEFAULT_RING_CAPACITY)?; // deterministic, no race
+                // (a refused command is never logged) — but only when there is a
+                // session to play into.
+                let player = if self.validating {
+                    None
+                } else {
+                    let player = FilePlayer::start(clip, DEFAULT_RING_CAPACITY)?;
+                    Self::warm_player(&player, DEFAULT_RING_CAPACITY)?; // deterministic, no race
+                    Some(player)
+                };
                 // Logged as a media op; `arrange_logged` never schedules, so the
                 // live path applies once and replay reconstructs the value.
                 let (op, fields) = media_ops::encode_play(&mut self.media_intern, &intent);
@@ -1470,7 +1751,7 @@ impl HostSession {
                 // after the player. A player appended after a materialized mixer
                 // would make its cord backward — every later render fails.
                 let mailbox = media::mailbox();
-                let node = PlaybackNode::new(Some(player), mailbox.clone());
+                let node = PlaybackNode::new(player, mailbox.clone());
                 let underruns = node.underrun_counter();
                 let deferred = node.deferred_counter();
                 let node = NodeKind::Opaque(Box::new(node));
@@ -1507,7 +1788,13 @@ impl HostSession {
                 if self.player_mailbox.is_none() {
                     return Err("splice requires a playing clip".into());
                 }
-                let clip = Self::resolve_clip(clip)?;
+                // As in `Play`: a dry run reads the document's doors (a player to
+                // splice into, the clip's region) and leaves the material alone.
+                let clip = if self.validating {
+                    clip.clone()
+                } else {
+                    Self::resolve_clip(clip)?
+                };
                 let intent = SpliceIntent {
                     at_frame: *at_frame,
                     path: clip.path.to_string_lossy().into_owned(),
@@ -1515,19 +1802,26 @@ impl HostSession {
                     len: clip.len,
                     crossfade: *crossfade,
                 };
-                let incoming = FilePlayer::start(clip, DEFAULT_RING_CAPACITY)?;
-                Self::warm_player(&incoming, DEFAULT_RING_CAPACITY)?;
+                let incoming = if self.validating {
+                    None
+                } else {
+                    let incoming = FilePlayer::start(clip, DEFAULT_RING_CAPACITY)?;
+                    Self::warm_player(&incoming, DEFAULT_RING_CAPACITY)?;
+                    Some(incoming)
+                };
                 let (op, fields) = media_ops::encode_splice(&mut self.media_intern, &intent);
                 self.engine.arrange_logged(op, fields)?;
-                let mailbox = self.player_mailbox.as_ref().expect("checked above");
-                mailbox
-                    .lock()
-                    .map_err(|_| "player mailbox poisoned")?
-                    .push_back(SpliceCmd {
-                        at_frame: *at_frame,
-                        incoming,
-                        crossfade: *crossfade,
-                    });
+                if let Some(incoming) = incoming {
+                    let mailbox = self.player_mailbox.as_ref().expect("checked above");
+                    mailbox
+                        .lock()
+                        .map_err(|_| "player mailbox poisoned")?
+                        .push_back(SpliceCmd {
+                            at_frame: *at_frame,
+                            incoming,
+                            crossfade: *crossfade,
+                        });
+                }
                 self.media
                     .lock()
                     .map_err(|_| "media session poisoned")?
@@ -1546,6 +1840,15 @@ impl HostSession {
                 if !bpm.is_finite() || *bpm <= 0.0 {
                     return Err(format!(
                         "source_tempo must be finite and positive, got {bpm}"
+                    ));
+                }
+                // The id is written as a bare word (`source_tempo <id> <bpm>`), so it
+                // takes the same discipline as a declared source's name: a session that
+                // cannot spell its ids cannot be reopened.
+                if !media::valid_name(source) {
+                    return Err(format!(
+                        "'{source}' is not usable as a source name (one token, no '#', not an \
+                         @frame or snap= modifier)"
                     ));
                 }
                 if !self.source_tempos.contains_key(source) && self.source_tempos.len() >= 1_000 {
@@ -1585,6 +1888,16 @@ impl HostSession {
                 channels,
                 at_frame,
             } => {
+                // The declaration names its own pool sources, so `channels` **sizes** the
+                // vector built below: a line carrying a width no capture could have
+                // recorded must be refused, never sized. The bound is the capture sanity
+                // bound — the same rule `SourceAdd` and `media::Capture::start` apply.
+                if !(1..=media::capture::CAPTURE_CHANNELS_SANITY).contains(channels) {
+                    let sanity = media::capture::CAPTURE_CHANNELS_SANITY;
+                    return Err(format!(
+                        "take '{take_id}' channels must be 1..={sanity}, got {channels}"
+                    ));
+                }
                 self.status_take(&TakeReport {
                     take_id: take_id.clone(),
                     frames: *frames,
@@ -1619,8 +1932,14 @@ impl HostSession {
                          not a merge"
                     ));
                 }
-                if matcher.is_empty() {
-                    return Err("a source matcher must not be empty".into());
+                // The matcher is written as a bare operand (`match=…`) and the
+                // tokenizer is whitespace-based, so it must be one token the parser
+                // reads back: a space or a `#` in it is a session that will not open.
+                if !media::valid_name(matcher) {
+                    return Err(format!(
+                        "the matcher '{matcher}' is not usable in the host v1 log (one token, \
+                         no whitespace, no '#')"
+                    ));
                 }
                 if !(1..=media::capture::CAPTURE_CHANNELS_SANITY).contains(channels) {
                     let sanity = media::capture::CAPTURE_CHANNELS_SANITY;
@@ -1669,7 +1988,13 @@ impl HostSession {
             }
             HostCommand::Pool { dir } => {
                 // Validate + resolve, then log (a refused pool is never logged).
-                self.set_pool(dir.clone())?;
+                // A dry run adopts the pool without conforming it — a save must not
+                // write material into the directory it is publishing (`note_pool`).
+                if self.validating {
+                    self.note_pool(dir.clone())?;
+                } else {
+                    self.set_pool(dir.clone())?;
+                }
                 let (op, fields) =
                     media_ops::encode_pool(&mut self.media_intern, &dir.to_string_lossy());
                 self.engine.arrange_logged(op, fields)?;
@@ -1685,7 +2010,19 @@ impl HostSession {
                 // Offline bounce: render + drain buffered tails. A capped drain
                 // is a *different, truncated* piece, so it fails loud rather than
                 // writing a quietly shortened file.
-                let (out, drain) = self.render_with_drain(*frames)?;
+                //
+                // **A bounce drives no gear**, for the reason `export` gives: an
+                // offline render exists to produce a file, and a `bounce` is the
+                // command a script reaches for when it writes the master. The slot
+                // is empty across the render — the node's ticks are computed from
+                // the block's own frame either way, and its transport tap is left
+                // alone until a block has a device to speak through — and the
+                // device is back before the refusal below, so a capped drain
+                // leaves the live session driving gear as it found it.
+                let device = self.detach_midi();
+                let rendered = self.render_with_drain(*frames);
+                self.restore_midi(device);
+                let (out, drain) = rendered?;
                 if drain.capped {
                     return Err(format!(
                         "bounce drain hit the {MAX_DRAIN_FRAMES}-frame bound with output still pending — the tail is truncated"
@@ -1741,6 +2078,21 @@ impl HostSession {
         Ok(())
     }
 
+    /// Retire the arranger wiring: every `ArrangerNode` leaves the graph, and the
+    /// underrun counters go with it. `wire_arranger` calls this on every reconcile
+    /// and `unmount mixer` calls it when the **bus** goes away — the mixer's own
+    /// disposer removes only the mixer node, and `Graph::remove_node` keeps every
+    /// cord that does not touch the node it removes, so without this an arranger
+    /// would stay mounted with its cords dropped: rendering every block, reading its
+    /// pool file, and counted by `underruns()`, all into a bus that is not there.
+    fn retire_arranger_wiring(&mut self) {
+        let old_nodes: Vec<engine::NodeId> = self.wired_tracks.drain().map(|(_, id)| id).collect();
+        for id in old_nodes {
+            self.engine.graph.remove_node(id);
+        }
+        self.arranger_underruns.clear();
+    }
+
     /// Reconcile the arranger nodes against the current arrangement value.
     ///
     /// The reference host is **reconcile-on-dirty**, not add-only: an `Arrange`
@@ -1786,14 +2138,20 @@ impl HostSession {
         // partial arrangement behind and the dirty flag survives for a clean
         // retry.
         self.engine.flush_scheduled();
-        let mixer = self
-            .engine
-            .node_of("mixer")
-            .ok_or("arrange requires the mixer to be mounted (mount mixer channels=N)")?;
+        let Some(mixer) = self.engine.node_of("mixer") else {
+            // **A bus-less window is a shape of the session's own timeline** (the
+            // mixer unmounted mid-piece, mounted again later): the wiring was retired
+            // with the bus, so there is nothing to build and nothing to say — the
+            // window renders the silence a session with no bus renders, and the debt
+            // (`arranger_awaiting_bus`) is settled by the next bus. An arrangement
+            // with no bus *anywhere* is a different question, and the `Err` under it
+            // is that answer.
+            if self.arranger_awaiting_bus {
+                return Ok(());
+            }
+            return Err("arrange requires the mixer to be mounted (mount mixer channels=N)".into());
+        };
 
-        // A new wiring replaces the old nodes (and their counters); drop the
-        // previous counters now so underruns() reflects the current wiring.
-        self.arranger_underruns.clear();
         let mut built: Vec<(String, usize, media::ArrangerNode)> = Vec::new();
         for (ti, track) in timeline.tracks.iter().enumerate() {
             if ti >= channels {
@@ -1817,11 +2175,9 @@ impl HostSession {
 
         // All validated — now commit (this phase cannot fail: `insert_before`
         // has a live pivot and `connect` is forward-ordered with `ch0..ch7`
-        // declared). Retire the previous wiring, then place each new node.
-        let old_nodes: Vec<engine::NodeId> = self.wired_tracks.drain().map(|(_, id)| id).collect();
-        for id in old_nodes {
-            self.engine.graph.remove_node(id);
-        }
+        // declared). Retire the previous wiring — nodes *and* their counters — then
+        // place each new node.
+        self.retire_arranger_wiring();
 
         for (tid, ti, node) in built {
             let id = self.engine.graph.insert_before(
@@ -1841,6 +2197,8 @@ impl HostSession {
             self.wired_tracks.insert(tid, id);
         }
         self.arrange_dirty = false;
+        // The debt is settled: the wiring matches the value again, on a bus.
+        self.arranger_awaiting_bus = false;
         Ok(())
     }
 
@@ -1995,7 +2353,10 @@ impl HostSession {
     /// so the export is the session's *current* value rendered from the start — a
     /// limiter mounted halfway through a session masters the whole file rather than
     /// silently missing from the deliverable. The length is the arrangement's own
-    /// ([`media::Timeline::end_frame`]), never a hand-computed count. The output is
+    /// ([`media::Timeline::end_frame`]), never a hand-computed count — and that call is
+    /// fallible on purpose: an arrangement holding a clip whose span cannot be
+    /// represented is **refused by name** rather than exported at a wrapped length.
+    /// The output is
     /// **f32** (bit-exact) or **s16 with fixed-seed TPDF dither** (reproducible), and a
     /// mix whose peak exceeds full scale is **refused with nothing written** — "never a
     /// clipped file" is a property of the command, not of the user's care.
@@ -2019,7 +2380,11 @@ impl HostSession {
         // The clone: current state, clock at 0, and no rendering while the state is
         // applied (`at_now`), so this is cheap even for a long session.
         let mut fresh = self.rebuild(None)?;
-        let frames = self.arrangement()?.end_frame();
+        // `?` on the arrangement's end: a clip whose span cannot be represented has no
+        // export length, and the two wrong answers (a wrapped sum, a `Frame::MAX`-frame
+        // render) are both worse than a refusal that names the clip. No op admits such a
+        // clip — this is the `Timeline` that came back from the session, named.
+        let frames = self.arrangement()?.end_frame()?;
         if frames == 0 {
             return Err("nothing to export: the arrangement has no clips".into());
         }
@@ -2294,6 +2659,15 @@ impl std::fmt::Debug for HostSession {
     }
 }
 
+/// A command the document walk **refused**: which one (its index in the script), and
+/// why. A *reader* only needs the reason — that is what `from_script` returns — but a
+/// **writer** has to name the edit it is refusing to write
+/// ([`HostSession::save`](crate::HostSession::save)), and an index alone is not a name.
+struct ScriptFault {
+    index: usize,
+    reason: String,
+}
+
 /// Execute a command script deterministically. Engine commands with an
 /// `at_frame` render up to that frame first, so the log records real frames;
 /// the final `Bounce` writes the master. The same script on fresh sessions
@@ -2313,6 +2687,38 @@ impl HostSession {
     /// rather than applied as an edit — `apply` refuses a *different* rate on a live
     /// session for exactly that reason.
     pub fn from_script(commands: &[HostCommand]) -> Result<Self, String> {
+        // A load *is* the session taking over the machine, so it gets the process's own
+        // MIDI output (a rebuilt session, and a save's self-check, do not — see
+        // `from_script_with`).
+        let (midi_port, midi_out) = midi_out_from_process();
+        Self::from_script_with(commands, midi_out, midi_port, false).map_err(|fault| fault.reason)
+    }
+
+    /// [`Self::from_script`] over an explicit MIDI output sink, saying **which**
+    /// command the walk refused rather than only why, and in a **mode**: a reader
+    /// (`validating: false`) or a **dry run** (`true`, the mode `save` checks its own
+    /// output in).
+    ///
+    /// The index is what makes this a *writer's* check: `save` builds its own output
+    /// through here, so its refusal can name the edit that would not apply, and not
+    /// merely the reason it would not. A `None` sink is a silent session — a save
+    /// validates the file, so it must not open a device, and must not take the live
+    /// session's (`load` opens its own because it adopts the session).
+    ///
+    /// **A dry run is the same walk with the material left out** (see
+    /// [`HostSession::validating`]): every value door runs, because it is the
+    /// reader's own door; nothing opens a file, spawns a thread, warms a decoder,
+    /// writes a pool or renders. The earlier version of this check built the
+    /// session outright, and building *is* running — a `play` in the script
+    /// started a `FilePlayer` and blocked on `warm_player`'s ten-second deadline,
+    /// and a `play` whose file had moved failed the save. Both are facts about the
+    /// material, not about the document.
+    fn from_script_with(
+        commands: &[HostCommand],
+        midi_out: Option<SharedMidiSink>,
+        midi_port: Option<String>,
+        validating: bool,
+    ) -> Result<Self, ScriptFault> {
         let rate = commands
             .iter()
             .find_map(|cmd| match cmd {
@@ -2321,16 +2727,40 @@ impl HostSession {
             })
             .unwrap_or(DEFAULT_SAMPLE_RATE);
         if rate == 0 {
-            return Err("session_rate must be non-zero".into());
+            return Err(ScriptFault {
+                index: 0,
+                reason: "session_rate must be non-zero".into(),
+            });
         }
-        let mut session = HostSession::new_at(rate);
-        for cmd in commands {
-            // `execute`, not `process`: a script built by `process` alone would have
-            // the *state* but an empty history — so a session opened from a file could
-            // not be undone, and saving it again would write only what happened after
-            // the load. (`execute` appends to the journal only when a session
-            // directory is set, and a session being built or loaded has none.)
-            session.execute(cmd)?;
+        let mut session = HostSession::new_at_with(rate, midi_out, midi_port);
+        session.validating = validating;
+        // **The script is a document, so it is applied as a document walk**
+        // ([`Engine::enter_walk`]) — the same mechanism `rebuild` uses, not a second
+        // one. An unplaced command renders nothing, so the apply queue never drains
+        // between the script's lines: a `mount … unmount … mount` the live path
+        // accepted and recorded (and a `save` therefore wrote) was refused here as a
+        // second instance, which made such a session **unopenable** — the platform
+        // wrote files it could not read back.
+        //
+        // Scoped with **no `?` between the enter and the leave**, so a refused command
+        // cannot leave a half-built session walking (and the caller keeps its own
+        // session either way: `load_session` only adopts a session that built whole).
+        session.engine.enter_walk();
+        let applied = (|| -> Result<(), (usize, String)> {
+            for (index, cmd) in commands.iter().enumerate() {
+                // `execute`, not `process`: a script built by `process` alone would
+                // have the *state* but an empty history — so a session opened from a
+                // file could not be undone, and saving it again would write only what
+                // happened after the load. (`execute` appends to the journal only when
+                // a session directory is set, and a session being built or loaded has
+                // none.)
+                session.execute(cmd).map_err(|e| (index, e))?;
+            }
+            Ok(())
+        })();
+        session.engine.leave_walk();
+        if let Err((index, reason)) = applied {
+            return Err(ScriptFault { index, reason });
         }
         Ok(session)
     }
@@ -2378,6 +2808,11 @@ impl HostSession {
     ///
     /// Pure with respect to `self`: the caller decides what to adopt and what to carry.
     ///
+    /// The history is re-issued as a **document walk** ([`Engine::enter_walk`]): while
+    /// the state is being applied, the one-instance-per-name rule is the *history's*
+    /// question, not the engine's — which is what lets a `mount … unmount … mount`
+    /// gesture survive a rebuild (see [`Self::rebuild_prefix`], which walks the same way).
+    ///
     /// The rebuilt session **shares this session's slot object** (and the port
     /// name), so the gear keeps being driven after a seek — but the rebuild's
     /// renders happen with the slot **emptied by the caller**: nothing is sent
@@ -2390,29 +2825,47 @@ impl HostSession {
             Some(self.midi_slot.clone()),
             self.midi_port.clone(),
         );
-        for entry in &self.history {
-            match upto {
-                Some(frame) => {
-                    if entry
-                        .first()
-                        .and_then(|c| c.at_frame())
-                        .is_some_and(|at| at > frame)
-                    {
-                        continue;
+        // **The history is a document, so it is re-issued as a document walk** (see
+        // [`Engine::enter_walk`]). The loop below renders nothing between the commands
+        // in the `at_now` case — and nothing at all for an unplaced command — so the
+        // engine's apply queue never drains: a `mount … unmount … mount` history that
+        // the live path accepted and recorded (the mixer going away mid-session and
+        // coming back is enough) was refused here as a second instance, which took
+        // `export` and every seek with it. Under the walk, "is this name live?" is
+        // asked of the history, which is the contract [`Engine::replay_from`] keeps
+        // for a log.
+        //
+        // Scoped deliberately: entered and left with **no `?` between them**, so a
+        // refused state command cannot leave the rebuilt session walking.
+        rebuilt.engine.enter_walk();
+        let walked = (|| -> Result<(), String> {
+            for entry in &self.history {
+                match upto {
+                    Some(frame) => {
+                        if entry
+                            .first()
+                            .and_then(|c| c.at_frame())
+                            .is_some_and(|at| at > frame)
+                        {
+                            continue;
+                        }
+                        for cmd in entry {
+                            rebuilt.process(cmd)?;
+                        }
                     }
-                    for cmd in entry {
-                        rebuilt.process(cmd)?;
-                    }
-                }
-                None => {
-                    // `at_now`: order decides, not timeline position, so applying the
-                    // state does not render the clock through the piece.
-                    for cmd in entry {
-                        rebuilt.process(&cmd.at_now())?;
+                    None => {
+                        // `at_now`: order decides, not timeline position, so applying the
+                        // state does not render the clock through the piece.
+                        for cmd in entry {
+                            rebuilt.process(&cmd.at_now())?;
+                        }
                     }
                 }
             }
-        }
+            Ok(())
+        })();
+        rebuilt.engine.leave_walk();
+        walked?;
         rebuilt.render_to(upto.unwrap_or(0))?;
         rebuilt.playing = self.playing;
         rebuilt.redo = self.redo.clone();
@@ -2493,6 +2946,50 @@ impl HostSession {
         })();
         self.restore_midi(device);
         let mut rebuilt = rebuilt?;
+        // **A seek re-anchors a playing follower**, because the rebuilt session
+        // gets a brand-new tap (`new_at_with`) and nothing else ever re-feeds it:
+        // `TransportPlay` is an *action*, so it is not state, is not in the history,
+        // and `rebuild` never re-applies it. Without this the adopted session is
+        // still `playing` (`rebuild` carries the flag across), so its ticks simply
+        // resume at the new position — and a pulse-counting follower keeps the
+        // count it already had, a permanent phase error that **no later message
+        // could correct**, because a playing transport is never followed by a
+        // `play`. The entry goes into the *rebuilt* log and is sent by the first
+        // render after the adoption, with the device already back in the slot: the
+        // "nothing is sent across a rebuild" rule is untouched.
+        //
+        // **The message is the same one a `play` at this frame sends**: `Start`
+        // from frame 0, `Continue` from anywhere else. That distinction is the
+        // whole point of the two messages, so it cannot be traded away for
+        // "re-anchoring": on the wire `Start` does not mean *re-anchor*, it means
+        // **"return to song start"** — which is why the `TransportPlay` arm above
+        // only sends it at frame 0. At 24 000 a `Start` would not re-zero a
+        // follower against the session, it would tell it to jump to its own song
+        // top while the session sits half a second in: a second, larger error
+        // than the phase one this message exists to correct. So a re-anchor
+        // re-declares the *only* thing 24 PPQN can honestly state at a non-zero
+        // frame — "keep running, the position moved" — which is `Continue`, and
+        // a seek that lands on frame 0 gets the `Start` that frame deserves.
+        //
+        // What that buys is a follower that re-bases its beat count on a
+        // `Continue` after a jump, and what it does not buy is a stated
+        // position: only Song Position Pointer can do that, and it is deferred.
+        //
+        // A **seek only**: undo and redo rebuild *at the current frame*
+        // (`replay_to_kind(self.engine.clock.frame(), false)`) over an
+        // arrangement edit, which cannot move a tick, so the follower is still in
+        // phase and a re-anchor there would be a message about nothing.
+        //
+        // A **stopped** transport feeds nothing: the follower was stopped by the
+        // `Stop` the old session already sent, and a rebuild is not what stopped it.
+        if is_seek && self.playing {
+            let transport = if frame == 0 {
+                engine::Transport::Start
+            } else {
+                engine::Transport::Continue
+            };
+            rebuilt.transport.push(frame, transport);
+        }
         rebuilt.carry_over(self, warm, frame, is_seek);
         *self = rebuilt;
         Ok(())
@@ -2531,7 +3028,11 @@ impl HostSession {
         self.midi_port = from.midi_port.clone();
         self.redo = from.redo.clone();
         self.session_dir = from.session_dir.clone();
+        // …and then **re-read against the history this rebuilt session actually has**,
+        // because that is the session the fault describes: an undo that removed the
+        // offending entry has nothing left to report (`rederive_journal_fault`).
         self.journal_error = from.journal_error.clone();
+        self.rederive_journal_fault();
         self.last_recovery = from.last_recovery.clone();
         self.last_export = from.last_export.clone();
         self.last_drain = from.last_drain;
@@ -2579,42 +3080,65 @@ impl HostSession {
             Some(self.midi_slot.clone()),
             self.midi_port.clone(),
         );
-        // **Tempo is the exception to `at_now`.** It is frame-placed *value* state (the
-        // tempo map is a function of the frame), so a change at 60 s must sit at 60 s in
-        // the map even when the run-in starts later — otherwise the audio would be right
-        // (the render reads frames) but every beat reading, the ruler and the shell's
-        // position readout would disagree with a full replay. The segment is pushed
-        // directly (no timeline render); the logged command is applied too, so the folded
-        // `params` value and the rebuilt log stay identical to the full path's.
-        for entry in &self.history {
-            for cmd in entry {
-                if let HostCommand::SetTempo {
-                    bpm,
-                    beats_per_bar,
-                    at_frame,
-                } = cmd
-                {
-                    let at = at_frame.unwrap_or(0);
-                    // Place the clock at the command's own frame (no render) and let the
-                    // engine log and **schedule** it there; the run-in render delivers the
-                    // event at its frame, which pushes the segment — exactly the sequence a
-                    // full replay performs, so the map ends up identical (pushing here as
-                    // well would double every segment).
-                    rebuilt.engine.seek(at);
-                    rebuilt.engine.set_tempo(*bpm, *beats_per_bar)?;
-                    continue;
+        // **A document walk, like `rebuild`** — the run-in renders nothing before it,
+        // so the apply queue never drains and the history's own `mount … unmount …
+        // mount` would be refused as a second instance. Scoped with no `?` between
+        // the enter and the leave.
+        rebuilt.engine.enter_walk();
+        let walked = (|| -> Result<(), String> {
+            // **Tempo is the exception to `at_now`.** It is frame-placed *value* state (the
+            // tempo map is a function of the frame), so a change at 60 s must sit at 60 s in
+            // the map even when the run-in starts later — otherwise the audio would be right
+            // (the render reads frames) but every beat reading, the ruler and the shell's
+            // position readout would disagree with a full replay. The segment is pushed
+            // directly (no timeline render); the logged command is applied too, so the folded
+            // `params` value and the rebuilt log stay identical to the full path's.
+            for entry in &self.history {
+                for cmd in entry {
+                    if let HostCommand::SetTempo {
+                        bpm,
+                        beats_per_bar,
+                        at_frame,
+                    } = cmd
+                    {
+                        // **The clock only ever moves forward here**, exactly as it does
+                        // on the live path: `process` renders up to a command's placement
+                        // when it is in the future, and when it is in the *past* it leaves
+                        // the clock where it is, so `set_tempo` stamps the change at the
+                        // current frame rather than at the stale one. Seeking to the
+                        // stated frame unconditionally walked the clock **backwards** over
+                        // such a command, and every `at_now` command after it was then
+                        // stamped *before* the ones before it — a document the walk
+                        // refuses as frame-inverted, on a history the live path wrote and
+                        // accepted. `max` is that rule, in one expression.
+                        let at = at_frame.unwrap_or(0).max(rebuilt.engine.clock.frame());
+                        // Place the clock at that frame (no render) and let the
+                        // engine log and **schedule** it there; the run-in render delivers
+                        // the event at its frame, which pushes the segment — exactly the
+                        // sequence a full replay performs, so the map ends up identical
+                        // (pushing here as well would double every segment).
+                        rebuilt.engine.seek(at);
+                        rebuilt.engine.set_tempo(*bpm, *beats_per_bar)?;
+                        continue;
+                    }
+                    // Everything else: `at_now` for the same reason the export uses it — the
+                    // state's *order* decides the value, and the clock must not walk the piece.
+                    rebuilt.process(&cmd.at_now())?;
                 }
-                // Everything else: `at_now` for the same reason the export uses it — the
-                // state's *order* decides the value, and the clock must not walk the piece.
-                rebuilt.process(&cmd.at_now())?;
             }
-        }
+            Ok(())
+        })();
+        rebuilt.engine.leave_walk();
+        walked?;
         Ok(rebuilt)
     }
 
     /// Undo the most recent **arrangement** edit: drop it from the state history
     /// and rebuild **to the current position**, so the playhead does not jump and
     /// the pool/mounts survive. `Ok(false)` when there is nothing to undo.
+    ///
+    /// **A refused replay changes nothing** — the contract `seek_to` states, owed
+    /// here too: see the restore below.
     ///
     /// Only `Arrange` ops are undoable — a `Mount`/`Pool`/`SetTempo` is session
     /// setup, not an edit, and undoing one would tear down the graph under the UI.
@@ -2628,21 +3152,45 @@ impl HostSession {
             return Ok(false);
         };
         let undone = self.history.remove(pos);
+        // The rebuild re-applies the *remaining* history, so it can be refused for a
+        // reason this edit has nothing to do with — the ordinary one being a pool
+        // directory that moved or was deleted. Then the edit goes back where it came
+        // from, in *both* stacks, which is what keeps the history describing the
+        // session: left out of it, the next `save` would write a script the live
+        // arrangement no longer matches, `can_undo`/`can_redo` would report a state
+        // that is not there, and the next `undo` would revert a *different* edit. The
+        // copy is one gesture, so it is cheaper than a snapshot of the whole history.
+        let restore = undone.clone();
+        let redo_len = self.redo.len();
         self.redo.push((pos, undone));
-        self.replay_to_kind(self.engine.clock.frame(), false)?;
+        let replayed = self.replay_to_kind(self.engine.clock.frame(), false);
+        if let Err(e) = replayed {
+            // `truncate` and not a `pop`: a take finalized on the way into the rebuild
+            // clears the branch for itself (`commit_state`), and a refusal undoes
+            // neither that nor the edit above it.
+            self.redo.truncate(redo_len);
+            self.history.insert(pos, restore);
+            return Err(e);
+        }
         Ok(true)
     }
 
     /// Redo the most recently undone edit, re-inserted at its original history
     /// position so the reconstruction is faithful. `Ok(false)` when nothing is
-    /// undone.
+    /// undone. A **refused replay** takes the entry back off the history and leaves
+    /// the redo branch whole, for the reason [`Self::undo`] gives.
     pub fn redo(&mut self) -> Result<bool, String> {
         let Some((pos, cmd)) = self.redo.pop() else {
             return Ok(false);
         };
         let at = pos.min(self.history.len());
         self.history.insert(at, cmd);
-        self.replay_to_kind(self.engine.clock.frame(), false)?;
+        let replayed = self.replay_to_kind(self.engine.clock.frame(), false);
+        if let Err(e) = replayed {
+            let cmd = self.history.remove(at);
+            self.redo.push((pos, cmd));
+            return Err(e);
+        }
         Ok(true)
     }
 
@@ -2715,7 +3263,17 @@ impl HostSession {
         }
         if let Some(frame) = cmd.at_frame() {
             let now = self.engine.clock.frame();
-            if frame > now {
+            // **A dry run renders nothing** (`validating`, the mode `save` checks its
+            // output in). Reaching a command's frame is *rendering* — which wires the
+            // arranger, opens every pool source through a reader thread and warms it.
+            // That is the session running, not the document being read, and a save
+            // must not do it: a render that cannot wire (the mixer went away, a source
+            // moved) would fail the save for a reason the document says nothing about.
+            // No verdict is lost by not rendering: every door this walk reaches —
+            // `mount`/`patch`/`set_param`'s scheduled-or-mounted rule, the mixer's
+            // channel count, the clip editor's ops — asks a question of the *sequence*
+            // of commands, and the sequence is walked whole either way.
+            if frame > now && !self.validating {
                 // The pre-render wiring can fail (a later command after the
                 // mixer was unmounted); a clean Err, never a panic in a host.
                 self.render((frame - now) as usize)?;
@@ -2791,6 +3349,34 @@ pub struct RecordingStatus {
     pub channels: usize,
 }
 
+/// Why a journal write did not happen (see [`HostSession::journal_error`]). The edit
+/// itself is never *failed* by either — it is already applied and logged — so both are
+/// reported rather than raised. They differ in **what they belong to and what clears
+/// them**, which is why they are two variants and not one message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JournalFault {
+    /// The entry is **not in the `host v1` text form**, or does not read back as itself,
+    /// so it is not written. The edit stands in the live session and a save refuses the
+    /// same history — so no later successful append clears this: the edit is still not
+    /// durable anywhere. The report is **re-derived from the history**
+    /// (`outstanding_refusal`) whenever the history changes, so it dies with its subject:
+    /// undoing the edit clears it, and redoing it brings it back. It is made only where
+    /// **neither** write path can carry the entry, so its claim ("in the live session and
+    /// nowhere else, and a save refuses the history as well") is true of both.
+    Refused(String),
+    /// The **journal file** refused the write or the flush. The next successful append —
+    /// or a save, which rewrites the journal — proves the file is writable again.
+    Write(String),
+}
+
+impl JournalFault {
+    fn message(&self) -> &str {
+        match self {
+            JournalFault::Refused(message) | JournalFault::Write(message) => message,
+        }
+    }
+}
+
 /// What a load recovered from the journal.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JournalRecovery {
@@ -2801,8 +3387,9 @@ pub struct JournalRecovery {
     /// rather than refusing to open the session.
     pub torn_lines: usize,
     /// Journal commands the session **refused** (a stale journal from a crash inside the
-    /// save's window, or a path that moved). Dropped and reported, not fatal: refusing
-    /// to open a session because of an autosave line is the worse failure.
+    /// save's window, or a path that moved), plus entries the `host v1` form cannot
+    /// parse at all. Dropped and reported, not fatal: refusing to open a session because
+    /// of an autosave line is the worse failure.
     pub refused: usize,
     /// The first refusal, for a shell to show.
     pub refused_reason: Option<String>,
@@ -2811,6 +3398,10 @@ pub struct JournalRecovery {
 /// Write one history **entry** (one gesture) as script lines. A multi-command entry
 /// is bracketed with `group begin`/`group end`, so the gesture structure survives a
 /// save (and replays as one undo step).
+///
+/// The refusal is stated as a fact about **the form** and nothing else — what the
+/// caller does about it (a save refuses the write; the journal drops the entry and
+/// reports it) is the caller's own sentence to add.
 fn write_entry(
     out: &mut String,
     entry: &[HostCommand],
@@ -2822,10 +3413,7 @@ fn write_entry(
     }
     for cmd in entry {
         let Some(line) = format_command(cmd, session_dir) else {
-            return Err(format!(
-                "the host v1 text form cannot express {cmd:?} — refusing to write a session that \
-                 would lose it"
-            ));
+            return Err(format!("the host v1 text form cannot express {cmd:?}"));
         };
         out.push_str(&line);
         out.push('\n');
@@ -2834,6 +3422,214 @@ fn write_entry(
         out.push_str("group end\n");
     }
     Ok(())
+}
+
+/// Split journal lines into **entries**: a bare command is one line, a gesture runs
+/// from its `group begin` to its `group end`. The journal is a sequence of complete
+/// entries and recovery is per entry, so each is parsed on its own — one unspellable
+/// line must not take the edits after it with it.
+fn journal_entries(lines: &[&str]) -> Vec<String> {
+    let mut entries: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.trim() == "group begin" {
+            // A gesture runs to its `group end`; an unterminated one (which
+            // `apply_journal` truncates before calling) runs to the end of the tail, so
+            // the parser reports it rather than this function guessing where it ended.
+            let last = lines[i + 1..]
+                .iter()
+                .position(|l| l.trim() == "group end")
+                .map_or(lines.len() - 1, |k| i + 1 + k);
+            entries.push(lines[i..=last].join("\n"));
+            i = last + 1;
+        } else if line.trim().is_empty() {
+            i += 1; // a blank line between entries is a crash artefact, not an entry
+        } else {
+            // A bare command is one entry — and so is a `group end` with no
+            // `group begin`, as the unparseable entry it is.
+            entries.push((*line).to_string());
+            i += 1;
+        }
+    }
+    entries
+}
+
+/// Whether two command lists are **the same commands** — compared by their *serialised
+/// form*, not by the derived `PartialEq`.
+///
+/// `HostCommand` carries `f32`/`f64`, and IEEE-754 leaves one hole in `==`: a `NaN` is
+/// not equal to itself. So the derived comparison answered "no, and no, and no" to a
+/// value the log *does* carry — `NaN` spells as `NaN` and reads back as `NaN` — which is
+/// a different answer from "the form lost it", and it never recovers. The serialised form
+/// compares what the log says, which is the question the round trip is asking. Every
+/// other difference the derived comparison caught is a difference in the text too: a
+/// field `format_command` never writes, a path the parser read differently, a gesture
+/// regrouped.
+fn same_commands(parsed: &[HostCommand], expected: &[HostCommand]) -> bool {
+    format!("{parsed:?}") == format!("{expected:?}")
+}
+
+/// Whether the rendered `text` of one history **entry** reads back as that entry: the
+/// same round trip `save` checks over a whole script, for a single gesture.
+/// `parse_script` must accept the line(s) *and* return the commands they came from — a
+/// line the tokenizer mangles (a `play` path with whitespace) is not the same command,
+/// and a journal that carries it cannot be reopened. The `Err` names **which** of the
+/// two it was, because "the edit is not in the form" and "the form reads this edit back
+/// as something else" are different faults with different fixes.
+///
+/// **`resolve` is the session directory whose relative `pool` path the text is read
+/// back against**, and it is what makes one rendered line comparable to two callers: the
+/// journal's `pool /abs/path` reads back as itself, and a save's `pool pool` reads back
+/// as the absolute path it resolves to — the same `resolve_session_paths` `save` and
+/// `load_session` run on a parsed script, so the two spellings of the same `pool` line
+/// both compare equal to the entry that made it.
+fn entry_round_trips(
+    entry: &[HostCommand],
+    text: &str,
+    resolve: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let mut parsed = parse_script(&format!("host v1\n{text}"))
+        .map_err(|e| format!("the host v1 text form cannot read it back ({e})"))?;
+    if let Some(dir) = resolve {
+        resolve_session_paths(&mut parsed, dir);
+    }
+    let expected: Vec<HostCommand> = if entry.len() == 1 {
+        entry.to_vec()
+    } else {
+        vec![HostCommand::Group {
+            commands: entry.to_vec(),
+        }]
+    };
+    if same_commands(&parsed, &expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "the host v1 text form reads it back as {parsed:?}, which is not the edit that was \
+             made"
+        ))
+    }
+}
+
+/// Why one history **entry** cannot be carried by a durable record, if it cannot be —
+/// the predicate the journal's write and the outstanding report are made of. `text` is
+/// cleared and filled with the entry's lines **in the spelling asked for**, so the
+/// caller can name the edit it is refusing or dropping without rendering it twice.
+///
+/// Two faults, in one place, because they clear differently and must not be *decided*
+/// differently: the form has no line for one of the entry's commands, or the lines it
+/// has do not read back as the entry that was made. `None` means the entry is
+/// spellable in the spelling asked for — so that one write path can carry it.
+///
+/// **`session_dir` is the caller's spelling, and the two callers spell differently**:
+/// the journal writes the paths the session *used* (`None`), while a save writes the
+/// copy inside the session directory (`Some(dir)`, which is also what makes a saved
+/// session movable). `Pool` is the **only** command whose line depends on it (the whole
+/// of `pool_text`), and a pool path with a space is unspellable in the journal's
+/// spelling and perfectly spellable in a save's, which spells it `pool pool`. A loss
+/// may therefore only be reported once **both** spellings have been asked — see
+/// [`outstanding_refusal`].
+fn entry_fault(
+    entry: &[HostCommand],
+    session_dir: Option<&std::path::Path>,
+    text: &mut String,
+) -> Option<String> {
+    text.clear();
+    match write_entry(text, entry, session_dir) {
+        // A command the form cannot express at all. A `save` refuses such a history by
+        // name, so this is the rare case — but the journal is the one write path that
+        // can meet an entry a save never saw (a session opened from a hand-edited
+        // script), and it is reported rather than skipped in silence.
+        Err(e) => return Some(e),
+        Ok(()) if text.is_empty() => {
+            return Some("it has no line in the host v1 text form".into());
+        }
+        Ok(()) => {}
+    }
+    entry_round_trips(entry, text, session_dir).err()
+}
+
+/// The report an entry the **autosave** dropped gets: **why** it could not be written
+/// and **what** the loss means. One construction for the write and the re-derivation, so
+/// the two can never describe the same edit differently.
+///
+/// The claim is a claim about **both** durable records — "it is in the live session and
+/// nowhere else, and a save refuses the history as well" — so it may only be made where
+/// that is true of both, which is what [`outstanding_refusal`] checks before calling
+/// this. An entry the journal cannot spell but a save can (a `pool` line under a
+/// directory whose path holds a space) is **not** reported: it is a line the baseline
+/// carries, the pool is context rather than an edit (`rebase_pool`), and the old report
+/// claimed a save-refusal for a save that had plainly succeeded.
+fn refusal_report(why: &str, text: &str) -> String {
+    let mut out = String::from(why);
+    out.push_str(
+        ", so this edit is not autosaved — it is in the live session and nowhere else, \
+         and a save refuses the history as well",
+    );
+    if !text.trim().is_empty() {
+        out.push_str(": ");
+        out.push_str(text.trim());
+    }
+    out
+}
+
+/// The **outstanding refusal** in `history`: the most recent entry that is in **no**
+/// durable record — neither the journal's spelling nor the save's — so a loss worth
+/// reporting is still standing. `None` when every entry is spellable by at least one of
+/// the two write paths.
+///
+/// The report is a **property of the history, not a latch** — a latch outlives its
+/// subject. `undo`/`redo` rebuild the session from the history, so an edit that is no
+/// longer in it is no longer lost, and a report naming it would be a false alarm: the
+/// shell's status line would read "autosave failed" after every subsequent edit, over an
+/// edit that is not in the session any more. Re-derived, the rule holds from both sides:
+/// an entry that *is* still there and still in no record keeps its report (which is what
+/// stops a later successful write from erasing it), and one that is gone takes it with
+/// it.
+///
+/// **Both spellings are asked, and the reason is the false alarm it removes.** `Pool` is
+/// the only line the session directory changes, so the two spellings differ for one
+/// command: a `pool` path holding a space is unspellable in the journal and spellable in
+/// a save, which spells it relative to the directory it lives in. Asking only the
+/// journal's spelling made a **successful** `save "/…/My Songs/song.d"` manufacture a
+/// fault claiming "a save refuses the history as well" over a `pool` line that save had
+/// just written into the baseline — a report whose text was false, which is worse than no
+/// report, because a user acts on it. The entry is named in the **save's** spelling,
+/// because that is the spelling the claim is about.
+fn outstanding_refusal(
+    history: &[Vec<HostCommand>],
+    dir: &std::path::Path,
+) -> Option<JournalFault> {
+    let mut text = String::new();
+    for entry in history.iter().rev() {
+        // A record the journal can hold is a record full stop: the edit is durable, so
+        // there is no loss to report even if a save would spell it differently.
+        if entry_fault(entry, None, &mut text).is_none() {
+            continue;
+        }
+        // Only spellable-in-the-baseline is a standing loss (a `pool` line): the edit
+        // is in `session.txt` the moment it is saved, and the pool is context.
+        if let Some(why) = entry_fault(entry, Some(dir), &mut text) {
+            return Some(JournalFault::Refused(refusal_report(&why, &text)));
+        }
+    }
+    None
+}
+
+/// How a writer **names** one history entry in a message: the lines it would be written
+/// as, or the command itself when the form has no line for it. The group markers are
+/// dropped — a gesture is named by its members, not by its bracketing.
+fn name_entry(entry: &[HostCommand], session_dir: Option<&std::path::Path>) -> String {
+    let mut text = String::new();
+    if write_entry(&mut text, entry, session_dir).is_err() {
+        return format!("{entry:?}");
+    }
+    let text = text.trim();
+    let text = text
+        .strip_prefix("group begin\n")
+        .and_then(|t| t.strip_suffix("\ngroup end"))
+        .unwrap_or(text);
+    text.replace('\n', "; ")
 }
 
 /// Re-point every `pool` command in the history at `pool` (recursing into gestures).
@@ -4025,10 +4821,6 @@ pub fn summarize(session: &HostSession) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Only used by the debug-gated poisoning test; gate the import so release
-    // clippy (-D warnings) doesn't flag them as unused.
-    #[cfg(debug_assertions)]
-    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     /// No `Arrange` command has run, so there is no editor: `arrangement()` is
     /// `Ok(default)` — the legitimate "nothing built yet" case, never an error.
@@ -4044,20 +4836,21 @@ mod tests {
         );
     }
 
-    /// An editor whose `snapshot()` errors must surface as `Err` — never a
-    /// silent empty `Timeline` (the fail-loud rule this accessor exists for).
+    /// A fade pair whose **sum** overflows `u64` is refused, and refusing it does
+    /// not damage the session. Both fade operands reach the host as raw `u64`
+    /// (`arrange set_clip_fade t0 c0 18446744073709551615 1`), so the sum leaves
+    /// the range and wraps to 0 — which used to pass the length check: a debug
+    /// build panicked on the overflow *inside `ClipEditor::apply`'s lock*, and
+    /// the poisoned mutex made every later `arrangement()` an `Err`; a release
+    /// build admitted the op, logged it, and rendered the clip at gain 0 for
+    /// every sample.
     ///
-    /// The error is induced the way it realistically occurs: a panic while the
-    /// editor holds its timeline lock. `SetClipFade` with `fade_in + fade_out`
-    /// overflowing `u64` trips the debug overflow check inside the op apply,
-    /// *under the lock* — the poisoned mutex is exactly what `snapshot()` maps
-    /// to `Err`. The panic is contained with `catch_unwind` so the session (and
-    /// its now-poisoned editor) survives to be read. Gated on
-    /// `debug_assertions` because the mechanism is an overflow check (release
-    /// builds have no reachable poison path through the public API).
+    /// Both halves are pinned here: the op is an `Err` naming the fade rule (not
+    /// a panic, not a silent success), and the editor is still readable and
+    /// writable afterwards — the clip keeps its fades and a legal `SetClipFade`
+    /// still applies, which is what "refused, never corrupted" means.
     #[test]
-    #[cfg(debug_assertions)]
-    fn arrangement_propagates_an_errored_snapshot_instead_of_an_empty_value() {
+    fn an_overflowing_fade_pair_is_refused_and_the_editor_stays_usable() {
         let mut session = HostSession::new();
         session
             .ensure_editor()
@@ -4067,8 +4860,8 @@ mod tests {
             .as_mut()
             .expect("ensure_editor built the editor");
 
-        // A valid track + clip so the overflowing SetClipFade reaches the
-        // overflow add (an absent clip would refuse before it).
+        // A valid track + clip so the overflowing SetClipFade reaches the fade
+        // check (an absent clip would refuse before it).
         let mut engine = Engine::new(48_000, 120.0, 4);
         editor.register(&mut engine).expect("register op handlers");
         editor
@@ -4099,9 +4892,10 @@ mod tests {
             )
             .expect("add clip");
 
-        // Poison: the overflow panics while the editor holds the timeline lock.
-        let poisoned = catch_unwind(AssertUnwindSafe(|| {
-            let _ = editor.apply(
+        // u64::MAX + 1 wraps to 0, so `0 > src_len` is false — the pair must be
+        // refused by name, never admitted and never a panic under the lock.
+        let err = editor
+            .apply(
                 &mut engine,
                 &media::ArrangeOp::SetClipFade {
                     track: "t0".into(),
@@ -4109,22 +4903,36 @@ mod tests {
                     fade_in: u64::MAX,
                     fade_out: 1,
                 },
-            );
-        }))
-        .is_err();
+            )
+            .expect_err("a wrapped fade sum must be refused, not accepted");
         assert!(
-            poisoned,
-            "the overflowing SetClipFade must panic (overflow check) to poison the lock"
+            err.contains("fades"),
+            "the refusal names the fade rule, got: {err}"
         );
+        // A legal pair over the same clip still applies, so the editor is writable.
+        editor
+            .apply(
+                &mut engine,
+                &media::ArrangeOp::SetClipFade {
+                    track: "t0".into(),
+                    clip: "c0".into(),
+                    fade_in: 64,
+                    fade_out: 128,
+                },
+            )
+            .expect("a legal SetClipFade still applies after the refusal");
 
-        // The session survived the contained panic; its snapshot now errors and
-        // arrangement() must propagate that Err — never Ok(empty).
-        let err = session
+        // The refusal left the session readable: a poisoned timeline would make
+        // this `Err`, and the legal pair above is the only fade in the value.
+        let c = &session
             .arrangement()
-            .expect_err("a poisoned editor must Err, not return an empty Timeline");
-        assert!(
-            err.contains("poison"),
-            "the error is the snapshot poison, got: {err}"
+            .expect("a refused op must not poison the timeline")
+            .tracks[0]
+            .clips[0];
+        assert_eq!(
+            (c.fade_in, c.fade_out),
+            (64, 128),
+            "the value carries the legal pair, never the refused one"
         );
     }
 
@@ -4327,6 +5135,54 @@ mod tests {
         assert_eq!(s.sources().len(), 1, "only the first declaration landed");
     }
 
+    /// The operands the log spells as **bare words** must be one token: the matcher of
+    /// a declared source, and the source a tempo is recorded for. A space in either (or
+    /// a `#`, which starts a comment) produces a line `parse_script` cannot read back, so
+    /// the session that holds it cannot be reopened — so the command is refused at the
+    /// door, like the name beside it.
+    #[test]
+    fn a_source_and_a_matcher_the_text_form_cannot_spell_are_refused() {
+        let mut s = HostSession::new();
+        let declare = |matcher: &str| HostCommand::SourceAdd {
+            name: "s1".into(),
+            kind: "alsa",
+            matcher: matcher.into(),
+            channels: 2,
+            clock: rig::ClockRole::Follower,
+        };
+
+        // A matcher with a space is one token too many in `match=…`.
+        let spaced = s.execute(&declare("hw:USB 1"));
+        assert!(spaced.is_err(), "a matcher with a space is refused");
+        // A `#` is a comment to the parser.
+        let hashed = s.execute(&declare("hw:#0"));
+        assert!(hashed.is_err(), "a matcher with a '#' is refused");
+        assert!(s.execute(&declare("")).is_err(), "and so is an empty one");
+        assert!(
+            s.sources().is_empty(),
+            "no refused declaration is logged: {}",
+            spaced.expect_err("the error")
+        );
+
+        // `source_tempo <id> <bpm>` spells the id as a word, so it takes the same
+        // discipline as the declaration's name.
+        let spaced_source = s.execute(&HostCommand::SetSourceTempo {
+            source: "jam ch0".into(),
+            bpm: 90.0,
+        });
+        assert!(
+            spaced_source.is_err(),
+            "a source id with a space is refused"
+        );
+        assert!(s.source_tempos().is_empty(), "and no tempo is recorded");
+        s.execute(&HostCommand::SetSourceTempo {
+            source: "jam.ch0".into(),
+            bpm: 90.0,
+        })
+        .expect("a spellable source id still records");
+        assert_eq!(s.source_tempos().get("jam.ch0"), Some(&90.0));
+    }
+
     #[test]
     fn source_add_parses_loudly_or_not_at_all() {
         let head = format!("host v{HOST_API_VERSION}\n");
@@ -4483,6 +5339,85 @@ mod tests {
         assert_eq!(s.position().frame, 0);
     }
 
+    /// **A refused replay changes nothing** — the contract `seek_to` states, owed by an
+    /// undo too. The rebuild re-applies the *remaining* history, so it can be refused
+    /// for a reason this edit has nothing to do with (the ordinary one being a pool
+    /// directory that moved or was deleted). The edit then has to go back where it came
+    /// from: out of the history and onto the redo branch it would leave the history
+    /// describing a session that never existed — the next `save` would write a script
+    /// the live arrangement no longer matches, `can_undo`/`can_redo` would report a
+    /// state that is not there, and the next `undo` would revert a *different* edit.
+    #[test]
+    fn a_refused_undo_leaves_the_history_alone() {
+        let (mut s, pool) = session_with_clip("undo-refused");
+        s.execute(&HostCommand::Arrange {
+            op: move_clip("c0", 4_800),
+            at_frame: None,
+        })
+        .expect("move");
+
+        // The pool goes away under the session: the live arrangement value still holds
+        // the clip, but a rebuild cannot re-open the pool.
+        std::fs::remove_dir_all(&pool).expect("remove pool");
+        let err = s.undo().expect_err("the rebuild refuses without the pool");
+        assert!(err.contains("pool"), "and it says why: {err}");
+        assert_eq!(
+            clip_of(&s).at_frame,
+            4_800,
+            "the refused undo did not revert the move"
+        );
+        assert!(s.can_undo(), "the edit is still there to undo");
+        assert!(
+            !s.can_redo(),
+            "nothing was undone, so there is nothing to redo"
+        );
+
+        // Put the pool back: the next undo undoes the *same* edit, not another one.
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_take(&pool, "s1", 48_000);
+        assert!(s.undo().expect("undo works"), "the move is undone");
+        let tl = s.arrangement().expect("tl");
+        assert_eq!(
+            tl.tracks[0].clips.len(),
+            1,
+            "the clip's own add was not what got undone"
+        );
+        assert_eq!(tl.tracks[0].clips[0].at_frame, 0, "the move is reverted");
+
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
+    /// The mirror: a refused **redo** leaves the redo branch whole. Popping the entry
+    /// and inserting it before the replay would destroy it outright — the one edit the
+    /// branch held is gone and cannot be brought back.
+    #[test]
+    fn a_refused_redo_keeps_the_redo_branch() {
+        let (mut s, pool) = session_with_clip("redo-refused");
+        s.execute(&HostCommand::Arrange {
+            op: move_clip("c0", 4_800),
+            at_frame: None,
+        })
+        .expect("move");
+        assert!(s.undo().expect("undo works"), "the move is undone");
+
+        std::fs::remove_dir_all(&pool).expect("remove pool");
+        let err = s.redo().expect_err("the rebuild refuses without the pool");
+        assert!(err.contains("pool"), "and it says why: {err}");
+        assert_eq!(
+            clip_of(&s).at_frame,
+            0,
+            "the refused redo did not re-apply the move"
+        );
+        assert!(s.can_redo(), "the edit is still there to redo");
+
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_take(&pool, "s1", 48_000);
+        assert!(s.redo().expect("redo works"), "the move is re-applied");
+        assert_eq!(clip_of(&s).at_frame, 4_800, "and it is the move");
+
+        let _ = std::fs::remove_dir_all(&pool);
+    }
+
     /// The undo / redo grammar lines parse.
     #[test]
     fn undo_and_redo_lines_parse() {
@@ -4627,6 +5562,87 @@ mod tests {
                 .map(|op| HostCommand::Arrange { op, at_frame: None })
                 .collect(),
         }
+    }
+
+    // ---- a clip source is a pool id, not a path ----
+
+    /// A pool directory with one take in it, and a readable WAV **beside** it (the
+    /// file an escaping source would reach).
+    fn pool_with_a_neighbour_take(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("host-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+        write_tone(&root, "secret", 48_000, 48_000);
+        assert!(
+            pool.join("../secret.wav").is_file(),
+            "the escaping source has something to reach"
+        );
+        (pool, root)
+    }
+
+    /// **A clip `source` is a pool id, not a path.** The operand is an arbitrary
+    /// whitespace-free token, and a session file is a document a person can edit, so
+    /// `add_clip t0 c0 ../secret …` parses and used to land: the clip's source was
+    /// joined onto the pool directory, the file was streamed through the arranger, and
+    /// its audio came out in bounces and exports — a session file that reads an
+    /// arbitrary readable WAV. The value model refuses the source by name, so the
+    /// gesture is not applied and nothing is logged.
+    #[test]
+    fn a_clip_source_that_would_escape_the_pool_is_refused() {
+        let (pool, root) = pool_with_a_neighbour_take("pool-escape");
+        let head = format!(
+            "host v1\nmount mixer channels=2 @0\npool {}\narrange add_track t0\n",
+            pool.display()
+        );
+
+        let err = run_script(
+            &parse_script(&format!(
+                "{head}arrange add_clip t0 c0 ../secret 0 4800 0 0 0 1.0\n"
+            ))
+            .expect("the script parses"),
+        )
+        .expect_err("a source that is not a pool id is refused");
+        assert!(err.contains("not a pool id"), "the refusal says why: {err}");
+
+        // A pool id is unaffected, and the value holds nothing the log could not name.
+        let s = run_script(
+            &parse_script(&format!(
+                "{head}arrange add_clip t0 c0 s1 0 4800 0 0 0 1.0\n"
+            ))
+            .expect("the script parses"),
+        )
+        .expect("a pool id still places a clip");
+        assert_eq!(clip_of(&s).source, "s1");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The resolver the production `set_pool` builds is the pool's guarded lookup.**
+    /// This is the seam every read of a clip's source goes through — the arranger
+    /// (`ArrangerNode::new`), `stretch` and the export — and it used to `join` the id
+    /// onto the pool directory itself, so `../secret` resolved to a path outside the
+    /// pool. It is the same closure the value check backs up, so it is pinned here
+    /// directly: an id that is not a plain pool id resolves to *nothing*.
+    #[test]
+    fn the_pool_resolver_only_resolves_a_plain_pool_id() {
+        let (pool, root) = pool_with_a_neighbour_take("pool-guard");
+        let s = session_with_pool("resolver-guard", &pool);
+        let resolve = s.pool_resolver.clone().expect("a pool is set");
+        assert_eq!(
+            resolve("s1"),
+            Some(pool.join("s1.wav")),
+            "a plain id resolves"
+        );
+        for bad in ["../secret", "..", "sub/s1", "secret "] {
+            assert!(
+                resolve(bad).is_none(),
+                "'{bad}' is not a plain pool id, so it resolves to nothing"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **One gesture is one undo.** A group of two trims lands as a single history
@@ -6008,6 +7024,560 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **A session that unmounts and re-mounts a plugin must still rebuild.**
+    ///
+    /// The engine releases a plugin's name when its unmount *applies*, so
+    /// `mount mixer` / `unmount mixer @96 000` / `mount mixer @192 000` is a session
+    /// the live path accepts and records. Every re-apply path — `export` (which
+    /// re-issues the history with its placements stripped) and a seek (the warm
+    /// prefix and the full replay, which `undo`/`redo` share) — used to walk that
+    /// history without rendering between the commands, so the apply queue never
+    /// drained and the second `mount` was refused as a second instance:
+    /// `Err("plugin 'mixer' is already mounted")` out of `export` and out of every
+    /// seek, on a session the platform itself had recorded. The rebuild now answers
+    /// the one-instance rule from the **history's** lifecycle, the way
+    /// `Engine::replay_from` answers it from a log's.
+    #[test]
+    fn a_session_that_re_mounts_a_plugin_still_exports_and_seeks() {
+        let root = std::env::temp_dir().join(format!("host-remount-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 240_000, 48_000);
+
+        // Four clips, one every two seconds: the plugin goes away at 2 s and comes
+        // back at 4 s, so the re-mount is a real lifecycle rather than a no-op pair.
+        let arrangement = |s: &mut HostSession| {
+            s.execute(&HostCommand::Pool { dir: pool.clone() })
+                .expect("pool");
+            s.execute(&HostCommand::Arrange {
+                op: media::ArrangeOp::AddTrack { track: "t0".into() },
+                at_frame: None,
+            })
+            .expect("track");
+            for (id, at) in [
+                ("c0", 0u64),
+                ("c1", 96_000),
+                ("c2", 144_000),
+                ("c3", 192_000),
+            ] {
+                let mut op = add_clip(id, at);
+                if let media::ArrangeOp::AddClip { clip, .. } = &mut op {
+                    clip.src_len = 48_000;
+                }
+                s.execute(&HostCommand::Arrange { op, at_frame: None })
+                    .expect("clip");
+            }
+        };
+        // The **bus**, re-mounted: the shape a `unmount mixer` + `mount mixer`
+        // gesture writes, and the one all three rebuilds refused.
+        let build_mixer = || -> HostSession {
+            let mut s = HostSession::new();
+            s.execute(&HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(0),
+            })
+            .expect("mount mixer");
+            arrangement(&mut s);
+            s.execute(&HostCommand::Unmount {
+                plugin: "mixer",
+                at_frame: Some(96_000),
+            })
+            .expect("unmount the mixer mid-session");
+            s.execute(&HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(192_000),
+            })
+            .expect("mount it again — the live path released the name");
+            s
+        };
+        // A plugin that is **not** the bus, so the clips keep playing across its
+        // re-mount: what the rebuilt session renders is then an observation of the
+        // rebuilt graph rather than of the bus being taken down.
+        let build_clock_out = || -> HostSession {
+            let mut s = HostSession::new();
+            s.execute(&HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(0),
+            })
+            .expect("mount mixer");
+            arrangement(&mut s);
+            s.execute(&HostCommand::Mount {
+                plugin: "clock_out",
+                params: vec![],
+                at_frame: Some(0),
+            })
+            .expect("first mount");
+            s.execute(&HostCommand::Unmount {
+                plugin: "clock_out",
+                at_frame: Some(96_000),
+            })
+            .expect("unmount it mid-session");
+            s.execute(&HostCommand::Mount {
+                plugin: "clock_out",
+                params: vec![],
+                at_frame: Some(192_000),
+            })
+            .expect("mount it again — the live path released the name");
+            s
+        };
+
+        // The history is what a rebuild re-issues: the triple is really there.
+        let text = build_mixer().script_text(&root).expect("the session text");
+        let mounts = text
+            .lines()
+            .filter(|l| l.starts_with("mount mixer"))
+            .count();
+        assert_eq!(
+            mounts, 2,
+            "both mounts are in the session's own text form:\n{text}"
+        );
+        assert!(
+            text.contains("unmount mixer @96000"),
+            "and the unmount keeps its placement:\n{text}"
+        );
+
+        // **`export`**: the rebuild strips every placement, so nothing renders
+        // between the commands — the exact shape that used to be refused.
+        let mut s = build_mixer();
+        s.export(&root.join("mix.wav"), ExportFormat::F32)
+            .expect("a re-mounted mixer still exports");
+        let record = s.last_export().cloned().expect("a report");
+        assert!(
+            record.peak > 0.01,
+            "the re-mounted bus carries the audio: {record:?}"
+        );
+
+        // **The warm-up seek** (`rebuild_prefix`): the run-in is not what releases
+        // the name either — the state walk has to.
+        let mut warm = build_mixer();
+        warm.execute(&HostCommand::TransportSeek { frame: 240_000 })
+            .expect("a warm seek over a re-mounted mixer");
+        let (frame, warmed) = warm.last_seek().expect("a seek ran");
+        assert_eq!(frame, 240_000);
+        assert!(warmed, "this is the prefix path this test is for");
+
+        // **The full replay** seek (the `upto = Some(frame)` rebuild, and the path
+        // `undo`/`redo` take), into the re-mounted era.
+        let mut full = build_clock_out();
+        full.replay_full(200_000)
+            .expect("a full-replay seek over a re-mounted plugin");
+        assert_eq!(full.position().frame, 200_000);
+        assert_eq!(
+            full.arrangement().expect("arrangement"),
+            warm.arrangement().expect("arrangement"),
+            "both rebuilds carry the arrangement across"
+        );
+        let audio = bounce(&mut full, 8_000, &root.join("after.wav"));
+        assert!(
+            audio.iter().any(|x| x.abs() > 0.01),
+            "the rebuilt session renders audio, so the re-mount did not break the graph"
+        );
+
+        // **An unplaced triple** — the shape an interactive `execute` writes, since a
+        // command with no placement renders nothing, so the queue never drains
+        // between them — takes the same three paths down if the rebuild only fixed
+        // the placed shape. Written out command by command, the way a UI sends them.
+        let mut plain = HostSession::new();
+        plain
+            .execute(&HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(0),
+            })
+            .expect("mount mixer");
+        plain
+            .execute(&HostCommand::Pool { dir: pool.clone() })
+            .expect("pool");
+        plain
+            .execute(&HostCommand::Arrange {
+                op: media::ArrangeOp::AddTrack { track: "t0".into() },
+                at_frame: None,
+            })
+            .expect("track");
+        plain
+            .execute(&HostCommand::Arrange {
+                op: add_clip("c0", 0),
+                at_frame: None,
+            })
+            .expect("clip");
+        plain
+            .execute(&HostCommand::Mount {
+                plugin: "clock_out",
+                params: vec![],
+                at_frame: None,
+            })
+            .expect("mount");
+        plain
+            .execute(&HostCommand::Unmount {
+                plugin: "clock_out",
+                at_frame: None,
+            })
+            .expect("unmount");
+        plain
+            .execute(&HostCommand::Bounce {
+                frames: 4_800,
+                path: root.join("unplaced-before.wav"),
+            })
+            .expect("a render applies the unplaced unmount");
+        plain
+            .execute(&HostCommand::Mount {
+                plugin: "clock_out",
+                params: vec![],
+                at_frame: None,
+            })
+            .expect("re-mount after a render — the name was released");
+        plain
+            .export(&root.join("unplaced.wav"), ExportFormat::F32)
+            .expect("an unplaced remount still exports");
+        plain
+            .execute(&HostCommand::TransportSeek { frame: 240_000 })
+            .expect("and still seeks");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The loader is a document walk too, or a saved re-mount cannot be reopened.**
+    ///
+    /// The commit above fixed every *re-apply* path — `rebuild`, `rebuild_prefix` — by
+    /// entering a document walk, so the one-instance rule is the history's question
+    /// while the state is re-issued. The **load** path was left out: `from_script`
+    /// issues each command with `execute`, unwalked. The saved text of the unplaced
+    /// triple is `mount clock_out` / `unmount clock_out` / `mount clock_out` with no
+    /// placement on any of them, and the bounce that released the name between the
+    /// first two is an *action*, so it is not in the text — a load re-issues three
+    /// unplaced commands with nothing rendering between them, and the second mount was
+    /// refused: `Err("plugin 'clock_out' is already mounted")`. The session could be
+    /// written but never opened, which is the same user-facing defect the walk exists
+    /// to kill, still reachable through `load_session`.
+    ///
+    /// The round-trip check inside `save` (the parsed text must equal the history) does
+    /// not catch it: the text is faithful, it is the *application* of the text that
+    /// failed. So this test goes all the way round — build, save, reopen — rather than
+    /// comparing commands.
+    #[test]
+    fn a_saved_session_that_re_mounts_a_plugin_reopens() {
+        let root = std::env::temp_dir().join(format!("host-remount-load-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 240_000, 48_000);
+
+        // The unplaced triple, built the way a UI sends it: a command with no
+        // placement renders nothing, so the name is released only by the bounce
+        // between the unmount and the re-mount. The live path accepts it, which is
+        // what puts it in the history a save writes.
+        let mut s = HostSession::new();
+        s.execute(&HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 2.0)],
+            at_frame: Some(0),
+        })
+        .expect("mixer");
+        s.execute(&HostCommand::Pool { dir: pool.clone() })
+            .expect("pool");
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::AddTrack { track: "t0".into() },
+            at_frame: None,
+        })
+        .expect("track");
+        s.execute(&HostCommand::Arrange {
+            op: add_clip("c0", 0),
+            at_frame: None,
+        })
+        .expect("clip");
+        s.execute(&HostCommand::Mount {
+            plugin: "clock_out",
+            params: vec![],
+            at_frame: None,
+        })
+        .expect("mount");
+        s.execute(&HostCommand::Unmount {
+            plugin: "clock_out",
+            at_frame: None,
+        })
+        .expect("unmount");
+        bounce(&mut s, 4_800, &root.join("mid.wav")); // a render applies the unmount
+        s.execute(&HostCommand::Mount {
+            plugin: "clock_out",
+            params: vec![],
+            at_frame: None,
+        })
+        .expect("re-mount — the name was released");
+
+        let dir = root.join("re-mounted.d");
+        s.save(&dir).expect("a session that re-mounts is savable");
+        let text = std::fs::read_to_string(dir.join("session.txt")).expect("the script");
+        let mounts = text
+            .lines()
+            .filter(|l| l.starts_with("mount clock_out"))
+            .count();
+        assert_eq!(
+            mounts, 2,
+            "both mounts are in the session's own text form:\n{text}"
+        );
+        assert!(
+            text.lines().any(|l| l.starts_with("unmount clock_out")),
+            "…with the unmount between them:\n{text}"
+        );
+
+        // **The load.** This is the round trip the commit's own test did not make: the
+        // session is rebuilt from the *file*, not compared as commands.
+        let mut loaded = HostSession::new();
+        loaded
+            .load_session(&dir)
+            .expect("a saved session that re-mounts a plugin must reopen");
+        assert_eq!(
+            loaded.arrangement().expect("tl"),
+            s.arrangement().expect("tl"),
+            "the arrangement round-trips"
+        );
+
+        // And the reopened session is a session, not a value: it exports, renders,
+        // seeks, and saves again (so a second load has to work as well).
+        loaded
+            .export(&root.join("reopened.wav"), ExportFormat::F32)
+            .expect("the reopened session exports");
+        let audio = bounce(&mut loaded, 4_800, &root.join("reopened-clip.wav"));
+        assert!(
+            audio.iter().any(|x| x.abs() > 0.01),
+            "the reopened session renders its clip"
+        );
+        loaded
+            .execute(&HostCommand::TransportSeek { frame: 240_000 })
+            .expect("and still seeks");
+        let again = root.join("re-mounted-again.d");
+        loaded.save(&again).expect("save again");
+        let mut twice = HostSession::new();
+        twice
+            .load_session(&again)
+            .expect("a re-saved re-mounting session reopens too");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The journal is a document walk too, or a re-mounting edit is dropped on load.**
+    ///
+    /// The journal is appended by the *live* path, where `mount p` / `unmount p` /
+    /// `mount p` is accepted because the name was released when the unmount applied.
+    /// `apply_journal` replays those lines back to back on a session that has rendered
+    /// nothing, so unwalked the re-mount was refused — and a refused journal entry is
+    /// **dropped and reported**, which means the load succeeded while silently losing
+    /// the user's last edit. The walk makes the journal's own lifecycle the answer,
+    /// exactly as it does for the script.
+    ///
+    /// The test drives the real thing: a session directory whose `journal.txt` holds an
+    /// unplaced re-mount triple, torn the way a crash mid-gesture tears one.
+    #[test]
+    fn a_journal_that_re_mounts_a_plugin_is_applied_not_dropped() {
+        let root =
+            std::env::temp_dir().join(format!("host-journal-remount-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 240_000, 48_000);
+
+        let mut s = HostSession::new();
+        s.execute(&HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 2.0)],
+            at_frame: Some(0),
+        })
+        .expect("mixer");
+        s.execute(&HostCommand::Pool { dir: pool.clone() })
+            .expect("pool");
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::AddTrack { track: "t0".into() },
+            at_frame: None,
+        })
+        .expect("track");
+        s.execute(&HostCommand::Arrange {
+            op: add_clip("c0", 0),
+            at_frame: None,
+        })
+        .expect("clip");
+        let dir = root.join("journalled.d");
+        s.save(&dir).expect("save the baseline");
+
+        // The autosave since that save: a re-mount of `clock_out`, written the way the
+        // live path writes it (unplaced, with a render between the unmount and the
+        // re-mount — the render is an action, so it is not in the journal). The journal
+        // holds entries only; `apply_journal` supplies the `host v1` header.
+        std::fs::write(
+            dir.join("journal.txt"),
+            b"mount clock_out\nunmount clock_out\nmount clock_out\n",
+        )
+        .expect("write the journal");
+
+        let mut loaded = HostSession::new();
+        loaded.load_session(&dir).expect("load");
+        let recovery = loaded.last_recovery().expect("a recovery report");
+        assert_eq!(
+            recovery.applied, 3,
+            "every journal command applied: {recovery:?}"
+        );
+        assert_eq!(
+            recovery.refused, 0,
+            "the re-mount is not a refusal any more: {recovery:?}"
+        );
+        assert!(
+            recovery.refused_reason.is_none(),
+            "…with no reason to report: {recovery:?}"
+        );
+
+        // The applied triple really is in the loaded session's history, so a further
+        // save carries it (this is what was being lost).
+        let again = root.join("journalled-again.d");
+        loaded.save(&again).expect("save the recovered session");
+        let text = std::fs::read_to_string(again.join("session.txt")).expect("the script");
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.starts_with("mount clock_out"))
+                .count(),
+            2,
+            "both mounts survived the load:\n{text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A warm seek over a tempo placed in the past does not walk the clock back.**
+    ///
+    /// `rebuild_prefix` places the clock at each `SetTempo`'s *stated* frame, because a
+    /// tempo segment has to sit at its own frame in the map even when the run-in starts
+    /// later. It did that unconditionally, so a tempo command whose placement is already
+    /// behind the clock moved the clock **backwards** — and every `at_now` command after
+    /// it was then stamped *before* the commands before it. On a history that also
+    /// re-mounts a plugin the result is `Mount@0 … Unmount@120000 … Mount@48000`: a
+    /// frame-inverted document, which the walk refuses (`plugin 'clock_out' goes back to
+    /// frame 48000 after frame 120000`) on a session the live path wrote and accepted.
+    ///
+    /// The rule is the live path's: `process` renders up to a placement only when it is
+    /// in the future, and `set_tempo` stamps at the current frame otherwise — so the
+    /// clock moves forward and only forward. `max` says that in one expression, and this
+    /// is the test that keeps it said.
+    #[test]
+    fn a_warm_seek_over_a_past_tempo_placement_still_works() {
+        let root = std::env::temp_dir().join(format!("host-past-tempo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 480_000, 48_000);
+
+        let mut s = HostSession::new();
+        s.execute(&HostCommand::Mount {
+            plugin: "mixer",
+            params: vec![("channels", 2.0)],
+            at_frame: Some(0),
+        })
+        .expect("mixer");
+        s.execute(&HostCommand::Pool { dir: pool.clone() })
+            .expect("pool");
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::AddTrack { track: "t0".into() },
+            at_frame: None,
+        })
+        .expect("track");
+        // A clip long enough to still be playing at the seek target, so "the rebuilt
+        // session renders" is an observation about the rebuilt graph.
+        let mut clip = add_clip("c0", 0);
+        if let media::ArrangeOp::AddClip { clip, .. } = &mut clip {
+            clip.src_len = 480_000;
+        }
+        s.execute(&HostCommand::Arrange {
+            op: clip,
+            at_frame: None,
+        })
+        .expect("clip");
+        s.execute(&HostCommand::Mount {
+            plugin: "clock_out",
+            params: vec![],
+            at_frame: Some(0),
+        })
+        .expect("mount");
+        s.execute(&HostCommand::SetTempo {
+            bpm: 90.0,
+            beats_per_bar: 4,
+            at_frame: Some(120_000),
+        })
+        .expect("tempo at 2.5 s");
+        s.execute(&HostCommand::Unmount {
+            plugin: "clock_out",
+            at_frame: Some(120_000),
+        })
+        .expect("unmount");
+        // **The past placement.** Issued while the clock is already past 48 000, so the
+        // live path stamps it at the current frame — and the history carries the stale
+        // one, which is what `rebuild_prefix` used to seek to.
+        s.execute(&HostCommand::SetTempo {
+            bpm: 140.0,
+            beats_per_bar: 4,
+            at_frame: Some(48_000),
+        })
+        .expect("a tempo whose placement is already behind the clock");
+        s.execute(&HostCommand::Mount {
+            plugin: "clock_out",
+            params: vec![],
+            at_frame: Some(300_000),
+        })
+        .expect("re-mount");
+        let live = s.engine.log.clone();
+        let live_bpm = s.position().bpm;
+
+        // A warm seek (the `rebuild_prefix` path) over that history.
+        s.execute(&HostCommand::TransportSeek { frame: 360_000 })
+            .expect("a warm seek over a past tempo placement");
+        let (frame, warmed) = s.last_seek().expect("a seek ran");
+        assert_eq!(frame, 360_000);
+        assert!(warmed, "this is the prefix path this test is for");
+        assert_eq!(
+            s.position().bpm,
+            live_bpm,
+            "the tempo map is the session's, not the stale placement's"
+        );
+        let audio = bounce(&mut s, 8_000, &root.join("after.wav"));
+        assert!(
+            audio.iter().any(|x| x.abs() > 0.01),
+            "the rebuilt session still renders"
+        );
+
+        // The invariant the walk now enforces, checked against the log the live path
+        // actually wrote: the lifecycle frames for one name are non-decreasing. The
+        // seek above succeeded precisely because `rebuild_prefix` preserved it — the
+        // stale 48 000 placement is not in the *log* (the live path stamped it at the
+        // current frame), it was only in the command the rebuild read.
+        let frames: Vec<u64> = live
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                engine::Event::Mount {
+                    plugin: "clock_out",
+                    at_frame,
+                    ..
+                } => Some(*at_frame),
+                engine::Event::ScheduleUnmount {
+                    plugin: "clock_out",
+                    at_frame,
+                } => Some(*at_frame),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            frames,
+            vec![0, 120_000, 300_000],
+            "the live path's lifecycle frames for clock_out are in order"
+        );
+        assert!(
+            frames.windows(2).all(|w| w[0] <= w[1]),
+            "…which is what the walk's frame rule requires: {frames:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// **A warm-up seek is a seek: provably equal to a replay.** The plan's item 15 asks
     /// for a jump into a long piece to be interactive *and* "provably equal to a replay".
     /// A jump past [`SEEK_WARMUP_FRAMES`] places the clock one second before the target
@@ -7047,6 +8617,792 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **The save's self-check has to have a twin on the autosave.** `save` refuses a
+    /// history the text form cannot spell, but the journal was written unchecked — and
+    /// a line `parse_script` rejects makes the **whole session** unopenable, not just
+    /// that edit. So a `play` whose path the word-based form cannot carry is applied but
+    /// *not* journalled, the failure is reported, and the journal keeps the edits it can
+    /// spell.
+    #[test]
+    fn a_journal_line_the_text_form_cannot_spell_is_not_written() {
+        let root = std::env::temp_dir().join(format!("host-journal-lossy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("my pool"); // the space is in the *play* path
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = session_with_pool("journal-lossy", &pool);
+        let dir = root.join("song.d");
+        s.save(&dir).expect("save the baseline");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("journal.txt")).expect("journal"),
+            "",
+            "a save resets the journal to its baseline"
+        );
+
+        // The host plays a path with a space in it (any path `FilePlayer` opens)…
+        s.execute(&HostCommand::Play {
+            clip: media::ClipRef {
+                path: pool.join("s1.wav"),
+                start: 0,
+                len: 0,
+            },
+            channel: 0,
+            at_frame: None,
+        })
+        .expect("the live path plays it");
+        // …and the autosave says so, naming the line it would not write.
+        let error = s
+            .journal_error()
+            .expect("the autosave reports what it could not write")
+            .to_string();
+        assert!(
+            error.contains("host v1") && error.contains("play"),
+            "and it names the format and the line: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("journal.txt")).expect("journal"),
+            "",
+            "and the unspellable edit is not written"
+        );
+
+        // An edit the text form *can* spell still is, so the journal is not merely empty.
+        s.execute(&gesture(vec![media::ArrangeOp::Trim {
+            track: "t0".into(),
+            clip: "c0".into(),
+            edge: media::Edge::Start,
+            by_frames: 1_200,
+        }]))
+        .expect("a spellable edit");
+
+        let journal = std::fs::read_to_string(dir.join("journal.txt")).expect("journal");
+        assert!(
+            !journal.contains("play"),
+            "the unspellable play is not in the journal:\n{journal}"
+        );
+        assert!(
+            journal.contains("arrange trim t0 c0 start 1200"),
+            "but the spellable edit is: {journal}"
+        );
+        // …and the report of the refused one **stands**: a later successful write does
+        // not put that play back in any durable record, and a save still refuses the
+        // history, so clearing the message here would leave the loss unreported.
+        let still = s
+            .journal_error()
+            .expect("a refusal is not erased by the next successful write")
+            .to_string();
+        assert!(
+            still.contains("play") && still.contains("host v1"),
+            "and it is the same report: {still}"
+        );
+
+        // The point of the guard: the session still opens, and it opens with the edit
+        // that *was* spellable.
+        let mut loaded = HostSession::new();
+        loaded
+            .load_session(&dir)
+            .expect("an unspellable edit must not make the session unopenable");
+        let recovery = loaded.last_recovery().cloned().expect("a report");
+        assert_eq!(recovery.applied, 1, "the spellable edit replayed");
+        assert_eq!(recovery.refused, 0, "nothing in the journal was refused");
+        assert_eq!(
+            clip_of(&loaded).src_len,
+            3_600,
+            "and the trim is in the reopened session"
+        );
+        assert!(s.save(&dir).is_err(), "a save still refuses the history");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A value that cannot compare equal to itself must not wedge the writer that has
+    /// to spell it.** `HostCommand` carries `f32`/`f64` and IEEE-754 leaves `NaN != NaN`,
+    /// so the read-back — the autosave's, and `save`'s, which is the same check over a
+    /// whole script — answered "no" to a `NaN` operand *permanently*: the entry was
+    /// refused, the message blamed the spelling rather than the value, and every later
+    /// save of the session failed for good. The `host v1` form spells a `NaN` as `NaN`
+    /// and reads it back as `NaN`, so the entry **is** in the form.
+    ///
+    /// **This is the autosave's half of the rule, and only that.** The journal's
+    /// predicate is *reads back as itself*, so the entry is written and the loss is
+    /// reported per entry on replay. `save` — the durable baseline — holds the stronger
+    /// rule, *and applies* (see `a_session_the_applier_refuses_is_not_saved`): a `NaN`
+    /// param is refused there by name, which is the honest verdict, because a session
+    /// file carrying it is a file `load_session` cannot open.
+    ///
+    /// The `NaN` is committed through `commit_state` because the live path cannot produce
+    /// one: `Engine::set_param` refuses a non-finite value before it is logged (the test
+    /// below). What is under test is the *guard*, not the door — so the guard must be a
+    /// property of the form and not of the value's ability to compare equal to itself.
+    #[test]
+    fn a_value_that_cannot_compare_equal_to_itself_does_not_wedge_the_autosave() {
+        let root = std::env::temp_dir().join(format!("host-journal-nan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = session_with_pool("journal-nan", &pool);
+        let dir = root.join("song.d");
+        s.save(&dir).expect("save the baseline");
+        let journal = || std::fs::read_to_string(dir.join("journal.txt")).expect("journal");
+
+        // A `NaN` param committed to the document — the one way it can be in a history.
+        s.commit_state(vec![HostCommand::SetParam {
+            plugin: "mixer",
+            param: "ch0.gain",
+            value: f32::NAN,
+            at_frame: None,
+        }]);
+        assert!(
+            journal().contains("set_param mixer ch0.gain NaN"),
+            "the form spells a NaN and reads it back, so the entry is journalled:\n{}",
+            journal()
+        );
+        assert!(
+            s.journal_error().is_none(),
+            "and there is nothing to report: {:?}",
+            s.journal_error()
+        );
+
+        // The next edit is journalled too: one operand that cannot compare equal to
+        // itself stops nothing.
+        s.execute(&gesture(vec![media::ArrangeOp::Trim {
+            track: "t0".into(),
+            clip: "c0".into(),
+            edge: media::Edge::Start,
+            by_frames: 1_200,
+        }]))
+        .expect("a normal edit");
+        let text = journal();
+        assert!(
+            text.contains("set_param mixer ch0.gain NaN")
+                && text.contains("arrange trim t0 c0 start 1200"),
+            "both entries are in the journal:\n{text}"
+        );
+
+        // The reopened session costs that one refused param and nothing else: the entry
+        // parses, and the *engine* refuses the value (the door below), which the replay
+        // reports per entry rather than treating as fatal.
+        let mut loaded = HostSession::new();
+        loaded.load_session(&dir).expect("load");
+        let recovery = loaded.last_recovery().cloned().expect("a report");
+        assert_eq!(recovery.applied, 1, "the trim replayed (one gesture)");
+        assert_eq!(recovery.refused, 1, "the NaN param is refused on replay");
+        let reason = recovery.refused_reason.expect("and it says why");
+        assert!(
+            reason.contains("finite") && reason.contains("NaN"),
+            "naming the value, not the spelling: {reason}"
+        );
+        assert_eq!(
+            clip_of(&loaded).src_len,
+            3_600,
+            "and the edit beside it is in the reopened session"
+        );
+
+        // The permanent half of the wedge is gone too, and gone *honestly*: one such
+        // operand no longer makes every later save refuse for a reason the user cannot
+        // act on — the save now refuses it **by name**, because the file it would write
+        // would not open. (`a_session_the_applier_refuses_is_not_saved` is where that
+        // rule is pinned, along with what the refusal must leave behind.)
+        assert!(
+            s.save(&dir).is_err(),
+            "a baseline the applier would refuse is not written"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **`SetParam` does not take a non-finite value, and the host keeps no second copy
+    /// of the rule.** The engine's `set_param` refuses it before the value is logged, so
+    /// the refusal is the engine's message and the host's commit path is never reached:
+    /// no history entry, no journal line, no reason to report, and a session that still
+    /// saves. This is what makes the test above a statement about the *form* — the door
+    /// is what stops a `NaN`, and this is where it is pinned on the host side.
+    #[test]
+    fn a_non_finite_param_is_refused_at_the_door_and_leaves_nothing_behind() {
+        let root = std::env::temp_dir().join(format!("host-journal-door-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = session_with_pool("journal-door", &pool);
+        let dir = root.join("song.d");
+        s.save(&dir).expect("save the baseline");
+
+        for (value, what) in [(f32::NAN, "a NaN"), (f32::INFINITY, "an infinity")] {
+            let refused = s
+                .execute(&HostCommand::SetParam {
+                    plugin: "mixer",
+                    param: "ch0.gain",
+                    value,
+                    at_frame: None,
+                })
+                .expect_err("a non-finite param is refused");
+            assert!(
+                refused.contains("ch0.gain") && refused.contains("finite"),
+                "{what} is named by the engine's rule: {refused}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("journal.txt")).expect("journal"),
+            "",
+            "and a refused command is not an edit, so nothing was journalled"
+        );
+        assert!(
+            s.journal_error().is_none(),
+            "nor is it a journal fault to report: {:?}",
+            s.journal_error()
+        );
+        s.save(&dir).expect("and the session still saves");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **`save` must not be able to write a session directory that will not open.** The
+    /// self-check `save` inherited compared the re-parsed script with the history, so it
+    /// answered the *form*'s question — "is this the same session?" — and not the
+    /// reader's. An entry can be spelled faithfully and still be **refused by the
+    /// applier**: `set_param … NaN` is the one spelling a `NaN` has, and the one verdict
+    /// is `parameter '…' must be finite`. So the file parsed, the comparison passed, and
+    /// the platform wrote a `session.txt` that `load_session` refuses — a brick needing
+    /// a hand-edit of its own text, with the journal already truncated.
+    ///
+    /// The rule is now *whatever is written can be read back **and applied***, checked by
+    /// building the session from the script through the walk `load_session` runs. So the
+    /// save is refused, by name, **before anything is written** — and the directory the
+    /// user already had (with the journal's unsaved tail in it) is exactly as it was.
+    #[test]
+    fn a_session_the_applier_refuses_is_not_saved() {
+        let root = std::env::temp_dir().join(format!("host-save-apply-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = session_with_pool("save-apply", &pool);
+        let dir = root.join("song.d");
+        s.save(&dir).expect("save the baseline");
+
+        // A spellable edit, so the journal holds a tail the refused save must not eat.
+        s.execute(&gesture(vec![media::ArrangeOp::Trim {
+            track: "t0".into(),
+            clip: "c0".into(),
+            edge: media::Edge::Start,
+            by_frames: 1_200,
+        }]))
+        .expect("a spellable edit");
+        // …and a value the applier refuses, committed to the document because the live
+        // path cannot produce one (`Engine::set_param` is the door — the test above).
+        s.commit_state(vec![HostCommand::SetParam {
+            plugin: "mixer",
+            param: "ch0.gain",
+            value: f32::NAN,
+            at_frame: None,
+        }]);
+        let script_before = std::fs::read(dir.join(SESSION_FILE)).expect("session");
+        let journal_before = std::fs::read(dir.join(JOURNAL_FILE)).expect("journal");
+        assert!(
+            String::from_utf8_lossy(&journal_before).contains("arrange trim t0 c0 start 1200"),
+            "the tail is the autosave: {}",
+            String::from_utf8_lossy(&journal_before)
+        );
+
+        let refused = s
+            .save(&dir)
+            .expect_err("a script the applier refuses is not written");
+        // **The edit and the reason, both by name** — an index and "the session text
+        // does not apply" would leave the user with no way to act on either.
+        assert!(
+            refused.contains("set_param mixer ch0.gain NaN"),
+            "the refusal names the edit it would not write: {refused}"
+        );
+        assert!(
+            refused.contains("finite") && refused.contains("NaN"),
+            "and the reason the reader would have refused it: {refused}"
+        );
+
+        // **Nothing was written, and nothing was emptied.** The order is the point: the
+        // journal is the only durable record of the edits since the last save, so a save
+        // that fails after truncating it destroys the tail to buy nothing.
+        assert_eq!(
+            std::fs::read(dir.join(SESSION_FILE)).expect("session"),
+            script_before,
+            "the previous session.txt is untouched"
+        );
+        assert_eq!(
+            std::fs::read(dir.join(JOURNAL_FILE)).expect("journal"),
+            journal_before,
+            "and the journal kept the tail it was holding"
+        );
+        assert!(
+            !dir.join("session.txt.tmp").exists(),
+            "not even a temp file: a refused save writes nothing"
+        );
+
+        // The point of the order: the directory the user already had still opens, with
+        // the edit in it. Without this the refused save would have bricked it.
+        let mut loaded = HostSession::new();
+        loaded
+            .load_session(&dir)
+            .expect("a refused save must not leave the directory unopenable");
+        assert_eq!(
+            clip_of(&loaded).src_len,
+            3_600,
+            "and it opens with the unsaved edit, not without it"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A missing file is a runtime condition, not an invalid document.** The `save`
+    /// self-check walked the script it was about to write by *building* it, and building
+    /// is **running**: the `Play` arm opened the named file through `resolve_clip`, spawned
+    /// a `FilePlayer` and blocked in `warm_player` on a ten-second deadline. So a
+    /// `play` whose file had moved — a rename, an ejected drive, a pool directory deleted
+    /// out from under the session — failed the build, and `save` refused a history that is
+    /// a perfectly good document, over a fact about *this machine's copy of the material*.
+    /// That is the same class of wrong as a save that fails because the disk is full: the
+    /// document is fine and the session must still save.
+    ///
+    /// The rule is now that the check asks the **document's** questions (does this mixer
+    /// exist, is this channel inside it, is this op legal in this arrangement) and not the
+    /// **material's** (can this file be opened, decoded and warmed). So the save succeeds
+    /// and the directory is written; the missing file is reported where it always was, by
+    /// the **reader** — and this test pins that half too, so the tolerance above cannot
+    /// quietly become silence: reopening still names the file, in the shape `load_session`
+    /// has always used for it.
+    #[test]
+    fn a_session_whose_play_file_moved_still_saves() {
+        let root = std::env::temp_dir().join(format!("host-save-moved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = session_with_pool("save-moved", &pool);
+        let dir = root.join("song.d");
+        s.save(&dir).expect("save the baseline");
+
+        // The recorder's shape: a `play` naming a file **by path** (the pool directory is
+        // *not* re-pointed at the copy — `rebase_pool` rewrites `pool` commands only, so
+        // the play line keeps the absolute path it was made with). The file is there now.
+        let clip = pool.join("s1.wav");
+        s.execute(&HostCommand::Play {
+            clip: media::ClipRef {
+                path: clip.clone(),
+                start: 0,
+                len: 0,
+            },
+            channel: 0,
+            at_frame: None,
+        })
+        .expect("play it while it is still there");
+
+        // …and now it is not. The session has not changed: the same commands, the same
+        // document, one fewer file on this machine.
+        std::fs::remove_file(&clip).expect("the file moves");
+
+        s.save(&dir)
+            .expect("a file that moved is a runtime condition, not an invalid document");
+        let script = std::fs::read_to_string(dir.join(SESSION_FILE)).expect("session");
+        assert!(
+            script.contains(&format!("play {}", clip.display())),
+            "the play line is in the baseline: it is part of the session, and a file that has \
+             moved is not a reason to refuse one"
+        );
+        // The journal was reset to the new baseline, so the save is whole rather than a
+        // write that left the previous one in place.
+        assert_eq!(
+            std::fs::read_to_string(dir.join(JOURNAL_FILE)).expect("journal"),
+            "",
+            "and the journal restarts from the baseline it just wrote"
+        );
+
+        // **The reader still reports the missing file**, in the shape `load_session` has
+        // always used for it: the baseline is a document walk, and a `play` it cannot
+        // resolve is an `Err` naming the path. Untouched by this change, and pinned here
+        // because "the save tolerates it" must never become "nobody mentions it".
+        let mut loaded = HostSession::new();
+        let err = loaded
+            .load_session(&dir)
+            .expect_err("the reader reports the file that is not there");
+        assert!(
+            err.contains("s1.wav"),
+            "naming the file, which is the actionable fact: {err}"
+        );
+
+        // **And the journal path is the tolerant one it has always been**: a `play` that
+        // reaches the load through the *autosave* is dropped and reported, not fatal, so a
+        // session edited after its material moved still opens. A second session, because
+        // the first one's baseline already holds the play and this half is about the tail.
+        write_tone(&pool, "s1", 48_000, 48_000); // the file comes back
+        let mut s2 = session_with_pool("save-moved-journal", &pool);
+        s2.save(&dir).expect("save a baseline with no play in it");
+        s2.execute(&HostCommand::Play {
+            clip: media::ClipRef {
+                path: clip.clone(),
+                start: 0,
+                len: 0,
+            },
+            channel: 0,
+            at_frame: None,
+        })
+        .expect("play it");
+        // …and goes away again, *after* the play reached the autosave.
+        let _ = std::fs::remove_file(&clip);
+        let journal = std::fs::read_to_string(dir.join(JOURNAL_FILE)).expect("journal");
+        assert!(
+            journal.contains("play "),
+            "the play is in the autosave tail, which is the path being tested: {journal}"
+        );
+
+        let mut loaded = HostSession::new();
+        loaded
+            .load_session(&dir)
+            .expect("a journal play whose file moved is dropped, not fatal");
+        let recovery = loaded.last_recovery().cloned().expect("a report");
+        assert_eq!(
+            recovery.refused, 1,
+            "the one refused command is the play, reported"
+        );
+        assert!(
+            recovery
+                .refused_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("s1.wav")),
+            "naming the file, which is the actionable fact: {:?}",
+            recovery.refused_reason
+        );
+        assert_eq!(
+            clip_of(&loaded).src_len,
+            4_800,
+            "and the rest of the session is intact"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The dry run must not open the material, and the way to show that is a file it
+    /// could open and must not.** The moved-file test above is not enough on its own: a
+    /// missing file is the one case the old code refused *fast*, so it says nothing about
+    /// the ten-second `warm_player` deadline or the decoder thread, which are paid for a
+    /// file that *is* there. This names a file that exists and is deliberately **not a
+    /// WAV**, so the old code read it (`not a RIFF file`) before it ever reached the warm
+    /// — and a check that opens no material cannot be refused by what is at the path.
+    /// The clock assertion is a bound, not a measurement: it is there so a future change
+    /// that reintroduces a blocking read fails *here*, loudly, rather than costing a user
+    /// ten seconds per save.
+    #[test]
+    fn the_save_check_never_opens_the_material_it_validates() {
+        let root = std::env::temp_dir().join(format!("host-save-nomedia-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = session_with_pool("save-nomedia", &pool);
+        let dir = root.join("song.d");
+
+        // A `play` of a path that is not audio at all, committed to the document the way
+        // the live path commits a real one (the pool's source is fine; this names a file
+        // beside it).
+        let not_audio = root.join("notes.txt");
+        std::fs::write(&not_audio, b"this is not a wav file\n").expect("write");
+        s.commit_state(vec![HostCommand::Play {
+            clip: media::ClipRef {
+                path: not_audio.clone(),
+                start: 0,
+                len: 0,
+            },
+            channel: 0,
+            at_frame: None,
+        }]);
+
+        let started = std::time::Instant::now();
+        s.save(&dir)
+            .expect("the check asks the document's questions, not the file's");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "the save must not wait on a decoder it never starts: {elapsed:?}"
+        );
+        assert!(
+            std::fs::read_to_string(dir.join(SESSION_FILE))
+                .expect("session")
+                .contains(&format!("play {}", not_audio.display())),
+            "and the play line is written: a file's contents are not a property of the document"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A successful save must not manufacture a fault whose text is false.** `save`
+    /// re-derives the outstanding refusal after it writes, because the pool re-point above
+    /// can have *changed* the answer — the journal spells a `pool` by the absolute path
+    /// the session used, a save spells the copy inside the session directory. But the
+    /// re-derivation asked only the **journal's** spelling, and those two differ for
+    /// exactly one line: `Pool`. So saving into a directory whose own path holds a space
+    /// (`"/…/My Songs/song.d"`) re-pointed the history at `"/…/My Songs/song.d/pool"`,
+    /// the journal could not spell that, and the save **reported a refusal over a save
+    /// that had plainly succeeded** — a message the user cannot act on, naming a
+    /// text-form failure for a path the text form spells perfectly well as `pool pool`.
+    ///
+    /// The report is a claim about **both** durable records, so it is now made only where
+    /// both agree: an entry the save can write is not "in the live session and nowhere
+    /// else", because it is in the baseline this save just wrote. A save into a directory
+    /// with a space in it therefore leaves no fault at all, and — the half that matters
+    /// most, because a false alarm is worse than none — the history stays saveable and
+    /// the report stays silent across a later edit.
+    #[test]
+    fn a_save_into_a_directory_with_a_space_reports_nothing() {
+        let root = std::env::temp_dir().join(format!("host-save-space-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = session_with_pool("save-space", &pool);
+        // The space is in the *session* path, which is what the pool re-point then copies
+        // into: the history's `pool` line becomes `<dir>/pool`, unspellable in the
+        // journal's spelling and spellable in the save's.
+        let dir = root.join("My Songs").join("song.d");
+        s.save(&dir).expect("a path with a space is a legal path");
+        assert!(
+            s.journal_error().is_none(),
+            "a save that succeeded reports nothing: {:?}",
+            s.journal_error()
+        );
+        assert!(
+            std::fs::read_to_string(dir.join(SESSION_FILE))
+                .expect("session")
+                .contains("pool pool\n"),
+            "and the save spells the pool the way a movable session must: relative"
+        );
+
+        // **And it stays silent.** The re-derivation runs again on every history change,
+        // so a false claim here would come back on the next `undo` too. A spellable edit
+        // is autosaved and reported as nothing.
+        s.execute(&gesture(vec![media::ArrangeOp::Trim {
+            track: "t0".into(),
+            clip: "c0".into(),
+            edge: media::Edge::Start,
+            by_frames: 1_200,
+        }]))
+        .expect("a spellable edit");
+        assert!(
+            s.journal_error().is_none(),
+            "and a later edit does not resurrect the false alarm: {:?}",
+            s.journal_error()
+        );
+        s.save(&dir).expect("and the session saves again");
+        assert!(
+            s.journal_error().is_none(),
+            "still nothing to report: {:?}",
+            s.journal_error()
+        );
+
+        // The directory is a normal, movable session: it opens from where it is.
+        let mut loaded = HostSession::new();
+        loaded.load_session(&dir).expect("open");
+        assert_eq!(
+            loaded.last_recovery().map(|r| r.refused),
+            Some(0),
+            "and nothing in it needed dropping"
+        );
+        assert_eq!(
+            clip_of(&loaded).src_len,
+            3_600,
+            "with the edits that were saved"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A report cannot outlive the edit it names.** The refusal is a fact about an
+    /// *edit*, and `undo`/`redo` rebuild the session from the history — so an edit that
+    /// has been undone is in no durable record because it is **not in the session at
+    /// all**. Carried across the rebuild, the report outlived its subject and the TUI's
+    /// status line read "autosave failed" after every subsequent edit, over an edit that
+    /// was no longer there; the one thing that would have cleared it is the next `save`,
+    /// which now *refuses* a history holding such an entry, so it never would have.
+    ///
+    /// The report is therefore **re-derived from the history** rather than latched, and
+    /// re-derived is not the same as cleared: the *redo* at the end puts the edit back
+    /// into the session, so its report must come back with it.
+    #[test]
+    fn an_undo_that_removes_a_refused_edit_clears_the_report() {
+        let root = std::env::temp_dir().join(format!("host-journal-alarm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = session_with_pool("journal-alarm", &pool);
+        let dir = root.join("song.d");
+        s.save(&dir).expect("save the baseline");
+
+        // A clip id with a space: the timeline takes it, the word-based form cannot spell
+        // it, so the autosave drops the entry and says so. An `Arrange` op, so it is
+        // undoable — the false alarm needs a *removable* subject.
+        s.execute(&HostCommand::Arrange {
+            op: media::ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: media::Clip {
+                    reversed: false,
+                    id: "c 0".into(),
+                    name: None,
+                    source: "s1".into(),
+                    src_start: 0,
+                    src_len: 2_400,
+                    at_frame: 0,
+                    fade_in: 0,
+                    fade_out: 0,
+                    gain: 1.0,
+                    loop_len: None,
+                },
+            },
+            at_frame: None,
+        })
+        .expect("the timeline itself accepts the id");
+        let report = s
+            .journal_error()
+            .expect("the autosave reports what it could not write")
+            .to_string();
+        assert!(
+            report.contains("c 0") && report.contains("not autosaved"),
+            "and it names the edit that is in no durable record: {report}"
+        );
+
+        // A **successful** write must not erase it — half the rule, and the half the
+        // previous change restored. (A `SetParam`, so it is not the `Arrange` entry the
+        // undo below is about.)
+        s.execute(&HostCommand::SetParam {
+            plugin: "mixer",
+            param: "ch0.gain",
+            value: 0.5,
+            at_frame: None,
+        })
+        .expect("a spellable edit");
+        assert!(
+            std::fs::read_to_string(dir.join(JOURNAL_FILE))
+                .expect("journal")
+                .contains("set_param mixer ch0.gain 0.5"),
+            "the autosave carried this one"
+        );
+        assert!(
+            s.journal_error().is_some(),
+            "and the refusal stands beside it: {:?}",
+            s.journal_error()
+        );
+
+        // Undo it: the edit leaves the history, so there is nothing left to report.
+        assert!(s.undo().expect("undo the refused edit"));
+        assert!(
+            s.journal_error().is_none(),
+            "the report cannot outlive the edit it names: {:?}",
+            s.journal_error()
+        );
+
+        // **Re-derived, not latched**: the redo puts the edit back in the session, so
+        // its report must come back with it. (Before the next edit, which clears the
+        // redo stack — a new state change makes an undone branch unreachable.)
+        assert!(s.redo().expect("redo the refused edit"));
+        let back = s
+            .journal_error()
+            .expect("an edit that is in the session again is lost again")
+            .to_string();
+        assert!(
+            back.contains("c 0"),
+            "and it is the same edit's report: {back}"
+        );
+        assert!(s.undo().expect("undo it again"));
+        assert!(
+            s.journal_error().is_none(),
+            "and it dies with its subject again: {:?}",
+            s.journal_error()
+        );
+
+        // …and the next edit is autosaved and silent, which is what the user sees: no
+        // status line at all, rather than a standing "autosave failed".
+        s.execute(&gesture(vec![media::ArrangeOp::Trim {
+            track: "t0".into(),
+            clip: "c0".into(),
+            edge: media::Edge::Start,
+            by_frames: 1_200,
+        }]))
+        .expect("a spellable edit after the undo");
+        let journal = std::fs::read_to_string(dir.join(JOURNAL_FILE)).expect("journal");
+        assert!(
+            journal.contains("arrange trim t0 c0 start 1200"),
+            "the autosave is working again: {journal}"
+        );
+        assert!(
+            s.journal_error().is_none(),
+            "and there is nothing to say about it: {:?}",
+            s.journal_error()
+        );
+
+        // The session directory the whole alarm was about is healthy: it opens, and it
+        // opens with the edits that are in the session.
+        let mut loaded = HostSession::new();
+        loaded.load_session(&dir).expect("load");
+        assert_eq!(
+            loaded.last_recovery().map(|r| r.refused),
+            Some(0),
+            "nothing in the journal needed dropping"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A journal line **nobody can parse** is dropped and reported, never fatal. The
+    /// write side refuses to produce one (the case above), so this is what a
+    /// hand-edited journal, or one from an older host, looks like — and the rule is the
+    /// one `apply_journal` already states for a *refused* entry: an autosave line must
+    /// not cost the user the session it sits in. The good line beside it still lands.
+    #[test]
+    fn an_unparseable_journal_line_is_dropped_not_fatal() {
+        let root =
+            std::env::temp_dir().join(format!("host-journal-garbage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let mut s = session_with_pool("journal-garbage", &pool);
+        let dir = root.join("song.d");
+        s.save(&dir).expect("save the baseline");
+
+        // A play line with a space in its path is four words against a three-word form.
+        // The gesture after it is well formed and must survive.
+        std::fs::write(
+            dir.join("journal.txt"),
+            "play /tmp/a b.wav ch0\ngroup begin\narrange set_clip_gain t0 c0 0.25\ngroup end\n",
+        )
+        .expect("a hand-written journal");
+
+        let mut loaded = HostSession::new();
+        loaded
+            .load_session(&dir)
+            .expect("an unparseable journal line must not stop the load");
+        let recovery = loaded.last_recovery().cloned().expect("a report");
+        assert_eq!(recovery.applied, 1, "the gesture beside it applied");
+        assert_eq!(recovery.refused, 1, "the unparseable entry is reported");
+        let reason = recovery
+            .refused_reason
+            .clone()
+            .expect("and the refusal says why");
+        assert!(
+            reason.contains("play") || reason.contains("operand"),
+            "the reason names the line: {reason}"
+        );
+        assert_eq!(clip_of(&loaded).gain, 0.25, "the gesture is in the session");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // ---- recording: the input device becomes pool material ----
 
     /// Feed an interleaved tone into a ring, the way a device callback would.
@@ -7231,6 +9587,44 @@ mod tests {
             "the session's rate, not a declared one"
         );
         assert_eq!(take.at_frame, 120, "the take's origin is kept");
+    }
+
+    /// A declaration is **wire input** that names its own pool sources: the take's channel
+    /// count sizes `{take_id}.ch{k}`, so a malformed one would size that vector from the
+    /// script line — thirty bytes aborting the process. The bound is the capture sanity
+    /// bound, the same rule every other channel count on this path obeys.
+    #[test]
+    fn a_take_declaration_refuses_a_channel_count_it_could_not_have_recorded() {
+        let sanity = media::capture::CAPTURE_CHANNELS_SANITY;
+
+        // The wire form: a well-formed line whose channel count no capture could produce.
+        let script = parse_script(&format!("host v1\ntake jam 96000 0 {} 0\n", sanity + 1))
+            .expect("the line's shape is well formed");
+        let refused = run_script(&script).expect_err("an unboundable width is refused");
+        assert!(refused.contains("channels"), "and it says why: {refused}");
+
+        // The same bound in memory, where a replayed declaration comes from and where
+        // `usize::MAX` is a capacity overflow rather than a merely enormous allocation.
+        let mut s = HostSession::new();
+        assert!(
+            s.execute(&HostCommand::Take {
+                take_id: "jam".into(),
+                frames: 0,
+                dropped: 0,
+                channels: usize::MAX,
+                at_frame: 0,
+            })
+            .is_err(),
+            "a width no capture could have recorded is refused"
+        );
+        assert!(s.last_take().is_none(), "and nothing landed in the session");
+
+        // The bound is inclusive, and it is the *sanity* bound rather than a new ceiling:
+        // a take recorded at the sanity width still replays.
+        let widest =
+            parse_script(&format!("host v1\ntake jam 96000 0 {sanity} 0\n")).expect("it parses");
+        let s = run_script(&widest).expect("the widest legal take binds");
+        assert_eq!(s.last_take().expect("the take is bound").channels, sanity);
     }
 
     /// Recording is one take at a time, needs somewhere to put it, and stopping
@@ -7645,11 +10039,14 @@ mod clock_out_wiring {
         assert_eq!(
             transport_events(&sends),
             vec![(0, "Start")],
-            "no transport command crossed the rebuild either"
+            "no transport command crossed the rebuild either — the seek's re-anchor is \
+             queued in the rebuilt tap and goes out with the first render after it"
         );
 
         // The device is back in the shared slot: the live render records
-        // ticks again, all at or past the seek target.
+        // ticks again, all at or past the seek target, and the re-anchor
+        // reaches the wire at the target frame — as the `Continue` a non-zero
+        // target gets, pinned in the next test.
         session.render(48_000).expect("render after the seek");
         let all = clock_frames(&sends);
         let resumed = &all[frames_before.len()..];
@@ -7657,6 +10054,159 @@ mod clock_out_wiring {
             !resumed.is_empty() && resumed.iter().all(|&f| f >= 24_000),
             "ticks again after the seek, from the target onward: {resumed:?}"
         );
+    }
+
+    /// **A seek while playing re-anchors the follower.** `TransportPlay` is an
+    /// *action*, so it is not state, never enters the history, and a rebuild
+    /// never re-applies it — and the rebuilt session gets a brand-new tap. So
+    /// without the re-anchor the adopted session is still `playing`, its ticks
+    /// resume at the new position, and a follower is never told the position
+    /// moved at all.
+    ///
+    /// The message is the one a `play` at that frame would send, and the
+    /// distinction is pinned here because it is the whole point of the two: at
+    /// 24 000 it is a **`Continue`**, because `Start` on this wire means "return
+    /// to song start" (the rule the `TransportPlay` arm already follows), and
+    /// sending it here would tell gear to jump to its own top while the session
+    /// sits half a second in. A seek to frame **0** does get the `Start` that
+    /// frame deserves — the same wire message a play from the top sends.
+    #[test]
+    fn a_seek_while_playing_re_anchors_the_follower_at_the_target() {
+        let (sink, sends) = fake_sink();
+        let mut session = HostSession::new_at_with(48_000, Some(sink), Some("fake".into()));
+        mount_clock_out(&mut session);
+        session.execute(&HostCommand::TransportPlay).expect("play");
+        session.render(48_000).expect("render one second");
+        assert_eq!(
+            transport_events(&sends),
+            vec![(0, "Start")],
+            "the play reached the wire once"
+        );
+
+        // Seek while playing: the rebuild is silent (nothing crosses a rebuild),
+        // and the re-anchor is due at the target — which is where the clock now
+        // stands, so it flushes at offset 0 of the first block after the rebuild.
+        session
+            .execute(&HostCommand::TransportSeek { frame: 24_000 })
+            .expect("seek");
+        assert_eq!(session.position().frame, 24_000, "the playhead moved");
+        assert!(session.is_playing(), "and the transport kept running");
+        assert_eq!(
+            transport_events(&sends),
+            vec![(0, "Start")],
+            "the rebuild itself sent nothing"
+        );
+        session
+            .render(512)
+            .expect("render one block after the seek");
+        assert_eq!(
+            transport_events(&sends),
+            vec![(0, "Start"), (24_000, "Continue")],
+            "a seek to a non-zero frame re-anchors with Continue: `Start` would mean \
+             'return to song start', which 24 000 is not"
+        );
+
+        // A seek back to the top re-anchors too, and lands on the same wire
+        // message a play from frame 0 sends — one `Start` at frame 0, not two.
+        // This is the case that keeps the `frame == 0` half of the rule pinned:
+        // the same feed that answered 24 000 with `Continue` answers 0 with
+        // `Start`, because there the two messages finally agree.
+        session
+            .execute(&HostCommand::TransportSeek { frame: 0 })
+            .expect("seek home");
+        session
+            .render(512)
+            .expect("render one block after seeking home");
+        assert_eq!(
+            transport_events(&sends),
+            vec![(0, "Start"), (24_000, "Continue"), (0, "Start")],
+            "a seek to the top re-anchors with Start: frame 0 is the one frame where \
+             'return to song start' and the session's position are the same statement"
+        );
+    }
+
+    /// The re-anchor belongs to a **seek that moved a playing transport**. A
+    /// stopped transport has already been stopped on the wire by the `Stop` the
+    /// old session sent, and a rebuild is not what stopped it, so a seek then
+    /// re-anchors nothing — a `Start` there would be a message about a follower
+    /// that is not running.
+    #[test]
+    fn a_seek_while_stopped_re_anchors_nothing() {
+        let (sink, sends) = fake_sink();
+        let mut session = HostSession::new_at_with(48_000, Some(sink), Some("fake".into()));
+        mount_clock_out(&mut session);
+        session.execute(&HostCommand::TransportPlay).expect("play");
+        session.render(48_000).expect("render one second");
+        session.execute(&HostCommand::TransportStop).expect("stop");
+        session.render(512).expect("render past the stop");
+        let before = transport_events(&sends);
+        assert_eq!(before, vec![(0, "Start"), (48_000, "Stop")]);
+
+        // A seek while stopped moves the playhead and re-anchores nothing.
+        session
+            .execute(&HostCommand::TransportSeek { frame: 24_000 })
+            .expect("seek while stopped");
+        session.render(512).expect("render after the seek");
+        assert_eq!(
+            transport_events(&sends),
+            before,
+            "a stopped transport re-anchors nothing"
+        );
+    }
+
+    /// …and it belongs to a **seek** alone. Undo and redo rebuild *at the current
+    /// frame*, over an arrangement edit, which cannot move a tick: the follower
+    /// is still in phase across the edit, so a re-anchor there would put a
+    /// message on the wire about nothing having moved.
+    #[test]
+    fn an_undo_while_playing_re_anchors_nothing() {
+        let root = std::env::temp_dir().join(format!("host-undo-midi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let (sink, sends) = fake_sink();
+        let mut session = HostSession::new_at_with(48_000, Some(sink), Some("fake".into()));
+        session
+            .execute(&HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(0),
+            })
+            .expect("mixer");
+        mount_clock_out(&mut session);
+        session
+            .execute(&HostCommand::Pool { dir: pool })
+            .expect("pool");
+        session
+            .execute(&HostCommand::Arrange {
+                op: media::ArrangeOp::AddTrack { track: "t0".into() },
+                at_frame: None,
+            })
+            .expect("track");
+        session.execute(&HostCommand::TransportPlay).expect("play");
+        session.render(48_000).expect("render one second");
+        let before = transport_events(&sends);
+        assert_eq!(before, vec![(0, "Start")]);
+
+        // An arrangement edit, then its undo: both rebuild the session, and
+        // neither moves the playhead (it is at 48 000 throughout).
+        session
+            .execute(&HostCommand::Arrange {
+                op: add_clip("c0", 0),
+                at_frame: None,
+            })
+            .expect("clip");
+        assert!(session.undo().expect("undo"), "an edit was undone");
+        assert_eq!(session.position().frame, 48_000, "the playhead stayed");
+        session.render(512).expect("render after the undo");
+        assert_eq!(
+            transport_events(&sends),
+            before,
+            "an undo at the current frame re-anchors nothing"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The export clone renders offline: it must send nothing, while the sink
@@ -7717,6 +10267,112 @@ mod clock_out_wiring {
         assert!(
             clock_frames(&sends).len() > frames_before.len(),
             "ticks again after the export"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The bounce is the other command that exists to write a file**, so it
+    /// detaches the sink slot across its offline render for the reason the export
+    /// path gives: a render that produces a file drives no gear. Pinned on the
+    /// ticks of the bounce **and of its drain tail** (drain blocks walk the node's
+    /// schedule exactly as timeline blocks do), on the queued transport message an
+    /// offline render would otherwise flush, and on the refill — a bounce that
+    /// emptied the slot for good would silence a live session.
+    #[test]
+    fn a_bounce_sends_nothing_and_the_live_session_resumes_afterwards() {
+        let root = std::env::temp_dir().join(format!("host-bounce-midi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+
+        let (sink, sends) = fake_sink();
+        let mut session = HostSession::new_at_with(48_000, Some(sink), Some("fake".into()));
+        session
+            .execute(&HostCommand::Mount {
+                plugin: "mixer",
+                params: vec![("channels", 2.0)],
+                at_frame: Some(0),
+            })
+            .expect("mixer");
+        mount_clock_out(&mut session);
+        session
+            .execute(&HostCommand::Pool { dir: pool })
+            .expect("pool");
+        session
+            .execute(&HostCommand::Arrange {
+                op: media::ArrangeOp::AddTrack { track: "t0".into() },
+                at_frame: None,
+            })
+            .expect("track");
+        session
+            .execute(&HostCommand::Arrange {
+                op: add_clip("c0", 0),
+                at_frame: None,
+            })
+            .expect("clip");
+        // Render once so the clock_out node is mounted and has driven the gear
+        // (mounts apply on the next render, so nothing has been sent yet).
+        session.execute(&HostCommand::TransportPlay).expect("play");
+        session.render(48_000).expect("render one second");
+        let frames_before = clock_frames(&sends);
+        let transport_before = transport_events(&sends);
+        assert!(!frames_before.is_empty(), "the live session drove the gear");
+        assert_eq!(transport_before, vec![(0, "Start")]);
+
+        // A resume at 48 000 is a `Continue`, and nothing has rendered since it
+        // was logged, so the message is still sitting in the tap waiting for the
+        // next block. The bounce would be that next block — and an offline render
+        // is no more entitled to put a transport command on the wire than to put
+        // ticks there.
+        session
+            .execute(&HostCommand::TransportPlay)
+            .expect("resume");
+        assert_eq!(
+            transport_events(&sends),
+            transport_before,
+            "the resume is queued, not yet on the wire"
+        );
+
+        let bounced = root.join("bounce.wav");
+        session
+            .execute(&HostCommand::Bounce {
+                frames: 48_000,
+                path: bounced.clone(),
+            })
+            .expect("bounce");
+        assert!(
+            bounced.exists(),
+            "the bounce still wrote its file — detaching is not skipping the work"
+        );
+        assert_eq!(
+            clock_frames(&sends),
+            frames_before,
+            "the bounce sent no ticks: not for its timeline, not for its drain tail"
+        );
+        assert_eq!(
+            transport_events(&sends),
+            transport_before,
+            "the bounce flushed nothing out of the transport tap"
+        );
+
+        // The slot is refilled after the bounce: gear is driven again, and the
+        // queued `Continue` goes out with the live render rather than having been
+        // swallowed by the bounce.
+        session.render(48_000).expect("render after the bounce");
+        assert!(
+            clock_frames(&sends).len() > frames_before.len(),
+            "ticks again after the bounce"
+        );
+        let after = transport_events(&sends);
+        assert_eq!(
+            after.len(),
+            2,
+            "the queued resume reached the wire after the bounce, not during it: {after:?}"
+        );
+        assert_eq!(
+            after[1].1, "Continue",
+            "and it is the resume's own message, a Continue from a non-zero frame"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

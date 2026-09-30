@@ -21,8 +21,24 @@
 //!
 //! Invariants enforced by every mutating op (fail-loud, never partial):
 //! `src_len > 0`, `gain` finite, `loop_len != Some(0)`, `at_frame + src_len` not
-//! overflowing, and `src_len <= i64::MAX` (so signed trim arithmetic never wraps).
+//! overflowing, `src_start + src_len` not overflowing (the source window is an
+//! address, and every op that rewrites a clip's geometry adds to it),
+//! `src_len <= i64::MAX` (so signed trim arithmetic never wraps), and a `source` that
+//! is a **plain pool id** (`pool::valid_id` — a source is a file stem, not a path, and
+//! the log carries it as an arbitrary token). An op that
+//! *changes* a clip's geometry (razor-split, chop, trim, stretch, loop) leaves the
+//! clip satisfying all of them — a shrink caps the fades it can no longer fit, the
+//! way `Stretch` always has — so no op the log accepts can hold a clip
+//! [`validate_clip`] refuses, which is what would make the whole track unplayable.
 //! A refused op returns `Err` and — per the engine contract — is never logged.
+//!
+//! **An op checks the arithmetic it does, it does not trust an admission it cannot
+//! see.** `Timeline` is `Deserialize` and a hand-built `Track` is a legal `&self`
+//! to [`Timeline::apply`], so a clip can reach an arm without having passed
+//! `AddClip`: the sums a geometry op computes are `checked` (an unchecked one is a
+//! debug panic inside the editor's timeline lock and a silent wrap in release),
+//! `Clip::end` is checked for the same reason, and an arm validates the clip it was
+//! handed where its own arithmetic depends on one.
 
 use serde::{Deserialize, Serialize};
 
@@ -47,7 +63,9 @@ pub enum Edge {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Clip {
     pub id: Id,
-    /// Content-hash id of the immutable float-WAV source (the media pool).
+    /// Content-hash id of the immutable float-WAV source (the media pool) — a
+    /// **pool id** (a plain file stem), not a path: [`validate_clip`] refuses one
+    /// that could address a file outside the pool.
     pub source: Id,
     /// First source frame of the region (absolute in the source).
     pub src_start: Frame,
@@ -84,13 +102,20 @@ pub struct Clip {
 }
 
 impl Clip {
-    /// The clip's end frame on the timeline (exclusive).
+    /// The clip's end frame on the timeline (exclusive), or `None` when the span
+    /// `at_frame + src_len` cannot be represented.
     ///
-    /// Callers may assume the span was validated when the clip was admitted
-    /// (`at_frame.checked_add(src_len)`); a clip built by hand and fed straight
-    /// to [`Timeline::apply`] is validated on the way in.
-    pub fn end(&self) -> Frame {
-        self.at_frame + self.src_len
+    /// **Checked, not wrapped.** `AddClip` and every op that rewrites a clip's
+    /// geometry validate the span, so this is `Some` for every clip the model
+    /// admits — but a `Clip` is `Deserialize` and a hand-built `Track` is a legal
+    /// `&self` to [`Timeline::apply`], so an unrepresentable span can reach a
+    /// `pub` method. An unchecked `+` here is a debug panic inside
+    /// [`Timeline::end_frame`] (which every `export` calls) and a **wrapped** end
+    /// in release: an export that silently drops the clip. [`Timeline::end_frame`]
+    /// refuses such a value by name; the render path saturates, because
+    /// `ArrangerNode::new` validated every clip it holds.
+    pub fn end(&self) -> Option<Frame> {
+        self.at_frame.checked_add(self.src_len)
     }
 
     /// The source offset for a timeline offset within the clip's span.
@@ -118,6 +143,16 @@ pub struct Track {
     pub id: Id,
     pub clips: Vec<Clip>,
 }
+
+/// The most slices one [`ArrangeOp::ChopClip`] will make.
+///
+/// A chop's grain is a slice per bar or finer, so 4096 is far past any hand-made
+/// arrangement — and it is a **bound**, not a cap: a larger `times` is refused by name
+/// rather than sized. `times` is a `u32` off the wire and the only other limit is
+/// `times <= src_len`, which reaches `i64::MAX`; without this the op is one logged
+/// line that builds billions of `Clip`s (three heap `String`s each) inside a
+/// `Timeline` `apply` already cloned, and sorts them.
+const MAX_CHOP_SLICES: Frame = 4096;
 
 /// Normalise a deserialized marker list: sorted by frame, at most one per frame (the
 /// last one wins, which is what "set" means).
@@ -254,6 +289,17 @@ pub enum ArrangeOp {
         fade_in: Frame,
         fade_out: Frame,
     },
+    /// **Bake a loop**: the clip plays its region `times` times, and is as long on the
+    /// timeline as the region is `times`.
+    ///
+    /// `times` is the **number of passes, not a factor**, and the region is fixed by
+    /// the first bake (`loop_len`, or the clip's own length when this is the first
+    /// loop) — so a re-bake re-reads the same region and sets the total to `times`
+    /// passes of it. `times: 3` applied twice is three passes, not nine; `times: 1` is
+    /// the single pass the clip was before its first bake, so **a re-bake with a
+    /// smaller count shortens the clip** — and caps the fades it can no longer cover,
+    /// the same rule every other shrink follows. `times: 0` is refused: it is not
+    /// "un-loop", which no op in this model represents (delete and re-add is).
     LoopRegion {
         track: Id,
         clip: Id,
@@ -262,6 +308,8 @@ pub enum ArrangeOp {
     ChopClip {
         track: Id,
         clip: Id,
+        /// The slice count. Bounded: `1 <= times <= min(src_len, 4096)` — a count past
+        /// that is refused by name, not sized (`MAX_CHOP_SLICES` in this module).
         times: u32,
         prefix: Id,
     },
@@ -337,6 +385,27 @@ pub fn validate_clip(c: &Clip) -> Result<(), String> {
     if c.at_frame.checked_add(c.src_len).is_none() {
         return Err(format!("clip '{}' span overflows the timeline", c.id));
     }
+    // The **source window** `[src_start, src_start + src_len)` is bounded for the same
+    // reason as the timeline span: razor-split and chop add to `src_start`, and a sum
+    // that leaves the range is a debug panic inside the editor's lock and a *wrapped*
+    // source offset in release — the clip reads from somewhere the user never asked
+    // for, with no diagnostic.
+    if c.src_start.checked_add(c.src_len).is_none() {
+        return Err(format!("clip '{}' source window overflows", c.id));
+    }
+    // A `source` is a **pool id**, and it is user-craftable: an arbitrary token in
+    // the `host v1` log (`add_clip <track> <clip> <source> …`) and a `Clip` is
+    // `Deserialize`. One carrying a path separator or whitespace is not an id, and
+    // every op that sets a source goes through here — so a value that could address a
+    // file outside the pool never enters the value, let alone the log. The lookup
+    // refuses it too (`Pool::path_for`): this is the guard at the *writing* end, so a
+    // saved session cannot carry a source that would only be refused when read.
+    if !crate::pool::valid_id(&c.source) {
+        return Err(format!(
+            "clip '{}' source '{}' is not a pool id (a source is a file stem, not a path)",
+            c.id, c.source
+        ));
+    }
     if let Some(name) = &c.name
         && !valid_name(name)
     {
@@ -346,7 +415,14 @@ pub fn validate_clip(c: &Clip) -> Result<(), String> {
         // the empty string without ambiguity.
         return Err(format!("clip '{}' has an unusable name '{name}'", c.id));
     }
-    if c.fade_in + c.fade_out > c.src_len {
+    // `checked_add`, not `+`: a pair whose sum overflows (`u64::MAX + 1` wraps to
+    // 0) would *pass* the length check and enter the value as a clip the renderer
+    // reads at gain 0 for every sample — a silent clip that claims to be audible.
+    // A sum that cannot be represented is refused like any other over-long fade.
+    if c.fade_in
+        .checked_add(c.fade_out)
+        .is_none_or(|s| s > c.src_len)
+    {
         return Err(format!("clip '{}' fades exceed the clip length", c.id));
     }
     Ok(())
@@ -357,13 +433,22 @@ impl Timeline {
     /// or 0 when there are no clips. This is the length an export renders — measured
     /// from the value, not handed in, so a mix cannot be exported short by a stale
     /// frame count.
-    pub fn end_frame(&self) -> Frame {
-        self.tracks
-            .iter()
-            .flat_map(|t| t.clips.iter())
-            .map(|c| c.end())
-            .max()
-            .unwrap_or(0)
+    ///
+    /// `Err` — **naming the clip** — when some clip's span is not representable.
+    /// The alternative is not a shorter answer but a wrong one: a wrapped sum is a
+    /// panic in debug and an end that fell *below* the clip's start in release, so
+    /// an `export` would write a mix missing its last clip. A `Timeline` is
+    /// `Deserialize`, so a snapshot can hold such a clip even though no op admits
+    /// one.
+    pub fn end_frame(&self) -> Result<Frame, String> {
+        let mut end = 0;
+        for c in self.tracks.iter().flat_map(|t| t.clips.iter()) {
+            let c_end = c
+                .end()
+                .ok_or_else(|| format!("clip '{}' span overflows the timeline", c.id))?;
+            end = end.max(c_end);
+        }
+        Ok(end)
     }
 
     /// The marker at `frame`, if any.
@@ -574,11 +659,18 @@ impl Timeline {
                         "cannot razor-split a looped clip (loop phase is not representable)".into(),
                     );
                 }
-                if *at_frame <= c.at_frame || *at_frame >= c.end() {
+                // `end()` is checked: a span that cannot be represented has no
+                // representable split frame either, and the `at_frame - c.at_frame` /
+                // `c.src_len - split_in` below would be nonsense on one. Naming the
+                // refusal beats a wrap, and a clip reaches an op without passing
+                // `AddClip` (a `Timeline` is `Deserialize`).
+                let end = c
+                    .end()
+                    .ok_or("razor-split: the clip's span is out of range")?;
+                if *at_frame <= c.at_frame || *at_frame >= end {
                     return Err(format!(
                         "split frame {at_frame} must be strictly inside [{}, {})",
-                        c.at_frame,
-                        c.end()
+                        c.at_frame, end
                     ));
                 }
                 let split_in = at_frame - c.at_frame; // frames into the clip (guaranteed > 0)
@@ -586,21 +678,37 @@ impl Timeline {
                 left.id = new_left.clone();
                 left.src_len = split_in;
                 left.fade_out = 0; // the split seam is hard (a crossfade is a later SetClipFade)
+                // A fade that was legal for the **whole** clip can outlast the half it
+                // lands on, and this op already rewrites the fades (the seam above), so
+                // cap them to the halves they must fit — the same rule `Stretch` follows
+                // when it repoints a clip at shorter material. Leaving them would admit a
+                // clip `validate_clip` refuses, and `ArrangerNode::new` refuses the whole
+                // *track* over one clip: a legal split that makes the session unplayable.
+                left.fade_in = left.fade_in.min(left.src_len);
                 let mut right = c.clone();
                 right.id = new_right.clone();
                 right.at_frame = *at_frame;
                 right.src_len = c.src_len - split_in;
                 right.fade_in = 0;
+                right.fade_out = right.fade_out.min(right.src_len);
                 if c.reversed {
                     // The clip's *first* frames are the region's **top**, so the left
                     // half takes the top and the right half the bottom — the mirror of
                     // the forward split (`clip_tests` pins both).
-                    left.src_start = c.src_start + right.src_len;
+                    left.src_start = c
+                        .src_start
+                        .checked_add(right.src_len)
+                        .ok_or("razor-split would move the left half past the source end")?;
                     right.src_start = c.src_start;
                 } else {
                     left.src_start = c.src_start;
-                    right.src_start = c.src_start + split_in;
+                    right.src_start = c
+                        .src_start
+                        .checked_add(split_in)
+                        .ok_or("razor-split would move the right half past the source end")?;
                 }
+                validate_clip(&left).map_err(|e| format!("razor-split left half: {e}"))?;
+                validate_clip(&right).map_err(|e| format!("razor-split right half: {e}"))?;
                 // drop the original clip, then sorted-insert both halves
                 self.tracks[ti].clips.remove(ci);
                 self.tracks[ti].clips.push(left);
@@ -756,7 +864,12 @@ impl Timeline {
                 let (ti, ci) = self
                     .locate(track, clip)
                     .ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
-                if fade_in + fade_out > self.tracks[ti].clips[ci].src_len {
+                // `checked_add` for the same reason as `validate_clip`: a wrapped sum
+                // would pass the length check and mute the clip instead of refusing it.
+                if fade_in
+                    .checked_add(*fade_out)
+                    .is_none_or(|s| s > self.tracks[ti].clips[ci].src_len)
+                {
                     return Err("fades exceed the clip length".into());
                 }
                 self.tracks[ti].clips[ci].fade_in = *fade_in;
@@ -778,12 +891,32 @@ impl Timeline {
                     .locate(track, clip)
                     .ok_or_else(|| format!("clip '{clip}' not on track '{track}'"))?;
                 let c = &mut self.tracks[ti].clips[ci];
+                // `times` is a **count of passes, not a factor**, and the region is fixed
+                // by the first bake — `loop_len`, or the clip's own length on the first
+                // loop. So a re-bake re-reads *the same* region and sets the total to
+                // `times` passes of it: `times: 3` twice is three passes, not nine, and
+                // `times: 1` is the single pass the clip was before its first bake.
                 let region = c.loop_len.unwrap_or(c.src_len);
                 let src_len = region
                     .checked_mul(*times as Frame)
                     .ok_or("loop region length overflows")?;
                 c.loop_len = Some(region);
                 c.src_len = src_len;
+                // A re-bake with a **smaller** count shortens the clip, so a fade that
+                // was legal for the longer clip can outlast the length it now covers:
+                // cap it, exactly as `RazorSplit`, `ChopClip` and `Stretch` do when they
+                // shrink `src_len`. Leaving it would admit a clip `validate_clip`
+                // refuses — and `ArrangerNode::new` refuses the whole *track* over one,
+                // so a logged op that made the session unplayable. (On a first bake the
+                // clip only grows, and both caps are no-ops.)
+                c.fade_in = c.fade_in.min(c.src_len);
+                c.fade_out = c.fade_out.min(c.src_len.saturating_sub(c.fade_in));
+                // `checked_mul` keeps the *length* representable; growing it can still
+                // push the clip's timeline span or its source window out of range (a
+                // clip placed near the end of the frame range, looped many times). Same
+                // rule as every other geometry op: an op the log accepts must not leave
+                // a clip the renderer refuses, because that wedges the whole track.
+                validate_clip(c).map_err(|e| format!("loop region: {e}"))?;
                 Ok(())
             }
             ArrangeOp::ChopClip {
@@ -804,11 +937,32 @@ impl Timeline {
                         "cannot chop a looped clip (loop phase is not representable)".into(),
                     );
                 }
+                // A clip reaches an op without passing `AddClip` — a `Timeline` is
+                // `Deserialize`, and a hand-built `Track` is a legal `&self` — so this
+                // arm checks the clip it is about to re-tile instead of trusting an
+                // admission it cannot see. It also *names* what is wrong: a source
+                // window that cannot be represented, where the `checked_add`s below
+                // would have reported it as a piece that would not fit.
+                validate_clip(&c).map_err(|e| format!("chop: {e}"))?;
                 let times_f = *times as Frame;
                 if times_f > c.src_len {
                     return Err(format!(
                         "chop {} times exceeds src_len {}",
                         times_f, c.src_len
+                    ));
+                }
+                // `times > src_len` is the only bound above, and `src_len` reaches
+                // `i64::MAX` — so `times` (a `u32` straight off the wire) can ask for
+                // billions of pieces. The loop below is `times` iterations, each
+                // allocating a `Clip` with three heap `String`s, inside a `Timeline`
+                // `apply` already cloned, followed by a `times`-element sort: a logged
+                // op that hangs long before it aborts on the allocation. The op's own
+                // grain is a slice per bar or finer, so a few thousand is a typo and
+                // the refusal names the bound.
+                if times_f > MAX_CHOP_SLICES {
+                    return Err(format!(
+                        "chop {} times exceeds the {MAX_CHOP_SLICES}-slice bound",
+                        times_f
                     ));
                 }
                 // Split the source region into `times` contiguous equal (within 1
@@ -820,23 +974,41 @@ impl Timeline {
                 // Forward, the pieces walk up from `src_start`; reversed, they walk
                 // **down** from the region's top (the first piece in time is the top).
                 let mut src_at = if c.reversed {
-                    c.src_start + c.src_len
+                    c.src_start
+                        .checked_add(c.src_len)
+                        .ok_or("chop would move a piece past the source end")?
                 } else {
                     c.src_start
                 };
                 let mut at = c.at_frame;
-                let mut seen = std::collections::HashSet::new();
+                // The arrangement's clip ids, gathered **once**: ids are unique across
+                // every track (`clip_id_exists` is the rule this preserves), so one set
+                // answers both questions the piece loop asks — is this derived id
+                // already taken, and has this loop already produced it — in O(1) each.
+                // Asking `clip_id_exists` per piece was `times` × clips string
+                // comparisons, which is what made an unbounded `times` quadratic.
+                let mut ids: std::collections::HashSet<Id> = self
+                    .tracks
+                    .iter()
+                    .flat_map(|t| t.clips.iter())
+                    .map(|c| c.id.clone())
+                    .collect();
                 for i in 0..times_f {
                     let pid = format!("{prefix}.{i}");
-                    if self.clip_id_exists(&pid) || !seen.insert(pid.clone()) {
+                    if !ids.insert(pid.clone()) {
                         return Err(format!("chop derived id '{pid}' already exists or repeats"));
                     }
                     let slen = base + if i < rem { 1 } else { 0 };
                     // Preserve the clip's outer fades on the first/last piece (as
                     // RazorSplit does) so a chop doesn't silently remove audible
                     // crossfades; interior seams are hard (a SetClipFade follows).
+                    // A piece is shorter than the clip the fade was legal for, so it is
+                    // capped to the piece — an uncapped fade would make a piece the
+                    // model refuses, and the renderer refuses the whole track over it.
                     if c.reversed {
-                        src_at -= slen;
+                        src_at = src_at
+                            .checked_sub(slen)
+                            .ok_or("chop would move a piece before the source start")?;
                     }
                     pieces.push(Clip {
                         id: pid,
@@ -847,16 +1019,36 @@ impl Timeline {
                         src_start: src_at,
                         src_len: slen,
                         at_frame: at,
-                        fade_in: if i == 0 { c.fade_in } else { 0 },
-                        fade_out: if i + 1 == times_f { c.fade_out } else { 0 },
+                        fade_in: if i == 0 { c.fade_in.min(slen) } else { 0 },
+                        fade_out: if i + 1 == times_f {
+                            c.fade_out.min(slen)
+                        } else {
+                            0
+                        },
                         gain: c.gain,
                         loop_len: None,
                         reversed: c.reversed,
                     });
+                    // Walk the pieces up the source window and down the timeline, both
+                    // `checked`: an unchecked `+` here is the same debug panic inside
+                    // the editor's lock (and the same silent wrap in release) that the
+                    // reversed arm's seed already refuses — one `reversed` boolean away
+                    // from the fixture the first pass of this fix added.
                     if !c.reversed {
-                        src_at += slen;
+                        src_at = src_at
+                            .checked_add(slen)
+                            .ok_or("chop would move a piece past the source end")?;
                     }
-                    at += slen;
+                    at = at
+                        .checked_add(slen)
+                        .ok_or("chop would move a piece past the end of the timeline")?;
+                }
+                // The pieces tile the original clip's span and source window, so for a
+                // clip the model accepted above (checked on the way in) this cannot
+                // fail — it states that, so a future change to the piece construction
+                // cannot quietly reintroduce a logged clip the renderer refuses.
+                for p in &pieces {
+                    validate_clip(p).map_err(|e| format!("chop piece '{}': {e}", p.id))?;
                 }
                 self.tracks[ti].clips.remove(ci);
                 self.tracks[ti].clips.extend(pieces);
@@ -933,6 +1125,17 @@ mod tests {
             .apply(&ArrangeOp::AddTrack { track: "t1".into() })
             .unwrap();
         t
+    }
+
+    /// Every clip in the value satisfies the model's invariants. This is the property
+    /// that makes an accepted op safe to *render*: `ArrangerNode::new` validates every
+    /// clip on a track and refuses the whole track over one of them, so a single clip an
+    /// op left invalid makes the session unplayable (and every later edit fail with it).
+    fn assert_all_clips_valid(t: &Timeline) {
+        for c in t.tracks.iter().flat_map(|tr| tr.clips.iter()) {
+            let verdict = validate_clip(c);
+            assert!(verdict.is_ok(), "clip '{}' is invalid: {verdict:?}", c.id);
+        }
     }
 
     #[test]
@@ -1301,8 +1504,10 @@ mod tests {
         }
         // And markers do not extend the arrangement.
         assert_eq!(
-            t3.end_frame(),
-            t.end_frame(),
+            t3.end_frame()
+                .expect("an admitted value has a representable end"),
+            t.end_frame()
+                .expect("an admitted value has a representable end"),
             "a marker past the last clip is not rendered silence"
         );
     }
@@ -1882,6 +2087,26 @@ mod tests {
         assert_eq!(c.source_frame_at(999), 999);
         assert_eq!(c.source_frame_at(1000), 0);
         assert_eq!(c.source_frame_at(2500), 500);
+
+        // Growing `src_len` can push the clip's timeline span out of range, and that is
+        // refused rather than admitted: an op the log accepts must not leave a clip the
+        // renderer refuses, or the whole track stops building readers.
+        let mut t = two_tracks();
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", u64::MAX - 100, 100),
+            })
+            .unwrap();
+        assert!(
+            t.apply(&ArrangeOp::LoopRegion {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 2,
+            })
+            .is_err(),
+            "a loop that would push the clip's span out of range is refused"
+        );
     }
 
     #[test]
@@ -1931,6 +2156,514 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    /// **A fade pair whose sum overflows `u64` is refused, not wrapped.** Both fade
+    /// operands are raw `u64` on the `host v1` text path (`arrange set_clip_fade t0
+    /// c0 18446744073709551615 1`), so the sum can leave the range: it wraps to 0,
+    /// `0 > src_len` is false, and the pair passes the length check. In a debug
+    /// build the `+` itself panics *under the editor's timeline lock*; in a release
+    /// build the clip is accepted and rendered at gain 0 for every sample — silent
+    /// while the log, panel and gain all claim it is audible.
+    #[test]
+    fn a_fade_pair_whose_sum_overflows_is_refused_not_wrapped() {
+        let t = two_tracks();
+        let fading = |fade_in, fade_out| ArrangeOp::SetClipFade {
+            track: "t0".into(),
+            clip: "c0".into(),
+            fade_in,
+            fade_out,
+        };
+        let t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 0, 100),
+            })
+            .unwrap();
+
+        // `AddClip` runs the same rule through `validate_clip`; a wrapped sum must
+        // not admit a clip the value model would refuse.
+        let mut c = clip("c0", 0, 100);
+        c.fade_in = u64::MAX;
+        c.fade_out = 1;
+        assert!(
+            t.apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: c
+            })
+            .is_err(),
+            "an overflowing fade pair must not enter the value through AddClip"
+        );
+
+        // `SetClipFade`: the overflowing pair is refused...
+        assert!(
+            t.apply(&fading(u64::MAX, 1)).is_err(),
+            "fade_in u64::MAX + fade_out 1 wraps to 0 — refuse, never admit"
+        );
+        // ...and so is the pair that only *reaches* the top of the range, which the
+        // wrapped comparison would also have waved through.
+        assert!(
+            t.apply(&fading(u64::MAX, 0)).is_err(),
+            "a fade pair above the clip length is refused however it was spelled"
+        );
+        // The boundary that is legal stays legal: `fade_in + fade_out == src_len`
+        // is exactly what the model allows.
+        assert!(t.apply(&fading(60, 40)).is_ok());
+    }
+
+    /// **A razor-split of a clip with a long fade leaves two clips the model accepts.**
+    /// The fade rule is a sum against `src_len`, and razor-split is an op that *shrinks*
+    /// `src_len` — it zeroed the two seam fades but kept the inherited ones on the halves
+    /// that did not have the seam. A full-length fade-in is one keypress away in the shell
+    /// (`f` with the playhead at the clip's end caps at `src_len - fade_out`), so
+    /// `f`-then-`x` produced a half with `fade_in = src_len_of_the_whole` on a clip a
+    /// fraction of that long. `ArrangerNode::new` validates every clip on a track and
+    /// refuses the *whole* track over one, so the split — legal, accepted and logged —
+    /// made the session unplayable, and the half could not even be trimmed back.
+    #[test]
+    fn a_razor_split_of_a_long_fade_leaves_two_valid_halves() {
+        let mut t = two_tracks();
+        // A full-length fade-in is legal (48000 + 0 == src_len) and one keypress away.
+        let mut c = clip("c0", 0, 48_000);
+        c.fade_in = 47_999;
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: c,
+            })
+            .unwrap();
+
+        let split = t
+            .apply(&ArrangeOp::RazorSplit {
+                track: "t0".into(),
+                clip: "c0".into(),
+                new_left: "L".into(),
+                new_right: "R".into(),
+                at_frame: 12_000,
+            })
+            .expect("a split of a fading clip is not refused");
+        assert_all_clips_valid(&split);
+
+        let l = split.clip("L").expect("left half").1;
+        let r = split.clip("R").expect("right half").1;
+        assert_eq!(l.src_len, 12_000, "the left half is the short one");
+        // Capped to the half, not kept whole: 47_999 does not fit 12_000 frames.
+        assert_eq!(l.fade_in, 12_000, "the fade is capped to the half");
+        assert_eq!(l.fade_out, 0, "the split seam stays hard");
+        assert_eq!((r.fade_in, r.fade_out), (0, 0), "the seam is hard");
+        assert_eq!(r.src_len, 36_000);
+
+        // The mirror: a fade-*out* longer than the right half is capped there.
+        let mut t = two_tracks();
+        let mut c = clip("c0", 0, 48_000);
+        c.fade_out = 47_000;
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: c,
+            })
+            .unwrap();
+        let split = t
+            .apply(&ArrangeOp::RazorSplit {
+                track: "t0".into(),
+                clip: "c0".into(),
+                new_left: "L".into(),
+                new_right: "R".into(),
+                at_frame: 12_000,
+            })
+            .expect("a split of a fading-out clip is not refused");
+        assert_all_clips_valid(&split);
+        assert_eq!(
+            split.clip("R").expect("right half").1.fade_out,
+            36_000,
+            "the fade-out is capped to the right half"
+        );
+    }
+
+    /// **A chop of a clip with a long fade leaves pieces the model accepts.** Same hole
+    /// as the split, per piece: the first piece inherited `fade_in` and the last
+    /// `fade_out` from the whole clip, and each piece is only `src_len / times` frames.
+    #[test]
+    fn a_chop_of_a_long_fade_leaves_pieces_the_model_accepts() {
+        let mut t = two_tracks();
+        let mut c = clip("c0", 0, 100);
+        c.fade_in = 50;
+        c.fade_out = 50; // exactly the clip's length: legal, and each piece is 10 frames
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: c,
+            })
+            .unwrap();
+
+        let chopped = t
+            .apply(&ArrangeOp::ChopClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 10,
+                prefix: "s".into(),
+            })
+            .expect("a chop of a fading clip is not refused");
+        assert_all_clips_valid(&chopped);
+        let pieces = &chopped.tracks[0].clips;
+        assert_eq!(pieces.len(), 10);
+        assert_eq!(
+            (pieces[0].fade_in, pieces[0].fade_out),
+            (10, 0),
+            "the leading fade is capped to the first piece"
+        );
+        assert_eq!(
+            (pieces[9].fade_in, pieces[9].fade_out),
+            (0, 10),
+            "the trailing fade is capped to the last piece"
+        );
+        assert!(
+            pieces[1..pieces.len() - 1]
+                .iter()
+                .all(|p| (p.fade_in, p.fade_out) == (0, 0)),
+            "the interior seams stay hard"
+        );
+    }
+
+    /// **A split and a chop are refused rather than wrapping when they would push the
+    /// source window past the frame range.** `src_start` is an unbounded `u64` on the
+    /// `add_clip` path, and a reversed split/chop *adds* to it: `u64::MAX - 3999 + 4000`
+    /// wraps in debug (a panic inside the editor's lock) and silently to a wrong offset
+    /// in release — the piece reads from somewhere the user never asked for. The clip is
+    /// refused at `AddClip` now that the window is bounded, and the arithmetic in both
+    /// arms is `checked_add` so a hand-built clip (a deserialized snapshot) is refused
+    /// there too rather than wrapped.
+    #[test]
+    fn a_source_window_past_the_frame_range_is_refused_not_wrapped() {
+        let t = two_tracks();
+        let mut c = clip("c0", 0, 4_000);
+        c.src_start = u64::MAX - 4_000; // the window ends on the last frame: legal
+        let t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: c,
+            })
+            .expect("the last representable window is legal");
+        let mut c = clip("c1", 0, 4_000);
+        c.src_start = u64::MAX - 3_999; // one frame further: the end leaves the range
+        let t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: c,
+            })
+            .expect_err("a source window that cannot be represented is refused");
+        assert!(
+            t.contains("source window"),
+            "the refusal names the source window, got: {t}"
+        );
+
+        // The arms refuse too, when a clip reaches them without passing `AddClip` (a
+        // value deserialized from a snapshot is a legal `&self` to `apply`).
+        let mut hand = two_tracks();
+        let mut c = clip("c0", 0, 4_000);
+        c.src_start = u64::MAX - 10; // the window cannot be represented
+        c.reversed = true; // the reversed arms add to `src_start`
+        hand.tracks[0].clips.push(c);
+        assert!(
+            hand.apply(&ArrangeOp::RazorSplit {
+                track: "t0".into(),
+                clip: "c0".into(),
+                new_left: "L".into(),
+                new_right: "R".into(),
+                at_frame: 100,
+            })
+            .is_err(),
+            "a reversed split that would wrap the source offset is refused"
+        );
+        assert!(
+            hand.apply(&ArrangeOp::ChopClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 4,
+                prefix: "p".into(),
+            })
+            .is_err(),
+            "a reversed chop that would wrap the source offset is refused"
+        );
+    }
+
+    /// **A clip's `source` is a pool id, not a path.** It is an arbitrary
+    /// whitespace-free token in the `host v1` log (`add_clip <track> <clip> <source>
+    /// …`) and a `Clip` is `Deserialize`, so a crafted value reaches the model — and
+    /// unfixed, the resolver joined it straight onto the pool directory, so
+    /// `../../elsewhere` read a WAV from outside the pool into a bounce or an export.
+    /// `AddClip` refuses it, and so does `Stretch` (the other op that sets a source),
+    /// so the bad value is never *logged*; `Pool::path_for` refuses it again on the
+    /// reading side.
+    #[test]
+    fn a_clip_source_that_is_not_a_pool_id_is_refused() {
+        let t = two_tracks();
+        for bad in [
+            "../../elsewhere",
+            "..",
+            ".",
+            "sub/s1",
+            "back\\slash",
+            "s1 ",
+            " ",
+        ] {
+            let mut c = clip("c0", 0, 4_000);
+            c.source = bad.into();
+            let err = t
+                .apply(&ArrangeOp::AddClip {
+                    track: "t0".into(),
+                    clip: c,
+                })
+                .expect_err("a source that is not a plain pool id is refused");
+            assert!(
+                err.contains("not a pool id"),
+                "the refusal says what is wrong: {err}"
+            );
+        }
+        assert!(
+            t.tracks[0].clips.is_empty(),
+            "a refused clip is not in the value (so it is not in the log)"
+        );
+
+        // A plain id is still a legal source.
+        let t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 0, 4_000),
+            })
+            .expect("a pool id places a clip");
+        assert_eq!(t.tracks[0].clips[0].source, "pool-1");
+        // …and `Stretch`, which repoints a clip at a rendered source, holds the same
+        // line: a rendered id is derived from the old source, so a bad one only arrives
+        // from a hand-built op.
+        assert!(
+            t.apply(&ArrangeOp::Stretch {
+                track: "t0".into(),
+                clip: "c0".into(),
+                source: "../elsewhere".into(),
+                src_len: 4_000,
+                num: 2,
+                den: 1,
+            })
+            .is_err(),
+            "a stretch cannot point a clip outside the pool either"
+        );
+    }
+
+    /// **The *forward* chop is checked the same way, and the arm validates the clip it
+    /// was handed.** The fix above made the *reversed* chop's seed a `checked_add` and
+    /// left the forward walk summing `src_at += slen` raw — the same panic and the same
+    /// silent wrap, one boolean (`reversed`) away from the fixture it added. The route is
+    /// a clip that reaches an op without passing `AddClip`: a hand-built `Track` is a
+    /// legal `&self`, and a `Timeline` is `Deserialize`. The arm now checks the clip
+    /// *and* the walk, and the refusal names the window rather than a piece that would
+    /// not fit.
+    #[test]
+    fn a_forward_chop_that_would_wrap_the_source_window_is_refused() {
+        let mut hand = two_tracks();
+        let mut c = clip("c0", 0, 4_000);
+        c.src_start = u64::MAX - 10; // the window cannot be represented
+        hand.tracks[0].clips.push(c);
+        let err = hand
+            .apply(&ArrangeOp::ChopClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 4,
+                prefix: "p".into(),
+            })
+            .expect_err("a forward chop of an unrepresentable window is refused");
+        assert!(
+            err.contains("source window"),
+            "the refusal names the source window, got: {err}"
+        );
+        assert_eq!(
+            hand.tracks[0].clips.len(),
+            1,
+            "a refused op leaves the value alone"
+        );
+
+        // A clip that is *admitted* can never make that sum overflow — the pieces tile
+        // `[src_start, src_start + src_len)` — and the pin that says so is the last
+        // piece's own `validate_clip`.
+        let t = two_tracks();
+        let mut c = clip("c0", 0, 4_000);
+        c.src_start = u64::MAX - 4_000; // the window ends on the last frame: legal
+        let t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: c,
+            })
+            .expect("the last representable window is legal");
+        let chopped = t
+            .apply(&ArrangeOp::ChopClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 4,
+                prefix: "p".into(),
+            })
+            .expect("a forward chop of a representable window applies");
+        assert_all_clips_valid(&chopped);
+        assert_eq!(
+            chopped.tracks[0]
+                .clips
+                .iter()
+                .map(|c| c.src_start + c.src_len)
+                .max(),
+            Some(u64::MAX),
+            "the last piece's window ends where the original's did"
+        );
+    }
+
+    /// **`times` is a count of passes, not a factor — and a re-bake that shortens a clip
+    /// caps its fades instead of being refused.** `LoopRegion` reads the region from
+    /// `loop_len`, so a re-bake re-reads *the same* region: `times: 3` twice is three
+    /// passes (a factor reading would make it nine, and every script that re-baked a
+    /// clip would grow it), and `times: 1` is the single pass the clip was before its
+    /// first bake. A shrink is a shrink, so the fade rule is the one every other shrink
+    /// follows (razor-split, chop, stretch): cap the fades to the length they now
+    /// cover. Without the cap the *newly added* `validate_clip` refused the op — a
+    /// shorter loop of a fading clip could not be made at all.
+    #[test]
+    fn a_re_baked_loop_sets_the_pass_count_and_caps_its_fades() {
+        let mut t = two_tracks();
+        // A 1000-frame region, baked three times, and then given a fade-in over the
+        // *baked* 3000 frames: legal there (the sum is against `src_len`), and 3x longer
+        // than the region it will have to fit when the loop is baked back down to one
+        // pass.
+        let c = clip("c0", 0, 1_000);
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: c,
+            })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::LoopRegion {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 3,
+            })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::SetClipFade {
+                track: "t0".into(),
+                clip: "c0".into(),
+                fade_in: 3_000,
+                fade_out: 0,
+            })
+            .expect("a fade over the baked length is legal");
+        let c = &t.tracks[0].clips[0];
+        assert_eq!(
+            (c.loop_len, c.src_len),
+            (Some(1_000), 3_000),
+            "three passes"
+        );
+
+        // The same count again is the same value — `times` counts, so it does not
+        // compound into nine passes.
+        t = t
+            .apply(&ArrangeOp::LoopRegion {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 3,
+            })
+            .unwrap();
+        let c = &t.tracks[0].clips[0];
+        assert_eq!(
+            (c.loop_len, c.src_len),
+            (Some(1_000), 3_000),
+            "`times` is a count of passes, not a factor"
+        );
+
+        // Fewer passes shortens the clip to the region — and the fade that covered the
+        // baked length is capped to what is left, not left to be refused.
+        let shorter = t
+            .apply(&ArrangeOp::LoopRegion {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 1,
+            })
+            .expect("a shorter loop is the clip's own length, not a refusal");
+        assert_all_clips_valid(&shorter);
+        let c = &shorter.tracks[0].clips[0];
+        assert_eq!(
+            (c.loop_len, c.src_len),
+            (Some(1_000), 1_000),
+            "one pass is the region the first bake fixed"
+        );
+        assert_eq!(c.fade_in, 1_000, "the fade is capped to the shorter clip");
+        assert_eq!(
+            c.source_frame_at(0),
+            0,
+            "and the region is unchanged, so the material is the region's"
+        );
+
+        // …and the region stays fixed: baking three passes again is three passes of the
+        // *original* region, not three of what is left.
+        let rebaked = shorter
+            .apply(&ArrangeOp::LoopRegion {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 3,
+            })
+            .unwrap();
+        let c = &rebaked.tracks[0].clips[0];
+        assert_eq!(
+            (c.loop_len, c.src_len),
+            (Some(1_000), 3_000),
+            "the first bake fixed the region for good"
+        );
+
+        // `times: 0` is not "un-loop": it is refused, and un-looping is a delete and a
+        // re-add (no op in this model drops a loop).
+        assert!(
+            shorter
+                .apply(&ArrangeOp::LoopRegion {
+                    track: "t0".into(),
+                    clip: "c0".into(),
+                    times: 0,
+                })
+                .is_err(),
+            "`times: 0` is refused rather than read as one pass"
+        );
+    }
+
+    /// **A span that cannot be represented has no end — it is checked, not wrapped.**
+    /// `Clip::end` is `pub` and its doc used to *assert* the span was validated on
+    /// admission, but a `Timeline` is `Deserialize` and a hand-built `Track` is a legal
+    /// `&self`: the unchecked `+` was a debug panic inside `end_frame()` — which every
+    /// `export` calls — and a *wrapped* end in release, i.e. a mix silently missing its
+    /// last clip. `end` is `Option`, `end_frame` is `Result` and names the clip, so the
+    /// export is refused instead.
+    #[test]
+    fn a_span_that_cannot_be_represented_has_no_end() {
+        let mut hand = two_tracks();
+        let mut c = clip("c0", 0, 1_000);
+        c.at_frame = u64::MAX - 10; // `at_frame + src_len` leaves the range
+        hand.tracks[0].clips.push(c);
+        let c = &hand.tracks[0].clips[0];
+        assert_eq!(c.end(), None, "an unrepresentable span has no end frame");
+        let err = hand
+            .end_frame()
+            .expect_err("the arrangement's end is refused, not wrapped");
+        assert!(
+            err.contains("clip 'c0'") && err.contains("span overflows"),
+            "the refusal names the clip and the span, got: {err}"
+        );
+
+        // An admitted clip is unaffected: the last representable span still ends on the
+        // last frame, and an empty arrangement is still 0.
+        let t = two_tracks();
+        let mut c = clip("c0", 0, 1_000);
+        c.at_frame = u64::MAX - 1_000;
+        let t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: c,
+            })
+            .expect("the last representable span is legal");
+        assert_eq!(t.end_frame().unwrap(), u64::MAX);
+        assert_eq!(two_tracks().end_frame().unwrap(), 0);
     }
 
     #[test]
@@ -2002,7 +2735,12 @@ mod tests {
             assert_eq!(c.gain, 1.0, "chop preserves the clip gain");
         }
         assert_eq!(
-            track.clips.last().unwrap().end(),
+            track
+                .clips
+                .last()
+                .unwrap()
+                .end()
+                .expect("a tiled piece has an end"),
             4000,
             "pieces tile the original span"
         );
@@ -2074,6 +2812,113 @@ mod tests {
                 prefix: "p".into()
             })
             .is_err()
+        );
+    }
+
+    /// **A chop is refused a slice count past its bound rather than sized for it.**
+    /// `times` is a `u32` straight off the wire (`arrange chop t0 c0 4294967295 pre @0`)
+    /// and the only other limit was `times <= src_len`, which reaches `i64::MAX`. So one
+    /// logged op could walk billions of pieces — each iteration a full scan of every
+    /// track's clip ids *and* a `Clip` with three heap `String`s, inside a `Timeline`
+    /// `apply` already cloned — and sort the result: a hang first, an allocation abort
+    /// second. The bound is a **refusal naming the limit**, and it is inclusive: the
+    /// count at the bound still applies, so nothing a hand makes is turned away.
+    #[test]
+    fn a_chop_past_the_slice_bound_is_refused_not_sized() {
+        let mut t = two_tracks();
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 0, MAX_CHOP_SLICES + 1),
+            })
+            .unwrap();
+
+        // One past the bound, on a clip long enough to satisfy `times <= src_len`. This
+        // is the assertion the fix turns: on the unbounded value the op *applies* and
+        // builds 4097 pieces, so it also fails fast there rather than hanging.
+        let err = t
+            .apply(&ArrangeOp::ChopClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: (MAX_CHOP_SLICES + 1) as u32,
+                prefix: "pre".into(),
+            })
+            .expect_err("a chop past the slice bound is refused");
+        assert!(
+            err.contains(&MAX_CHOP_SLICES.to_string()),
+            "the refusal names the bound, got: {err}"
+        );
+
+        // The reported trigger: the wire's largest `u32`, on a clip long enough that
+        // `times <= src_len` does not catch it. Refused before a piece is built.
+        let mut wide = two_tracks();
+        wide = wide
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 0, u32::MAX as Frame),
+            })
+            .unwrap();
+        assert!(
+            wide.apply(&ArrangeOp::ChopClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: u32::MAX,
+                prefix: "pre".into(),
+            })
+            .is_err(),
+            "chop times = u32::MAX is refused"
+        );
+
+        // At the bound it still applies, and every piece is a clip the model accepts.
+        let at_bound = t
+            .apply(&ArrangeOp::ChopClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: MAX_CHOP_SLICES as u32,
+                prefix: "pre".into(),
+            })
+            .expect("a chop at the bound applies");
+        assert_eq!(
+            at_bound.tracks[0].clips.len(),
+            MAX_CHOP_SLICES as usize,
+            "every slice at the bound is produced"
+        );
+        assert_all_clips_valid(&at_bound);
+    }
+
+    /// **The derived-id check spans every track, not the chopped one.** Clip ids are
+    /// unique across the whole arrangement (`Timeline::clip` resolves an id without
+    /// naming a track, and `Duplicate` checks the whole value), so a chop whose piece id
+    /// is already taken on *another* track is refused. The duplicate check is now a hash
+    /// set gathered before the walk — this is what keeps it from becoming the chopped
+    /// track's own ids, which would let two tracks hold the same clip id.
+    #[test]
+    fn a_chop_is_refused_a_derived_id_taken_on_another_track() {
+        let mut t = two_tracks();
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 0, 4000),
+            })
+            .unwrap();
+        t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t1".into(),
+                clip: clip("pre.1", 0, 4000),
+            })
+            .unwrap();
+
+        let err = t
+            .apply(&ArrangeOp::ChopClip {
+                track: "t0".into(),
+                clip: "c0".into(),
+                times: 4,
+                prefix: "pre".into(),
+            })
+            .expect_err("a piece id already on another track is refused");
+        assert_eq!(
+            err, "chop derived id 'pre.1' already exists or repeats",
+            "the refusal names the colliding piece"
         );
     }
 }
