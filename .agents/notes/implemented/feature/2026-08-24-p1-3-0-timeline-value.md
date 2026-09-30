@@ -38,7 +38,10 @@ mutation on `Err`).
 Invariants enforced by every mutating op (fail-loud, never logged on refusal):
 `src_len > 0`, `src_len <= i64::MAX` (so signed trim arithmetic never wraps), `gain`
 finite, `loop_len != Some(0)`, `at_frame + src_len` not overflowing,
-`src_start + src_len` not overflowing, and `fade_in + fade_out <= src_len`. The three
+`src_start + src_len` not overflowing, `fade_in + fade_out <= src_len`, and a `source`
+that is a **plain pool id** — it is a file stem, not a path, and it is an arbitrary token
+in the `host v1` log ([clip-source
+fix](../bug-fix/2026-09-29-a-clip-source-is-a-pool-id-not-a-path.md)). The three
 sums are **checked, not wrapped**: the fades and `src_start` are raw `u64` on the
 `host v1` text path, so a pair or a window can leave the range — see the
 [fade-sum fix](../bug-fix/2026-09-29-fade-sums-are-checked-not-wrapped.md) and the

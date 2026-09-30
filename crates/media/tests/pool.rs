@@ -105,6 +105,41 @@ fn recover_rebuilds_missing_peaks() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// **The resolver a host hands the arranger is the guarded lookup.** A clip's `source`
+/// is an arbitrary token in the `host v1` log, so a resolver that joins the id onto the
+/// pool directory itself turns `../escape` into `<pool>/../escape.wav`: a readable file
+/// outside the pool, streamed into whatever the session renders. `Pool::resolver`
+/// delegates to `path_for`, so a crafted id resolves to *nothing*.
+#[test]
+fn resolver_refuses_an_id_that_is_not_a_plain_pool_id() {
+    let root = tmp_dir("resolver-escape");
+    let dir = root.join("pool");
+    std::fs::create_dir_all(&dir).unwrap();
+    write_finalized(&dir, "take-5", 1_000, 48_000, 0.1);
+    // A readable WAV one level *above* the pool: what the escaping id would reach.
+    write_finalized(&root, "escape", 1_000, 48_000, 0.9);
+    assert!(
+        dir.join("../escape.wav").is_file(),
+        "the escape target exists"
+    );
+
+    let pool = Pool::open(&dir).unwrap();
+    let resolve = pool.resolver();
+    assert_eq!(
+        resolve("take-5"),
+        Some(dir.join("take-5.wav")),
+        "a plain id resolves to the pool's own file"
+    );
+    for bad in ["../escape", "..", "sub/take-5", "take 5", ""] {
+        assert!(
+            resolve(bad).is_none(),
+            "'{bad}' is not a plain pool id, so it resolves to nothing"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn path_for_maps_stem_to_wav() {
     let dir = tmp_dir("path");

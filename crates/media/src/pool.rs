@@ -6,8 +6,9 @@
 //! Sources are immutable *post-finalize*; `Pool::recover` only finalizes crashed
 //! takes (patches the header + truncates a torn tail) and *derives* missing
 //! `.peaks` — it never mutates a well-formed source. A clip references a source by
-//! its stem id (`take_id.ch{N}`); the arranger's `PoolResolver`/`Pool::path_for`
-//! maps that id to its `.wav` path.
+//! its stem id (`take_id.ch{N}`); the arranger's `PoolResolver` maps that id to its
+//! `.wav` path, and [`Pool::resolver`] is the guarded way a host builds one
+//! ([`Pool::path_for`] is the lookup itself).
 //!
 //! **The pool is session-owned material at the session rate.** Material enters
 //! through [`Pool::import`] (which converts a foreign rate once, at the boundary)
@@ -21,6 +22,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -154,7 +156,11 @@ pub struct Pool {
 /// should-fix 5). Also refuses **whitespace**: a pool source id has to be nameable in
 /// the space-separated `host v1` log, so an id with a space could exist on disk but
 /// never be named back (the panel marks such a stem; nothing can address it).
-fn valid_id(id: &str) -> bool {
+///
+/// `pub` because the rule belongs to the pool and a caller cannot re-derive it: a
+/// host resolves clip sources through [`Pool::resolver`], and the value model
+/// refuses a clip whose `source` is not one (a clip source is a pool id, not a path).
+pub fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && !id.contains('/')
         && !id.contains('\\')
@@ -192,6 +198,22 @@ impl Pool {
         }
         let p = self.dir.join(format!("{id}.wav"));
         p.is_file().then_some(p)
+    }
+
+    /// A [`PoolResolver`](crate::PoolResolver) over this pool — the guarded
+    /// [`Pool::path_for`] lookup, for handing to the arranger.
+    ///
+    /// **A host resolves a clip source through the pool, never by joining an id onto
+    /// the pool directory itself.** A clip's `source` is an arbitrary token in the
+    /// `host v1` log (`add_clip <track> <clip> <source> …`) and a `Clip` is
+    /// `Deserialize`, so it is user-craftable: `dir.join("../../elsewhere.wav")`
+    /// reaches any readable WAV, and it is then streamed through the arranger into
+    /// bounces and exports. The guard is here, so the seam the arranger takes is here
+    /// too — a `PoolResolver` built by hand can still be unguarded, but nothing in the
+    /// platform builds one any more.
+    pub fn resolver(&self) -> crate::PoolResolver {
+        let pool = self.clone();
+        Arc::new(move |id| pool.path_for(id))
     }
 
     /// Enumerate the pool sources (`.wav` files, sorted by filename for a

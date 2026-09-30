@@ -746,12 +746,10 @@ impl HostSession {
         // A file that cannot be converted is reported, not fatal: it stays at its
         // own rate and the arranger names it if a clip reads it.
         self.pool_conformed = pool.conform(self.engine.clock.sample_rate)?.converted;
-        let resolver_dir = dir.clone();
-        let resolver: media::PoolResolver = std::sync::Arc::new(move |id| {
-            let p = resolver_dir.join(format!("{id}.wav"));
-            p.is_file().then_some(p)
-        });
-        self.pool_resolver = Some(resolver);
+        // The pool's own guarded lookup, not a `join` of the id onto the dir: a
+        // clip's `source` is a token in the log, so it can carry `../` and would
+        // otherwise read a WAV from outside the pool.
+        self.pool_resolver = Some(pool.resolver());
         self.pool_dir = Some(dir);
         Ok(())
     }
@@ -4954,6 +4952,87 @@ mod tests {
                 .map(|op| HostCommand::Arrange { op, at_frame: None })
                 .collect(),
         }
+    }
+
+    // ---- a clip source is a pool id, not a path ----
+
+    /// A pool directory with one take in it, and a readable WAV **beside** it (the
+    /// file an escaping source would reach).
+    fn pool_with_a_neighbour_take(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("host-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pool = root.join("pool");
+        std::fs::create_dir_all(&pool).expect("pool dir");
+        write_tone(&pool, "s1", 48_000, 48_000);
+        write_tone(&root, "secret", 48_000, 48_000);
+        assert!(
+            pool.join("../secret.wav").is_file(),
+            "the escaping source has something to reach"
+        );
+        (pool, root)
+    }
+
+    /// **A clip `source` is a pool id, not a path.** The operand is an arbitrary
+    /// whitespace-free token, and a session file is a document a person can edit, so
+    /// `add_clip t0 c0 ../secret …` parses and used to land: the clip's source was
+    /// joined onto the pool directory, the file was streamed through the arranger, and
+    /// its audio came out in bounces and exports — a session file that reads an
+    /// arbitrary readable WAV. The value model refuses the source by name, so the
+    /// gesture is not applied and nothing is logged.
+    #[test]
+    fn a_clip_source_that_would_escape_the_pool_is_refused() {
+        let (pool, root) = pool_with_a_neighbour_take("pool-escape");
+        let head = format!(
+            "host v1\nmount mixer channels=2 @0\npool {}\narrange add_track t0\n",
+            pool.display()
+        );
+
+        let err = run_script(
+            &parse_script(&format!(
+                "{head}arrange add_clip t0 c0 ../secret 0 4800 0 0 0 1.0\n"
+            ))
+            .expect("the script parses"),
+        )
+        .expect_err("a source that is not a pool id is refused");
+        assert!(err.contains("not a pool id"), "the refusal says why: {err}");
+
+        // A pool id is unaffected, and the value holds nothing the log could not name.
+        let s = run_script(
+            &parse_script(&format!(
+                "{head}arrange add_clip t0 c0 s1 0 4800 0 0 0 1.0\n"
+            ))
+            .expect("the script parses"),
+        )
+        .expect("a pool id still places a clip");
+        assert_eq!(clip_of(&s).source, "s1");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The resolver the production `set_pool` builds is the pool's guarded lookup.**
+    /// This is the seam every read of a clip's source goes through — the arranger
+    /// (`ArrangerNode::new`), `stretch` and the export — and it used to `join` the id
+    /// onto the pool directory itself, so `../secret` resolved to a path outside the
+    /// pool. It is the same closure the value check backs up, so it is pinned here
+    /// directly: an id that is not a plain pool id resolves to *nothing*.
+    #[test]
+    fn the_pool_resolver_only_resolves_a_plain_pool_id() {
+        let (pool, root) = pool_with_a_neighbour_take("pool-guard");
+        let s = session_with_pool("resolver-guard", &pool);
+        let resolve = s.pool_resolver.clone().expect("a pool is set");
+        assert_eq!(
+            resolve("s1"),
+            Some(pool.join("s1.wav")),
+            "a plain id resolves"
+        );
+        for bad in ["../secret", "..", "sub/s1", "secret "] {
+            assert!(
+                resolve(bad).is_none(),
+                "'{bad}' is not a plain pool id, so it resolves to nothing"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **One gesture is one undo.** A group of two trims lands as a single history

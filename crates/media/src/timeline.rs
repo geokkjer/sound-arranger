@@ -22,8 +22,10 @@
 //! Invariants enforced by every mutating op (fail-loud, never partial):
 //! `src_len > 0`, `gain` finite, `loop_len != Some(0)`, `at_frame + src_len` not
 //! overflowing, `src_start + src_len` not overflowing (the source window is an
-//! address, and every op that rewrites a clip's geometry adds to it), and
-//! `src_len <= i64::MAX` (so signed trim arithmetic never wraps). An op that
+//! address, and every op that rewrites a clip's geometry adds to it),
+//! `src_len <= i64::MAX` (so signed trim arithmetic never wraps), and a `source` that
+//! is a **plain pool id** (`pool::valid_id` — a source is a file stem, not a path, and
+//! the log carries it as an arbitrary token). An op that
 //! *changes* a clip's geometry (razor-split, chop, trim, stretch, loop) leaves the
 //! clip satisfying all of them — a shrink caps the fades it can no longer fit, the
 //! way `Stretch` always has — so no op the log accepts can hold a clip
@@ -61,7 +63,9 @@ pub enum Edge {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Clip {
     pub id: Id,
-    /// Content-hash id of the immutable float-WAV source (the media pool).
+    /// Content-hash id of the immutable float-WAV source (the media pool) — a
+    /// **pool id** (a plain file stem), not a path: [`validate_clip`] refuses one
+    /// that could address a file outside the pool.
     pub source: Id,
     /// First source frame of the region (absolute in the source).
     pub src_start: Frame,
@@ -376,6 +380,19 @@ pub fn validate_clip(c: &Clip) -> Result<(), String> {
     // for, with no diagnostic.
     if c.src_start.checked_add(c.src_len).is_none() {
         return Err(format!("clip '{}' source window overflows", c.id));
+    }
+    // A `source` is a **pool id**, and it is user-craftable: an arbitrary token in
+    // the `host v1` log (`add_clip <track> <clip> <source> …`) and a `Clip` is
+    // `Deserialize`. One carrying a path separator or whitespace is not an id, and
+    // every op that sets a source goes through here — so a value that could address a
+    // file outside the pool never enters the value, let alone the log. The lookup
+    // refuses it too (`Pool::path_for`): this is the guard at the *writing* end, so a
+    // saved session cannot carry a source that would only be refused when read.
+    if !crate::pool::valid_id(&c.source) {
+        return Err(format!(
+            "clip '{}' source '{}' is not a pool id (a source is a file stem, not a path)",
+            c.id, c.source
+        ));
     }
     if let Some(name) = &c.name
         && !valid_name(name)
@@ -2330,6 +2347,69 @@ mod tests {
             })
             .is_err(),
             "a reversed chop that would wrap the source offset is refused"
+        );
+    }
+
+    /// **A clip's `source` is a pool id, not a path.** It is an arbitrary
+    /// whitespace-free token in the `host v1` log (`add_clip <track> <clip> <source>
+    /// …`) and a `Clip` is `Deserialize`, so a crafted value reaches the model — and
+    /// unfixed, the resolver joined it straight onto the pool directory, so
+    /// `../../elsewhere` read a WAV from outside the pool into a bounce or an export.
+    /// `AddClip` refuses it, and so does `Stretch` (the other op that sets a source),
+    /// so the bad value is never *logged*; `Pool::path_for` refuses it again on the
+    /// reading side.
+    #[test]
+    fn a_clip_source_that_is_not_a_pool_id_is_refused() {
+        let t = two_tracks();
+        for bad in [
+            "../../elsewhere",
+            "..",
+            ".",
+            "sub/s1",
+            "back\\slash",
+            "s1 ",
+            " ",
+        ] {
+            let mut c = clip("c0", 0, 4_000);
+            c.source = bad.into();
+            let err = t
+                .apply(&ArrangeOp::AddClip {
+                    track: "t0".into(),
+                    clip: c,
+                })
+                .expect_err("a source that is not a plain pool id is refused");
+            assert!(
+                err.contains("not a pool id"),
+                "the refusal says what is wrong: {err}"
+            );
+        }
+        assert!(
+            t.tracks[0].clips.is_empty(),
+            "a refused clip is not in the value (so it is not in the log)"
+        );
+
+        // A plain id is still a legal source.
+        let t = t
+            .apply(&ArrangeOp::AddClip {
+                track: "t0".into(),
+                clip: clip("c0", 0, 4_000),
+            })
+            .expect("a pool id places a clip");
+        assert_eq!(t.tracks[0].clips[0].source, "pool-1");
+        // …and `Stretch`, which repoints a clip at a rendered source, holds the same
+        // line: a rendered id is derived from the old source, so a bad one only arrives
+        // from a hand-built op.
+        assert!(
+            t.apply(&ArrangeOp::Stretch {
+                track: "t0".into(),
+                clip: "c0".into(),
+                source: "../elsewhere".into(),
+                src_len: 4_000,
+                num: 2,
+                den: 1,
+            })
+            .is_err(),
+            "a stretch cannot point a clip outside the pool either"
         );
     }
 
