@@ -160,6 +160,28 @@ Development is model-assisted and disclosed per commit: the model is the **autho
 harness. Known-flaky tests are named in the capability page with what is known about them, rather than
 quietly retried.
 
+## Contributing
+
+**Outside contributions are not accepted yet — not until there is a beta to contribute to.** This is a
+deliberate policy rather than an oversight, so that the repository's own history says what it is before
+anyone invests time in it.
+
+- **Pull requests will be closed unmerged.** Not because the work is unwelcome, but because there is
+  no stable API to build against: the architecture, the license and even the project's name are still
+  moving. A patch against a surface that is about to change costs you more than it costs us.
+- **Issues are welcome, and are the best way in.** [Bug reports and design
+  objections](https://github.com/geokkjer/sound-arranger/issues) need no CLA and no commitment — a
+  bug report against a pre-alpha build is genuinely useful, and it is the route by which a later
+  contribution starts.
+- **Fork it if you want to build on it.** The license already grants that, and nothing here
+  restricts it. You simply cannot push back yet.
+- **Why the gate exists, beyond focus:** while the human is the *sole copyright holder*, the project
+  can still be relicensed in one step — and it currently intends to keep that option open. Accepting
+  a first outside commit ends that permanently. So the gate lifts at beta, and a contribution policy
+  (a lightweight DCO or CLA) will be chosen and written down *before* it lifts, not after the first
+  PR arrives. The reasoning is in the [contributing note](.agents/notes/proposed/process/2026-09-30-no-outside-contributions-before-beta.md)
+  and [RESEARCH.md](RESEARCH.md) §12.
+
 ## License
 
 GPL-3.0-or-later ([LICENSE](LICENSE)) — rationale and the dependency compatibility matrix are in

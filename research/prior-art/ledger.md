@@ -140,9 +140,13 @@ scope here.
 
 1. **Who owns the row when a peer changes?** A new upstream release can invalidate an `adopted`
    verdict. `Revisit if` is the hook; nothing yet watches it.
-2. **Do we want a `Prior-art: PA-0007` commit trailer**, mirroring the existing `Assisted-by:`
-   convention? Attractive because it cannot go stale — it ships with the patch. Deferred: the
-   Agent Note link covers it for now, and our AGENTS.md warns against over-building process.
-3. **Should `research/architecture/` be split?** Nine of 59 documents are prior art; the rest are
+2. **Should `research/architecture/` be split?** Nine of 59 documents are prior art; the rest are
    model reviews and design studies. The ledger indexes them today; a physical move is a larger
    change than the problem currently justifies.
+
+## Settled — not open
+
+- **No `Prior-art: PA-0007` commit trailer.** Considered and declined: prior-art work here is
+  deliberate and purposeful, done when a design question demands it, not a routine accompaniment to
+  commits. A trailer would be ceremony attached to nothing. The Agent Note link is the record, and
+  the ledger entry is the evidence.
