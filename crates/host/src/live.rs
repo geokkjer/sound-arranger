@@ -60,6 +60,17 @@ pub struct Snapshot {
     /// The audio output's state: `None` when the host runs silent (no device was
     /// requested), otherwise the negotiated rate/layout and the played counters.
     pub audio: Option<AudioStatus>,
+    /// The take in progress, for a **live** indicator: `None` when no recording is
+    /// running. The counterpart of `HostOutcome::recording`, which a command
+    /// response carries once; a polling shell needs it every frame.
+    pub recording: Option<crate::RecordingStatus>,
+    /// The last finished take, so a shell can say what landed and where it went
+    /// (`TakeReport::sources`). `None` until one finishes.
+    pub last_take: Option<crate::TakeReport>,
+    /// The pool's source ids. A shell names a new take against these so it cannot
+    /// collide with a source the session already holds — the id is required before
+    /// the recording starts, so it cannot be discovered afterwards.
+    pub pool_ids: Vec<String>,
     /// The MIDI clock-out status, next to the meters: the port being driven
     /// (`None` when the process asked for no device) and the `clock_out`
     /// plugin's overflow counter (read back through its
@@ -137,6 +148,9 @@ impl Default for Snapshot {
             master: 0.0,
             mastering: None,
             last_export: None,
+            recording: None,
+            last_take: None,
+            pool_ids: Vec::new(),
             audio: None,
             midi: Default::default(),
             can_undo: false,
@@ -684,6 +698,16 @@ fn publish(session: &HostSession, shared: &Mutex<Snapshot>, audio: &AudioState) 
     // the overflow counter are cheap reads (an option clone and an atomic
     // load), and a shell draws both next to the meters.
     s.midi = session.midi_status();
+    // The take state rides the publish pass for the same reason the MIDI status
+    // does: a shell that polls the snapshot must be able to show a **live**
+    // recording indicator and the last finished take, without treating the
+    // one-shot `HostOutcome` as if it were state. Reading through `session` keeps
+    // the session the single source of truth.
+    s.recording = session.recording();
+    s.last_take = session.last_take().cloned();
+    // Cached (see `HostSession::pool_ids`): this runs on every pump tick, and
+    // listing the pool reads a directory.
+    s.pool_ids = session.pool_ids().to_vec();
     s.audio = match audio {
         AudioState::Off => None,
         AudioState::Failed(e) => Some(AudioStatus {

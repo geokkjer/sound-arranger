@@ -238,6 +238,18 @@ enum Button {
     Rewind,
 }
 
+/// What `o` does, as the **host's** state declares it (see `App::record_intent`).
+///
+/// An enum rather than a test on the status string: the decision is engine state, and
+/// naming it is what lets a headless test drive it without a device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordIntent {
+    /// A take is running: stop it.
+    Stop,
+    /// No take is running: ask for a name.
+    Name,
+}
+
 impl App {
     /// Boot against the live host, with a real audio device when one exists, and
     /// load the demo profile. Failures land in `status`, never as a panic.
@@ -403,14 +415,10 @@ impl App {
         if let Some(err) = &outcome.journal_error {
             self.status = format!("autosave failed: {err}");
         }
-        // A take in progress is a live state, not a one-shot message — the indicator
-        // re-renders on every refresh, with the frames the demux has written.
-        if let Some(rec) = &outcome.recording {
-            self.status = format!(
-                "● recording {} — {} ch, {} frames, {} dropped (`:record stop` ends it)",
-                rec.take_id, rec.channels, rec.frames, rec.dropped
-            );
-        }
+        // A take in progress is **not** written into the status line: it is live
+        // state, so the footer draws it from the snapshot (`recording_line`) and a
+        // message — an export report, a source error — cannot hide it. The finish is
+        // still announced once, below.
         // A finished export is a deliverable: say what was written, once (the report
         // replaces the command line's echo, because it is what the user wanted to know).
         // The dedupe key is the whole report, not just (length, format): two exports of
@@ -852,6 +860,7 @@ impl App {
         match action {
             Action::PlayToggle => self.toggle(),
             Action::Stop => self.stop(),
+            Action::RecordToggle => self.record_toggle(),
             Action::Rewind => self.rewind(),
             Action::SeekSeconds(seconds) => self.nudge(seconds),
             Action::SeekClip(forward) => self.timeline_key(|app| app.seek_clip(forward)),
@@ -1343,6 +1352,49 @@ impl App {
             } else {
                 format!("added track {track} — `R` renames it, ch{index} is its mixer channel")
             };
+        }
+    }
+
+    /// `o`: stop the take in progress, or open the command line to name a new one.
+    ///
+    /// The iced shell auto-names takes (`take-N`, checked against the pool it reads);
+    /// this shell asks, because a take's id is **declared state** — the session
+    /// replays without the device — so the name is a real decision and the prompt is
+    /// where this shell makes decisions. Stopping needs no name, so it is one key in
+    /// both shells: both send the same `record` verb.
+    fn record_toggle(&mut self) {
+        // The decision is **engine state**, read from the host at the moment of the
+        // press — not from the status line, which is a message channel an export or a
+        // source error overwrites. The event loop refreshes `snap` every frame, but a
+        // key press is not a frame.
+        self.snap = self.host.snapshot();
+        match self.record_intent() {
+            RecordIntent::Stop => {
+                // Stop needs no name, so it runs on the key. Refresh afterwards the
+                // way the command line does, so the finished take's report and the
+                // new pool sources are visible rather than waiting for the next
+                // command.
+                if self.command("record stop", HostCommand::RecordStop) {
+                    self.refresh_arrangement();
+                }
+            }
+            RecordIntent::Name => {
+                let prefill = "record ".to_string();
+                self.prompt = Some(prefill.clone());
+                self.prompt_prefill = Some(prefill);
+                self.history_at = self.history.len();
+                self.status = "name the take and press Enter (e.g. `record take-1`)".to_string();
+            }
+        }
+    }
+
+    /// What `o` does, as the host's state declares it — a pure function of the
+    /// snapshot, so the decision is testable without a device.
+    fn record_intent(&self) -> RecordIntent {
+        if self.snap.recording.is_some() {
+            RecordIntent::Stop
+        } else {
+            RecordIntent::Name
         }
     }
 
@@ -2646,11 +2698,18 @@ impl App {
             self.draw_mixer(frame, mixer_area);
             self.draw_foot(frame, foot);
         } else {
+            // The footer gains a row for the live take line only while a take runs;
+            // idle it keeps the two-line state block it has always had.
+            let foot_rows = if recording_line(&self.snap).is_some() {
+                5
+            } else {
+                4
+            };
             let [head, controls, meters, foot] = Layout::vertical([
                 Constraint::Length(5),
                 Constraint::Length(3),
                 Constraint::Min(3),
-                Constraint::Length(4),
+                Constraint::Length(foot_rows),
             ])
             .areas(area);
 
@@ -3088,16 +3147,29 @@ impl App {
             None => self.status.clone().into(),
         };
 
-        let paragraph = Paragraph::new(vec![
+        let mut lines = vec![
             ratatui::text::Line::from(vec![
                 mode,
                 Span::raw(format!("  {focus}mouse {}   {latency}", on_off(self.mouse))),
                 Span::styled(timeline, Style::new().fg(Color::Gray)),
             ]),
             second,
-        ])
-        .block(Block::bordered().title(" state "))
-        .wrap(Wrap { trim: true });
+        ];
+        // The third line is the **take**, drawn from the snapshot rather than written
+        // into the status: a recording is state, so its counters move every frame and
+        // no later message can overwrite it.
+        if let Some(take) = recording_line(&self.snap) {
+            lines.push(ratatui::text::Line::from(Span::styled(
+                take,
+                Style::new()
+                    .fg(Color::LightRed)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+
+        let paragraph = Paragraph::new(lines)
+            .block(Block::bordered().title(" state "))
+            .wrap(Wrap { trim: true });
 
         frame.render_widget(paragraph, area);
     }
@@ -3139,6 +3211,26 @@ impl App {
             popup,
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The take line
+// ---------------------------------------------------------------------------
+
+/// The live take line, drawn from the **snapshot** the event loop refreshes every
+/// frame — so a running take's counters move with the host, and a status message (an
+/// export report, a source error) cannot hide the recording.
+///
+/// `None` when no take is running. The finished take stays a one-shot announcement in
+/// the status line: it has an action to offer (`arrange add_clip`), and it does not
+/// belong on screen forever.
+fn recording_line(snap: &Snapshot) -> Option<String> {
+    snap.recording.as_ref().map(|rec| {
+        format!(
+            "● REC {} — {} ch, {} frames, {} dropped (`:record stop` ends it)",
+            rec.take_id, rec.channels, rec.frames, rec.dropped
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3552,6 +3644,58 @@ mod tests {
             .expect("draw does not fail on a test backend");
 
         buffer_text(terminal.backend().buffer())
+    }
+
+    /// `o`'s decision is the **host's** state, not the status line.
+    ///
+    /// The status is a message channel: an export report or a source error overwrites
+    /// it, and an earlier `command refused` sits in it until the next command. Deciding
+    /// from it — the first version did — acted on state that was not the host's: it
+    /// offered to start a take while one ran, and stopped one that had already ended.
+    #[test]
+    fn the_record_key_reads_the_snapshot_not_the_status() {
+        let mut app = App::demo();
+
+        // A take is running while the status says something else entirely: stop it.
+        app.snap.recording = Some(host::RecordingStatus {
+            take_id: "take-3".to_string(),
+            frames: 4_800,
+            dropped: 0,
+            channels: 2,
+        });
+        app.status =
+            "exported 96000 frames (wav, +512 tail) — peak -1.0 dBFS, rms -3.0 dBFS".to_string();
+        assert_eq!(app.record_intent(), RecordIntent::Stop);
+
+        // No take runs, but the status still says one does: ask for a name rather than
+        // send a stop the host would refuse.
+        app.snap.recording = None;
+        app.status = "● recording take-3 — 2 ch, 4800 frames, 0 dropped (`:record stop` ends it)"
+            .to_string();
+        assert_eq!(app.record_intent(), RecordIntent::Name);
+    }
+
+    /// The take line is drawn from the snapshot, so it is live — the counters are the
+    /// host's, not the last thing a command wrote — and absent when no take runs.
+    #[test]
+    fn the_take_line_is_drawn_from_the_snapshot() {
+        let mut app = App::demo();
+        app.snap.recording = None;
+        assert_eq!(recording_line(&app.snap), None);
+
+        app.snap.recording = Some(host::RecordingStatus {
+            take_id: "take-3".to_string(),
+            frames: 4_800,
+            dropped: 0,
+            channels: 2,
+        });
+        let line = recording_line(&app.snap).expect("a running take draws a line");
+        assert!(line.contains("REC"), "{line}");
+        assert!(line.contains("take-3"), "{line}");
+        assert!(line.contains("4800"), "{line}");
+
+        // The footer renders it, from the snapshot, below the status line.
+        assert!(rendered(&mut app).contains("● REC take-3"));
     }
 
     /// The session pool is **one directory per process** (`session_pool_dir`), so
