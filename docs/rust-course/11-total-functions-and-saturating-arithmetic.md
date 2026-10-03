@@ -65,9 +65,12 @@ Three moves worth memorizing:
    saturation *could* break monotonicity (two beats mapping to the same
    saturated frame). It doesn't, *because only the final open-ended segment can
    reach the sum* — a closed segment's own length bounds it. The argument is
-   written where the code is, and a test pins it
-   (`frame_at_is_total_over_the_beat_domain`, clock.rs — go read it; it beats
-   the domain with absurd beats and asserts total + monotone together).
+   written where the code is, and two tests pin the two halves separately:
+   `frame_at_is_total_over_the_beat_domain` (clock.rs) beats the domain with
+   absurd beats — `NaN`, `INFINITY`, `1e300`, negatives — and asserts totality,
+   while `frame_at_saturates_the_sum_when_a_seek_puts_a_tempo_near_the_top` pins
+   the monotone, never-below-the-segment half under saturation. Totality and
+   monotonicity are separate claims; read them as such.
 
 That last style point is the lesson inside the lesson: **a `saturating_*` call
 without a comment saying why saturation is *sound here* is half-done.** The

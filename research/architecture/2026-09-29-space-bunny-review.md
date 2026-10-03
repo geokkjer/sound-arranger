@@ -46,8 +46,9 @@
 
 ## What landed
 
-Twenty-six commits on `fix/space-bunny-review` (worktree `../sa-spacebunny-fixes`), one per defect,
-`main` untouched. Each carries a regression test and passed the full local gate set
+Thirty-seven commits on `fix/space-bunny-review` (worktree `../sa-spacebunny-fixes`, tip
+`ea01d0d`): thirty-four fixes, plus the verbatim review files and two index updates. `main` was
+untouched until the merge. Each fix carries a regression test and passed the full local gate set
 (`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, the workspace
 suite, the agent-notes verifier, and both shell-spike builds).
 

@@ -36,10 +36,12 @@ follows what the refuser can hand over *without allocating*:
 
 ```rust
 pub enum ApplyFaultReason {
-    /// A plugin's own refusal … moved, verbatim, never formatted here.
+    /// A plugin's own refusal, from its fallible `apply` — **moved, verbatim,
+    /// never formatted here**, so recording costs the engine nothing.
     Given(String),
     /// A cord the engine or the graph refused: a `&'static str` class and the
-    /// cord exactly as the log spells it.
+    /// cord exactly as the log spells it — two `(plugin, port)` pairs, all
+    /// `&'static str`.
     Cord {
         class: &'static str,
         from: (&'static str, &'static str),
@@ -48,10 +50,14 @@ pub enum ApplyFaultReason {
 }
 ```
 
+(The three fields carry their own doc comments in the file; they are the only
+elision in this snippet.)
+
 Two very different payload strategies in one enum:
 
-- **`Cord`** holds zero owned bytes. The `class` is a `&'static str` from
-  `ConnectClass::as_str` (a `const fn` — the strings are in the binary), and the
+- **`Cord`** holds zero owned bytes. The `class` is a `&'static str` — either from
+  `ConnectClass::as_str` (a `const fn` — the strings are in the binary) or one of
+  the engine's own two "endpoint is not mounted" phrases — and the
   identities are `&'static str` the *log already holds*: recording this fault
   copies nothing, moves nothing, allocates nothing.
 - **`Given(String)`** looks like it breaks the rule — but read the doc: the
@@ -68,9 +74,10 @@ Allocating here is the point, not an accident: this is a read."*
 
 ## 10.3 The graph's half: `ConnectClass`, a `Copy` vocabulary
 
-`Graph::connect` refuses eight ways, and each way is a variant of `ConnectClass`
-— `UnknownFromNode`, `Backward`, `NoFromPort`, `Direction`, `KindMismatch`,
-`ControlDriven`, `ChannelMismatch`, … Read its definition and notice what it
+`Graph::connect` refuses nine ways — nine `ConnectClass` variants across eight
+refusal sites in `try_connect` — `UnknownFromNode`, `UnknownToNode`, `Backward`,
+`NoFromPort`, `NoToPort`, `Direction`, `KindMismatch`, `ControlDriven`,
+`ChannelMismatch`. Read its definition and notice what it
 *doesn't* hold: no `String`, no `Vec`, no format args. It's `Copy`. That's what
 makes it recordable from the audio thread.
 
@@ -78,10 +85,11 @@ Beside it, `ConnectRefusal<'a>` — the class plus the two port names the caller
 passed, **borrowed from the call** (`'a`) — and the pair of methods that split
 the concern:
 
-- `connect` returns `Result<(), ConnectRefusal>` — **one rule, the loud door**,
-  for the control side, where the `Display` impl formats a sentence.
-- `try_connect` (used by the render path) records the refusal as a fault
-  instead of formatting it.
+- `connect` returns `Result<(), String>` — **one rule, the loud door**, for the
+  control side, where the `Display` impl has already built the sentence.
+- `try_connect` (used by the render path) *answers* with the same refusal as data
+  (`Result<(), ConnectRefusal>`) instead of a sentence; `Engine::apply_patch` is
+  what records it as an `ApplyFault`.
 
 One rule, two doorways, chosen by *where the caller runs*. That's the whole
 pattern in a sentence.

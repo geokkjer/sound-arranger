@@ -1,6 +1,6 @@
 # sound-arranger — Desktop UI Plan (the Vue side of the Host API)
 
-> **Status: proposed (design draft) — superseded as the shell direction (2026-09-22).** The Tauri
+> **Status: proposed (design draft) — superseded as the shell direction (2026-09-22) — the approach was tried and decided against.** The Tauri
 > shell this plan was written for is **retired** and frozen ([`crates/shell/RETIRED.md`](../../crates/shell/RETIRED.md),
 > [shells note](../../.agents/notes/implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md));
 > the shells are **iced** and **ratatui**, both in-process Rust over the same Host API. This plan keeps its

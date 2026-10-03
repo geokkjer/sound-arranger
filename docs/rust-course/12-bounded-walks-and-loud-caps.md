@@ -27,16 +27,19 @@ The rule that came out of it:
 > **No unbounded loop on the render thread.** Whatever a bound clips is
 > **counted, never hidden.**
 
-The pattern appears four times in the engine, and each appearance pairs a cap
-with a counter. Learn the pattern once here, then recognize it on sight.
+The pattern appears four times in the engine, each appearance pairing a cap with a
+counter. There is one further bound that is deliberately **not** of that shape — a
+liveness cap with no counter — and §12.5 calls it out rather than pretending it
+fits. Learn the shape here, then recognize it on sight.
 
 ## 12.2 The euclidean walk: a closed-form count makes the cap honest
 
 Read `EuclideanGen`'s render in `graph.rs` slowly. The block must decide which
-pattern steps fall inside it. At a sane tempo that's a handful of steps; at a
-tempo like 1e9 bpm it's millions — and nothing in the *music* says that can't
-happen, because the tempo came from a logged `set_tempo` that validated its
-*range* but not its *walk length*. The walk is bounded two ways:
+pattern steps fall inside it. At a sane tempo that's a handful of steps; at
+1e9 bpm it is **709 724 steps in one 512-frame block** — the repo works that
+number out in the doc above the walk — and nothing in the *music* says that
+can't happen, because the tempo came from a logged `set_tempo` that validated
+its *range* but not its *walk length*. The walk is bounded two ways:
 
 ```rust
 let grid = s1.saturating_sub(s0).max(0) as u64;   // the whole grid, closed form
@@ -127,7 +130,8 @@ held to the standard the code is.
 feedback structure (if one ever ships) never ends, so:
 
 ```rust
-let max_frames = max_frames.min(MAX_DRAIN_FRAMES);   // 48_000 * 60 — one minute
+// Bound the drain: a feedback structure can ring indefinitely.
+let max_frames = max_frames.min(MAX_DRAIN_FRAMES);   // 48_000 * 60
 …
 if frames_done >= max_frames {
     capped = true;
@@ -143,30 +147,45 @@ prints `drain tail frames: N (CAPPED)` — you saw the uncapped shape in
 when the honest answer is one bit ("the drain stopped early"), one bit is
 enough.
 
-## 12.5 The fourth cap you already know
+## 12.5 The caps you already know — and the one that breaks the rule
 
 `MAX_APPLY_FAULTS` (Lesson 10) is the same pattern applied to *storage*: faults
 past the bound are counted in `apply_faults_dropped`, never silently
-disappeared. Four sites, one shape:
+disappeared. Five bounds, one shape — except the third row, which is the honest
+exception:
 
 | Site | The bound | The loud part |
 |---|---|---|
 | euclidean walk | `EUCLIDEAN_STEP_CAP` = `BLOCK * 8` | `euclidean.drops` counter (exact, closed-form) |
-| tick walk | `TICK_WALK_CAP` (the correction walk, both directions) | due-tick count by binary search; the overflow counter stays *exact* |
+| tick *emission* | `CLOCK_OUT_CAP` = 64 ticks per block | `overflows` counter — exactly how many ticks the block dropped |
+| tick *correction* walk | `TICK_WALK_CAP` = `1 << 16`, both directions | **nothing** — see below |
 | drain | `MAX_DRAIN_FRAMES` = 1 minute | `DrainOutcome::capped` flag |
 | fault list | `MAX_APPLY_FAULTS` = 64 | `apply_faults_dropped` counter |
 
+The one exception is the tick **correction** walk. It exists to undo f64
+rounding; when a tempo whose ticks are closer together than frames makes it
+unable to converge, the walk stops at its cap and *returns the index it
+reached*. At runtime that is reported nowhere, but it is not hidden:
+`the_downward_walk_is_bounded` (clock_out.rs) constructs exactly such a map and
+asserts `Some(n0 - TICK_WALK_CAP)` — short by the cap — and
+`an_absurd_fast_tempo_renders_the_next_block` covers the upward case. It is the
+right trade (the render path must return, and in a regime where the beat domain
+and the frame domain disagree by ~1e14 ticks there is no exact answer to cheaply
+compute), but it is a **liveness** bound, not a reported truncation — which is
+why it is called out here rather than counted alongside the four caps above.
+
 **A cap without its counter is a silent truncation.** If you take one rule
 from this lesson, take that sentence — it's the difference between "bounded"
-and "quietly wrong within budget."
+and "quietly wrong within budget", and the exception above is worth
+understanding precisely because it shows what the rule costs when you break it.
 
 ## Your turn
 
 ⭐ **1.** Read the two tempo-bound tests and run them:
 
 ```sh
-cargo test -p engine euclidean     # the bounded-walk and drops-counter tests
-cargo test -p engine clock_out     # the tick-walk tests, incl. the absurd-tempo ones
+cargo test -p engine --test euclidean_tempo   # the bounded-walk and drops-counter tests
+cargo test -p engine clock_out                # the tick-walk tests, incl. the absurd-tempo ones
 ```
 
 Find the test that feeds an absurd tempo and asserts on the *counter*, not the
@@ -181,9 +200,11 @@ frames" makes a generous cap the only exit?
 
 🔧 **3.** `due_ticks_from` special-cases "every index the map can name is due"
 *before* building the bracket (returning
-`u64::MAX.saturating_sub(from).saturating_add(1)`). Write the test that forces
-that case — the doc says a tempo fast enough that even `u64::MAX` rounds inside
-the block — and check it in.
+`u64::MAX.saturating_sub(from).saturating_add(1)`). That case is already tested:
+`a_fast_tempo_one_block_in_does_not_panic_or_walk` (clock_out.rs) drives 1e300 bpm
+and asserts the count is *exact* (`u64::MAX - 63`, "not short by one"). Read it,
+then make it bite — delete the special case, run the test, and read the failure:
+the count comes back one short, which is the whole reason the branch exists.
 
 🔧 **4.** Pick any loop on a render path in the repo (`rg "while|for" crates/engine/src -n`)
 and audit it against this lesson: what bounds it? What is counted or flagged

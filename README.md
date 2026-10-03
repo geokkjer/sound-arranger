@@ -84,7 +84,7 @@ into a long piece wants a checkpoint. Reasons, not just absences:
 | `crates/media` | The media engine (core-privileged, not a plugin): disk streaming, splice during playback, the recording writer with crash recovery, multi-channel capture, the float-WAV pool with peak pyramids, import/conform, a band-limited resampler, the clip model with its ACID ops and the arranger node, and the arrangement-command codec. |
 | `crates/workflow` | The shell workflow defined once: the modal, key-driven editing model both shells implement, the `Action` vocabulary, the snap-grid state, and the keymap that generates `?` help. Toolkit-free, with a test proving every action claimed to be a log op is an op the host's parser accepts. |
 | `crates/host` | The Host API contract — commands are logged events, plus events and values a shell reads — and the headless reference host: `run_script` assembles a profile and bounces byte-identically, while a live session takes incremental edits, gestures (one undo step each), sessions as directories, seeking at scale, recording, and export. |
-| `crates/shell` | **Retired** (2026-09-22) — the Tauri + Vue shell. Frozen, excluded from the workspace, kept as the porting reference: [`crates/shell/RETIRED.md`](crates/shell/RETIRED.md). |
+| `crates/shell` | **Retired** (2026-09-22) — the Tauri + Vue shell, an approach tried and decided against. Frozen and excluded from the workspace, kept only until someone deletes it: [`crates/shell/RETIRED.md`](crates/shell/RETIRED.md). |
 | `spikes/tui-shell` | The terminal shell (primary): arrangement view with braille envelopes, edits dispatched through the host's own `arrange` language, a console whose faders read back from the log, pool panel, mouse, deterministic `--dump`. |
 | `spikes/iced-shell` | The iced shell (second): window, transport, meters following the audio, and a real mixer — `iced_audio` faders on a dB range, positions read from the host's parameter fold. |
 | `plugins/` | External-integration home (placeholder): programs and devices we drive and record, not plugin binaries — see [plugins/README.md](plugins/README.md). |
@@ -110,7 +110,7 @@ research and decision records read as consequences rather than claims.
   alternatives that were rejected; standing orders in [AGENTS.md](AGENTS.md).
 - [RESEARCH.md](RESEARCH.md) — working research: verified crate versions, the licensing matrix,
   latency notes, DAW prior art.
-- [docs/design/](docs/design/) — the **retired** Tauri/Vue design, kept as history. The Rust shells
+- [docs/design/](docs/design/) — the design of the shell we tried and decided against, kept as history. The Rust shells
   are the live UI.
 - [docs/audio-latency.md](docs/audio-latency.md) — Linux kernel and userspace latency tuning;
   [docs/soft-synth-fundsp.md](docs/soft-synth-fundsp.md) — building native voices on fundsp.
