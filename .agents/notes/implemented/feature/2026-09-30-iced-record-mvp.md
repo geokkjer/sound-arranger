@@ -34,11 +34,14 @@ against the pool the host publishes.**
    `pool_ids` is what makes the name collision-free. Both are read through the session in the same
    publish pass the meters and MIDI use, and `pool_ids` is **cached**, refreshed where the pool can
    change (`set_pool`, a finished take), because `Pool::list` reads a directory and publish runs on
-   every pump tick.
+   every pump tick. Both shells **decide** start-vs-stop from this state — `o` re-reads the snapshot at
+   the key press — and draw the live take line from it, never from the status line, which any later
+   message overwrites.
 4. **The iced shell auto-names** `take-N`, taking the highest `take-N.chK` the pool holds plus one, so
    a gap is never reused and non-take material does not shift the numbering. **The TUI asks**, opening
    the command line prefilled with `record `, because that is where that shell makes decisions and the
-   id is a real one. The shells differ in how a name is chosen, not in what the key means.
+   id is a real one. Stopping needs no name, so `o` stops the running take in both shells. The shells
+   differ in how a name is chosen, not in what the key means.
 5. **A static timeline placeholder**, not a canvas: the snapshot publishes no clips and no tracks, so
    there is nothing to draw. The placeholder reports the transport's position as a fraction of the
    furthest it has played — honest and derived — and says on screen that a real timeline needs the
@@ -67,8 +70,9 @@ against the pool the host publishes.**
 
 ## Consequences
 
-- **The recorder is reachable in both shells.** `o` records; the iced shell shows a live
-  `● REC take-N — frames, ch, dropped` line and reports the finished take with its pool sources.
+- **The recorder is reachable in both shells.** `o` records and `o` stops; the iced shell shows a live
+  `● REC take-N — frames, ch, dropped` line and reports the finished take with its pool sources, and
+  the TUI draws the same line from the same snapshot fields in its footer.
 - **Verified against real hardware, not a fixture**: `cargo run -- --record-check` drives the whole
   path through the real host and a Scarlett 2i2 — `take-2` captured **57,856 frames, 2 ch, 0 dropped**,
   left `take-2.ch0`/`.ch1` in the pool, and correctly chose `take-2` because `take-1` was there. The
@@ -81,15 +85,22 @@ against the pool the host publishes.**
 - **`--record-check` is the instrument for this verb**, as `--sweep` is for a fader drag: a GUI
   interaction cannot be scripted from outside, so the shell drives itself. It needs an input device, so
   it is not a CI gate — the owner runs it.
-- **The toggle's start-vs-stop decision has a test, device-gated rather than mocked**
-  (`record_toggle::the_toggle_starts_then_stops_a_take`). It reads the host rather than the repaint and
-  asserts the started id equals what `next_take_id` derived — pinning `take-1` would pass once on a
-  clean pool and fail on the next run, which is a test that only works the first time. With no input
-  device (CI) it verifies the refusal path instead and says which branch it took, so a skipped
-  assertion cannot read as a pass.
-- **Two bugs came out of building it, both from the same shape** — acting on state that was not the
-  host's: the pool was set *before* `host.load`, which replaces the session wholesale and threw it
-  away, and `toggle_record` decided start-vs-stop from the last repaint, so a key press could act on a
-  stale take state. Both are fixed by ordering and by reading the host at the moment of the decision.
+- **The toggle's start-vs-stop decision is pinned in both shells.** The iced one is device-gated rather
+  than mocked (`record_toggle::the_toggle_starts_then_stops_a_take`): it reads the host rather than the
+  repaint and asserts the started id equals what `next_take_id` derived — pinning `take-1` would pass
+  once on a clean pool and fail on the next run, which is a test that only works the first time. With
+  no input device (CI) it verifies the refusal path instead and says which branch it took, so a skipped
+  assertion cannot read as a pass. The TUI's decision is a pure function of the snapshot, so it is
+  tested headlessly (`the_record_key_reads_the_snapshot_not_the_status`) with a status line that
+  contradicts the snapshot in both directions, the drawn line is asserted from the snapshot
+  (`the_take_line_is_drawn_from_the_snapshot`), and `command`'s contract — the `Result` is the answer,
+  not the status line — has its own test (`command_result::the_result_is_the_answer_not_the_status`).
+- **The same shape showed up three times.** Acting on state that was not the host's: the pool was set
+  *before* `host.load`, which replaces the session wholesale and threw it away; the iced `toggle_record`
+  decided start-vs-stop from the last repaint; and the TUI's `o`, added in this slice, decided from the
+  status line — so an export report or a source error could make the key offer to start a take while
+  one ran, and the REC counter froze at the last command's value while `snap.recording` moved every
+  frame. All three are fixed by reading the host at the moment of the decision: the snapshot decides,
+  and the live line is drawn from it.
 
 Authored with DeepSeek-V4.1-Flash · DeepSeek Harness, 2026-09-30.

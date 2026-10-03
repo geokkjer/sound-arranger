@@ -408,7 +408,7 @@ impl Spike {
         let db = fader_range().unmap_to_db(normal);
         let gain = 10f32.powf(db / 20.0);
         self.status = format!("{param} = {db:+.1} dB ({gain:.4})");
-        self.command(HostCommand::SetParam {
+        let _ = self.command(HostCommand::SetParam {
             plugin: "mixer",
             param,
             value: gain,
@@ -435,7 +435,9 @@ impl Spike {
                 self.span_frames = self.span_frames.max(self.snap.frame);
             }
             Message::Play => self.play(),
-            Message::Stop => self.command(HostCommand::TransportStop),
+            Message::Stop => {
+                let _ = self.command(HostCommand::TransportStop);
+            }
             Message::Rewind => self.rewind(),
             Message::Key(key) => self.on_key(key),
             Message::Fader(index, gesture) => self.gesture(index, gesture),
@@ -528,14 +530,20 @@ impl Spike {
         match action {
             Action::PlayToggle => self.toggle(),
             Action::RecordToggle => self.toggle_record(),
-            Action::Stop => self.command(HostCommand::TransportStop),
+            Action::Stop => {
+                let _ = self.command(HostCommand::TransportStop);
+            }
             Action::Rewind => self.rewind(),
             Action::SeekSeconds(seconds) => self.seek_seconds(seconds),
             Action::Vertical(direction) => self.select_strip(direction),
             Action::Zoom(direction) => self.ride(direction),
             Action::Fit => self.set_selected_fader(1.0),
-            Action::Undo => self.command(HostCommand::Undo),
-            Action::Redo => self.command(HostCommand::Redo),
+            Action::Undo => {
+                let _ = self.command(HostCommand::Undo);
+            }
+            Action::Redo => {
+                let _ = self.command(HostCommand::Redo);
+            }
             Action::Prompt => {
                 self.prompt = Some(String::new());
                 self.history_at = self.history.len();
@@ -635,21 +643,21 @@ impl Spike {
     /// Spacebar: start or stop, whichever the transport is not.
     fn toggle(&mut self) {
         if self.snap.playing {
-            self.command(HostCommand::TransportStop);
+            let _ = self.command(HostCommand::TransportStop);
         } else {
             self.play();
         }
     }
 
     fn play(&mut self) {
-        self.command(HostCommand::TransportPlay);
+        let _ = self.command(HostCommand::TransportPlay);
     }
 
     fn rewind(&mut self) {
         // Seek is "rebuild + render to target", so it is intended for a stopped
         // transport: stop first, then move the playhead home.
-        self.command(HostCommand::TransportStop);
-        self.command(HostCommand::TransportSeek { frame: 0 });
+        let _ = self.command(HostCommand::TransportStop);
+        let _ = self.command(HostCommand::TransportSeek { frame: 0 });
     }
 
     /// `,`/`.`: ±1 s, stopping first (a seek is rebuilt to the target frame).
@@ -660,8 +668,8 @@ impl Spike {
             .as_ref()
             .map_or(SAMPLE_RATE, |a| a.sample_rate as i64);
         let target = (self.snap.frame as i64 + seconds * rate).max(0) as u64;
-        self.command(HostCommand::TransportStop);
-        self.command(HostCommand::TransportSeek { frame: target });
+        let _ = self.command(HostCommand::TransportStop);
+        let _ = self.command(HostCommand::TransportSeek { frame: target });
     }
 
     /// `j`/`k`: move the console's selected strip (channels first, master last).
@@ -885,20 +893,49 @@ impl Spike {
         // ended. A repaint is at most a frame away, but a key press is not a frame.
         self.snap = self.host.snapshot();
         if let Some(rec) = self.snap.recording.clone() {
-            self.command(HostCommand::RecordStop);
-            self.status = format!(
-                "finished {} — {} frames, {} ch (its sources are pool material now)",
-                rec.take_id, rec.frames, rec.channels
-            );
+            // A stop the host refused is its own answer, already in the status line:
+            // overwriting it here would report a take that did not end.
+            if self.command(HostCommand::RecordStop).is_err() {
+                return;
+            }
+            // The report is the authoritative one. The stop drains the device, so the
+            // pre-stop snapshot's frame count is short by the tail — read what landed
+            // from the host (the same `last_take` the take line draws) rather than
+            // repainting a count that is already stale.
+            match self.host.outcome() {
+                Ok(outcome) => {
+                    self.snap.recording = outcome.recording;
+                    self.snap.last_take = outcome.last_take;
+                    self.status = match &self.snap.last_take {
+                        Some(t) => format!(
+                            "finished {} — {} frames, {} ch (its sources are pool material now)",
+                            t.take_id, t.frames, t.channels
+                        ),
+                        None => format!(
+                            "{} stopped — its sources are pool material now",
+                            rec.take_id
+                        ),
+                    };
+                }
+                Err(e) => {
+                    self.status = format!(
+                        "{} stopped, but the report could not be read: {e}",
+                        rec.take_id
+                    );
+                }
+            }
             return;
         }
         let take_id = self.next_take_id();
-        self.command(HostCommand::Record {
-            take_id: take_id.clone(),
-        });
-        // The refusal is real and worth reading: no pool, or a device that would
-        // not open. Either way `Record` says which, and the status line keeps it.
-        if !self.status.starts_with("command refused") {
+        // A successful start says which take is running. A refusal (no pool, or a
+        // device that would not open) keeps the host's own words; the `Result` is the
+        // answer, not the status line, which an earlier refusal is still sitting in.
+        if self
+            .command(HostCommand::Record {
+                take_id: take_id.clone(),
+            })
+            .is_ok()
+        {
             self.status = format!("● recording {take_id} — `o` stops it");
         }
     }
@@ -949,9 +986,20 @@ impl Spike {
         .into()
     }
 
-    fn command(&mut self, command: HostCommand) {
-        if let Err(e) = self.host.execute(command) {
-            self.status = format!("command refused: {e}");
+    /// Apply a command and return the host's answer.
+    ///
+    /// The `Result` is the authority: `execute` is a synchronous round trip through
+    /// the actor, so it already knows whether the command was applied. The status
+    /// line is only where a refusal is **said** — it is never cleared on success, so
+    /// reading it back for `command refused` turns an earlier refusal into a
+    /// misreading of this one. A caller that needs the answer matches on this.
+    fn command(&mut self, command: HostCommand) -> Result<(), String> {
+        match self.host.execute(command) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.status = format!("command refused: {e}");
+                Err(e)
+            }
         }
     }
 }
@@ -970,7 +1018,7 @@ fn stat<'a>(label: &'a str, value: String) -> Element<'a, Message> {
 ///
 /// Read from the **snapshot** (the host publishes the take state every pump tick),
 /// so it is live rather than a one-shot message that scrolls away — the same split
-/// the TUI makes.
+/// the TUI's footer makes, from the same fields.
 fn take_label(snap: &Snapshot) -> String {
     if let Some(rec) = &snap.recording {
         return format!(
@@ -1929,5 +1977,35 @@ mod record_toggle {
             "{:?}",
             spike.status
         );
+    }
+}
+
+#[cfg(test)]
+mod command_result {
+    use super::*;
+
+    /// `command`'s `Result` is the answer; the status line is only where a refusal is
+    /// **said**, and it is never cleared on success.
+    ///
+    /// Reading the status back for `command refused` is what made a successful record
+    /// start on a lingering refusal read as a refusal. The `Result` cannot be confused
+    /// that way, and this pins the contract the toggle now relies on.
+    #[test]
+    fn the_result_is_the_answer_not_the_status() {
+        let mut spike = Spike::headless();
+
+        // A refusal is both returned and said, so a caller may keep the host's words.
+        assert!(spike.command(HostCommand::RecordStop).is_err());
+        assert!(
+            spike.status.starts_with("command refused"),
+            "{:?}",
+            spike.status
+        );
+
+        // A command the host applies returns `Ok` while an earlier refusal is still on
+        // the status line: a caller testing the status would read success as refusal.
+        let stale = spike.status.clone();
+        assert!(spike.command(HostCommand::TransportStop).is_ok());
+        assert_eq!(spike.status, stale);
     }
 }

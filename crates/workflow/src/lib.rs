@@ -310,10 +310,9 @@ impl Action {
         }
     }
 
-    /// The `host v1` operation this action dispatches, when it is a log op. The
-    /// strings are the parser's own op names (`arrange <name> …`), so a shell builds a
-    /// line and the test below proves the vocabulary still has it.
-    /// The **arrange-line verb** this action logs, when it has one.
+    /// The **arrange-line verb** this action logs, when it has one. The strings are
+    /// the parser's own op names (`arrange <name> …`), so a shell builds a line and
+    /// the test below proves the vocabulary still has it.
     ///
     /// `None` for anything a shell drives itself rather than through
     /// `parse_arrange_line` — every transport verb, and `RecordToggle`, whose take
