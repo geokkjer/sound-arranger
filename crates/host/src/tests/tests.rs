@@ -4775,6 +4775,94 @@ fn a_finished_take_is_committed_to_the_session_state() {
     );
 }
 
+/// The pool-id cache the snapshot publishes: `set_pool` lists the directory, a
+/// finished take joins it, and a refresh that fails **keeps** what it had.
+///
+/// The last is the point. A shell auto-names takes against this list, so a transient
+/// listing failure that emptied it would restart the names at `take-1` and eat a
+/// refusal for an id the pool already holds. The host's free-id check is the safety
+/// net against overwrite, not against forgetting.
+#[test]
+fn the_pool_id_cache_lists_the_pool_and_survives_a_failed_refresh() {
+    let root = std::env::temp_dir().join(format!("host-pool-ids-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let pool = root.join("pool");
+    std::fs::create_dir_all(&pool).expect("pool dir");
+
+    // A source already in the directory is listed when the pool is bound.
+    let held = pool.join("held.ch0.wav");
+    let mut writer = media::wav::WavWriter::create_float(&held, 48_000, 1).expect("create");
+    writer.write(&[0.0f32; 64]).expect("samples");
+    writer.finalize().expect("finalize");
+
+    let mut s = HostSession::new();
+    assert!(
+        s.pool_ids().is_empty(),
+        "nothing is listed before a pool is bound"
+    );
+    s.execute(&HostCommand::Pool { dir: pool.clone() })
+        .expect("pool");
+    assert!(
+        s.pool_ids().iter().any(|id| id == "held.ch0"),
+        "set_pool lists what the directory holds: {:?}",
+        s.pool_ids()
+    );
+
+    // A **rebind** clears: the previous pool's names must not follow the session to
+    // a different directory. (The merge gate caught this half unpinned — the rest of
+    // the test binds one pool, so carrying the old ids across would have passed.)
+    let other = root.join("other");
+    std::fs::create_dir_all(&other).expect("other pool");
+    s.execute(&HostCommand::Pool { dir: other })
+        .expect("rebind");
+    assert!(
+        !s.pool_ids().iter().any(|id| id == "held.ch0"),
+        "a rebind drops the previous pool's names: {:?}",
+        s.pool_ids()
+    );
+    // Binding the original pool again lists it again, and keeps the rest of the
+    // test on the pool that holds the take.
+    s.execute(&HostCommand::Pool { dir: pool.clone() })
+        .expect("rebind back");
+    assert!(
+        s.pool_ids().iter().any(|id| id == "held.ch0"),
+        "binding the original pool lists it again: {:?}",
+        s.pool_ids()
+    );
+
+    // A finished take's sources join the cache without a re-bind.
+    let ring = std::sync::Arc::new(media::Spsc::<f32>::new(64));
+    s.start_recording("jam", ring, 48_000, 2)
+        .expect("the take starts");
+    s.execute(&HostCommand::RecordStop).expect("the take stops");
+    for source in ["jam.ch0", "jam.ch1"] {
+        assert!(
+            s.pool_ids().iter().any(|id| id == source),
+            "the finished take's {source} joins the cache: {:?}",
+            s.pool_ids()
+        );
+    }
+
+    // A refresh that cannot read the directory leaves the cache as it was: the
+    // session still holds these ids, and forgetting them is the defect.
+    let ring = std::sync::Arc::new(media::Spsc::<f32>::new(64));
+    s.start_recording("jam-2", ring, 48_000, 1)
+        .expect("the take starts");
+    let before = s.pool_ids().to_vec();
+    std::fs::remove_dir_all(&pool).expect("the pool directory goes away under the session");
+    assert!(
+        s.stop_recording().is_err(),
+        "finalizing had nowhere to write"
+    );
+    assert_eq!(
+        s.pool_ids(),
+        before.as_slice(),
+        "a failed refresh keeps the ids it had"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The point of the declaration: a loaded session binds its take **without opening a
 /// device** — what is in the WAV is not this layer's business.
 #[test]

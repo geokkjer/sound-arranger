@@ -34,9 +34,12 @@ against the pool the host publishes.**
    `pool_ids` is what makes the name collision-free. Both are read through the session in the same
    publish pass the meters and MIDI use, and `pool_ids` is **cached**, refreshed where the pool can
    change (`set_pool`, a finished take), because `Pool::list` reads a directory and publish runs on
-   every pump tick. Both shells **decide** start-vs-stop from this state — `o` re-reads the snapshot at
-   the key press — and draw the live take line from it, never from the status line, which any later
-   message overwrites.
+   every pump tick. A refresh that cannot read the directory **keeps the previous ids** — the pool that
+   is bound has not changed, and forgetting what it holds is what would restart a shell's names — while
+   a **rebind** (`set_pool`) clears first, because the old pool's names belong to the old pool; the
+   listing there comes from the handle already in hand rather than a second `Pool::open`. Both shells
+   **decide** start-vs-stop from this state — `o` re-reads the snapshot at the key press — and draw the
+   live take line from it, never from the status line, which any later message overwrites.
 4. **The iced shell auto-names** `take-N`, taking the highest `take-N.chK` the pool holds plus one, so
    a gap is never reused and non-take material does not shift the numbering. **The TUI asks**, opening
    the command line prefilled with `record `, because that is where that shell makes decisions and the
@@ -84,7 +87,16 @@ against the pool the host publishes.**
   while the transport is stopped is telling the truth about the device and not about the take.
 - **`--record-check` is the instrument for this verb**, as `--sweep` is for a fader drag: a GUI
   interaction cannot be scripted from outside, so the shell drives itself. It needs an input device, so
-  it is not a CI gate — the owner runs it.
+  it is not a CI gate — the owner runs it. It now asserts the **after-state** too: every source of the
+  finished take must appear in the published `pool_ids`, which is the list the next name is chosen
+  against.
+- **The two reviews' deferred items landed in the follow-up slice** (`fix/host-pool-ids`): a refresh
+  that cannot read the directory keeps the ids it had (pinned by
+  `the_pool_id_cache_lists_the_pool_and_survives_a_failed_refresh`, which also covers `set_pool`'s
+  listing and the finished take's join), `set_pool` lists from the pool already in hand, the
+  replayed-`Take` arm says why it needs no refresh, `demo_pool_dir` is derived from the crate's
+  manifest directory rather than the cwd, and the TUI footer gives the take line its own row so a
+  status long enough to wrap can no longer clip the one line that must stay visible while recording.
 - **The toggle's start-vs-stop decision is pinned in both shells.** The iced one is device-gated rather
   than mocked (`record_toggle::the_toggle_starts_then_stops_a_take`): it reads the host rather than the
   repaint and asserts the started id equals what `next_take_id` derived — pinning `take-1` would pass

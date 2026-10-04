@@ -795,22 +795,40 @@ impl HostSession {
         // otherwise read a WAV from outside the pool.
         self.pool_resolver = Some(pool.resolver());
         self.pool_dir = Some(dir);
-        self.refresh_pool_ids();
+        // A rebind invalidates the cache: what the previous pool held belongs to it,
+        // not to this one. List from the handle already in hand rather than opening
+        // the directory a second time, and if the listing fails the cache stays empty
+        // — "unknown", which the host's free-id check covers — instead of carrying
+        // the old pool's names across.
+        self.pool_ids.clear();
+        self.refresh_pool_ids_from(&pool);
         Ok(())
     }
 
-    /// Re-list the pool's source ids into the cache the snapshot publishes.
+    /// Re-list the bound pool's source ids into the cache the snapshot publishes.
     ///
     /// Called where the pool can change, not per frame: `Pool::list` reads the
-    /// directory.
+    /// directory. **A failed refresh keeps the previous ids**: the pool that is bound
+    /// has not changed, and forgetting what it holds would make a shell's auto-namer
+    /// restart at `take-1` and eat a refusal for a name that should have been
+    /// skipped. The host's free-id check is the safety net against overwrite, not
+    /// against forgetting.
     fn refresh_pool_ids(&mut self) {
-        self.pool_ids = self
-            .pool_dir
-            .as_ref()
-            .and_then(|dir| media::Pool::open(dir).ok())
-            .and_then(|pool| pool.list().ok())
-            .map(|index| index.sources.into_iter().map(|s| s.id).collect())
-            .unwrap_or_default();
+        let Some(dir) = self.pool_dir.clone() else {
+            return;
+        };
+        if let Ok(pool) = media::Pool::open(&dir) {
+            self.refresh_pool_ids_from(&pool);
+        }
+    }
+
+    /// Take the ids from a pool in hand, leaving the cache alone if the listing fails.
+    /// The caller owns whether "left alone" is meaningful: `set_pool` clears first,
+    /// because it rebinds.
+    fn refresh_pool_ids_from(&mut self, pool: &media::Pool) {
+        if let Ok(index) = pool.list() {
+            self.pool_ids = index.sources.into_iter().map(|s| s.id).collect();
+        }
     }
 
     /// The pool source ids, cached — what a shell reads to name a new take
@@ -1916,6 +1934,13 @@ impl HostSession {
             // so binding it touches no device and reads no file. The pool ids follow the
             // `{take_id}.ch{k}` convention, which is why the declaration names the shape
             // rather than each source.
+            //
+            // **The id cache needs no refresh here.** A `Take` is only ever logged after
+            // the `Pool` that bound the directory — recording refuses without one — and a
+            // replay cannot add files to that directory; `set_pool` is the one place the
+            // binding changes and the one place an existing directory is listed. A
+            // hand-written document that declares a take with no pool has an empty cache
+            // already, and nothing to name takes against.
             HostCommand::Take {
                 take_id,
                 frames,

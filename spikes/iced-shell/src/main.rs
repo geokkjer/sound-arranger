@@ -234,23 +234,15 @@ struct Spike {
 /// `set_pool` refuses a directory that does not exist (load-bearing: the rebuild
 /// path relies on that refusal, see `HostSession::set_pool`), so making the
 /// directory is the shell's errand. The path sits under the workspace's ignored
-/// `target/`, resolved by walking up from the spike, which is why the demo needs
-/// no absolute path and the pool can never be committed.
+/// `target/`, derived from the crate's own manifest directory — deterministic no
+/// matter where the binary is invoked, unlike walking up from the cwd. The spike
+/// lives at `spikes/iced-shell`, so the workspace root is two levels up.
 fn demo_pool_dir() -> std::path::PathBuf {
-    // Walk up to the **workspace** root: a spike has its own `target/`, so the
-    // marker is the shared `crates/` directory, not a target dir that cargo would
-    // create next to the spike.
-    let mut dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    loop {
-        if dir.join("crates").is_dir() {
-            break;
-        }
-        match dir.parent() {
-            Some(parent) => dir = parent.to_path_buf(),
-            None => break,
-        }
-    }
-    dir.join("target").join("iced-pool")
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("target")
+        .join("iced-pool")
 }
 
 #[derive(Debug, Clone)]
@@ -296,24 +288,22 @@ impl Spike {
             },
             Err(e) => format!("demo script does not parse: {e}"),
         };
-        // The pool is named only when it failed: a shell's status line is for what
-        // went wrong, not for the bookkeeping that worked.
         // The pool is set **after** the load, because `load` replaces the session
         // wholesale — setting it first was silently discarded, and `record` then
         // refused for want of a pool that had been chosen and thrown away. Created
         // here because `set_pool` refuses a directory that does not exist (a
-        // load-bearing refusal, see `HostSession::set_pool`).
-        let pool_status = match std::fs::create_dir_all(demo_pool_dir()) {
-            Ok(()) => match host.execute(HostCommand::Pool {
-                dir: demo_pool_dir(),
-            }) {
+        // load-bearing refusal, see `HostSession::set_pool`). The path is resolved
+        // once: it is the same directory for the create and the bind.
+        let pool_dir = demo_pool_dir();
+        // The pool is named only when it failed: a status line is for what went
+        // wrong, not for the bookkeeping that worked.
+        let pool_status = match std::fs::create_dir_all(&pool_dir) {
+            Ok(()) => match host.execute(HostCommand::Pool { dir: pool_dir }) {
                 Ok(()) => String::new(),
                 Err(e) => format!("pool refused: {e}"),
             },
             Err(e) => format!("cannot create the pool: {e}"),
         };
-        // The pool is named only when it failed: a status line is for what went
-        // wrong, not for the bookkeeping that worked.
         let status = if pool_status.is_empty() {
             demo
         } else {
@@ -1133,6 +1123,21 @@ fn record_check() -> i32 {
             );
             if t.frames == 0 {
                 eprintln!("record-check: the take captured no frames");
+                return 1;
+            }
+            // The **after-state**, not just the take: the list the next take is named
+            // against must include this one's sources, or the auto-namer would reuse
+            // the id it just recorded. This is the assertion the check was missing.
+            let missing: Vec<&String> = t
+                .sources
+                .iter()
+                .filter(|source| !spike.snap.pool_ids.contains(source))
+                .collect();
+            if !missing.is_empty() {
+                eprintln!(
+                    "record-check: the take's sources {missing:?} did not reach the published pool: {:?}",
+                    spike.snap.pool_ids
+                );
                 return 1;
             }
             println!("record-check: OK — a take reached the pool");
