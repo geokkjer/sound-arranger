@@ -195,7 +195,8 @@ printf 'set_param mixer master.gain 0.4 @0\nset_param mixer master.gain 0.5 @0\n
 ```
 
 Load and bounce again, the same way as above. The first line of the output is
-new — the report of what the recovery did:
+new — the report of what the recovery did (the rest of the summary is the one
+Step 1 shows, unchanged):
 
 ```text
 host: journal: 2 applied, 1 torn, 0 refused
@@ -216,10 +217,21 @@ Four things happened, and each is visible:
   dropped. One bad line does not take the edits after it anywhere, because
   there is nothing after it — the journal is append-only.
 - **The edits survived.** `cmp` against the clean reload's WAV: different. Count
-  the peak with the Step 4 snippet: it is **10248** where the clean bounce
-  peaked **16397** — a ratio of exactly 0.625, which is `0.5 / 0.8`: the
-  journaled gain change is *audibly present* in the recovered render. The
-  crash cost nothing but the write it was in the middle of.
+  the **peak** (not the Step 4 snippet — that one counts *nonzero* samples, which
+  is `35584` here):
+
+  ```sh
+  python3 -c "
+  import struct
+  d=open('/tmp/hello-again.wav','rb').read()
+  print(max(abs(struct.unpack('<h',d[i:i+2])[0]) for i in range(44,len(d),2)))"
+  ```
+
+  It prints **10248** where the clean bounce peaked **16397** — the two gains'
+  ratio `0.5 / 0.8 = 0.625`, so the journaled gain change is *audibly present* in
+  the recovered render (the integer peaks land at 0.62499 of each other, the
+  rounding of 16-bit samples). The crash cost nothing but the write it was in the
+  middle of.
 
 The report line is built from the host's recovery record — applied gestures,
 torn lines, refused entries, and the first refusal's own words — through the

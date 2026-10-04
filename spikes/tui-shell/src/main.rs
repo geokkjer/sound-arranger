@@ -8,7 +8,7 @@
 //!
 //! 1. **It runs in a terminal** (the TUI's version of "the window opens").
 //! 2. **The host thread is unchanged** — the same [`host::live::HostHandle`] the
-//!    Tauri bridge and the iced spike use.
+//!    Tauri bridge and the iced spike used.
 //! 3. **Transport** (play / stop / rewind / seek) drives it.
 //! 4. **Meters and the playhead follow the audio**, polled from the published
 //!    `Snapshot` once per frame.

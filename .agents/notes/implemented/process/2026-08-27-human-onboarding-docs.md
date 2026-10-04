@@ -64,4 +64,5 @@ copy/paste, the prefilled prompts) through a real pty.
   optional in the reading order (after lesson 6) but it is where "why is this written so
   defensively?" now sends you.
 
-*Authored with GLM-5.3 Flash · ZCode, 2026-08-27.*
+*Authored with GLM-5.3 Flash · ZCode, 2026-08-27; the hardening-tier entry and the tour's
+silence-trap correction added 2026-09-30 with GLM-5.3 · OpenCode.*

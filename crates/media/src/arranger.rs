@@ -18,8 +18,10 @@
 //! is counted and is a *hard error the bounce must surface* (assert `underruns ==
 //! 0`), because an underrun cannot be recovered without shifting every later
 //! sample of that clip (an SPSC ring has no random access — you cannot skip a
-//! frame you never received). The module asserts `popped == off` in debug so a
-//! test that slips fails loudly instead of shipping shifted audio. The profile
+//! frame you never received). The module asserts `popped + off0 == off` in debug
+//! (skipped at a source's end-of-file, where `off` correctly runs ahead into
+//! silence) so a test that slips fails loudly instead of shipping shifted audio.
+//! The profile
 //! must also render **contiguously from frame 0** (a bounce from an offset would
 //! begin every reader at its source frame 0 while `off` claims otherwise).
 

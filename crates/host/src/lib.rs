@@ -15,8 +15,8 @@
 //! [`run_script`] assembles the profile (the "sound clip arranger mixer
 //! sampler editor") and executes a command list deterministically: the same
 //! script on fresh sessions produces byte-identical bounces. The CLI
-//! (`src/main.rs`) is the composition-seams "headless smoke binary". A future
-//! Tauri shell implements the identical contract — swapping shells swaps only
+//! (`src/main.rs`) is the composition-seams "headless smoke binary". The
+//! shells implement the identical contract — swapping shells swaps only
 //! the transport adapter; the text format (`parse_script`, versioned
 //! [`HOST_API_VERSION`]) is the wire schema its commands validate against.
 //!

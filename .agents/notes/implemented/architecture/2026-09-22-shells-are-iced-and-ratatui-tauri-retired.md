@@ -2,6 +2,13 @@
 
 Status: implemented
 
+> **Superseded in framing (2026-09-30):** [Tauri was an experiment we decided
+> against](2026-09-30-tauri-was-an-experiment-and-iced-is-next.md) sharpens this decision. Tauri is
+> an approach the owner *tried and decided against*, not a "porting reference" with a live role,
+> and that note records the forward plan — iced carries the recorder profile once the recorder is
+> good enough. This note's reasoning and its decision stand; the role it assigns the frozen crate
+> does not.
+
 ## Problem
 
 The app shell is a **Tauri v2 + Vue 3 + TypeScript** desktop app. It works, and it was the

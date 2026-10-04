@@ -81,19 +81,23 @@ workspace is what keeps two shells from growing two workflows.
   shells swaps one transport adapter.
 - **the shells** — `spikes/iced-shell` (iced 0.14 + `iced_audio` widgets) and
   `spikes/tui-shell` (ratatui), each an isolated workspace that owns a live
-  `host::live::HostHandle`. **The Tauri v2 + Vue shell (`crates/shell`) is
-  retired** (2026-09-22): it is frozen and excluded from the workspace, kept as the
-  porting reference for the Rust shells —
+  `host::live::HostHandle`. The **Tauri v2 + Vue shell was an approach we tried
+  and decided against** (2026-09-22): `crates/shell` is frozen, out of the
+  workspace, and kept only until someone deletes it — it is not a design
+  reference and no longer a client of anything —
   [`crates/shell/RETIRED.md`](../crates/shell/RETIRED.md), decision in
-  [the shells note](../.agents/notes/implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md).
-  Historically it was the first rich shell and, as the *bridge*, owned a live
-  `host::HostSession` and exposed a single Tauri command (`run_host_script`) that
-  ran the versioned text format — the *same* contract the CLI smoke binary drives, so a script that
-  bounces byte-identically on the CLI behaves the same here. It exists so the frontend work has a home and
-  to prove host↔shell wiring, not because anything in the core depends on it.
+  [the shells note](../.agents/notes/implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md)
+  and its [2026-09-30 framing note](../.agents/notes/implemented/architecture/2026-09-30-tauri-was-an-experiment-and-iced-is-next.md).
+  It was the first rich shell and proved the UI-as-plugin contract end to end —
+  the *bridge* owned a live `host::HostSession` and exposed a single Tauri command
+  (`run_host_script`) that ran the versioned text format, the *same* contract the
+  CLI smoke binary drives. That it worked is exactly why the cost it carried
+  (Vue beside Rust, a webview, an IPC wire, a serde bridge, an npm toolchain in
+  the build, webkit/GPU on the deploy path) is the complexity the Rust shells
+  exist to remove.
 
 The dependency direction is the whole point: `engine` and `media` must never
-depend on `tauri`. The UI is a plugin, not the substrate (the
+depend on a GUI toolkit. The UI is a plugin, not the substrate (the
 [UI-as-plugin note](../.agents/notes/implemented/architecture/2026-08-18-ui-as-plugin-host-api-and-headless-reference.md)
 owns that decision).
 
@@ -944,12 +948,15 @@ targets a recent toolchain, as does `edition = "2024"` in `Cargo.toml`.
 
 ### 7.1 Why a headless host first
 
-The UI-as-plugin note's central claim: **the UI must be interchangeable — the
-reference shell is a *reference implementation* of the host, not the host.** And a
+The UI-as-plugin note's central claim: **the UI must be interchangeable — every
+shell is an *implementation* of the host, not the host.** And a
 contract no second host has exercised is a wish. So before any GUI shell, there
 is a *headless* host that exercises the entire contract deterministically, CI-
 tested. The `host` binary reads a text script and runs it — record, splice,
-mix, bounce — with no frontend whatsoever.
+mix, bounce — with no frontend whatsoever. The shells come after it, and in one
+direction: the TUI is the working shell while the recorder profile is built, and
+the iced shell is taken to that same profile once the recorder is good enough
+([the shell framing note](../.agents/notes/implemented/architecture/2026-09-30-tauri-was-an-experiment-and-iced-is-next.md)).
 
 The contract has three parts (carefully distinguished, and this distinction is
 worth internalizing):
@@ -1091,8 +1098,9 @@ considered, and the code is candid about its edges.
   (later) a generative improviser or a headless box, because it encodes no product
   assumptions.
 - Enforced by the seam: `engine`/`media` compile with no GUI-toolkit dependency,
-  so swapping the shell (the headless CLI plus two live shells today, possibly
-  egui or WASM after) is provably possible, not just claimed.
+  so swapping the shell (the headless CLI, the TUI today, and the iced shell that
+  carries the recorder profile once the recorder is good enough) is provably
+  possible, not just claimed.
 
 **Cons**
 
@@ -1177,8 +1185,12 @@ considered, and the code is candid about its edges.
   `MAX_BLIPS = 16` hard cap and drops notes beyond it. The notes call voice
   stealing "undesigned" (RESEARCH §14 risk 8). None of this is *wrong* for a
   spike, but it's debt that becomes audible the moment polyphony exceeds 16.
-- `VecDeque::with_capacity(8)` in the player's splice buffer is a documented
-  "would allocate on the render path past 8" edge — a real, if unlikely, footgun.
+- `VecDeque::with_capacity(8)` in the player's splice buffer is a real,
+  **script-reachable** footgun, not a theoretical one: the 2026-09-29 external
+  review confirmed a `host v1` script can queue more than 8 splices into one block,
+  so the buffer grows on the render path (invariant 1). The fix is deferred with a
+  reason — claims `2-media-io#5` and `7-mechanical#3` in
+  [the disposition](../research/architecture/2026-09-29-space-bunny-review.md).
 
 ### Decision: the headless host before, and as a gate on, the GUI shell
 
@@ -1186,10 +1198,10 @@ considered, and the code is candid about its edges.
 
 - Proves the contract is real — a contract exercised by exactly one host is a
   wish; this is exercised by a CI-tested headless binary running real scripts.
-- Keeps the profile *logic* out of Vue by construction: the headless host has to
-  run it, so it can't hide in a component.
-- `engine`/`media` stay `tauri`-free, which is the entire "interchangeable UI"
-  claim.
+- Keeps the profile *logic* out of the shell by construction: the headless host has
+  to run it, so it can't hide in a widget.
+- `engine`/`media` stay free of any GUI toolkit, which is the entire
+  "interchangeable UI" claim.
 
 **Cons**
 
@@ -1241,8 +1253,10 @@ Beyond the per-decision cons above, a few systemic risks worth naming:
    the one core log.)*
 3. **Ceremony without payoff** — the whole plugin machinery must earn its keep
    via more than one host. The terminal and iced shells both exercise the same
-   contract today (the Tauri shell this originally gated on never arrived), so
-   the question is answered for now; a seam with exactly one client is a tax.
+   contract today, so the question is answered for now; a seam with exactly one
+   client is a tax. (The Tauri + Vue shell this originally gated on was built,
+   proved the contract, and was then decided against — 2026-09-22,
+   [framing note](../.agents/notes/implemented/architecture/2026-09-30-tauri-was-an-experiment-and-iced-is-next.md).)
 4. **Determinism is scoped to "no underrun."** Engine replay is byte-identical
    and media commands ride the same log — but a streaming reader that underruns
    emits zeros, and an SPSC ring has no random access. Byte-identity holds for a
