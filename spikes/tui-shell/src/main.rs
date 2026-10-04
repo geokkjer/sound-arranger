@@ -3147,31 +3147,41 @@ impl App {
             None => self.status.clone().into(),
         };
 
-        let mut lines = vec![
+        let message = Paragraph::new(vec![
             ratatui::text::Line::from(vec![
                 mode,
                 Span::raw(format!("  {focus}mouse {}   {latency}", on_off(self.mouse))),
                 Span::styled(timeline, Style::new().fg(Color::Gray)),
             ]),
             second,
-        ];
-        // The third line is the **take**, drawn from the snapshot rather than written
-        // into the status: a recording is state, so its counters move every frame and
-        // no later message can overwrite it.
-        if let Some(take) = recording_line(&self.snap) {
-            lines.push(ratatui::text::Line::from(Span::styled(
-                take,
-                Style::new()
-                    .fg(Color::LightRed)
-                    .add_modifier(Modifier::BOLD),
-            )));
+        ])
+        .wrap(Wrap { trim: true });
+
+        // The **take** is its own row, not a third line of the wrapping paragraph: a
+        // status long enough to wrap would otherwise push it out of the block's inner
+        // height, and the one line that must stay visible while recording is the one
+        // that says a take is running. The message above is the part allowed to clip.
+        let take = recording_line(&self.snap);
+        let block = Block::bordered().title(" state ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let [message_area, take_area] = Layout::vertical([
+            Constraint::Min(0),
+            Constraint::Length(u16::from(take.is_some())),
+        ])
+        .areas(inner);
+        frame.render_widget(message, message_area);
+        if let Some(take) = take {
+            frame.render_widget(
+                Paragraph::new(ratatui::text::Line::from(Span::styled(
+                    take,
+                    Style::new()
+                        .fg(Color::LightRed)
+                        .add_modifier(Modifier::BOLD),
+                ))),
+                take_area,
+            );
         }
-
-        let paragraph = Paragraph::new(lines)
-            .block(Block::bordered().title(" state "))
-            .wrap(Wrap { trim: true });
-
-        frame.render_widget(paragraph, area);
     }
 
     /// The `?` overlay: the keymap table, rendered (so it cannot drift from the
