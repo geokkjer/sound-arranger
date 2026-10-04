@@ -227,10 +227,13 @@ struct Spike {
     history: Vec<String>,
     history_at: usize,
     help: bool,
-    /// The furthest frame playback has reached, so the timeline keeps a span while
-    /// stopped. A shell-side memory, not engine state: the span is the **max** of this
-    /// and the arrangement's own end (`timeline_span`), so a loaded piece shows its
-    /// whole length before it is played.
+    /// The furthest frame playback has reached **in this pass**, so the timeline keeps a
+    /// span while stopped. A shell-side memory, not engine state: the span is the **max**
+    /// of this and the arrangement's own end (`timeline_span`), so a loaded piece shows
+    /// its whole length before it is played. It **resets when the transport moves
+    /// backwards** — a `:load` starts a new session at frame 0, and a seek or rewind
+    /// starts a new pass; keeping the old maximum would compress a freshly loaded piece
+    /// into the left of the canvas (see `advance_span`).
     span_frames: u64,
     /// The shared workflow's snap grid. The iced timeline draws the arrangement, but
     /// it has no editing gestures yet, so the grid cannot quantize an edit here — the
@@ -431,9 +434,10 @@ impl Spike {
             Message::Tick => {
                 self.snap = self.host.snapshot();
                 // The played-span memory the timeline's width derives from: the furthest
-                // the transport has been, so the view is stable while stopped instead of
-                // rescaling every frame.
-                self.span_frames = self.span_frames.max(self.snap.frame);
+                // the transport has been **this pass**, so the view is stable while
+                // stopped instead of rescaling every frame. A backward move (a `:load`,
+                // a seek, a rewind) starts a new pass and forgets the old maximum.
+                self.span_frames = advance_span(self.span_frames, self.snap.frame);
             }
             Message::Play => self.play(),
             Message::Stop => {
@@ -1051,6 +1055,18 @@ fn take_label(snap: &Snapshot) -> String {
         ),
         None => "no take yet — `o` records one".to_string(),
     }
+}
+
+/// The played-span memory after seeing `frame`: the running maximum, **reset** when the
+/// transport moves backwards.
+///
+/// Backwards means a new pass: a `:load` starts a new session at frame 0, and a seek or
+/// rewind returns to a frame already played. Keeping the old maximum through that would
+/// let the played span dominate the arrangement's own end in [`timeline_span`], drawing
+/// a freshly loaded piece compressed into the left of the canvas — the one flow the
+/// timeline exists for.
+fn advance_span(span: u64, frame: u64) -> u64 {
+    if frame < span { frame } else { span.max(frame) }
 }
 
 /// The span the timeline maps onto: the arrangement's own end, or the furthest frame
@@ -2196,6 +2212,18 @@ mod timeline {
             error: Some("poisoned".into()),
         };
         assert_eq!(timeline_span(&failed, 1_000), 1_000);
+    }
+
+    /// The played-span memory grows forward and **resets** on a backward move, so a
+    /// loaded or rewound piece is drawn against its own arrangement end again.
+    #[test]
+    fn the_span_memory_resets_when_the_transport_moves_backwards() {
+        assert_eq!(advance_span(0, 0), 0);
+        assert_eq!(advance_span(0, 500), 500);
+        assert_eq!(advance_span(500, 900), 900);
+        assert_eq!(advance_span(900, 400), 400, "a seek back starts a new pass");
+        assert_eq!(advance_span(400, 0), 0, "a load starts at frame 0");
+        assert_eq!(advance_span(0, 250), 250, "and grows again from there");
     }
 
     /// The canvas program is built from a snapshot with **no tracks** and from one with

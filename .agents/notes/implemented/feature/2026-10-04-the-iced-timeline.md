@@ -29,9 +29,11 @@ draws it with a `canvas` program.**
 2. **The cache is rebuilt only where the arrangement can change.** `HostSession` keeps the
    `TimelineStatus` and a private `refresh_timeline()`; the refresh points are the end of the
    public `execute` (once per applied **state** command), `carry_over` (a seek/undo/redo adopts a
-   rebuilt session), and once at the end of `from_script` (a loaded session). `new_at_with` builds
-   it once, so a fresh session reports an **empty** arrangement rather than "unknown". The pump
-   never rebuilds it: `publish` copies `session.timeline_status()`.
+   rebuilt session), the end of `from_script` (a loaded session), and the end of `apply_journal`
+   (the autosave replayed on top of it — so a **journaled load refreshes twice**, the script's
+   value then the journal's; the later one is the answer, and a load with no journal keeps the
+   first). `new_at_with` builds it once, so a fresh session reports an **empty** arrangement rather
+   than "unknown". The pump never rebuilds it: `publish` copies `session.timeline_status()`.
 3. **`execute` refreshes; `process` does not.** `process` is also the replay path a rebuild, a
    script load and a journal walk take. Those loops call `process` and refresh **once** when they
    are done, so an undo of a long history reconstructs the timeline one time, not once per
@@ -46,11 +48,14 @@ draws it with a `canvas` program.**
    (over `frame_x`) maps a clip's placement and length onto plot points, clamping a frame past the
    span to the right edge and returning zero width for a zero span. `frame_x` draws the playhead
    too, so the two cannot disagree.
-6. **The span is `max(arrangement end, furthest frame played)`.** The arrangement's own end comes
-   from `media::Timeline::end_frame()`; the played span is the shell's memory of the furthest
-   frame the transport reached. The max is what makes the view stable in both states: a loaded
-   piece shows its whole length **before** it is played, and a take recorded past the last clip
-   still has somewhere to put the playhead.
+6. **The span is `max(arrangement end, furthest frame played this pass)`.** The arrangement's own
+   end comes from `media::Timeline::end_frame()`; the played span is the shell's memory of the
+   furthest frame the transport reached, and it **resets when the transport moves backwards**
+   (`advance_span`): a `:load` starts a new session at frame 0 and a seek or rewind starts a new
+   pass, so a freshly loaded piece is drawn against its own end instead of being compressed into
+   the left of a canvas whose span the previous session set. The max is what makes the view stable
+   in both states: a loaded piece shows its whole length **before** it is played, and a take
+   recorded past the last clip still has somewhere to put the playhead.
 
 ## Alternatives considered
 
@@ -97,10 +102,11 @@ draws it with a `canvas` program.**
   the adopted cache follows the rebuild — while an empty session reports an empty timeline with no
   error. Every existing test keeps passing, and `HostOutcome.arrangement` is unchanged.
 - **The iced shell draws a real timeline**, and the placeholder is gone. `position_fraction`
-  (which measured against the played span) is deleted with it; `clip_span`/`frame_x` replace it and
-  are unit-tested (zero span, a clip at frame 0, a fractional mapping, a clamp past the span). The
-  canvas program is built from a snapshot with no tracks, with tracks, and with an error, so the
-  empty and failed states cannot panic.
+  (which measured against the played span) is deleted with it; `clip_span`/`frame_x`/`advance_span`
+  replace it and are unit-tested (zero span, a clip at frame 0, a fractional mapping, a clamp past
+  the span, and the span memory's reset on a backward move). The canvas program is built from a
+  snapshot with no tracks, with tracks, and with an error, so the empty and failed states cannot
+  panic.
 - **The shell's "not built yet" messages moved to what is actually missing.** The canvas exists
   now, so a grid or editing action that still cannot quantize says the **editing gestures** are not
   built, not that the canvas is. The shared workflow is untouched: the key, the mode and the grid
