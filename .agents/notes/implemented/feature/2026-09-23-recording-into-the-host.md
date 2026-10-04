@@ -82,7 +82,9 @@ duration, and the report's channels/sources were lies). The hermetic test could 
 Fixed in the same slice: `fill_input` pushes every channel interleaved; `InputHandle` carries the
 **stream's** channel count and `record` sizes the capture from that one handle; a unit test pins the
 interleaved contract and a hardware-gated `#[ignore]`d test asserts a real device yields its own
-channel count at **full duration**; `stop_recording` reports the take even when the stop complains;
+channel count at **full duration**; `stop_recording` reports the take even when the stop complains, and
+the `Take` **declaration is committed even when the stop complains** — the take landed in the pool, so a
+document that dropped it would lose the take on reload, while the complaint still reaches the caller;
 re-recording over an existing take id is refused; and a rebuild (seek/Load/undo) **stops** a take in
 progress instead of dropping it, with the report surviving the rebuild. The review's arity gaps were
 already closed by the `exact` sweep in the same round.

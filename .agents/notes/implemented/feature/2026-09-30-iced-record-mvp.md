@@ -37,9 +37,12 @@ against the pool the host publishes.**
    every pump tick. A refresh that cannot read the directory **keeps the previous ids** — the pool that
    is bound has not changed, and forgetting what it holds is what would restart a shell's names — while
    a **rebind** (`set_pool`) clears first, because the old pool's names belong to the old pool; the
-   listing there comes from the handle already in hand rather than a second `Pool::open`. Both shells
-   **decide** start-vs-stop from this state — `o` re-reads the snapshot at the key press — and draw the
-   live take line from it, never from the status line, which any later message overwrites.
+   listing there comes from the handle already in hand rather than a second `Pool::open`. The cache
+   lists the names the pool **holds**, not only the ones it can read: a `.wav` that exists but cannot be
+   parsed is reported in `Pool::list`'s `errors` and still occupies its name, so its id stays — otherwise
+   the shell proposes it and eats the free-id refusal, the symptom the cache exists to prevent. Both
+   shells **decide** start-vs-stop from this state — `o` re-reads the snapshot at the key press — and
+   draw the live take line from it, never from the status line, which any later message overwrites.
 4. **The iced shell auto-names** `take-N`, taking the highest `take-N.chK` the pool holds plus one, so
    a gap is never reused and non-take material does not shift the numbering. **The TUI asks**, opening
    the command line prefilled with `record `, because that is where that shell makes decisions and the
