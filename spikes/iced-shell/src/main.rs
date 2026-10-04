@@ -28,8 +28,14 @@
 //!    dragging a fader sends a logged `set_param` back. That is the mixer path a
 //!    shell needs, with stock widgets.
 //!
-//! It is *not* a UI: there is no timeline canvas, no waveform, no clip editing,
-//! no text-heavy layout. Those are the parts that decide iced against ratatui
+//! 7. **The timeline is a real canvas** — one lane per track from the arrangement the
+//!    snapshot publishes (`Snapshot::timeline`), each clip a rectangle whose `at_frame`
+//!    and `src_len` map onto the canvas width, with the playhead at the transport's
+//!    frame. The span is derived (the arrangement's end, or the furthest frame played),
+//!    never a shell-side constant.
+//!
+//! It is *not* a UI yet: there is no waveform, no clip editing, no text-heavy
+//! layout. Those are the parts that decide iced against ratatui
 //! ([the two candidate shells](../../.agents/notes/implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md)),
 //! and the evaluations record them as the next step.
 //!
@@ -44,12 +50,15 @@
 use std::time::Duration;
 
 use host::HostCommand;
-use host::live::{HostHandle, Snapshot};
+use host::live::{HostHandle, Snapshot, TimelineStatus};
 
 use iced::keyboard;
+use iced::widget::canvas;
 use iced::widget::{column, container, progress_bar, row, text, vertical_slider};
 use iced::window;
-use iced::{Center, Element, Fill, Length, Subscription, Theme};
+use iced::{
+    Center, Color, Element, Fill, Length, Point, Rectangle, Renderer, Size, Subscription, Theme,
+};
 use iced_audio::{DBRange, Normal, NormalParam};
 use workflow::{Action, Key as WorkflowKey, Mode};
 
@@ -218,14 +227,18 @@ struct Spike {
     history: Vec<String>,
     history_at: usize,
     help: bool,
-    /// The furthest frame playback has reached, so the placeholder timeline has a
-    /// span to show the position against. A shell-side memory, not engine state:
-    /// the snapshot publishes no arrangement (see `position_fraction`).
+    /// The furthest frame playback has reached **in this pass**, so the timeline keeps a
+    /// span while stopped. A shell-side memory, not engine state: the span is the **max**
+    /// of this and the arrangement's own end (`timeline_span`), so a loaded piece shows
+    /// its whole length before it is played. It **resets when the transport moves
+    /// backwards** — a `:load` starts a new session at frame 0, and a seek or rewind
+    /// starts a new pass; keeping the old maximum would compress a freshly loaded piece
+    /// into the left of the canvas (see `advance_span`).
     span_frames: u64,
-    /// The shared workflow's snap grid. iced has no timeline canvas yet, so the
-    /// grid cannot quantize an edit here — but the *state* and its cycling order
-    /// are the workflow's, and the shell says which division is armed rather than
-    /// pretending the key does nothing.
+    /// The shared workflow's snap grid. The iced timeline draws the arrangement, but
+    /// it has no editing gestures yet, so the grid cannot quantize an edit here — the
+    /// *state* and its cycling order are the workflow's, and the shell says which
+    /// division is armed rather than pretending the key does nothing.
     grid: workflow::Grid,
 }
 
@@ -420,9 +433,11 @@ impl Spike {
         match message {
             Message::Tick => {
                 self.snap = self.host.snapshot();
-                // The placeholder's span: the furthest the transport has been, so
-                // the bar keeps a stable width instead of rescaling every frame.
-                self.span_frames = self.span_frames.max(self.snap.frame);
+                // The played-span memory the timeline's width derives from: the furthest
+                // the transport has been **this pass**, so the view is stable while
+                // stopped instead of rescaling every frame. A backward move (a `:load`,
+                // a seek, a rewind) starts a new pass and forgets the old maximum.
+                self.span_frames = advance_span(self.span_frames, self.snap.frame);
             }
             Message::Play => self.play(),
             Message::Stop => {
@@ -558,7 +573,7 @@ impl Spike {
             Action::ExportMix => {
                 // The workflow's export gesture, prefilled like the TUI's: the iced shell
                 // has the same command line, so the render-out path is shared rather than
-                // a gap (only the *canvas* is missing, not the gesture).
+                // a gap (only the *editing gestures* are missing, not the gesture).
                 self.prompt = Some("export mix.wav f32".to_string());
                 self.status =
                     "export the whole arrangement: edit the path/format, then Enter".to_string();
@@ -567,8 +582,8 @@ impl Spike {
                 self.grid.cycle();
                 self.status = if self.grid.is_on() {
                     format!(
-                        "snap grid: {} — the grid is workflow state, but the iced timeline \
-                         canvas is not built yet, so nothing snaps here",
+                        "snap grid: {} — the grid is workflow state, but the iced timeline's \
+                         editing gestures are not built yet, so nothing snaps here",
                         self.grid.label()
                     )
                 } else {
@@ -578,7 +593,7 @@ impl Spike {
             other => {
                 self.status = format!(
                     "`{}` needs the timeline — the workflow's keys are shared, but the iced \
-                     timeline canvas is not built yet",
+                     shell's timeline editing is not built yet",
                     other.name()
                 );
             }
@@ -778,7 +793,7 @@ impl Spike {
             reading,
             controls,
             self.console(),
-            self.timeline_placeholder(),
+            self.timeline(),
             text(take_label(&self.snap)).size(12),
             text(audio_label(&self.snap)).size(12),
             line,
@@ -947,30 +962,44 @@ impl Spike {
         format!("take-{next}")
     }
 
-    /// A **static** stand-in for the arrangement timeline.
+    /// The arrangement timeline: a caption and the canvas that draws it.
     ///
-    /// Deliberately not a canvas: the snapshot publishes no clips and no tracks, so
-    /// there is nothing to draw yet — a real one needs a host-side projection first
-    /// (`Snapshot` carries the transport, the meters and the take state, and no
-    /// arrangement). What this does show is honest and derived: the transport's
-    /// position as a fraction of the furthest it has played, so playback is visible
-    /// at a glance without pretending to know where the material is.
-    fn timeline_placeholder(&self) -> Element<'_, Message> {
-        let fraction = position_fraction(&self.snap, self.span_frames);
+    /// The arrangement comes from `Snapshot::timeline` — the host's **cached**
+    /// reconstruction, behind an `Arc`, so the per-frame poll clones a pointer rather
+    /// than the whole piece. The canvas is a real one: one lane per track, each clip a
+    /// rectangle mapped from `at_frame`/`src_len`, and the playhead at `snap.frame`. The
+    /// span is the arrangement's end or the furthest frame played, whichever is greater,
+    /// so a loaded piece is visible before it is played and the view never rescales
+    /// under a stopped transport.
+    ///
+    /// An `error` on the status is drawn **as the error**, never as an empty timeline:
+    /// the host can fail to reconstruct a poisoned arrangement, and a shell that drew
+    /// nothing would be saying "the piece is empty" about a piece it could not read.
+    fn timeline(&self) -> Element<'_, Message> {
+        let status = &self.snap.timeline;
+        let span = timeline_span(status, self.span_frames);
+        let clips = status
+            .timeline
+            .as_ref()
+            .map_or(0, |t| t.tracks.iter().map(|track| track.clips.len()).sum());
+        let caption = format!(
+            "{:.2} s / {:.2} s · {} clip(s)",
+            self.snap.seconds,
+            span as f64 / f64::from(self.snap.sample_rate.max(1)),
+            clips
+        );
+        let tracks = status.timeline.as_ref().map_or(0, |t| t.tracks.len());
+        let canvas: Element<'_, Message> = canvas::Canvas::new(TimelineView {
+            status: status.clone(),
+            frame: self.snap.frame,
+            span,
+        })
+        .width(Fill)
+        .height(Length::Fixed(timeline_height(tracks)))
+        .into();
         column![
-            row![
-                text("timeline").size(11),
-                text(format!(
-                    "{:.2} s · frame {} · {:.0}%",
-                    self.snap.seconds,
-                    self.snap.frame,
-                    fraction * 100.0
-                ))
-                .size(11),
-            ]
-            .spacing(12),
-            progress_bar(0.0..=1.0, fraction),
-            text("a real timeline needs the arrangement on the snapshot — not built yet").size(10),
+            row![text("timeline").size(11), text(caption).size(11)].spacing(12),
+            canvas,
         ]
         .spacing(4)
         .into()
@@ -1028,17 +1057,216 @@ fn take_label(snap: &Snapshot) -> String {
     }
 }
 
-/// How far through its own length the transport is, 0..1, for the placeholder bar.
+/// The played-span memory after seeing `frame`: the running maximum, **reset** when the
+/// transport moves backwards.
 ///
-/// The snapshot publishes **no arrangement**, so there is nothing to measure
-/// against yet; this is the honest stand-in: the position as a fraction of the
-/// playing span the shell has seen (0 while stopped or unstarted), which moves with
-/// playback without pretending to know where the clips are.
-fn position_fraction(snap: &Snapshot, span_frames: u64) -> f32 {
-    if span_frames == 0 {
+/// Backwards means a new pass: a `:load` starts a new session at frame 0, and a seek or
+/// rewind returns to a frame already played. Keeping the old maximum through that would
+/// let the played span dominate the arrangement's own end in [`timeline_span`], drawing
+/// a freshly loaded piece compressed into the left of the canvas — the one flow the
+/// timeline exists for.
+fn advance_span(span: u64, frame: u64) -> u64 {
+    if frame < span { frame } else { span.max(frame) }
+}
+
+/// The span the timeline maps onto: the arrangement's own end, or the furthest frame
+/// the transport has played, whichever is greater.
+///
+/// The **max** is what makes the view honest in both directions: a loaded piece shows
+/// its whole length before it is played (the arrangement end), and a take recorded past
+/// the last clip still has somewhere to put the playhead (the played span). Neither
+/// alone works: the arrangement end is 0 in an empty session, and the played span is 0
+/// while stopped.
+fn timeline_span(status: &TimelineStatus, played: u64) -> u64 {
+    let end = status
+        .timeline
+        .as_ref()
+        .and_then(|timeline| timeline.end_frame().ok())
+        .unwrap_or(0);
+    end.max(played)
+}
+
+/// A timeline frame's x within a plot `width`, for a `span` of frames.
+///
+/// The one mapping the timeline draws with, kept pure so the geometry can be tested
+/// without a renderer. A zero span (nothing placed, nothing played) draws at the left
+/// edge rather than dividing by zero, and a frame past the span clamps to the right edge
+/// so a stale span never draws outside the box.
+fn frame_x(frame: u64, span: u64, width: f32) -> f32 {
+    if span == 0 || width <= 0.0 {
         return 0.0;
     }
-    (snap.frame as f32 / span_frames as f32).clamp(0.0, 1.0)
+    (frame as f64 / span as f64).clamp(0.0, 1.0) as f32 * width
+}
+
+/// A clip's `(x, width)` in plot points, from its placement and its span.
+///
+/// The clip's own width is the mapped distance between `at_frame` and
+/// `at_frame + src_len`, so a clip that runs past the span clamps to a zero-width (or
+/// truncated) bar at the right edge instead of overflowing the canvas.
+fn clip_span(at_frame: u64, src_len: u64, span: u64, width: f32) -> (f32, f32) {
+    let x = frame_x(at_frame, span, width);
+    let end = frame_x(at_frame.saturating_add(src_len), span, width);
+    (x, (end - x).max(0.0))
+}
+
+/// The canvas's height for `tracks` lanes — one lane per track, a minimum of one so an
+/// empty arrangement still has a bed to draw the message on.
+fn timeline_height(tracks: usize) -> f32 {
+    let lanes = tracks.max(1) as f32;
+    (TIMELINE_PAD * 2.0 + lanes * TIMELINE_LANE_HEIGHT + (lanes - 1.0) * TIMELINE_LANE_GAP)
+        .min(TIMELINE_MAX_HEIGHT)
+}
+
+/// The timeline canvas's geometry, in points.
+const TIMELINE_PAD: f32 = 8.0;
+/// The gutter the track ids are drawn in; clips map onto the width **after** it, so a
+/// label never sits under a clip.
+const TIMELINE_LABEL_WIDTH: f32 = 64.0;
+const TIMELINE_LANE_HEIGHT: f32 = 22.0;
+const TIMELINE_LANE_GAP: f32 = 6.0;
+/// The tallest the timeline grows before lanes start shrinking; past this the shell's
+/// other rows would be pushed off the window.
+const TIMELINE_MAX_HEIGHT: f32 = 260.0;
+const TIMELINE_PLAYHEAD_WIDTH: f32 = 2.0;
+
+const TIMELINE_BG: Color = Color::from_rgb(0.06, 0.06, 0.08);
+const TIMELINE_LANE: Color = Color::from_rgb(0.12, 0.12, 0.16);
+const TIMELINE_CLIP: Color = Color::from_rgb(0.30, 0.55, 0.85);
+const TIMELINE_CLIP_EDGE: Color = Color::from_rgb(0.55, 0.78, 1.0);
+const TIMELINE_PLAYHEAD: Color = Color::from_rgb(1.0, 0.55, 0.35);
+const TIMELINE_LABEL: Color = Color::from_rgb(0.75, 0.78, 0.85);
+/// The muted colour of "there is nothing to draw, and why".
+const TIMELINE_MUTED: Color = Color::from_rgb(0.62, 0.48, 0.48);
+
+/// The timeline canvas program.
+///
+/// It owns its data — a cloned [`TimelineStatus`] (an `Arc` clone, not the piece) plus
+/// the playhead frame and the span — so the canvas needs no borrow of the shell and is
+/// rebuilt from each snapshot. It is deliberately **not** cached: an edit, an undo or a
+/// load can change the arrangement under it, and a cached geometry would keep drawing
+/// the piece the shell no longer holds.
+struct TimelineView {
+    status: TimelineStatus,
+    /// The transport's frame, for the playhead.
+    frame: u64,
+    /// The span every x maps against (see [`timeline_span`]).
+    span: u64,
+}
+
+impl canvas::Program<Message> for TimelineView {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: iced::mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut canvas_frame = canvas::Frame::new(renderer, bounds.size());
+        canvas_frame.fill_rectangle(Point::ORIGIN, bounds.size(), TIMELINE_BG);
+        let text_width = (bounds.width - TIMELINE_PAD * 2.0).max(1.0);
+
+        // A failed reconstruction is drawn **as itself**. An empty lane bed here would
+        // say "the arrangement is empty" about a piece the host could not read.
+        if let Some(error) = &self.status.error {
+            canvas_frame.fill_text(canvas::Text {
+                content: format!("arrangement unavailable — {error}"),
+                position: Point::new(TIMELINE_PAD, TIMELINE_PAD),
+                max_width: text_width,
+                color: TIMELINE_MUTED,
+                size: 12.0.into(),
+                ..canvas::Text::default()
+            });
+            return vec![canvas_frame.into_geometry()];
+        }
+
+        let Some(timeline) = &self.status.timeline else {
+            canvas_frame.fill_text(canvas::Text {
+                content: "waiting for the arrangement on the snapshot".to_string(),
+                position: Point::new(TIMELINE_PAD, TIMELINE_PAD),
+                max_width: text_width,
+                color: TIMELINE_MUTED,
+                size: 12.0.into(),
+                ..canvas::Text::default()
+            });
+            return vec![canvas_frame.into_geometry()];
+        };
+
+        let plot_x = TIMELINE_LABEL_WIDTH;
+        let plot_width = (bounds.width - plot_x - TIMELINE_PAD).max(1.0);
+        let lanes = timeline.tracks.len().max(1) as f32;
+        let lane_height =
+            ((bounds.height - TIMELINE_PAD * 2.0 - TIMELINE_LANE_GAP * (lanes - 1.0)) / lanes)
+                .max(4.0);
+
+        if timeline.tracks.is_empty() {
+            canvas_frame.fill_text(canvas::Text {
+                content: "the arrangement has no tracks".to_string(),
+                position: Point::new(plot_x, TIMELINE_PAD),
+                max_width: plot_width,
+                color: TIMELINE_MUTED,
+                size: 11.0.into(),
+                ..canvas::Text::default()
+            });
+        }
+
+        for (index, track) in timeline.tracks.iter().enumerate() {
+            let y = TIMELINE_PAD + index as f32 * (lane_height + TIMELINE_LANE_GAP);
+            // The lane's bed, so a track with no clip in view still reads as a lane.
+            canvas_frame.fill_rectangle(
+                Point::new(plot_x, y),
+                Size::new(plot_width, lane_height),
+                TIMELINE_LANE,
+            );
+            // The track id, in the gutter the clip mapping leaves free. Text is drawn on
+            // top of the geometry by iced, which is exactly where a lane label belongs.
+            canvas_frame.fill_text(canvas::Text {
+                content: track.id.clone(),
+                position: Point::new(4.0, y + lane_height / 2.0),
+                max_width: TIMELINE_LABEL_WIDTH - 8.0,
+                color: TIMELINE_LABEL,
+                size: 11.0.into(),
+                align_y: iced::alignment::Vertical::Center,
+                ..canvas::Text::default()
+            });
+            for clip in &track.clips {
+                let (x, width) = clip_span(clip.at_frame, clip.src_len, self.span, plot_width);
+                if width <= 0.0 {
+                    continue;
+                }
+                let bar = Rectangle {
+                    x: plot_x + x,
+                    y: y + 1.0,
+                    width: width.max(1.0),
+                    height: (lane_height - 2.0).max(1.0),
+                };
+                canvas_frame.fill_rectangle(bar.position(), bar.size(), TIMELINE_CLIP);
+                canvas_frame.stroke_rectangle(
+                    bar.position(),
+                    bar.size(),
+                    canvas::Stroke::default()
+                        .with_color(TIMELINE_CLIP_EDGE)
+                        .with_width(1.0),
+                );
+            }
+        }
+
+        // The playhead, over the lanes and clamped to the plot.
+        let x = plot_x + frame_x(self.frame, self.span, plot_width);
+        canvas_frame.fill_rectangle(
+            Point::new(x - TIMELINE_PLAYHEAD_WIDTH / 2.0, TIMELINE_PAD),
+            Size::new(
+                TIMELINE_PLAYHEAD_WIDTH,
+                (bounds.height - TIMELINE_PAD * 2.0).max(1.0),
+            ),
+            TIMELINE_PLAYHEAD,
+        );
+
+        vec![canvas_frame.into_geometry()]
+    }
 }
 
 fn transport_label(snap: &Snapshot) -> &'static str {
@@ -1437,7 +1665,8 @@ mod tests {
 
     /// The iced shell speaks the shared workflow's grid too: the same cycling
     /// order and the same labels, and it *says* that nothing snaps here yet
-    /// (the timeline canvas is the part that is missing, not the model).
+    /// (the editing gestures are the part that is missing, not the model or the
+    /// canvas that now draws it).
     #[test]
     fn the_grid_cycles_and_says_what_it_cannot_do() {
         let mut spike = Spike::headless();
@@ -1893,20 +2122,153 @@ mod record_mvp {
         assert!(done.contains("last take"), "{done}");
         assert!(done.contains("2 pool source(s)"), "{done}");
     }
+}
 
-    /// The placeholder reports the transport's own position, and never invents an
-    /// arrangement: with no span it stays at zero rather than dividing by zero.
+#[cfg(test)]
+mod timeline {
+    use super::*;
+
+    /// A clip on `t0`, for the fixtures below.
+    fn clip(id: &str, at_frame: u64, src_len: u64) -> media::Clip {
+        media::Clip {
+            id: id.into(),
+            name: None,
+            source: "s.ch0".into(),
+            src_start: 0,
+            src_len,
+            at_frame,
+            fade_in: 0,
+            fade_out: 0,
+            gain: 1.0,
+            loop_len: None,
+            reversed: false,
+        }
+    }
+
+    /// A snapshot carrying `tracks`, as the host publishes one (the `Arc` is the same
+    /// shape `TimelineStatus` builds).
+    fn snapshot_with(tracks: Vec<media::Track>) -> Snapshot {
+        Snapshot {
+            timeline: TimelineStatus {
+                timeline: Some(std::sync::Arc::new(media::Timeline {
+                    tracks,
+                    markers: Vec::new(),
+                })),
+                error: None,
+            },
+            frame: 250,
+            ..Snapshot::default()
+        }
+    }
+
+    /// The clip mapping is the timeline's one piece of arithmetic: zero span, frame 0,
+    /// a fractional placement, and a clamp past the end.
     #[test]
-    fn the_placeholder_position_is_bounded() {
-        let spike = Spike::headless();
-        assert_eq!(position_fraction(&spike.snap, 0), 0.0);
+    fn the_clip_mapping_is_bounded() {
+        // A zero/empty span draws at the left rather than dividing by zero, at any
+        // canvas width (including a degenerate one).
+        assert_eq!(frame_x(500, 0, 200.0), 0.0);
+        assert_eq!(clip_span(0, 0, 0, 200.0), (0.0, 0.0));
+        assert_eq!(clip_span(500, 500, 1_000, 0.0), (0.0, 0.0));
 
-        let mut snap = spike.snap.clone();
-        snap.frame = 250;
-        assert!((position_fraction(&snap, 1000) - 0.25).abs() < 1e-6);
-        // Past the recorded span it clamps rather than exceeding the bar.
-        snap.frame = 5_000;
-        assert_eq!(position_fraction(&snap, 1000), 1.0);
+        // A clip at frame 0 starts at the left and spans its own length.
+        assert_eq!(clip_span(0, 500, 1_000, 200.0), (0.0, 100.0));
+
+        // A fractional mapping lands where the ratio says (250/1000 of 200 = 50).
+        let (x, width) = clip_span(250, 250, 1_000, 200.0);
+        assert!((x - 50.0).abs() < 1e-4, "x = {x}");
+        assert!((width - 50.0).abs() < 1e-4, "width = {width}");
+
+        // Past the span, both ends clamp to the right edge: never outside the box.
+        assert_eq!(frame_x(5_000, 1_000, 200.0), 200.0);
+        assert_eq!(clip_span(1_500, 500, 1_000, 200.0), (200.0, 0.0));
+        // A clip that starts before the end and runs past it is truncated there.
+        assert_eq!(clip_span(750, 500, 1_000, 200.0), (150.0, 50.0));
+    }
+
+    /// The span is the arrangement's end or the furthest frame played, whichever is
+    /// greater — so a loaded piece is visible before it is played, and a take past the
+    /// last clip still has room for the playhead.
+    #[test]
+    fn the_span_is_the_arrangement_end_or_the_furthest_frame_played() {
+        let empty = Snapshot::default();
+        assert_eq!(timeline_span(&empty.timeline, 0), 0);
+        assert_eq!(timeline_span(&empty.timeline, 4_800), 4_800);
+
+        let placed = snapshot_with(vec![media::Track {
+            id: "t0".into(),
+            clips: vec![clip("c0", 0, 96_000)],
+        }]);
+        assert_eq!(timeline_span(&placed.timeline, 0), 96_000);
+        assert_eq!(
+            timeline_span(&placed.timeline, 192_000),
+            192_000,
+            "a played frame past the arrangement still widens the span"
+        );
+
+        // A failed reconstruction is not an arrangement: the played span stands alone.
+        let failed = TimelineStatus {
+            timeline: None,
+            error: Some("poisoned".into()),
+        };
+        assert_eq!(timeline_span(&failed, 1_000), 1_000);
+    }
+
+    /// The played-span memory grows forward and **resets** on a backward move, so a
+    /// loaded or rewound piece is drawn against its own arrangement end again.
+    #[test]
+    fn the_span_memory_resets_when_the_transport_moves_backwards() {
+        assert_eq!(advance_span(0, 0), 0);
+        assert_eq!(advance_span(0, 500), 500);
+        assert_eq!(advance_span(500, 900), 900);
+        assert_eq!(advance_span(900, 400), 400, "a seek back starts a new pass");
+        assert_eq!(advance_span(400, 0), 0, "a load starts at frame 0");
+        assert_eq!(advance_span(0, 250), 250, "and grows again from there");
+    }
+
+    /// The canvas program is built from a snapshot with **no tracks** and from one with
+    /// tracks, at the heights the shell derives. Neither may panic — the placeholder
+    /// this replaced is gone, but an empty or unreadable arrangement is still a state
+    /// the shell has to draw.
+    #[test]
+    fn the_canvas_program_builds_from_a_snapshot_with_and_without_tracks() {
+        // No arrangement value, an empty arrangement, an arrangement with a track, and
+        // a failed reconstruction: every shape the snapshot can publish.
+        let shapes = [
+            Snapshot::default(),
+            snapshot_with(Vec::new()),
+            snapshot_with(vec![
+                media::Track {
+                    id: "t0".into(),
+                    clips: vec![clip("c0", 0, 48_000)],
+                },
+                media::Track {
+                    id: "t1".into(),
+                    clips: vec![clip("c1", 24_000, 48_000), clip("c2", 72_000, 0)],
+                },
+            ]),
+            Snapshot {
+                timeline: TimelineStatus {
+                    timeline: None,
+                    error: Some("the editor is poisoned".into()),
+                },
+                ..Snapshot::default()
+            },
+        ];
+
+        let mut spike = Spike::headless();
+        for snap in shapes {
+            for tracks in [0usize, 1, 2, 8] {
+                assert!(
+                    timeline_height(tracks) >= TIMELINE_PAD * 2.0,
+                    "the {tracks}-lane height collapses"
+                );
+            }
+            spike.snap = snap;
+            // Building the widget is the program construction the canvas does on every
+            // redraw; there is no renderer here, so this is where "builds" is pinned.
+            let _ = spike.timeline();
+        }
     }
 }
 
