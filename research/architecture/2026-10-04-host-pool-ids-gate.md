@@ -23,6 +23,8 @@
 | §5 The new test fails on the parent commit exactly as claimed (the gate transplanted it into a `git archive` copy of `3cc2c71`); it covers the bind listing, the finished-take join, and keep-on-failure | VERIFIED | No change beyond the §2 addition. |
 | §2/§4 `demo_pool_dir` is the same directory the old walk found for `cargo run`, `cargo test`, and off-repo launches; the TUI footer reserves the take row at every size that renders the footer at all, and truncates rather than wraps the take line so the `● REC take-N` prefix survives | VERIFIED | No change. |
 
+**Correction (2026-10-04, from the [PR #12 gate](2026-10-04-host-integrity-gate.md)).** §1 below says *"A rebuild that stops an in-progress take (`lib.rs:2985-2988`) commits the `Take` at history end, then replays it under the same `Pool` — the listing sees the files."* The **listing** half is right, but the **declaration** half is false at `473d944`: the rebuild path (`lib.rs:3005-3010`) stops the take and carries only `last_take` through `carry_over`; it commits no `HostCommand::Take`. The cache conclusion the review drew from it still holds; the claim that a rebuild declares the take does not. The gap is recorded as the next slice's finding in the PR #12 archive.
+
 ## The review, verbatim
 
 All gates re-run locally: fmt OK, notes verifier OK, `clippy -D warnings` OK on root + both spike workspaces, workspace 419/419, iced 17/17, tui 57/57. Base confirmed: merge-base = `3cc2c71` = `main` tip, one commit.
