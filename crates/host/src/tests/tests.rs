@@ -4863,6 +4863,80 @@ fn the_pool_id_cache_lists_the_pool_and_survives_a_failed_refresh() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A `.wav` that cannot be read still **holds its name**: the cache lists it, or a
+/// shell naming a take against the list proposes an id the host then refuses.
+///
+/// `Pool::list` reports an unreadable source in `errors` and skips it from `sources`,
+/// so mapping only `sources` lost the name — the merge gate's finding, the same
+/// refusal-eating symptom one level below a missing directory.
+#[test]
+fn an_unreadable_pool_file_still_holds_its_name_in_the_cache() {
+    let root = std::env::temp_dir().join(format!("host-pool-broken-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let pool = root.join("pool");
+    std::fs::create_dir_all(&pool).expect("pool dir");
+
+    // Zero bytes: the file is there, but it cannot be parsed as a WAV.
+    std::fs::write(pool.join("broken.ch0.wav"), []).expect("a zero-byte wav");
+
+    let mut s = HostSession::new();
+    s.execute(&HostCommand::Pool { dir: pool.clone() })
+        .expect("pool");
+    assert!(
+        s.pool_ids().iter().any(|id| id == "broken.ch0"),
+        "an unreadable file's name is still held: {:?}",
+        s.pool_ids()
+    );
+
+    // Knowing it is the point: the host still refuses a capture over that name, so
+    // the shell has to be able to skip it rather than propose it.
+    let ring = std::sync::Arc::new(media::Spsc::<f32>::new(64));
+    assert!(
+        s.start_recording("broken", ring, 48_000, 1).is_err(),
+        "the occupied name is refused, not overwritten"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A take that finalizes **with a complaint** is still declared.
+///
+/// The capture is the side effect and the declaration is the state: a take whose WAV
+/// and peaks landed, with a complaint about the tail, has to be in the document or a
+/// reload silently loses it. The complaint is surfaced either way.
+#[test]
+fn a_take_that_finalizes_with_a_complaint_is_still_declared() {
+    let root = std::env::temp_dir().join(format!("host-take-complaint-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let pool = root.join("pool");
+    std::fs::create_dir_all(&pool).expect("pool dir");
+
+    let mut s = HostSession::new();
+    s.execute(&HostCommand::Pool { dir: pool.clone() })
+        .expect("pool");
+    let ring = std::sync::Arc::new(media::Spsc::<f32>::new(64));
+    s.start_recording("jam", ring, 48_000, 1)
+        .expect("the take starts");
+
+    // The directory goes away under the take, so finalizing has nowhere to write: the
+    // stop complains, and the files already written are what is left.
+    std::fs::remove_dir_all(&pool).expect("the pool goes away under the take");
+    assert!(
+        s.execute(&HostCommand::RecordStop).is_err(),
+        "the stop reports the complaint"
+    );
+
+    // The declaration is state even so — the take did not vanish with the complaint,
+    // and a document that omitted it would lose the take on reload.
+    let text = s.script_text(&root).expect("the session writes");
+    assert!(
+        text.contains("take jam "),
+        "a complained take is still declared: {text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The point of the declaration: a loaded session binds its take **without opening a
 /// device** — what is in the WAV is not this layer's business.
 #[test]

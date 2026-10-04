@@ -826,9 +826,25 @@ impl HostSession {
     /// The caller owns whether "left alone" is meaningful: `set_pool` clears first,
     /// because it rebinds.
     fn refresh_pool_ids_from(&mut self, pool: &media::Pool) {
-        if let Ok(index) = pool.list() {
-            self.pool_ids = index.sources.into_iter().map(|s| s.id).collect();
-        }
+        let Ok(index) = pool.list() else {
+            return;
+        };
+        let mut ids: Vec<String> = index.sources.into_iter().map(|s| s.id).collect();
+        // A `.wav` that exists but cannot be read is reported in `errors`, not
+        // `sources` — and it still **occupies its name**. Keep the id anyway: a shell
+        // names a new take against this list, so an id missing here means it proposes
+        // one the free-id check then refuses, which is the symptom the cache exists to
+        // prevent. (The merge gate found the hole; `Pool::list`'s per-source error path
+        // is otherwise invisible to the cache.)
+        ids.extend(index.errors.into_iter().filter_map(|(path, _)| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_suffix(".wav"))
+                .map(str::to_string)
+        }));
+        ids.sort();
+        ids.dedup();
+        self.pool_ids = ids;
     }
 
     /// The pool source ids, cached — what a shell reads to name a new take
@@ -1915,19 +1931,30 @@ impl HostSession {
             }
             HostCommand::Record { take_id } => self.record(take_id),
             HostCommand::RecordStop => {
-                let take = self.stop_recording()?;
-                self.status_take(&take);
-                // The capture was the side effect; the **declaration** is the state. It is
-                // committed through the same path every other state command uses, so the
-                // save and the journal name the take that just landed — while `RecordStop`
-                // itself stays an action the replay never re-runs (it would open a device).
-                self.commit_state(vec![HostCommand::Take {
-                    take_id: take.take_id.clone(),
-                    frames: take.frames,
-                    dropped: take.dropped,
-                    channels: take.channels,
-                    at_frame: take.at_frame,
-                }]);
+                // A finalizing complaint still leaves a take in the pool, so the
+                // **declaration** is state either way. `stop_recording` keeps the report
+                // on the session before it propagates the complaint, so the declaration
+                // is committed even then — a document that dropped it would lose the take
+                // on reload — and the complaint is returned *after*, because the caller
+                // still has to hear it. `was_recording` keeps a stop with nothing
+                // recording from re-declaring the take before it.
+                let was_recording = self.recording.is_some();
+                let stopped = self.stop_recording();
+                if was_recording && let Some(take) = self.last_take.clone() {
+                    // The capture was the side effect; the declaration is the state. It
+                    // is committed through the same path every other state command uses,
+                    // so the save and the journal name the take that just landed — while
+                    // `RecordStop` itself stays an action the replay never re-runs (it
+                    // would open a device).
+                    self.commit_state(vec![HostCommand::Take {
+                        take_id: take.take_id.clone(),
+                        frames: take.frames,
+                        dropped: take.dropped,
+                        channels: take.channels,
+                        at_frame: take.at_frame,
+                    }]);
+                }
+                stopped?;
                 Ok(())
             }
             // A take declaration, replayed or loaded: the audio is already pool material,
