@@ -72,7 +72,11 @@ called twice.
 
 - **The counter is now trustworthy**, which is what makes it useful: a non-zero `underruns` during
   playback is a genuine shortfall rather than the cost of standing still. The `--sweep` instrument in
-  the iced spike reports the idle rate so a regression of this exact kind is visible in seconds.
+  the iced spike is the regression guard, and it keeps **both** probes the diagnosis needed: it
+  reports the idle rate over a second, and it re-runs the idle → fader → play crossing at three
+  pre-play delays (300/1200/2400 ms) so a regression cannot hide behind a single repeated sample. The
+  delay sweep was dropped by the record slice and restored at the merge gate; a note that owns a fix
+  has to keep naming the instrument that guards it.
 - **Cost is a little wasted work while idle** — silence is pushed in a loop each pump iteration. The
   ring is small (16,384 samples) and the write is a handful of operations when already full, so this is
   accepted rather than optimised. It also keeps the device genuinely running, which is what a DAW wants

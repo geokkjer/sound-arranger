@@ -1096,7 +1096,10 @@ fn record_check() -> i32 {
     // Start: the same key the window sends.
     spike.update(Message::Key(WorkflowKey::Char('o')));
     println!("record-check: start status {:?}", spike.status);
-    if !spike.status.contains("recording") {
+    // The marker, not the substring: the host refuses a second take with "a take
+    // is already *recording*", so `contains("recording")` would read a refusal as
+    // a start — the smell this slice removed from the toggle itself.
+    if !spike.status.starts_with("● recording") {
         eprintln!("record-check: could not start a take (no input device?)");
         return 1;
     }
@@ -1197,6 +1200,40 @@ fn sweep() -> i32 {
         "sweep: t+{}ms STOPPED — underruns {stopped_b:?}",
         t0.elapsed().as_millis()
     );
+
+    // The owner's order: the app is open and idle, a fader moves, then play.
+    //
+    // This **varies the pre-play delay** on purpose. Sampling a fixed moment twice
+    // is what hid the idle-starve bug for several attempts: a reading taken before
+    // the device thread opens the stream shows `0 -> 0`, which reads as a quiet
+    // device when it is an unopened one. Scaling the delay makes the accrual
+    // arithmetic. Before the pump kept an idle ring fed these three lines read
+    // 15,360 / 59,392 / 116,736 — 48,000 per second of idle, one per frame; they
+    // must read 0 now, and a non-zero value here is the regression.
+    //
+    // This block was dropped by the record slice's first commit and **restored**
+    // after the merge gate caught it: the note that owns the idle-starve fix still
+    // names this probe as the regression instrument, and a guard deleted in
+    // silence is the shape that note exists to prevent.
+    for delay_ms in [300u64, 1200, 2400] {
+        let mut probe = Spike::from_host(HostHandle::spawn_with_audio());
+        let read = |s: &mut Spike| {
+            s.snap = s.host.snapshot();
+            s.snap.audio.as_ref().map(|a| a.underruns)
+        };
+        let at_open = read(&mut probe);
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        // "move the sliders"
+        probe.update(Message::Fader(0, 0.42));
+        probe.update(Message::Fader(1, 0.17));
+        let before_play = read(&mut probe);
+        let _ = probe.host.execute(HostCommand::TransportPlay);
+        std::thread::sleep(Duration::from_millis(250));
+        let after_play = read(&mut probe);
+        println!(
+            "sweep: idle {delay_ms:>4}ms -> play: open {at_open:?}, before play {before_play:?}, after play {after_play:?}"
+        );
+    }
 
     if let Err(e) = spike.host.execute(HostCommand::TransportPlay) {
         eprintln!("sweep: transport play refused: {e}");
@@ -1918,9 +1955,10 @@ mod record_toggle {
             return;
         }
 
-        // It started: the status says so, and the same key stops it.
+        // It started: the status carries the marker (not just the substring — the
+        // host's refusal says "a take is already recording"), and the same key stops it.
         assert!(
-            spike.status.contains("recording"),
+            spike.status.starts_with("● recording"),
             "a started take should say so: {:?}",
             spike.status
         );
