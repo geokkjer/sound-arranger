@@ -52,6 +52,8 @@ against the pool the host publishes.**
    there is nothing to draw. The placeholder reports the transport's position as a fraction of the
    furthest it has played — honest and derived — and says on screen that a real timeline needs the
    arrangement on the snapshot first.
+   **Superseded 2026-10-04**: the arrangement is on the snapshot now, and the iced shell draws a
+   real timeline ([the iced timeline](2026-10-04-the-iced-timeline.md)).
 
 ## Alternatives considered
 

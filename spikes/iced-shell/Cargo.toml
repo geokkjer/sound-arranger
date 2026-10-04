@@ -21,6 +21,10 @@ iced = { version = "0.14", features = ["canvas", "image"] }
 # https://github.com/iced-rs/iced_audio
 iced_audio = "0.17"
 host = { path = "../../crates/host" }
+# The arrangement value the timeline canvas draws (`media::Timeline` / `Track` /
+# `Clip`), the same model the TUI's timeline panel reads. The shell names the
+# types the host publishes; it does not compute the arrangement.
+media = { path = "../../crates/media" }
 # The mixer's **declared parameter bounds** — the fader's ceiling comes from
 # here, not from a number guessed in the shell, so a fader can never ask the
 # host for a value the host must refuse.

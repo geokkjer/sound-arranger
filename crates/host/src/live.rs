@@ -28,6 +28,24 @@ use media::devices::OutputHandle;
 
 use crate::{HostCommand, HostSession, JournalRecovery};
 
+/// The arrangement on the snapshot, for a shell that draws a timeline every frame.
+///
+/// The value sits behind an [`Arc`](std::sync::Arc) for the same reason the take state
+/// rides the publish pass: a shell polls the snapshot every frame, so a poll must clone
+/// a **pointer**, not every clip. The session rebuilds it where the arrangement can
+/// change — a committed state command, a load, a rebuild's adoption — and never per
+/// pump tick or per replayed step ([`HostSession::refresh_timeline`]).
+#[derive(Debug, Clone, Default)]
+pub struct TimelineStatus {
+    /// The arrangement, once one is built. `None` before the first edit, and whenever
+    /// the reconstruction failed.
+    pub timeline: Option<std::sync::Arc<media::Timeline>>,
+    /// Why the reconstruction failed. `Some` means a shell must **say so**, not draw an
+    /// empty timeline — the rule `HostOutcome::arrangement` already follows. `None` on a
+    /// fresh session with nothing built yet.
+    pub error: Option<String>,
+}
+
 /// The published state a shell reads: transport position + the mixer meters +
 /// the audio state. Updated by the pump and by command handling; cheap to clone.
 #[derive(Debug, Clone)]
@@ -71,6 +89,10 @@ pub struct Snapshot {
     /// collide with a source the session already holds — the id is required before
     /// the recording starts, so it cannot be discovered afterwards.
     pub pool_ids: Vec<String>,
+    /// The arrangement, cached in the session and published behind an `Arc` so a
+    /// polling shell draws a timeline every frame without copying it (see
+    /// [`TimelineStatus`]).
+    pub timeline: TimelineStatus,
     /// The MIDI clock-out status, next to the meters: the port being driven
     /// (`None` when the process asked for no device) and the `clock_out`
     /// plugin's overflow counter (read back through its
@@ -151,6 +173,7 @@ impl Default for Snapshot {
             recording: None,
             last_take: None,
             pool_ids: Vec::new(),
+            timeline: TimelineStatus::default(),
             audio: None,
             midi: Default::default(),
             can_undo: false,
@@ -708,6 +731,9 @@ fn publish(session: &HostSession, shared: &Mutex<Snapshot>, audio: &AudioState) 
     // Cached (see `HostSession::pool_ids`): this runs on every pump tick, and
     // listing the pool reads a directory.
     s.pool_ids = session.pool_ids().to_vec();
+    // The arrangement is a **cached** reconstruction (see `TimelineStatus`): this
+    // clones an `Arc`, so the per-tick publish does not walk the timeline.
+    s.timeline = session.timeline_status().clone();
     s.audio = match audio {
         AudioState::Off => None,
         AudioState::Failed(e) => Some(AudioStatus {

@@ -4937,6 +4937,74 @@ fn a_take_that_finalizes_with_a_complaint_is_still_declared() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The snapshot's arrangement is a **cached** reconstruction: built when a state command
+/// commits, following the next edit, and surviving the rebuild an undo performs — without
+/// the pump tick walking the history.
+#[test]
+fn the_arrangement_cache_follows_the_committed_edits() {
+    let root = std::env::temp_dir().join(format!("host-timeline-cache-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let pool = root.join("pool");
+    std::fs::create_dir_all(&pool).expect("pool dir");
+
+    let mut s = HostSession::new();
+    // A fresh session reports an **empty** arrangement, not an unknown one.
+    let fresh = s.timeline_status();
+    assert!(fresh.error.is_none(), "{:?}", fresh.error);
+    assert!(
+        fresh.timeline.as_ref().is_some_and(|t| t.tracks.is_empty()),
+        "a fresh session has an empty arrangement"
+    );
+
+    s.execute(&HostCommand::Pool { dir: pool.clone() })
+        .expect("pool");
+    s.execute(&HostCommand::Arrange {
+        op: media::ArrangeOp::AddTrack { track: "t0".into() },
+        at_frame: None,
+    })
+    .expect("track");
+    let built = s.timeline_status().timeline.clone().expect("arrangement");
+    assert_eq!(built.tracks.len(), 1);
+    assert_eq!(built.tracks[0].id, "t0");
+
+    // A clip appears in the cache on the commit that placed it.
+    s.execute(&HostCommand::Arrange {
+        op: media::ArrangeOp::AddClip {
+            track: "t0".into(),
+            clip: media::Clip {
+                id: "c0".into(),
+                source: "s.ch0".into(),
+                src_start: 0,
+                src_len: 480,
+                at_frame: 0,
+                fade_in: 0,
+                fade_out: 0,
+                gain: 1.0,
+                loop_len: None,
+                name: Some("first".into()),
+                reversed: false,
+            },
+        },
+        at_frame: None,
+    })
+    .expect("clip");
+    let built = s.timeline_status().timeline.clone().expect("arrangement");
+    assert_eq!(built.tracks[0].clips.len(), 1);
+    assert_eq!(built.tracks[0].clips[0].id, "c0");
+
+    // An undo **rebuilds** the session; the adopted cache carries the reverted
+    // arrangement, which is the path `carry_over` refreshes.
+    s.execute(&HostCommand::Undo).expect("undo");
+    let built = s.timeline_status().timeline.clone().expect("arrangement");
+    assert!(
+        built.tracks[0].clips.is_empty(),
+        "the undo is in the cache: {:?}",
+        built.tracks[0].clips
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The point of the declaration: a loaded session binds its take **without opening a
 /// device** — what is in the WAV is not this layer's business.
 #[test]

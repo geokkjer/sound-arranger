@@ -1546,6 +1546,7 @@ dependencies = [
  "host",
  "iced",
  "iced_audio",
+ "media",
  "workflow",
 ]
 

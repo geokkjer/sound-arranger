@@ -555,6 +555,10 @@ pub struct HostSession {
     /// rather than per frame. A shell reads it to name a new take without
     /// colliding with an existing source.
     pool_ids: Vec<String>,
+    /// The snapshot's cached arrangement (see [`Self::refresh_timeline`]): rebuilt where
+    /// the arrangement can change, and published behind an `Arc` so a polling shell draws
+    /// a timeline every frame without copying it.
+    timeline: crate::live::TimelineStatus,
     /// The last successful export's report (length, format, peak, RMS) — a shell
     /// shows what was written without recomputing the render.
     last_export: Option<media_ops::ExportRecord>,
@@ -731,7 +735,7 @@ impl HostSession {
         let media: Arc<Mutex<MediaSession>> = Arc::new(Mutex::new(MediaSession::default()));
         media_ops::register_handlers(&mut engine, media.clone())
             .expect("media op handlers register once on a fresh engine");
-        HostSession {
+        let mut session = HostSession {
             engine,
             transport,
             midi_slot,
@@ -750,6 +754,7 @@ impl HostSession {
             pool_dir: None,
             pool_conformed: Vec::new(),
             pool_ids: Vec::new(),
+            timeline: crate::live::TimelineStatus::default(),
             last_export: None,
             last_seek: None,
             source_tempos: std::collections::HashMap::new(),
@@ -767,7 +772,12 @@ impl HostSession {
             journal_error: None,
             last_recovery: None,
             validating: false,
-        }
+        };
+        // The snapshot's arrangement is a **cached** reconstruction: build it once so a
+        // fresh session reports an empty arrangement rather than "unknown", and rebuild
+        // it where the arrangement can change (see `refresh_timeline`).
+        session.refresh_timeline();
+        session
     }
 
     /// Set the media pool for arrangement clips. The pool (float-WAV sources by
@@ -851,6 +861,31 @@ impl HostSession {
     /// without colliding with a source the session already holds.
     pub fn pool_ids(&self) -> &[String] {
         &self.pool_ids
+    }
+
+    /// Rebuild the snapshot's cached arrangement.
+    ///
+    /// [`Self::arrangement`] *reconstructs* the timeline from the editor's log, so it is
+    /// called where the arrangement can change — a committed state command ([`Self::execute`]),
+    /// a load ([`Self::from_script`]), and a rebuild's adoption (`carry_over`) — never per
+    /// pump tick and never per replayed step of a long history. The snapshot carries the
+    /// result behind an `Arc`, so a shell's poll clones a pointer.
+    fn refresh_timeline(&mut self) {
+        self.timeline = match self.arrangement() {
+            Ok(timeline) => crate::live::TimelineStatus {
+                timeline: Some(std::sync::Arc::new(timeline)),
+                error: None,
+            },
+            Err(e) => crate::live::TimelineStatus {
+                timeline: None,
+                error: Some(e),
+            },
+        };
+    }
+
+    /// The snapshot's arrangement cache, as published (see [`Self::refresh_timeline`]).
+    pub fn timeline_status(&self) -> &crate::live::TimelineStatus {
+        &self.timeline
     }
 
     /// The sources the last [`set_pool`](Self::set_pool) brought to the session
@@ -1549,8 +1584,10 @@ impl HostSession {
             for cmd in &commands {
                 // A journal entry the session refuses (a stale journal from a crash in
                 // the save's window, or a pool that moved) is **dropped and reported**,
-                // never fatal.
-                match self.execute(cmd) {
+                // never fatal. `process`, not `execute`: the journal is a document walk
+                // too, so its arrangement cache is rebuilt once at the end (below) rather
+                // than once per replayed entry.
+                match self.process(cmd) {
                     Ok(()) => report.applied += 1,
                     Err(e) => {
                         report.refused += 1;
@@ -1562,6 +1599,8 @@ impl HostSession {
             }
         }
         self.engine.leave_walk();
+        // The journal's edits are in the session now: rebuild the arrangement cache once.
+        self.refresh_timeline();
         Ok(report)
     }
 
@@ -2835,13 +2874,16 @@ impl HostSession {
         session.engine.enter_walk();
         let applied = (|| -> Result<(), (usize, String)> {
             for (index, cmd) in commands.iter().enumerate() {
-                // `execute`, not `process`: a script built by `process` alone would
-                // have the *state* but an empty history — so a session opened from a
-                // file could not be undone, and saving it again would write only what
-                // happened after the load. (`execute` appends to the journal only when
-                // a session directory is set, and a session being built or loaded has
-                // none.)
-                session.execute(cmd).map_err(|e| (index, e))?;
+                // **`process`, not `execute`.** Both apply the command and record it in
+                // the history — a script built with neither would have the *state* but an
+                // empty history, so the session could not be undone and saving it again
+                // would write only what happened after the load. But `execute` also
+                // rebuilds the snapshot's arrangement cache, and a load walks the whole
+                // document: the cache is built **once** after the walk, below, not once
+                // per replayed step. (`execute` is a thin wrapper: `process` plus that
+                // refresh. The journal is appended only when a session directory is set,
+                // and a session being built or loaded has none.)
+                session.process(cmd).map_err(|e| (index, e))?;
             }
             Ok(())
         })();
@@ -2849,6 +2891,9 @@ impl HostSession {
         if let Err((index, reason)) = applied {
             return Err(ScriptFault { index, reason });
         }
+        // A loaded session's arrangement cache is built once, here: the replay applied the
+        // state commands through `process`, which does not refresh per step.
+        session.refresh_timeline();
         Ok(session)
     }
 
@@ -2856,7 +2901,14 @@ impl HostSession {
     /// form of [`run_script`], for a live UI that edits one op at a time. A
     /// refused op returns `Err` and changes nothing; the session stays usable.
     pub fn execute(&mut self, cmd: &HostCommand) -> Result<(), String> {
-        self.process(cmd)
+        let result = self.process(cmd);
+        // The arrangement cache is rebuilt **once per applied state command**, here and
+        // not inside `process`: `process` is also the replay path a rebuild walks, and
+        // there the adoption refreshes once instead of once per replayed step.
+        if result.is_ok() && cmd.is_state() {
+            self.refresh_timeline();
+        }
+        result
     }
 
     /// Render forward to an absolute frame in chunks, so a long seek does not
@@ -3131,6 +3183,9 @@ impl HostSession {
         } else {
             from.last_seek
         };
+        // The rebuilt session replayed the history through `process`, which refreshes
+        // nothing per step; its adopted arrangement is cached once, here.
+        self.refresh_timeline();
     }
 
     /// The **full replay** seek: rebuild from the history and render the timeline from 0.
