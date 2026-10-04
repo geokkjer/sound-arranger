@@ -4808,6 +4808,28 @@ fn the_pool_id_cache_lists_the_pool_and_survives_a_failed_refresh() {
         s.pool_ids()
     );
 
+    // A **rebind** clears: the previous pool's names must not follow the session to
+    // a different directory. (The merge gate caught this half unpinned — the rest of
+    // the test binds one pool, so carrying the old ids across would have passed.)
+    let other = root.join("other");
+    std::fs::create_dir_all(&other).expect("other pool");
+    s.execute(&HostCommand::Pool { dir: other })
+        .expect("rebind");
+    assert!(
+        !s.pool_ids().iter().any(|id| id == "held.ch0"),
+        "a rebind drops the previous pool's names: {:?}",
+        s.pool_ids()
+    );
+    // Binding the original pool again lists it again, and keeps the rest of the
+    // test on the pool that holds the take.
+    s.execute(&HostCommand::Pool { dir: pool.clone() })
+        .expect("rebind back");
+    assert!(
+        s.pool_ids().iter().any(|id| id == "held.ch0"),
+        "binding the original pool lists it again: {:?}",
+        s.pool_ids()
+    );
+
     // A finished take's sources join the cache without a re-bind.
     let ring = std::sync::Arc::new(media::Spsc::<f32>::new(64));
     s.start_recording("jam", ring, 48_000, 2)
