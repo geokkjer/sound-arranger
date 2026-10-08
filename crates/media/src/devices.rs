@@ -317,6 +317,97 @@ pub fn open_input(ring: Arc<Spsc<f32>>) -> Result<InputHandle, String> {
     let device = host
         .default_input_device()
         .ok_or("no default input device")?;
+    open_input_on(device, ring)
+}
+
+/// The cpal name of the PCM that carries a **server's** sources (PulseAudio's
+/// protocol, which PipeWire also speaks).
+pub const PULSE_DEVICE: &str = "PulseAudio Sound Server";
+
+/// The binding rule for a name-rule source: a **case-insensitive substring** of
+/// the cpal device name. Pure, so the rule is testable without hardware — and it
+/// is a rule, never an index (indices renumber across reboots and replugs).
+fn name_matches(pattern: &str, name: &str) -> bool {
+    !pattern.is_empty() && name.to_lowercase().contains(&pattern.to_lowercase())
+}
+
+/// Find the input device whose cpal display name matches `pattern`
+/// (case-insensitive substring). The pattern is a **rule, never an index** —
+/// indices renumber across reboots and replugs (the rig note's rule), so a
+/// session that named one would bind the wrong device or none.
+fn find_input_device(pattern: &str) -> Result<cpal::Device, String> {
+    if pattern.is_empty() {
+        return Err("a source matcher must not be empty".into());
+    }
+    let devices = cpal::default_host()
+        .devices()
+        .map_err(|e| format!("device enumeration: {e}"))?;
+    let mut names = Vec::new();
+    for device in devices {
+        let name = format!("{device}");
+        if name_matches(pattern, &name) {
+            return Ok(device);
+        }
+        names.push(name);
+    }
+    Err(format!(
+        "no input device matches '{pattern}' — available: {}",
+        names.join(", ")
+    ))
+}
+
+/// Open an input device chosen by a name rule (the `alsa` source kind).
+pub fn open_input_device(ring: Arc<Spsc<f32>>, pattern: &str) -> Result<InputHandle, String> {
+    let device = find_input_device(pattern)?;
+    open_input_on(device, ring)
+}
+
+/// Open the PulseAudio/PipeWire **source** named `source` (the `pulse` kind).
+///
+/// A PipeWire *node* — a sink's `.monitor`, a `pw-loopback` — is not a cpal
+/// device at all; it is reached through the PulseAudio-protocol PCM with
+/// `PULSE_SOURCE` naming it. Measured on this machine (2026-10-08): the `pulse`
+/// PCM honours `PULSE_SOURCE` (captured −7.7 dBFS of a played tone while the
+/// default source was a silent microphone), while PipeWire's `PIPEWIRE_NODE` and
+/// `PIPEWIRE_PROPS` were ignored. This is therefore the working route for
+/// capturing an external program — VCV Rack's output, via the sink monitor or a
+/// loopback — by name.
+///
+/// `PULSE_SOURCE` is **process-global**, and Rust 2024 makes setting it
+/// `unsafe`, so the write is serialised behind [`DEVICE_ENV_LOCK`] and the
+/// previous value is restored before returning. The stream keeps the source it
+/// connected to; the variable only has to be right at open.
+pub fn open_input_pulse_source(ring: Arc<Spsc<f32>>, source: &str) -> Result<InputHandle, String> {
+    if source.is_empty() {
+        return Err("a pulse source name must not be empty".into());
+    }
+    let device = find_input_device(PULSE_DEVICE)?;
+    let _guard = DEVICE_ENV_LOCK
+        .lock()
+        .map_err(|_| "the device environment lock is poisoned".to_string())?;
+    let previous = std::env::var_os("PULSE_SOURCE");
+    // SAFETY: `DEVICE_ENV_LOCK` held above makes this the only writer of
+    // `PULSE_SOURCE` in the process, and the previous value is restored before the
+    // guard drops. The variable is read when a PulseAudio client connects, which
+    // happens inside `open_input_on` below.
+    unsafe { std::env::set_var("PULSE_SOURCE", source) };
+    let opened = open_input_on(device, ring);
+    match previous {
+        // SAFETY: as above — still under the lock, restoring the pre-call state.
+        Some(v) => unsafe { std::env::set_var("PULSE_SOURCE", v) },
+        // SAFETY: as above.
+        None => unsafe { std::env::remove_var("PULSE_SOURCE") },
+    }
+    opened
+}
+
+/// Serialises the process-global `PULSE_SOURCE` window (see
+/// [`open_input_pulse_source`]).
+static DEVICE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Open `device` and start its capture stream — the shared body of every input
+/// entry point (default, name rule, pulse source).
+fn open_input_on(device: cpal::Device, ring: Arc<Spsc<f32>>) -> Result<InputHandle, String> {
     let config = device
         .default_input_config()
         .map_err(|e| format!("input config: {e}"))?;

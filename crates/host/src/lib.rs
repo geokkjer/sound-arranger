@@ -196,7 +196,15 @@ pub enum HostCommand {
     /// An **action**, not state: opening a device is a side effect, and a replay must
     /// never touch hardware. What the log keeps is the finished [`HostCommand::Take`]
     /// declaration, so a loaded session describes its own material.
-    Record { take_id: String },
+    Record {
+        take_id: String,
+        /// The **declared rig source** to capture (`source add <name> …`), if any.
+        /// `None` keeps the original behaviour — the machine's default input —
+        /// so every existing script and session still parses and records. A named
+        /// source that is unknown, or whose kind has no binding yet, is a loud
+        /// refusal: the recorder never silently captures a different device.
+        source: Option<String>,
+    },
     /// Stop the take in progress and finalize it (headers, peaks). A no-op-looking
     /// error when nothing is recording — never a silent half-take. Commits the
     /// resulting [`HostCommand::Take`] to the session's state.
@@ -222,6 +230,11 @@ pub enum HostCommand {
         dropped: u64,
         channels: usize,
         at_frame: u64,
+        /// The **declared source** this take captured, when one was named. Trailing and
+        /// optional in the line (`take … source=<name>`), so a session recorded before
+        /// the binding slice parses unchanged. `None` means the default input: the
+        /// material is still real, the session just cannot say what it heard.
+        source: Option<String>,
     },
     /// **A declared rig source** — the set of sources the recorder intends to
     /// capture, as *state* (see the takes slice): the declaration is data, and a
@@ -1056,19 +1069,29 @@ impl HostSession {
             handle: None,
             capture,
             take_id: take_id.to_string(),
+            // The device-less seam (`start_recording`) and its tests have no source;
+            // `record` fills this in when a declared source was named.
+            source: None,
             sources,
             at_frame,
         });
         Ok(())
     }
 
-    /// Start a take from the **default input device** — the `record <take_id>` line.
+    /// Start a take from a capture source — the `record <take_id> [source=<name>]` line.
     ///
     /// The device is opened at its own default config (its channel count and rate), and
     /// the take lands in the session's pool at the session rate. Recording is
     /// independent of the transport: the take is not aligned to the playhead (that is
     /// the jam layer's fixed-offset problem), it is material for the arrangement.
-    pub fn record(&mut self, take_id: &str) -> Result<(), String> {
+    ///
+    /// With `source = None` this is the **default input device**, exactly as before the
+    /// binding slice. With a name, the declared [`rig::SourceDecl`] is resolved to a
+    /// real capture path and the name travels into the take's report and declaration:
+    /// a session then says which source it recorded, not just what the machine's
+    /// default happened to be. An unknown name, or a kind with no binding yet
+    /// (`jack`, `osc`), is refused — never a silent fallback.
+    pub fn record(&mut self, take_id: &str, source: Option<&str>) -> Result<(), String> {
         // Fail before opening anything if the take could not be written anyway.
         if self.recording.is_some() {
             return Err("a take is already recording — run `record stop` first".into());
@@ -1079,12 +1102,55 @@ impl HostSession {
         let ring = std::sync::Arc::new(media::Spsc::new(1 << 16));
         // One call: the handle carries the **stream's** rate and channel count, so the
         // capture cannot be sized from a config that raced a device swap.
-        let handle = media::devices::open_input(std::sync::Arc::clone(&ring))?;
+        let handle = match source {
+            None => media::devices::open_input(std::sync::Arc::clone(&ring))?,
+            Some(name) => {
+                // Resolve the declaration first: the refusal has to name the rig, and
+                // it must happen before any device is touched.
+                let decl = self
+                    .sources
+                    .iter()
+                    .find(|s| s.name == name)
+                    .cloned()
+                    .ok_or_else(|| {
+                        let declared: Vec<&str> =
+                            self.sources.iter().map(|s| s.name.as_str()).collect();
+                        if declared.is_empty() {
+                            format!(
+                                "no source '{name}' is declared — declare one with \
+                                 `source add {name} kind=… match=… channels=… clock=…`"
+                            )
+                        } else {
+                            format!(
+                                "no source '{name}' is declared (declared: {})",
+                                declared.join(", ")
+                            )
+                        }
+                    })?;
+                match decl.kind {
+                    "alsa" => media::devices::open_input_device(
+                        std::sync::Arc::clone(&ring),
+                        &decl.matcher,
+                    )?,
+                    "pulse" => media::devices::open_input_pulse_source(
+                        std::sync::Arc::clone(&ring),
+                        &decl.matcher,
+                    )?,
+                    other => {
+                        return Err(format!(
+                            "source '{name}' is declared kind '{other}', which has no binding yet \
+                             (kinds with a binding: alsa, pulse)"
+                        ));
+                    }
+                }
+            }
+        };
         let rate = handle.sample_rate;
         let channels = (handle.channels as usize).clamp(1, media::capture::CAPTURE_CHANNELS_SANITY);
         self.start_recording(take_id, ring, rate, channels)?;
         if let Some(rec) = self.recording.as_mut() {
             rec.handle = Some(handle);
+            rec.source = source.map(str::to_string);
         }
         Ok(())
     }
@@ -1099,6 +1165,7 @@ impl HostSession {
             handle,
             capture,
             take_id,
+            source,
             sources,
             at_frame,
         } = rec;
@@ -1113,6 +1180,7 @@ impl HostSession {
             frames: capture.frames(),
             monitor_dropped: capture.dropped(),
             channels: capture.channels(),
+            source,
             sources,
             sample_rate: self.engine.clock.sample_rate,
             at_frame,
@@ -1137,6 +1205,7 @@ impl HostSession {
             frames: rec.capture.frames(),
             monitor_dropped: rec.capture.dropped(),
             channels: rec.capture.channels(),
+            source: rec.source.clone(),
         })
     }
 
@@ -1970,7 +2039,7 @@ impl HostSession {
                 self.source_tempos.insert(source.clone(), *bpm);
                 Ok(())
             }
-            HostCommand::Record { take_id } => self.record(take_id),
+            HostCommand::Record { take_id, source } => self.record(take_id, source.as_deref()),
             HostCommand::RecordStop => {
                 // A finalizing complaint still leaves a take in the pool, so the
                 // **declaration** is state either way. `stop_recording` keeps the report
@@ -1993,6 +2062,7 @@ impl HostSession {
                         dropped: take.monitor_dropped,
                         channels: take.channels,
                         at_frame: take.at_frame,
+                        source: take.source.clone(),
                     }]);
                 }
                 stopped?;
@@ -2015,6 +2085,7 @@ impl HostSession {
                 dropped,
                 channels,
                 at_frame,
+                source,
             } => {
                 // The declaration names its own pool sources, so `channels` **sizes** the
                 // vector built below: a line carrying a width no capture could have
@@ -2031,6 +2102,7 @@ impl HostSession {
                     frames: *frames,
                     monitor_dropped: *dropped,
                     channels: *channels,
+                    source: source.clone(),
                     sources: (0..*channels).map(|k| format!("{take_id}.ch{k}")).collect(),
                     sample_rate: self.engine.clock.sample_rate,
                     at_frame: *at_frame,
@@ -3460,6 +3532,9 @@ struct Recording {
     handle: Option<media::devices::InputHandle>,
     capture: media::Capture,
     take_id: String,
+    /// The declared source this take captured, when one was named. `None` is the
+    /// default input — the pre-binding behaviour, kept readable.
+    source: Option<String>,
     /// The pool source ids the take will produce (`take.ch0`, `take.ch1`, …).
     sources: Vec<String>,
     /// Where the capture started on the session timeline (the transport frame when
@@ -3478,6 +3553,9 @@ pub struct TakeReport {
     /// nothing monitored the take**). Not take loss: the pool write is authoritative.
     pub monitor_dropped: u64,
     pub channels: usize,
+    /// The declared source this take captured, if one was named. `None` means the
+    /// default input — the take still replays, it just cannot say what it heard.
+    pub source: Option<String>,
     /// The pool source ids to place on a track (`{take_id}.ch{k}`).
     pub sources: Vec<String>,
     pub sample_rate: u32,
@@ -3493,6 +3571,8 @@ pub struct RecordingStatus {
     /// Monitor frames lost so far; zero while nothing monitors the take.
     pub monitor_dropped: u64,
     pub channels: usize,
+    /// The declared source this take is capturing, when one was named.
+    pub source: Option<String>,
 }
 
 /// Why a journal write did not happen (see [`HostSession::journal_error`]). The edit
@@ -3869,16 +3949,24 @@ pub fn format_command(cmd: &HostCommand, session_dir: Option<&std::path::Path>) 
         } => format!("set_tempo {bpm} {beats_per_bar}{}", frame(at_frame)),
         HostCommand::Unmount { plugin, at_frame } => format!("unmount {plugin}{}", frame(at_frame)),
         HostCommand::Pool { dir } => format!("pool {}", pool_text(dir, session_dir)),
-        // `take <take_id> <frames> <dropped> <channels> <at_frame>` — the pool sources are
-        // the `{take_id}.ch{k}` convention, and `at_frame` is the take's origin rather
-        // than an edit time, so it is not `@`-suffixed.
+        // `take <take_id> <frames> <dropped> <channels> <at_frame> [source=<name>]` — the
+        // pool sources are the `{take_id}.ch{k}` convention, and `at_frame` is the take's
+        // origin rather than an edit time, so it is not `@`-suffixed. `source=` is
+        // trailing and omitted when the take came from the default input.
         HostCommand::Take {
             take_id,
             frames,
             dropped,
             channels,
             at_frame,
-        } => format!("take {take_id} {frames} {dropped} {channels} {at_frame}"),
+            source,
+        } => {
+            let provenance = match source {
+                Some(s) => format!(" source={s}"),
+                None => String::new(),
+            };
+            format!("take {take_id} {frames} {dropped} {channels} {at_frame}{provenance}")
+        }
         // `source add <name> kind=<kind> match=<matcher> channels=<n> clock=<role>` —
         // the matcher is one token, so the line is whitespace-round-trippable (a
         // matcher with a space has no spelling yet).
@@ -4376,18 +4464,56 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
                 });
             }
             "record" => {
-                exact(&words, 2, at, "record")?;
+                // `record <take> [source=<name>]` — the source is the **declared rig
+                // name** the take should be captured from; omitted means the default
+                // input, which is what every pre-binding script wrote.
+                if words.len() != 2 && words.len() != 3 {
+                    return Err(format!(
+                        "line {at}: record takes 1 or 2 operand(s), got {}",
+                        words.len() - 1
+                    ));
+                }
                 let take_id = word(&words, 1, at)?;
+                let source = match words.get(2) {
+                    None => None,
+                    Some(tok) if tok.starts_with("source=") => {
+                        Some(keyed("source", tok, at)?.to_string())
+                    }
+                    Some(tok) => {
+                        // A stray word is a typo, not a take id with a space: the second
+                        // operand is the provenance modifier, and saying so beats
+                        // "unexpected token".
+                        return Err(format!(
+                            "line {at}: record takes 1 or 2 operand(s) — the second is \
+                             source=<name>, got '{tok}'"
+                        ));
+                    }
+                };
                 if take_id == "stop" {
+                    if source.is_some() {
+                        return Err(format!(
+                            "line {at}: `record stop` takes no source — the source names what a \
+                             take captures"
+                        ));
+                    }
                     commands.push(HostCommand::RecordStop);
                 } else {
                     commands.push(HostCommand::Record {
                         take_id: take_id.to_string(),
+                        source,
                     });
                 }
             }
             "take" => {
-                exact(&words, 6, at, "take")?;
+                // `take <id> <frames> <dropped> <channels> <at_frame> [source=<name>]` —
+                // the provenance modifier is optional, so every pre-binding session and
+                // every existing test line parses unchanged.
+                if words.len() != 6 && words.len() != 7 {
+                    return Err(format!(
+                        "line {at}: take takes 5 or 6 operand(s), got {}",
+                        words.len() - 1
+                    ));
+                }
                 let take_id = word(&words, 1, at)?.to_string();
                 let frames = word(&words, 2, at)?
                     .parse::<u64>()
@@ -4401,12 +4527,26 @@ pub fn parse_script(text: &str) -> Result<Vec<HostCommand>, String> {
                 let at_frame = word(&words, 5, at)?
                     .parse::<u64>()
                     .map_err(|_| format!("line {at}: bad take origin (want a frame)"))?;
+                let source = match words.get(6) {
+                    None => None,
+                    Some(tok) => {
+                        let name = keyed("source", tok, at)?;
+                        if !media::valid_name(name) {
+                            return Err(format!(
+                                "line {at}: '{name}' is not usable as a take's source name (one \
+                                 token, no '#', not an @frame or snap= modifier)"
+                            ));
+                        }
+                        Some(name.to_string())
+                    }
+                };
                 commands.push(HostCommand::Take {
                     take_id,
                     frames,
                     dropped,
                     channels,
                     at_frame,
+                    source,
                 });
             }
             "source" => {

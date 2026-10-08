@@ -67,8 +67,11 @@ source add synth kind=alsa match=hw:USB channels=8 clock=master
   source, a seek rebuilds it, and the autosave journal has it per gesture.
 - The clock-out slice has a destination and does not need to invent one: `clock=follower` is the
   set of sources to drive, and `clock=master` is the one the session follows.
-- The binding slice can resolve `matcher` to a real device without touching the declaration —
-  which is why `matcher` is a *rule* rather than a resolved handle.
+- The binding slice **shipped 2026-10-08** and resolves `matcher` to a real capture path without
+  touching the declaration
+  ([recording binds a declared source](../feature/2026-10-08-recording-binds-a-declared-source.md)):
+  `record <take> source=<name>`, `kind=alsa` by cpal device name and `kind=pulse` by server source
+  name. That is why `matcher` is a *rule* rather than a resolved handle.
 - **Honest limitation:** a matcher is one token, so a device name containing a space cannot be
   declared yet; such a line is refused loudly rather than truncated, and the comment on the parse
   arm says where quoted matchers would come from.

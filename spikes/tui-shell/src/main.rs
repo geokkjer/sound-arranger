@@ -3680,6 +3680,7 @@ mod tests {
             frames: 4_800,
             monitor_dropped: 0,
             channels: 2,
+            source: None,
         });
         app.status =
             "exported 96000 frames (wav, +512 tail) — peak -1.0 dBFS, rms -3.0 dBFS".to_string();
@@ -3706,6 +3707,7 @@ mod tests {
             frames: 4_800,
             monitor_dropped: 0,
             channels: 2,
+            source: None,
         });
         let line = recording_line(&app.snap).expect("a running take draws a line");
         assert!(line.contains("REC"), "{line}");
@@ -6288,8 +6290,8 @@ mod tests {
         }
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
         assert!(
-            app.status.contains("takes 1 operand"),
-            "a stray word is a parse error: {}",
+            app.status.contains("source=<name>"),
+            "a stray word is a parse error that names the modifier: {}",
             app.status
         );
 

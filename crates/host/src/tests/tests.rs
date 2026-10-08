@@ -1221,6 +1221,7 @@ fn the_text_form_round_trips_every_state_command() {
         dropped: 0,
         channels: 2,
         at_frame: 0,
+        source: None,
     });
     commands.push(HostCommand::Group {
         commands: vec![
@@ -1265,6 +1266,7 @@ fn the_text_form_round_trips_every_state_command() {
         HostCommand::Redo,
         HostCommand::Record {
             take_id: "t".into(),
+            source: None,
         },
         HostCommand::Bounce {
             frames: 1,
@@ -5049,6 +5051,7 @@ fn a_take_declaration_refuses_a_channel_count_it_could_not_have_recorded() {
             dropped: 0,
             channels: usize::MAX,
             at_frame: 0,
+            source: None,
         })
         .is_err(),
         "a width no capture could have recorded is refused"
@@ -5127,11 +5130,185 @@ fn recording_refuses_what_it_cannot_do() {
         "and its WAV was finalized in the pool"
     );
 
-    // The text form: `record <take_id>` starts, `record stop` stops.
-    let parsed = parse_script("host v1\nrecord jam1\nrecord stop\n").expect("parse");
-    assert!(matches!(&parsed[0], HostCommand::Record { take_id } if take_id == "jam1"));
-    assert!(matches!(&parsed[1], HostCommand::RecordStop));
+    // The text form: `record <take_id>` starts, `record stop` stops — and the
+    // optional `source=` provenance modifier parses into the command.
+    let parsed =
+        parse_script("host v1\nrecord jam1\nrecord jam2 source=vcv\nrecord stop\n").expect("parse");
+    assert!(
+        matches!(&parsed[0], HostCommand::Record { take_id, source } if take_id == "jam1" && source.is_none())
+    );
+    assert!(
+        matches!(&parsed[1], HostCommand::Record { take_id, source } if take_id == "jam2" && source.as_deref() == Some("vcv"))
+    );
+    assert!(matches!(&parsed[2], HostCommand::RecordStop));
 
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **Binding a declared source is deliberate, never a fallback.** A `record` that
+/// names a source must capture *that* source; an unknown name, or a kind with no
+/// binding yet, is refused — and the refusal must not have started a take, opened a
+/// device, or quietly recorded the default input instead.
+///
+/// No bound source is opened here (CI has no device): what this pins is the
+/// resolution and the refusals, which is exactly where a silent fallback would live.
+#[test]
+fn record_resolves_a_declared_source_or_refuses_loudly() {
+    let root = std::env::temp_dir().join(format!("src-bind-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("temp pool");
+    let mut s = HostSession::new();
+    s.execute(&HostCommand::Pool { dir: root.clone() })
+        .expect("pool");
+
+    // Nothing declared: the refusal names the source and teaches the syntax, rather
+    // than recording whatever the machine's default input happens to be.
+    let err = s
+        .execute(&HostCommand::Record {
+            take_id: "t1".into(),
+            source: Some("vcv".into()),
+        })
+        .expect_err("an undeclared source is refused");
+    assert!(err.contains("vcv"), "{err}");
+    assert!(
+        err.contains("source add"),
+        "and it says how to declare one: {err}"
+    );
+    assert!(s.recording().is_none(), "no take was started");
+
+    // Declared, but `jack` has no binding: refused by name, naming the kind.
+    s.execute(&HostCommand::SourceAdd {
+        name: "vcv".into(),
+        kind: "jack",
+        // One token: the whitespace log cannot spell a matcher with a space yet.
+        matcher: "VCV-Rack:out_1".into(),
+        channels: 2,
+        clock: rig::ClockRole::Free,
+    })
+    .expect("source add");
+    let err = s
+        .execute(&HostCommand::Record {
+            take_id: "t1".into(),
+            source: Some("vcv".into()),
+        })
+        .expect_err("an unbound kind is refused");
+    assert!(err.contains("jack"), "{err}");
+    assert!(err.contains("no binding"), "{err}");
+    assert!(s.recording().is_none(), "still no take");
+    assert!(s.last_take().is_none(), "and nothing was finalized");
+
+    // A second, *declared* name is listed when the requested one is a typo.
+    s.execute(&HostCommand::SourceAdd {
+        name: "monitor".into(),
+        kind: "pulse",
+        matcher: "alsa_output.usb-Scarlett.sink.monitor".into(),
+        channels: 2,
+        clock: rig::ClockRole::Free,
+    })
+    .expect("source add");
+    let err = s
+        .execute(&HostCommand::Record {
+            take_id: "t1".into(),
+            source: Some("monitr".into()),
+        })
+        .expect_err("a typo is refused");
+    assert!(err.contains("monitr") && err.contains("monitor"), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A take's **provenance is its declaration**: `source=<name>` parses, round-trips
+/// and survives a replay, so a loaded session says what it recorded — while a take
+/// recorded before the binding slice (no modifier) still parses and means "the
+/// default input".
+#[test]
+fn a_take_declaration_carries_its_source() {
+    let script = parse_script("host v1\nsession_rate 48000\ntake jam 96000 0 2 120 source=vcv\n")
+        .expect("a take line with provenance parses");
+    let s = run_script(&script).expect("the session replays");
+    let take = s.last_take().expect("the take is bound");
+    assert_eq!(take.source.as_deref(), Some("vcv"));
+    assert_eq!(
+        format_command(&script[1], None).expect("a take line formats"),
+        "take jam 96000 0 2 120 source=vcv",
+        "and the formatter writes it back"
+    );
+
+    // The pre-binding line, unchanged and still unambiguous.
+    let plain =
+        parse_script("host v1\nsession_rate 48000\ntake jam 96000 0 2 120\n").expect("parse");
+    let s = run_script(&plain).expect("replay");
+    assert_eq!(s.last_take().expect("bound").source, None);
+    assert_eq!(
+        format_command(&plain[1], None).expect("a plain take line formats"),
+        "take jam 96000 0 2 120",
+        "no modifier when there is no source"
+    );
+}
+
+/// **The binding, on real hardware.** Declares a `pulse` source for the default
+/// sink's monitor and records a short take through `record <take> source=<name>`,
+/// asserting that a bound source really opens, captures frames, and carries its
+/// name into the take report.
+///
+/// Run it with a hardware session:
+/// `cargo test -p host --lib -- --ignored record_binds_a_declared_pulse_source`
+#[test]
+#[ignore = "needs PipeWire/PulseAudio with a default sink; run with --ignored"]
+fn record_binds_a_declared_pulse_source() {
+    // The monitor of the current default sink: whatever plays there is the source.
+    let sink = std::process::Command::new("pactl")
+        .args(["get-default-sink"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string());
+    let Some(sink) = sink.filter(|s| !s.is_empty()) else {
+        eprintln!("SKIP: `pactl get-default-sink` reported no sink");
+        return;
+    };
+    let monitor = format!("{sink}.monitor");
+
+    let root = std::env::temp_dir().join(format!("src-bind-hw-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("temp pool");
+
+    let mut s = HostSession::new();
+    s.execute(&HostCommand::SessionRate { hz: 48_000 })
+        .expect("session rate");
+    s.execute(&HostCommand::Pool { dir: root.clone() })
+        .expect("pool");
+    s.execute(&HostCommand::SourceAdd {
+        name: "mon".into(),
+        kind: "pulse",
+        matcher: monitor.clone(),
+        channels: 2,
+        clock: rig::ClockRole::Free,
+    })
+    .expect("declare the monitor");
+
+    s.execute(&HostCommand::Record {
+        take_id: "bound".into(),
+        source: Some("mon".into()),
+    })
+    .expect("a declared pulse source binds and opens");
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    s.execute(&HostCommand::RecordStop).expect("the take stops");
+    let report = s.last_take().cloned().expect("the take is reported");
+    assert_eq!(
+        report.source.as_deref(),
+        Some("mon"),
+        "the take names its source"
+    );
+    assert!(
+        report.frames > 0,
+        "a bound source captured frames: {report:?}"
+    );
+    assert!(
+        report.sources.iter().all(|id| id.starts_with("bound.")),
+        "and its pool sources follow the convention: {:?}",
+        report.sources
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
