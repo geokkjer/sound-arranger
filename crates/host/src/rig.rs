@@ -12,7 +12,14 @@
 /// The seam family a source belongs to. A closed list, like the plugin
 /// registry: an unknown kind is a loud parse error, not a silently inert
 /// declaration.
-pub const SOURCE_KINDS: &[&str] = &["alsa", "jack", "osc"];
+///
+/// `alsa` binds a **cpal device name** (hardware, or `Default Audio Device`).
+/// `pulse` binds a **PulseAudio/PipeWire source name** — a sink's `.monitor`, a
+/// `pw-loopback` — which is how a software partner such as VCV Rack is captured
+/// (`record <take> source=<name>`). `jack` and `osc` are declared seams with **no
+/// binding yet**: a `record` that names one is refused rather than silently
+/// capturing something else.
+pub const SOURCE_KINDS: &[&str] = &["alsa", "pulse", "jack", "osc"];
 
 /// Look up a source kind, mirroring the host's registry lookup (`in_list`):
 /// an unknown kind names the registry rather than guessing.

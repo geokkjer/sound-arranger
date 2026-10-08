@@ -1,5 +1,36 @@
 use super::*;
 
+/// The source-binding rule: a **case-insensitive substring** of the device name,
+/// and an empty matcher matches nothing (never "everything").
+#[test]
+fn a_matcher_is_a_case_insensitive_substring_rule() {
+    assert!(name_matches("scarlett", "Scarlett 2i2 4th Gen, USB Audio"));
+    assert!(name_matches("USB Audio", "Scarlett 2i2 4th Gen, USB Audio"));
+    assert!(name_matches("Default Audio Device", "Default Audio Device"));
+    assert!(name_matches("PulseAudio", "PulseAudio Sound Server"));
+    assert!(
+        !name_matches("scarlett", "Felucca, USB Audio"),
+        "a rule that does not match must not bind a different device"
+    );
+    assert!(
+        !name_matches("", "anything"),
+        "an empty matcher is not a wildcard"
+    );
+}
+
+/// A source that matches no device is **refused with the list**, never a fallback
+/// to the default input. Hardware-independent: with no devices at all it still
+/// errors rather than opening something else.
+#[test]
+fn a_matcher_that_matches_nothing_is_refused() {
+    let ring = std::sync::Arc::new(crate::ring::Spsc::new(1 << 12));
+    let err = match open_input_device(ring, "definitely-no-such-device-xyz") {
+        Err(e) => e,
+        Ok(_) => panic!("a rule with no device must refuse, not open something else"),
+    };
+    assert!(!err.is_empty(), "and the refusal says something");
+}
+
 /// A mono source is duplicated across the device's channels, one source
 /// sample per FRAME (not per output sample — that would halve the rate).
 #[test]

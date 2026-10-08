@@ -21,11 +21,13 @@ Two things on this machine sharpen the contract (owner's session, 2026-10-08):
   freeze the owner hit is the **ALSA device entry** (`(1-2 in, 1-2 out)`), which tries to take the
   Scarlett's hardware while PipeWire owns it. The JACK entry needs `pw-jack` (there is no `jackd`;
   PipeWire provides JACK). So **v1 must not depend on JACK.**
-- **Capture is a PipeWire source, and binding to one is the real gap.** `HostSession::record`
-  opens the machine's **default input device** — there is no per-source choice. The rig
-  declaration exists and is state ([the rig declaration is state](../../implemented/architecture/2026-09-27-the-rig-declaration-is-state.md)),
-  but binding a declared `matcher` to a real device is explicitly the later slice; until it lands,
-  "record Rack" means changing the machine's default source for the whole session.
+- **Capture is a PipeWire source, and binding to one was the real gap.** `HostSession::record`
+  opened the machine's **default input device** — there was no per-source choice. The rig
+  declaration existed and is state ([the rig declaration is state](../../implemented/architecture/2026-09-27-the-rig-declaration-is-state.md)),
+  but binding a declared `matcher` to a real device was the later slice; **it shipped the same day**
+  ([recording binds a declared source](../../implemented/feature/2026-10-08-recording-binds-a-declared-source.md)),
+  so "record Rack" is now `record <take> source=vcv` rather than a change to the machine's default
+  source.
 
 ## Proposal
 
@@ -33,9 +35,10 @@ Two things on this machine sharpen the contract (owner's session, 2026-10-08):
 
 1. **Addressing.** The owner starts Rack; the session *addresses* it, never spawns or supervises
    it. The source is declared with the existing vocabulary, e.g.
-   `source add vcv kind=alsa match="Scarlett 2i2 4th Gen" channels=2 clock=free`
-   (a PipeWire source name, matched by pattern like the studio's `pw-link` scripts — never a device
-   index). `kind=jack` stays a declared-but-unbound name in v1.
+   `source add vcv kind=pulse match=alsa_output.usb-Focusrite_Scarlett_2i2_4th_Gen_…HiFi__Line1__sink.monitor
+   channels=2 clock=free` (a PipeWire source name, matched by pattern like the studio's `pw-link`
+   scripts — never a device index; **`kind=pulse`, not `alsa`** — see the binding note, item 3).
+   `kind=jack` stays a declared-but-unbound name in v1.
 2. **The capture tap.** Two routes, both PipeWire sources:
    - **Sink monitor (v1 default).** Rack → PA → the Scarlett sink; capture
      `alsa_output.usb-Focusrite_Scarlett_2i2_4th_Gen_*.HiFi__Line1__sink.monitor`. Zero new nodes,
@@ -44,13 +47,17 @@ Two things on this machine sharpen the contract (owner's session, 2026-10-08):
    - **`pw-loopback` (isolation).** A dedicated virtual source that carries only Rack. One extra
      persisted node, and it is what makes the studio rig's "two VCV instances" sketch playable.
    The take's provenance names which tap it was; the choice is per session, not global.
-3. **Binding (the missing software).** `record <take> source=<name>` resolves the declared
-   `matcher` to a capture device and sizes the take from it. Concretely on this box, cpal/ALSA
-   enumerates the `pipewire` and `pulse` PCMs, and a *specific* PipeWire source is selected by
-   opening that PCM with a node hint (`PIPEWIRE_NODE` / `PULSE_SOURCE`) — a process-level hint, so
-   the slice must set and restore it around the stream open, and a **native PipeWire client** is
-   the clean long-term replacement. Until the slice lands, the owner can record today by making
-   the monitor the default source; the session then cannot name what it recorded from.
+3. **Binding (shipped 2026-10-08).** `record <take> source=<name>` resolves the declared
+   `matcher` to a capture device and sizes the take from it — see
+   [recording binds a declared source](../../implemented/feature/2026-10-08-recording-binds-a-declared-source.md).
+   Measurements settled the mechanism this note guessed at: a PipeWire node is declared
+   **`kind=pulse`** with the source name as the matcher, because the `pulse` PCM honours
+   `PULSE_SOURCE` while PipeWire's `PIPEWIRE_NODE` and `PIPEWIRE_PROPS` were ignored on this
+   version. So the Rack source is spelled
+   `source add vcv kind=pulse match=…HiFi__Line1__sink.monitor channels=2 clock=free`;
+   `kind=alsa` is the cpal **device-name** rule and stays right for hardware. The
+   process-global hint is serialised and restored by the slice, and a **native PipeWire
+   client** remains the clean long-term replacement.
 4. **Sync.** v1 sends **MIDI clock out** (`clock_out`) to Rack's MIDI-CV, so Rack follows our tempo
    and start/stop. No JACK transport and no shared position beyond MIDI clock/SPP. A free-running
    take is acceptable: per the external-programs decision the **recording is the durable artifact**,

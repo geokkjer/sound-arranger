@@ -944,9 +944,13 @@ impl Spike {
         // A successful start says which take is running. A refusal (no pool, or a
         // device that would not open) keeps the host's own words; the `Result` is the
         // answer, not the status line, which an earlier refusal is still sitting in.
+        // A take from the machine's default input: naming a declared source is the
+        // command line's job (`record <take> source=<name>`), and a shell affordance
+        // for it follows the binding slice rather than guessing a source here.
         if self
             .command(HostCommand::Record {
                 take_id: take_id.clone(),
+                source: None,
             })
             .is_ok()
         {
@@ -2189,6 +2193,7 @@ mod record_mvp {
             frames: 4800,
             monitor_dropped: 0,
             channels: 2,
+            source: None,
         });
         let live = take_label(&spike.snap);
         assert!(live.contains("REC"), "{live}");
@@ -2205,6 +2210,7 @@ mod record_mvp {
             frames: 4800,
             monitor_dropped: 512,
             channels: 2,
+            source: None,
         });
         let monitored = take_label(&spike.snap);
         assert!(
@@ -2219,6 +2225,7 @@ mod record_mvp {
             frames: 96_000,
             monitor_dropped: 0,
             channels: 2,
+            source: None,
             sources: vec!["take-2.ch0".into(), "take-2.ch1".into()],
             sample_rate: 48_000,
             at_frame: 0,
