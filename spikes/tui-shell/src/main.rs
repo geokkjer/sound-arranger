@@ -3236,9 +3236,17 @@ impl App {
 /// belong on screen forever.
 fn recording_line(snap: &Snapshot) -> Option<String> {
     snap.recording.as_ref().map(|rec| {
+        // Monitor drops are best-effort and zero unless something monitors the take,
+        // so they are named and shown only when they happen — "N dropped" beside a
+        // take read as lost audio.
+        let monitor = if rec.monitor_dropped > 0 {
+            format!(", {} monitor drops", rec.monitor_dropped)
+        } else {
+            String::new()
+        };
         format!(
-            "● REC {} — {} ch, {} frames, {} dropped (`:record stop` ends it)",
-            rec.take_id, rec.channels, rec.frames, rec.dropped
+            "● REC {} — {} ch, {} frames{monitor} (`:record stop` ends it)",
+            rec.take_id, rec.channels, rec.frames
         )
     })
 }
@@ -3670,7 +3678,7 @@ mod tests {
         app.snap.recording = Some(host::RecordingStatus {
             take_id: "take-3".to_string(),
             frames: 4_800,
-            dropped: 0,
+            monitor_dropped: 0,
             channels: 2,
         });
         app.status =
@@ -3696,13 +3704,17 @@ mod tests {
         app.snap.recording = Some(host::RecordingStatus {
             take_id: "take-3".to_string(),
             frames: 4_800,
-            dropped: 0,
+            monitor_dropped: 0,
             channels: 2,
         });
         let line = recording_line(&app.snap).expect("a running take draws a line");
         assert!(line.contains("REC"), "{line}");
         assert!(line.contains("take-3"), "{line}");
         assert!(line.contains("4800"), "{line}");
+        assert!(
+            !line.contains("drops"),
+            "an unmonitored take reports no drops: {line}"
+        );
 
         // The footer renders it, from the snapshot, below the status line.
         assert!(rendered(&mut app).contains("● REC take-3"));

@@ -215,8 +215,10 @@ pub enum HostCommand {
         take_id: String,
         /// Session frames written per channel.
         frames: u64,
-        /// Source frames the capture dropped (the ring was full) — material fidelity
-        /// that the WAV cannot record, so the declaration does.
+        /// Monitor frames a **monitored** ring could not take — best-effort only, and
+        /// zero when nothing monitored the take. It is *not* a measure of the material
+        /// (the pool write is authoritative); a fidelity fact the WAV cannot record, so
+        /// the declaration keeps it. The token stays `dropped` for `host v1` compatibility.
         dropped: u64,
         channels: usize,
         at_frame: u64,
@@ -1109,7 +1111,7 @@ impl HostSession {
         let report = TakeReport {
             take_id,
             frames: capture.frames(),
-            dropped: capture.dropped(),
+            monitor_dropped: capture.dropped(),
             channels: capture.channels(),
             sources,
             sample_rate: self.engine.clock.sample_rate,
@@ -1133,7 +1135,7 @@ impl HostSession {
         self.recording.as_ref().map(|rec| RecordingStatus {
             take_id: rec.take_id.clone(),
             frames: rec.capture.frames(),
-            dropped: rec.capture.dropped(),
+            monitor_dropped: rec.capture.dropped(),
             channels: rec.capture.channels(),
         })
     }
@@ -1988,7 +1990,7 @@ impl HostSession {
                     self.commit_state(vec![HostCommand::Take {
                         take_id: take.take_id.clone(),
                         frames: take.frames,
-                        dropped: take.dropped,
+                        dropped: take.monitor_dropped,
                         channels: take.channels,
                         at_frame: take.at_frame,
                     }]);
@@ -2027,7 +2029,7 @@ impl HostSession {
                 self.status_take(&TakeReport {
                     take_id: take_id.clone(),
                     frames: *frames,
-                    dropped: *dropped,
+                    monitor_dropped: *dropped,
                     channels: *channels,
                     sources: (0..*channels).map(|k| format!("{take_id}.ch{k}")).collect(),
                     sample_rate: self.engine.clock.sample_rate,
@@ -3472,8 +3474,9 @@ pub struct TakeReport {
     pub take_id: String,
     /// Session frames written per channel.
     pub frames: u64,
-    /// Source frames the capture had to drop (the ring was full).
-    pub dropped: u64,
+    /// Monitor frames a monitored ring could not take (best-effort only; **zero when
+    /// nothing monitored the take**). Not take loss: the pool write is authoritative.
+    pub monitor_dropped: u64,
     pub channels: usize,
     /// The pool source ids to place on a track (`{take_id}.ch{k}`).
     pub sources: Vec<String>,
@@ -3487,7 +3490,8 @@ pub struct TakeReport {
 pub struct RecordingStatus {
     pub take_id: String,
     pub frames: u64,
-    pub dropped: u64,
+    /// Monitor frames lost so far; zero while nothing monitors the take.
+    pub monitor_dropped: u64,
     pub channels: usize,
 }
 
