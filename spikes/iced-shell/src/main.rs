@@ -997,7 +997,8 @@ impl Spike {
         self.status = match &self.record_source {
             Some(name) => format!("record source: {name} — the next `o` captures it"),
             None if names.is_empty() => {
-                "record source: default input (no sources declared — try `source add …`)".to_string()
+                "record source: default input (no sources declared — try `source add …`)"
+                    .to_string()
             }
             None => "record source: default input".to_string(),
         };

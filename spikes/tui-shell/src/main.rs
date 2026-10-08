@@ -1405,9 +1405,7 @@ impl App {
                     Some(name) => format!(
                         "recording from '{name}' — edit the take id if you like, then Enter"
                     ),
-                    None => {
-                        "name the take and press Enter (e.g. `record take-1`)".to_string()
-                    }
+                    None => "name the take and press Enter (e.g. `record take-1`)".to_string(),
                 };
             }
         }
@@ -3929,9 +3927,8 @@ mod tests {
             // The entry's key column sits just inside the overlay's border, and the
             // overlay is drawn over other panels — so the token is matched **after a
             // border**, not at the start of the screen line.
-            let after_border = |l: &String| {
-                l.contains(&format!("│{token}")) || l.contains(&format!("│ {token}"))
-            };
+            let after_border =
+                |l: &String| l.contains(&format!("│{token}")) || l.contains(&format!("│ {token}"));
             assert!(
                 key_lines.iter().any(after_border),
                 "key `{token}` (row {index}) is not reachable in the overlay"
