@@ -88,6 +88,34 @@ sibling:
   small, separate follow-on, and a render path that does not wire the arranger becomes *optional*
   — worth doing only if a timeline-free recorder build is ever actually wanted.
 
+### The levels: core, plugin, profile, rig
+
+Four levels, each assembled from the one below — **composition, not containment**:
+
+| Level | What it is | Does it run? |
+|---|---|---|
+| **Core** | clock · graph interpreter · session log · context · media engine — model-free, shared | never alone |
+| **Plugin** | one capability as a node/op/service (`euclidean`, `scale`, `tone`, `mixer`, `master`, a CLAP-host adapter) | inside a profile |
+| **Profile** | an assembly *value*: name + op set + mount set + default surface | **yes — this is the process** |
+| **Rig / session** | one or more profile **instances** composed across a process/audio boundary | yes, as a chain |
+
+Two rules follow, and they are the point:
+
+- **The platform is never the process; a profile instance is.** The core is a library that
+  `run_script` assembles a profile from; every running binary is some profile's assembly. That is
+  why the umbrella is infrastructure and the profile carries the product name.
+- **Profiles stay coarse; the small units are plugins.** The Unix/JACK impulse to give the mixer or
+  a generator its own profile is right about small units and wrong about *which* unit: a process
+  boundary around something that must share the sample clock and the graph is exactly what the
+  [external-programs rule](2026-09-21-external-programs-not-sidecars.md) says a boundary is not for.
+  A partner is something you start or address, sync and record — not your own internals.
+
+**The end goal is the rig/studio**: a set of small programs wired into one session that can be
+played, recorded and arranged, with a session declaring its own sources, channels and clock roles
+([the rig declaration is state](../../implemented/architecture/2026-09-27-the-rig-declaration-is-state.md)).
+`recorder` stays the focus because it is the tape that makes a rig usable — capture, alignment,
+clock, mix, master, export. The levels name the goal; they do not re-order the work.
+
 ### What this phase does not prove (the arranger's corner, owned and written down)
 
 Structural live editing (graph swap under load) · clip/region semantics in the value schema · the
@@ -121,6 +149,11 @@ sentiment, because "viable but not focus" decays into "never" without one.
   and a mount set — not machinery. The budget rule is binding.
 - **Rename the crates to `audio-*`.** Rejected for now: no code carries the project name, so the
   prefix buys nothing and costs churn across every `use`. Revisit if the crates are ever published.
+- **Split the mixer, a generator, or the clock out as its own profile (`mixer` profile, `clock`
+  profile).** Rejected: it moves a plugin up a level and buys a process boundary and a clock bridge
+  for something that must share the sample clock and the graph. The small unit is the plugin; a
+  profile is a program; a rig wires programs. Revisit only if one of them must run on another
+  machine or outlive the session's process.
 
 ## Acceptance criteria
 
@@ -171,3 +204,8 @@ sentiment, because "viable but not focus" decays into "never" without one.
   it is the signal to split the representations, not a bug to patch.
 
 *Authored with DeepSeek-V4.1-Flash · DeepSeek Harness, 2026-09-27.*
+
+*Amended with DeepSeek-V4.1-Flash · DeepSeek Harness, 2026-10-08: the four levels (core, plugin,
+profile, rig), the "the platform is never the process" rule, "profiles stay coarse — the small
+units are plugins", and the rig/studio as the end goal. The owner's decisions; no prior decision
+is rewritten.*
