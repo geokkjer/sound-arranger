@@ -193,6 +193,15 @@ fn main() -> iced::Result {
         std::process::exit(record_check());
     }
 
+    // `--record-underrun` samples the **output device's** underrun counter across a
+    // play+record cycle. Play alone is clean (see `--sweep`), so the question the
+    // owner's report raises is whether starting a take bursts the counter once or
+    // starves it for the whole take — a burst is cosmetic, sustained starvation is
+    // real dropout. Additive probe; it records one take like `--record-check`.
+    if std::env::args().any(|arg| arg == "--record-underrun") {
+        std::process::exit(record_underrun());
+    }
+
     // `--keys` opens the keymap overlay at boot: the same affordance the TUI spike has,
     // and what makes the help screenshotable (a GUI's keys cannot be piped in).
     let keys = std::env::args().any(|arg| arg == "--keys");
@@ -1040,9 +1049,17 @@ fn stat<'a>(label: &'a str, value: String) -> Element<'a, Message> {
 /// the TUI's footer makes, from the same fields.
 fn take_label(snap: &Snapshot) -> String {
     if let Some(rec) = &snap.recording {
+        // Monitor drops are best-effort and zero unless something is monitoring the
+        // take, so they are named and shown only when they happen: "N dropped" beside
+        // a take read as lost audio, which it is not.
+        let monitor = if rec.monitor_dropped > 0 {
+            format!(", {} monitor drops", rec.monitor_dropped)
+        } else {
+            String::new()
+        };
         return format!(
-            "● REC {} — {} frames, {} ch, {} dropped  (`o` stops it)",
-            rec.take_id, rec.frames, rec.channels, rec.dropped
+            "● REC {} — {} frames, {} ch{monitor}  (`o` stops it)",
+            rec.take_id, rec.frames, rec.channels
         );
     }
     match &snap.last_take {
@@ -1346,8 +1363,8 @@ fn record_check() -> i32 {
     match &spike.snap.last_take {
         Some(t) => {
             println!(
-                "record-check: take {} — {} frames, {} ch, {} dropped, sources {:?}",
-                t.take_id, t.frames, t.channels, t.dropped, t.sources
+                "record-check: take {} — {} frames, {} ch, {} monitor drops, sources {:?}",
+                t.take_id, t.frames, t.channels, t.monitor_dropped, t.sources
             );
             if t.frames == 0 {
                 eprintln!("record-check: the take captured no frames");
@@ -1376,6 +1393,77 @@ fn record_check() -> i32 {
             1
         }
     }
+}
+
+/// Sample the output device's underrun counter across a play+record cycle.
+///
+/// The counter is in **device frames** (one per starved frame), so a single starved
+/// callback adds its whole buffer length and a two-second burst reads as ~96 000.
+/// The question is therefore the *shape*: a one-time jump at the stream transition
+/// (cosmetic, and the known 2026-09-21 finding) versus a counter that keeps climbing
+/// while the take runs (real starvation, and a bug in the record path). Each line
+/// prints the counter and the delta from the previous sample, so the two are
+/// distinguishable at a glance.
+fn record_underrun() -> i32 {
+    let mut spike = Spike::from_host(HostHandle::spawn_with_audio());
+    let mut last: Option<u64> = None;
+
+    sample_underruns(&mut spike, &mut last, "at open");
+    std::thread::sleep(Duration::from_millis(700));
+    sample_underruns(&mut spike, &mut last, "idle");
+
+    let _ = spike.host.execute(HostCommand::TransportPlay);
+    for i in 1..=4 {
+        std::thread::sleep(Duration::from_millis(150));
+        sample_underruns(&mut spike, &mut last, &format!("playing +{}ms", i * 150));
+    }
+
+    // Start the take the way the window does: the same key, through `update`.
+    spike.update(Message::Key(WorkflowKey::Char('o')));
+    println!("record-underrun: start status {:?}", spike.status);
+    std::thread::sleep(Duration::from_millis(50));
+    sample_underruns(&mut spike, &mut last, "record start");
+
+    for i in 1..=8 {
+        std::thread::sleep(Duration::from_millis(250));
+        spike.snap = spike.host.snapshot();
+        let rec = spike
+            .snap
+            .recording
+            .as_ref()
+            .map(|r| r.monitor_dropped)
+            .unwrap_or(0);
+        let u = spike.snap.audio.as_ref().map(|a| a.underruns);
+        let delta = match (u, last) {
+            (Some(b), Some(a)) => b.saturating_sub(a),
+            _ => 0,
+        };
+        last = u;
+        println!(
+            "record-underrun: {:<28} underruns {u:?} (+{delta}) monitor-dropped {rec}",
+            format!("rec +{:>4}ms", i * 250)
+        );
+    }
+
+    spike.update(Message::Key(WorkflowKey::Char('o')));
+    std::thread::sleep(Duration::from_millis(400));
+    sample_underruns(&mut spike, &mut last, "after stop");
+    println!("record-underrun: stop status {:?}", spike.status);
+    0
+}
+
+/// One sample of the output device's underruns/drops, with the delta since the
+/// previous sample, so a one-time burst and a climbing counter are told apart.
+fn sample_underruns(spike: &mut Spike, last: &mut Option<u64>, label: &str) {
+    spike.snap = spike.host.snapshot();
+    let u = spike.snap.audio.as_ref().map(|a| a.underruns);
+    let drops = spike.snap.audio.as_ref().map(|a| a.drops);
+    let delta = match (u, *last) {
+        (Some(b), Some(a)) => b.saturating_sub(a),
+        _ => 0,
+    };
+    *last = u;
+    println!("record-underrun: {label:<28} underruns {u:?} (+{delta}) drops {drops:?}");
 }
 
 /// Drive a fader through the **real** message path — the same `Message::Fader`
@@ -2099,20 +2187,37 @@ mod record_mvp {
         spike.snap.recording = Some(host::RecordingStatus {
             take_id: "take-2".into(),
             frames: 4800,
-            dropped: 0,
+            monitor_dropped: 0,
             channels: 2,
         });
         let live = take_label(&spike.snap);
         assert!(live.contains("REC"), "{live}");
         assert!(live.contains("take-2"), "{live}");
         assert!(live.contains("4800"), "{live}");
+        assert!(
+            !live.contains("drops"),
+            "a take nobody monitors says nothing about drops: {live}"
+        );
+
+        // Monitor loss is best-effort and named as such, never shown as "dropped".
+        spike.snap.recording = Some(host::RecordingStatus {
+            take_id: "take-2".into(),
+            frames: 4800,
+            monitor_dropped: 512,
+            channels: 2,
+        });
+        let monitored = take_label(&spike.snap);
+        assert!(
+            monitored.contains("512 monitor drops"),
+            "the counter is labelled as monitor loss: {monitored}"
+        );
 
         // A finished take wins once recording is cleared, because the id is free.
         spike.snap.recording = None;
         spike.snap.last_take = Some(host::TakeReport {
             take_id: "take-2".into(),
             frames: 96_000,
-            dropped: 0,
+            monitor_dropped: 0,
             channels: 2,
             sources: vec!["take-2.ch0".into(), "take-2.ch1".into()],
             sample_rate: 48_000,

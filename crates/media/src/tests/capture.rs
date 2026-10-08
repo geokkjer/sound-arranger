@@ -208,3 +208,59 @@ fn faster_drift_records_into_session_frames() {
 fn slower_drift_records_into_session_frames() {
     assert_drift_corrected(47_999, 48_000); // device clock slower (the ratio < 1 case)
 }
+
+/// The regression the shell exposed: **an unmonitored take reports no drops**,
+/// however long it runs, while a monitored one still counts what its monitor
+/// could not take.
+///
+/// The monitoring ring holds 65 536 frames (1.365 s at 48 kHz). Filled
+/// unconditionally, it overflowed once and every later sample counted as
+/// "dropped" — so an intact nine-second take reported ~360 000 drops next to its
+/// frame count, which reads as catastrophic loss. The rings are now filled only
+/// while a monitor is attached (see `channel_ring`), so the counter measures
+/// monitor quality and is zero when there is no monitor to have any.
+#[test]
+fn monitor_drops_are_counted_only_while_a_monitor_is_attached() {
+    let dir = std::env::temp_dir().join(format!("cap-monitor-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let channels = 2;
+    let sr = 48_000u32;
+    // Three ring capacities: the old behaviour would overflow it twice over.
+    let frames = 3 * (1 << 16);
+    let source = Arc::new(Spsc::new(1 << 19));
+    let cap = Capture::start(&dir, "nomon", channels, sr, sr, source.clone()).unwrap();
+
+    feed_interleaved(&source, channels, frames, sr);
+    // Drain, bounded: the demux is a thread, so wait for the take rather than guess.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while cap.frames() < frames as u64 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        cap.dropped(),
+        0,
+        "no monitor is attached, so there is no monitor loss to count"
+    );
+    assert_eq!(
+        cap.frames(),
+        frames as u64,
+        "and the take itself is whole — drops never meant take loss"
+    );
+
+    // Attaching a monitor starts the ring feed. A monitor that never drains loses
+    // samples, which is the one thing this counter is for.
+    let ring = cap.channel_ring(0);
+    assert!(ring.is_empty(), "a fresh monitor ring starts empty");
+    feed_interleaved(&source, channels, frames, sr);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while cap.frames() < 2 * frames as u64 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        cap.dropped() > 0,
+        "a monitor that never drains must count what its full ring refused"
+    );
+
+    cap.stop().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

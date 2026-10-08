@@ -5015,7 +5015,7 @@ fn a_take_declaration_replays_without_a_device() {
     let take = s.last_take().expect("the take is bound");
     assert_eq!(take.take_id, "jam");
     assert_eq!(take.frames, 96_000);
-    assert_eq!(take.dropped, 7);
+    assert_eq!(take.monitor_dropped, 7);
     assert_eq!(take.channels, 2);
     assert_eq!(take.sources, vec!["jam.ch0", "jam.ch1"]);
     assert_eq!(

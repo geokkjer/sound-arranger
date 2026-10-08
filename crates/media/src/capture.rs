@@ -6,8 +6,10 @@
 //! **float-WAV pool source + `.peaks` sidecar** (the prior-art dispositions:
 //! 32-bit float on disk, 256-sample min/max reductions).
 //!
-//! The pool write is authoritative; the monitoring rings are best-effort
-//! (full → dropped + counted, the consumer must keep up — the tests pace it).
+//! The pool write is authoritative; the monitoring rings are best-effort. A ring is
+//! filled **only while a monitor is attached** (obtained through
+//! [`Capture::channel_ring`]), so a take nobody monitors neither fills a ring nor
+//! counts a drop: a full ring is a lost *monitor* sample, never a lost take.
 //! The demux thread is off the audio path (allocation allowed).
 
 use std::path::{Path, PathBuf};
@@ -33,6 +35,10 @@ pub const CAPTURE_CHANNELS_SANITY: usize = 64;
 pub struct Capture {
     channels: usize,
     channel_rings: Vec<Arc<Spsc<f32>>>,
+    /// Per channel: has a monitor attached (someone asked for `channel_ring`)?
+    /// The demux fills only a monitored ring, so an unmonitored take reports
+    /// zero drops instead of one per frame once the ring fills.
+    monitored: Vec<Arc<AtomicBool>>,
     stop: Arc<AtomicBool>,
     handle: Mutex<Option<JoinHandle<()>>>,
     err: Arc<Mutex<Option<String>>>,
@@ -92,11 +98,21 @@ impl Capture {
         let channel_rings: Vec<Arc<Spsc<f32>>> = (0..channels)
             .map(|_| Arc::new(Spsc::new(1 << 16)))
             .collect();
+        // One monitor flag per channel, set by `channel_ring`. Best-effort by
+        // construction: with no monitor attached the demux does no ring work.
+        let monitored: Vec<Arc<AtomicBool>> = (0..channels)
+            .map(|_| Arc::new(AtomicBool::new(false)))
+            .collect();
         let stop = Arc::new(AtomicBool::new(false));
         let err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let frames = Arc::new(AtomicU64::new(0));
         let dropped = Arc::new(AtomicU64::new(0));
-        let (rings2, stop2, err2) = (channel_rings.clone(), stop.clone(), err.clone());
+        let (rings2, monitored2, stop2, err2) = (
+            channel_rings.clone(),
+            monitored.clone(),
+            stop.clone(),
+            err.clone(),
+        );
         let (frames2, dropped2) = (frames.clone(), dropped.clone());
         let pool_dir = pool_dir.to_path_buf();
         let take_id = take_id.to_string();
@@ -184,10 +200,16 @@ impl Capture {
                         }
                         // Monitoring rings are best-effort: the pool write is
                         // authoritative; a full ring is a dropped monitor
-                        // sample (counted), never a lost take.
-                        for &s in &session {
-                            if !rings2[k].try_push(s) {
-                                dropped2.fetch_add(1, Ordering::Relaxed);
+                        // sample (counted), never a lost take. With **no monitor
+                        // attached** there is nothing to fill and nothing to
+                        // count — otherwise the ring fills once and the counter
+                        // then climbs at ~48 000/s for a take that is perfectly
+                        // intact, which reads as catastrophic loss in a shell.
+                        if monitored2[k].load(Ordering::Relaxed) {
+                            for &s in &session {
+                                if !rings2[k].try_push(s) {
+                                    dropped2.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
                     }
@@ -207,6 +229,7 @@ impl Capture {
         Ok(Capture {
             channels,
             channel_rings,
+            monitored,
             stop,
             handle: Mutex::new(Some(handle)),
             err,
@@ -222,7 +245,13 @@ impl Capture {
     }
 
     /// The monitoring ring for channel `k` (fed by the demux thread).
+    ///
+    /// **Calling this attaches a monitor**, and the demux starts filling the
+    /// channel's ring from that point on. A take nobody monitors keeps its rings
+    /// empty and [`Capture::dropped`] at zero, so the counter means monitor loss
+    /// rather than "this counter grows with the take".
     pub fn channel_ring(&self, k: usize) -> Arc<Spsc<f32>> {
+        self.monitored[k].store(true, Ordering::Relaxed);
         self.channel_rings[k].clone()
     }
 
@@ -230,6 +259,11 @@ impl Capture {
         self.frames.load(Ordering::Relaxed)
     }
 
+    /// Samples a **monitored** channel's ring could not take because it was full.
+    ///
+    /// Zero when no monitor is attached, and never a take frame: the pool write is
+    /// authoritative and this counter describes the best-effort monitor only. A
+    /// shell that shows it next to a take is showing monitor quality, not loss.
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
