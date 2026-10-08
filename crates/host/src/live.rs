@@ -89,6 +89,11 @@ pub struct Snapshot {
     /// collide with a source the session already holds — the id is required before
     /// the recording starts, so it cannot be discovered afterwards.
     pub pool_ids: Vec<String>,
+    /// The **declared rig's source names** (`source add`), in declaration order, so a
+    /// shell can offer them: `record <take> source=<name>` binds one, and the shell's
+    /// record gesture arms the choice. Names only — the declaration's matcher and
+    /// clock role stay in the session, which owns them.
+    pub sources: Vec<String>,
     /// The arrangement, cached in the session and published behind an `Arc` so a
     /// polling shell draws a timeline every frame without copying it (see
     /// [`TimelineStatus`]).
@@ -173,6 +178,7 @@ impl Default for Snapshot {
             recording: None,
             last_take: None,
             pool_ids: Vec::new(),
+            sources: Vec::new(),
             timeline: TimelineStatus::default(),
             audio: None,
             midi: Default::default(),
@@ -731,6 +737,9 @@ fn publish(session: &HostSession, shared: &Mutex<Snapshot>, audio: &AudioState) 
     // Cached (see `HostSession::pool_ids`): this runs on every pump tick, and
     // listing the pool reads a directory.
     s.pool_ids = session.pool_ids().to_vec();
+    // The declared rig, names only: a shell arms one of these for `record`. Cheap
+    // to clone (a handful of short strings) and it never touches a device.
+    s.sources = session.sources().iter().map(|d| d.name.clone()).collect();
     // The arrangement is a **cached** reconstruction (see `TimelineStatus`): this
     // clones an `Arc`, so the per-tick publish does not walk the timeline.
     s.timeline = session.timeline_status().clone();

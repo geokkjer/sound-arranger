@@ -151,6 +151,12 @@ pub enum Action {
     /// shell supplies one: `take-1`, `take-2`, … The shell owns the naming because
     /// only it can see what the session already holds.
     RecordToggle,
+    /// Arm the **declared source** the next take captures: `default input → the
+    /// rig's first source → … → default`. The shell owns the armed name (it is UI
+    /// state, like the take id); the host binds it only when the take starts, via
+    /// `record <take> source=<name>`. A rig with no declared sources cycles to
+    /// `default` and stays there.
+    CycleRecordSource,
     // panels and viewport
     CycleFocus(i32),
     /// Move down (+1) / up (-1) inside the focused panel: mixer channel, active track.
@@ -263,6 +269,7 @@ impl Action {
             Action::SeekSeconds(_) => "seek by seconds",
             Action::SeekClip(_) => "next / previous clip",
             Action::RecordToggle => "record / stop recording",
+            Action::CycleRecordSource => "arm the record source",
             Action::CycleFocus(_) => "move the focus",
             Action::Vertical(_) => "move the selection",
             Action::Timeline(_) => "scroll / extend the selection",
@@ -397,6 +404,11 @@ pub static KEYMAP: &[Binding] = &[
         "o",
         &[(Key::Char('o'), Action::RecordToggle)],
         "record / stop recording",
+    ),
+    bind(
+        "A",
+        &[(Key::Char('A'), Action::CycleRecordSource)],
+        "record source: arm the declared source the next take captures",
     ),
     bind(
         "r  Home",

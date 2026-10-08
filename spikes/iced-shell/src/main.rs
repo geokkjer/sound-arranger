@@ -249,6 +249,11 @@ struct Spike {
     /// *state* and its cycling order are the workflow's, and the shell says which
     /// division is armed rather than pretending the key does nothing.
     grid: workflow::Grid,
+    /// The **declared source** the next take will capture, when one is armed (`A`
+    /// cycles `default → the rig's sources → default`). `None` is the default input.
+    /// Shell state, like the take id: the host binds the name at `record` time and the
+    /// take report carries it back.
+    record_source: Option<String>,
 }
 
 /// A pool directory for this run, **created**, so the shell can record.
@@ -346,6 +351,7 @@ impl Spike {
             help: false,
             span_frames: 0,
             grid: workflow::Grid::default(),
+            record_source: None,
         };
         spike.adopt();
         spike
@@ -544,6 +550,7 @@ impl Spike {
         match action {
             Action::PlayToggle => self.toggle(),
             Action::RecordToggle => self.toggle_record(),
+            Action::CycleRecordSource => self.cycle_record_source(),
             Action::Stop => {
                 let _ = self.command(HostCommand::TransportStop);
             }
@@ -760,7 +767,11 @@ impl Spike {
             control("Play", Message::Play),
             control("Stop", Message::Stop),
             control("Rewind", Message::Rewind),
-            text("space = play/stop · r = rewind · o = record/stop").size(12),
+            text(format!(
+                "space = play/stop · r = rewind · o = record/stop · A = source: {}",
+                record_source_label(self.record_source.as_deref())
+            ))
+            .size(12),
         ]
         .spacing(12)
         .align_y(iced::Center);
@@ -944,18 +955,52 @@ impl Spike {
         // A successful start says which take is running. A refusal (no pool, or a
         // device that would not open) keeps the host's own words; the `Result` is the
         // answer, not the status line, which an earlier refusal is still sitting in.
-        // A take from the machine's default input: naming a declared source is the
-        // command line's job (`record <take> source=<name>`), and a shell affordance
-        // for it follows the binding slice rather than guessing a source here.
+        // The take captures the **armed** source (`A` cycles it); `None` is the default
+        // input, exactly as before the binding slice.
+        let source = self.record_source.clone();
         if self
             .command(HostCommand::Record {
                 take_id: take_id.clone(),
-                source: None,
+                source: source.clone(),
             })
             .is_ok()
         {
-            self.status = format!("● recording {take_id} — `o` stops it");
+            self.status = match &source {
+                Some(name) => format!("● recording {take_id} from '{name}' — `o` stops it"),
+                None => format!("● recording {take_id} — `o` stops it"),
+            };
         }
+    }
+
+    /// `A`: arm the source the next take captures — `default input → the rig's first
+    /// declared source → … → default`.
+    ///
+    /// The armed name is **shell state** (like the take id): the host publishes the
+    /// declarations (`snap.sources`) and binds the name only at `record` time. A rig
+    /// with nothing declared cycles to `default` and says so, rather than arming a
+    /// name that could never bind.
+    fn cycle_record_source(&mut self) {
+        self.snap = self.host.snapshot();
+        let names = &self.snap.sources;
+        self.record_source = match &self.record_source {
+            None => names.first().cloned(),
+            Some(current) => {
+                let idx = names.iter().position(|n| n == current);
+                match idx {
+                    Some(i) if i + 1 < names.len() => Some(names[i + 1].clone()),
+                    // The last declared source (or a name no longer declared) cycles
+                    // back to the default input.
+                    _ => None,
+                }
+            }
+        };
+        self.status = match &self.record_source {
+            Some(name) => format!("record source: {name} — the next `o` captures it"),
+            None if names.is_empty() => {
+                "record source: default input (no sources declared — try `source add …`)".to_string()
+            }
+            None => "record source: default input".to_string(),
+        };
     }
 
     /// The next `take-N` this session does not already hold.
@@ -1044,6 +1089,15 @@ fn stat<'a>(label: &'a str, value: String) -> Element<'a, Message> {
     column![text(label).size(11), text(value).size(18)]
         .spacing(2)
         .into()
+}
+
+/// What the footer says the next take will capture: the armed declared source, or
+/// the machine's default input.
+fn record_source_label(armed: Option<&str>) -> String {
+    match armed {
+        Some(name) => name.to_string(),
+        None => "default".to_string(),
+    }
 }
 
 /// The take line: a live recording indicator, or the last finished take.
@@ -2145,6 +2199,52 @@ mod fader_step {
 mod record_mvp {
     use super::*;
 
+    /// `A` arms the declared rig in order and wraps back to the default input, and the
+    /// footer names what is armed — the shell half of `record <take> source=<name>`.
+    #[test]
+    fn the_source_key_cycles_the_declared_rig() {
+        let mut spike = Spike::headless();
+
+        // Declare through the host, not the snapshot: the cycle reads the *published*
+        // rig, so a `source add` typed on the command line is what it arms.
+        for (name, matcher) in [("vcv", "sink.monitor"), ("mon", "loopback")] {
+            spike
+                .command(host::HostCommand::SourceAdd {
+                    name: name.into(),
+                    kind: "pulse",
+                    matcher: matcher.into(),
+                    channels: 2,
+                    clock: host::rig::ClockRole::Free,
+                })
+                .expect("source add");
+        }
+        // The actor publishes after it replies: wait for the rig rather than race the pump.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while spike.host.snapshot().sources.len() < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        spike.update(Message::Key(WorkflowKey::Char('A')));
+        assert_eq!(
+            spike.record_source.as_deref(),
+            Some("vcv"),
+            "the first declared source: {}",
+            spike.status
+        );
+        assert!(spike.status.contains("vcv"), "{}", spike.status);
+
+        spike.update(Message::Key(WorkflowKey::Char('A')));
+        assert_eq!(spike.record_source.as_deref(), Some("mon"), "then the next");
+
+        spike.update(Message::Key(WorkflowKey::Char('A')));
+        assert_eq!(spike.record_source, None, "and back to the default input");
+        assert!(spike.status.contains("default"), "{}", spike.status);
+
+        // The footer names it: the default reads "default", an armed name reads itself.
+        assert_eq!(record_source_label(None), "default");
+        assert_eq!(record_source_label(Some("vcv")), "vcv");
+    }
+
     /// A new take must not reuse a name the pool already holds.
     ///
     /// The id is chosen *before* the recording starts (a take is declared state,
@@ -2153,7 +2253,6 @@ mod record_mvp {
     #[test]
     fn the_next_take_avoids_the_names_the_pool_holds() {
         let mut spike = Spike::headless();
-
         // An empty pool starts at one. (`next_take_id` reads the published pool,
         // not the filesystem, so a `--record-check` run's leftovers cannot reach it.)
         spike.snap.pool_ids.clear();
