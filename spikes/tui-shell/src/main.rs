@@ -158,6 +158,10 @@ struct App {
     /// panel, the active track, and the mode.
     arrangement: Option<Arrangement>,
     sources: Sources,
+    /// The **declared source** the next take will capture, when one is armed (`A`
+    /// cycles `default → the rig's sources → default`). `None` is the default input.
+    /// Shell state, like the take id: the host binds the name at `record` time.
+    record_source: Option<String>,
     view: Option<View>,
     mode: Mode,
     focus: Panel,
@@ -289,6 +293,7 @@ impl App {
             mixer_rect: Rect::default(),
             arrangement: None,
             sources: Sources::default(),
+            record_source: None,
             view: None,
             mode: Mode::Normal,
             focus: Panel::Mixer,
@@ -654,6 +659,7 @@ impl App {
             mixer_rect: Rect::default(),
             arrangement: None,
             sources: Sources::default(),
+            record_source: None,
             view: None,
             mode: Mode::Normal,
             focus: Panel::Mixer,
@@ -831,7 +837,11 @@ impl App {
         if self.help {
             match key.code {
                 KeyCode::Char('j') | KeyCode::Down => {
-                    self.help_scroll = (self.help_scroll + 1).min(workflow::help_len());
+                    // The overlay scrolls **wrapped lines**, and a help row can wrap to
+                    // two or three, so clamping to the entry count left the last
+                    // bindings unreachable on a short terminal. Three lines per entry is
+                    // the safe bound (the exact count needs the draw width).
+                    self.help_scroll = (self.help_scroll + 1).min(workflow::help_len() * 3);
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
                     self.help_scroll = self.help_scroll.saturating_sub(1);
@@ -861,6 +871,7 @@ impl App {
             Action::PlayToggle => self.toggle(),
             Action::Stop => self.stop(),
             Action::RecordToggle => self.record_toggle(),
+            Action::CycleRecordSource => self.cycle_record_source(),
             Action::Rewind => self.rewind(),
             Action::SeekSeconds(seconds) => self.nudge(seconds),
             Action::SeekClip(forward) => self.timeline_key(|app| app.seek_clip(forward)),
@@ -1379,11 +1390,23 @@ impl App {
                 }
             }
             RecordIntent::Name => {
-                let prefill = "record ".to_string();
+                // The line is prefilled with the **armed source** and the shell's own
+                // next take id, so the typed text is what runs — the source is visible
+                // before Enter, not appended behind the user's back.
+                let take_id = self.next_take_id();
+                let prefill = match &self.record_source {
+                    Some(name) => format!("record {take_id} source={name}"),
+                    None => format!("record {take_id}"),
+                };
                 self.prompt = Some(prefill.clone());
                 self.prompt_prefill = Some(prefill);
                 self.history_at = self.history.len();
-                self.status = "name the take and press Enter (e.g. `record take-1`)".to_string();
+                self.status = match &self.record_source {
+                    Some(name) => format!(
+                        "recording from '{name}' — edit the take id if you like, then Enter"
+                    ),
+                    None => "name the take and press Enter (e.g. `record take-1`)".to_string(),
+                };
             }
         }
     }
@@ -1396,6 +1419,57 @@ impl App {
         } else {
             RecordIntent::Name
         }
+    }
+
+    /// `A`: arm the source the next take captures — `default input → the rig's first
+    /// declared source → … → default`.
+    ///
+    /// Shell state, like the take id: the host publishes the declarations (`snap.sources`)
+    /// and binds the name only when the take starts. A rig with nothing declared cycles
+    /// to `default` and says so, rather than arming a name that could never bind.
+    fn cycle_record_source(&mut self) {
+        self.snap = self.host.snapshot();
+        // Cloned: the names are read to choose the next one, then `record_source` is
+        // written — a handful of short strings, once per keypress.
+        let names = self.snap.sources.clone();
+        self.record_source = match &self.record_source {
+            None => names.first().cloned(),
+            Some(current) => {
+                let idx = names.iter().position(|n| n == current);
+                match idx {
+                    Some(i) if i + 1 < names.len() => Some(names[i + 1].clone()),
+                    // The last declared source (or one no longer declared) goes back
+                    // to the default input.
+                    _ => None,
+                }
+            }
+        };
+        self.status = match &self.record_source {
+            Some(name) => format!("record source: {name} — the next `o` captures it"),
+            None if names.is_empty() => {
+                "record source: default input (no sources declared — try `source add …`)"
+                    .to_string()
+            }
+            None => "record source: default input".to_string(),
+        };
+    }
+
+    /// The next `take-N` this session does not already hold — the id the record prompt
+    /// is prefilled with (the host needs the id before the take starts).
+    fn next_take_id(&self) -> String {
+        let mut next = 1u32;
+        for id in &self.snap.pool_ids {
+            // `take-7.ch0` names take 7 in the capture convention.
+            let Some(number) = id
+                .strip_prefix("take-")
+                .and_then(|rest| rest.split(['.', '-']).next())
+                .and_then(|n| n.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            next = next.max(number + 1);
+        }
+        format!("take-{next}")
     }
 
     /// `R`: open the command line **prefilled** with the rename line, so the name is
@@ -3664,6 +3738,53 @@ mod tests {
         buffer_text(terminal.backend().buffer())
     }
 
+    /// `A` arms the declared rig for the next take, and the record prompt is prefilled
+    /// with the armed source — the shell half of `record <take> source=<name>`, so what
+    /// runs is what is on screen.
+    #[test]
+    fn the_source_key_arms_the_declared_rig_for_the_next_take() {
+        let mut app = App::demo();
+        app.command(
+            "source add vcv kind=pulse match=sink.monitor channels=2 clock=free",
+            HostCommand::SourceAdd {
+                name: "vcv".into(),
+                kind: "pulse",
+                matcher: "sink.monitor".into(),
+                channels: 2,
+                clock: host::rig::ClockRole::Free,
+            },
+        );
+        // The actor publishes after it replies: wait for the rig rather than race it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while app.host.snapshot().sources.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        app.on_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
+        assert_eq!(
+            app.record_source.as_deref(),
+            Some("vcv"),
+            "the declared source is armed: {}",
+            app.status
+        );
+        assert!(app.status.contains("vcv"), "{}", app.status);
+
+        // `o` prefills the line with the armed source: the typed text is what runs.
+        app.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::empty()));
+        let prompt = app.prompt.clone().expect("the record prompt opens");
+        assert!(prompt.starts_with("record take-"), "{prompt}");
+        assert!(prompt.contains("source=vcv"), "{prompt}");
+
+        // Cycling past the last source returns to the default input, and the prefill
+        // names no source — the pre-binding behaviour.
+        app.prompt = None;
+        app.on_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
+        assert_eq!(app.record_source, None, "{}", app.status);
+        app.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::empty()));
+        let prompt = app.prompt.clone().expect("the record prompt opens");
+        assert!(!prompt.contains("source="), "{prompt}");
+    }
+
     /// `o`'s decision is the **host's** state, not the status line.
     ///
     /// The status is a message channel: an export report or a source error overwrites
@@ -3785,18 +3906,32 @@ mod tests {
         let mut app = App::demo();
         app.help = true;
 
-        // The overlay is scrollable (the keymap outgrew a 24-row terminal), so
-        // "every key is listed" means every row is *reachable*: scroll to each
-        // index and look for that entry's key token. The overlay pads the key
-        // column, so matching on the first token is enough.
+        // The overlay is scrollable (the keymap outgrew a 24-row terminal) and ratatui
+        // scrolls *wrapped lines*, so a row index is not a scroll offset. "Every key is
+        // listed" is therefore checked as **reachability**: at some scroll position the
+        // entry's key token starts a line of the overlay. Collected across every scroll
+        // stop, so adding a binding cannot shift a row out of the check.
         let help: Vec<(&str, &str)> = workflow::help().collect();
-        for (index, (keys, _)) in help.iter().enumerate() {
-            app.help_scroll = index;
+        let mut key_lines: Vec<String> = Vec::new();
+        // Every scroll stop the keys can reach (`j` clamps at three wrapped lines per
+        // entry), so a row cannot hide behind a count change.
+        for scroll in 0..=workflow::help_len() * 3 {
+            app.help_scroll = scroll;
             let screen = rendered(&mut app);
+            for line in screen.lines() {
+                key_lines.push(line.trim_start_matches(['│', ' ', '┌', '└']).to_string());
+            }
+        }
+        for (index, (keys, _)) in help.iter().enumerate() {
             let token = keys.split_whitespace().next().expect("a key");
+            // The entry's key column sits just inside the overlay's border, and the
+            // overlay is drawn over other panels — so the token is matched **after a
+            // border**, not at the start of the screen line.
+            let after_border =
+                |l: &String| l.contains(&format!("│{token}")) || l.contains(&format!("│ {token}"));
             assert!(
-                screen.contains(token),
-                "key `{token}` (row {index}) missing from the overlay:\n{screen}"
+                key_lines.iter().any(after_border),
+                "key `{token}` (row {index}) is not reachable in the overlay"
             );
         }
 

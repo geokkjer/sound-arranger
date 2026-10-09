@@ -52,6 +52,13 @@ also speaks.
 - **`PULSE_SOURCE` is process-global and `unsafe` to set in edition 2024**, so the window is
   serialised behind `media::devices::DEVICE_ENV_LOCK` and the previous value is restored before
   the open returns; the stream keeps the source it connected to.
+- **The shells arm the source.** `A` cycles `default input → the rig's declared sources → default`
+  ([`Action::CycleRecordSource`](../../../../crates/workflow/src/lib.rs), so both shells share one
+  key, one help row and one meaning). The rig is published as names in the snapshot
+  (`Snapshot::sources`), `o` records the armed name, and the footer names it. The TUI prefills its
+  record prompt with the armed source and its next take id, so the line that runs is the line on
+  screen rather than the source being appended behind the user's back. A rig with nothing declared
+  arms `default` and says so.
 
 ## Verified
 
@@ -61,6 +68,9 @@ also speaks.
   is unchanged).
 - `media` unit tests pin the matcher rule (substring, case-insensitive, empty is not a wildcard)
   and the no-match refusal.
+- Both shells: `the_source_key_cycles_the_declared_rig` (iced) and
+  `the_source_key_arms_the_declared_rig_for_the_next_take` (tui) declare a rig through the host,
+  cycle it, and assert the armed name and the prefill — iced 21, tui 58 tests, green.
 - **On hardware** (ignored by default): `record_binds_a_declared_pulse_source` declares the default
   sink's monitor as `kind=pulse`, records through `record bound source=mon`, and asserts the take
   named its source, captured frames, and produced `bound.ch{k}` pool sources — run and passing
@@ -80,8 +90,10 @@ also speaks.
   were ignored on this PipeWire version.
 - **Make the source permanent session state and bind at load.** Rejected: binding opens a device,
   and replay must never touch hardware — the same rule the take declaration follows.
-- **A record gesture in the shells that picks a source.** Deferred: the command line and scripts
-  carry the binding now, and a shell affordance is a UI slice of its own.
+- **Keep the source choice on the command line only, with no shell gesture.** Rejected: the command
+  line stays (scripts need it), but a record key that cannot pick a declared source quietly records
+  the default input for anyone who does not know the modifier exists. `A` arms the choice in both
+  shells; the footer names what is armed.
 - **Two simultaneous sources per session.** Out of scope: one take records one source, which is
   what `HostSession`'s single active capture already models.
 
@@ -98,6 +110,11 @@ also speaks.
   client — recorded here rather than discovered later.
 - The monitor route captures the **whole sink**, so the arranger's own playback lands in the take
   if it plays there; a `pw-loopback` is the isolation route the contract describes.
+- **One bug fell out of the shell work:** the TUI's help overlay clamped `help_scroll` to the number
+  of keymap *entries* while ratatui scrolls *wrapped lines*, so on a short terminal the last
+  bindings (from `m` down) could not be read. The clamp is now three wrapped lines per entry and the
+  test checks **reachability across every reachable scroll stop** instead of "the token appears
+  somewhere on screen" (which had been passing on unrelated text).
 
 *Authored with DeepSeek-V4.1-Flash · DeepSeek Harness, 2026-10-08. The owner's session chose the
 slice and approved the plan; the measurement that picked `PULSE_SOURCE` is in this note.*
