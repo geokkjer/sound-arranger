@@ -201,15 +201,24 @@ evaluation note is [`.agents/notes/proposed/architecture/2026-09-21-iced-shell-e
    **steady p50 16.7–17.0 ms (59–60 fps), p95 18.7–30.4 ms** with the transport running under
    Mesa's *software* renderer — the reference maths is now the **TUI's**, the Vue shell being
    retired. Clip **editing** is still unbuilt.
-2. **The widget gap.** reka-ui/shadcn give menus, dialogs, popovers, tooltips, context menus,
-   comboboxes, virtualised lists, drag-and-drop, and text inputs with IME. iced ships a smaller
-   core set (`button`, `text_input`, `pick_list`, `slider`, `pane_grid`, `table`, `scrollable`,
-   canvas) plus third-party crates (`iced_aw`, …). The count of hand-rolled widgets
-   *is* the cost of the single stack.
-3. **The UI-as-plugin tension.** The composition thesis wants UI plugins loaded at runtime; the Vue
-   shell does that with a declarative loader + registry. Compiled Rust has no runtime widget
-   loader — an iced shell would need a data-driven view layer or a WASM/scripted seam to keep that
-   promise. This is the sharpest architectural question, not a performance one.
+2. **The widget gap — measured 2026-10-15, and smaller than it read.**
+   [The inventory](research/architecture/2026-10-15-iced-widget-inventory.md) shows the shipped Vue
+   shell used **plain markup** (15 `<button>`, 3 `<input>`, 3 `<textarea>`, 1 `<canvas>`, and zero
+   selects/dialogs/context menus/drags — `reka-ui` declared in `package.json` and imported by no file),
+   while iced's core has **37 widget modules** (including `tooltip`, `table`, `markdown`, rich text with
+   `Span`/`Fragment`, and IME in both text widgets) and **`iced_aw 0.14.1`** (MIT, version-aligned with
+   iced 0.14) adds the menu bar, context menu, drop-down, tabs, cards, number inputs and pickers. What
+   is left to build is **pointer interaction, list windowing and an accessibility tree** (iced has zero
+   `accesskit` references) — with the hand-rolled count stated in the inventory.
+3. **The UI-as-plugin tension — answered 2026-10-15:**
+   [UI plugins in a compiled shell](.agents/notes/proposed/architecture/2026-10-15-ui-plugins-in-a-compiled-shell.md).
+   The premise was wrong: the Vue shell's `plugins.ts` is a **static** registry (no dynamic `import()`,
+   no manifest fetch — the runtime loader was design, not shipped behaviour), so "runtime-contributed
+   UI" was never exercised even in the webview shell. The proposal: views are compiled crates behind a
+   toolkit-free `CanvasView`-shaped contract (the FaderFrame lesson), composition is **data** (a profile
+   table over a compiled registry, hot-swappable without a restart), the `Command` half is already the
+   shared `workflow` table, and runtime *code* contribution waits behind a named WASM/external-process
+   door.
 4. **Framework churn.** iced is a single-maintainer project that explicitly reserves the right to
    break its API (0.14 is the released baseline; `master` already requires rustc 1.93). That is a
    real ongoing cost against a frozen Vue/webview baseline.
