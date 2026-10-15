@@ -95,6 +95,15 @@ question, and keep the Tauri + Vue shell shipped until those measurements exist.
   with 0 columns too — the compositor not asking for a frame reads as a stall, and `--perf` reports
   the gaps by value rather than hiding them. Numbers and the peaks path:
   [`spikes/iced-shell/README.md`](../../../../spikes/iced-shell/README.md).
+- **The widget and plugin questions are answered, and the premise corrected** (2026-10-15).
+  [The inventory](../../../../research/architecture/2026-10-15-iced-widget-inventory.md) measures the
+  retired shell's real surface (plain markup; `reka-ui` declared and never imported; 2,251 lines of
+  hand-written front end) against iced 0.14 core + `iced_aw 0.14.1` (version-aligned) and states the
+  hand-rolled count; [the UI-plugin note](2026-10-15-ui-plugins-in-a-compiled-shell.md) answers
+  criterion 4. Two findings are load-bearing: the Vue shell's "registry" was **static** (no dynamic
+  import, no manifest fetch — the runtime loader was design, not shipped behaviour), and iced has **no
+  accessibility tree** (zero `accesskit` references across `iced`, `iced_winit`, `iced_runtime`,
+  `iced_core`), which is exactly what the plan bought with `reka-ui`.
 - **The human's read of the window is favourable** — "looks good and more native" than the webview
   shell — and **`egui` and Slint were dismissed by inspection** as not what this app wants. The
   appraisal is an input to the decision, not evidence for it: the acceptance criteria below are
@@ -156,18 +165,35 @@ rejected) note replacing this one:
    maths, since the Vue shell was retired: same laws, per-shell units.*
 3. A **widget inventory** lists every surface the Vue shell has today (menus, dialogs, context
    menus, tooltips, pickers, text inputs with IME, virtualised lists, drag-and-drop) against iced's
-   core + third-party crates, with the hand-rolled count stated explicitly. *Still open.*
+   core + third-party crates, with the hand-rolled count stated explicitly. *Answered 2026-10-15:*
+   [the inventory](../../../../research/architecture/2026-10-15-iced-widget-inventory.md) — and it
+   corrects this criterion's premise: the shipped Vue shell used **plain markup** (15 `<button>`, 3
+   `<input>`, 3 `<textarea>`, 1 `<canvas>`, 0 selects/dialogs/context menus/drags), declared `reka-ui`
+   and imported it **nowhere**; iced's core has 37 widget modules (including `tooltip`, `table`,
+   `markdown`, rich text, and IME in both text widgets) and `iced_aw 0.14.1` is version-aligned and
+   adds the menu bar, context menu, drop-down, tabs and pickers. The real gaps are pointer
+   interaction, list windowing and the **accessibility tree** (zero accesskit references anywhere in
+   the iced stack).
 4. The **UI-as-plugin question** is answered in writing: how (or whether) runtime-contributed UI
-   survives in a compiled Rust shell, and what that costs the composition thesis. *Still open.*
+   survives in a compiled Rust shell, and what that costs the composition thesis. *Answered 2026-10-15:*
+   [UI plugins in a compiled shell](2026-10-15-ui-plugins-in-a-compiled-shell.md) — views are compiled
+   crates behind a toolkit-free contract, composition is a data table over a compiled registry (which
+   is what the Vue shell's static `plugins.ts` actually was), the `Command` half is already the
+   shared `workflow` table, runtime *code* contribution is deferred behind a named WASM/external-process
+   door, and accessibility is a stated cost rather than an assumed freebie.
 5. The transport/meters seam is exercised **only** through `HostCommand` + `Snapshot`, verified by
    the shell compiling without touching `HostSession`. *Holds by construction; still not asserted as
    a gate.*
 
 ## Risks
 
-- **The widget gap is the real cost.** iced's core widgets are a fraction of reka-ui/shadcn; the
-  re-implementation of timeline maths, inspector inputs, menus, and drag gestures may exceed the
-  complexity it removes.
+- **The widget gap is the real cost — but it is narrower, and differently shaped, than this note first
+  assumed.** iced's core has 37 widget modules and `iced_aw` covers menus, context menus, drop-downs,
+  tabs and pickers; the shipped Vue shell used plain markup and never imported the component library
+  this note credited it with. What is genuinely ours to build is **pointer interaction** (clip drag,
+  resize, marquee, cross-widget drag), **list windowing** (no virtualised list; `lazy` only caches) and
+  an **accessibility tree**, which iced does not have at all
+  ([inventory](../../../../research/architecture/2026-10-15-iced-widget-inventory.md)).
 - **Single-maintainer churn.** iced explicitly reserves breaking changes; 0.14 → 0.15-dev already
   moves the MSRV to 1.93. A shell written against it is a commitment to periodic porting.
 - **Losing the webview's free surface**: text layout, IME, accessibility, HiDPI, clipboard,
