@@ -158,6 +158,128 @@ pub type PeakLevel = (Vec<f32>, Vec<f32>);
 /// The parsed sidecar: (base_bin, levels, frames, sample_rate, per-level data).
 pub type PeakData = (u32, usize, u64, u32, Vec<PeakLevel>);
 
+/// The **read side** of the pyramid: one source's persisted `.peaks`, with the
+/// envelope query a UI draws with.
+///
+/// [`PeakBuilder`] is the write side — it accumulates min/max as samples arrive, which
+/// is what the recorder feeds. A shell that draws a source which already exists reads
+/// the sidecar instead of re-reading the WAV: the pyramid is persisted exactly so the
+/// UI does not have to. (The TUI spike rebuilds a builder from the WAV; that works, and
+/// reads every sample. This is the cheaper route the sidecar exists for.)
+///
+/// The query that matters is **level-aware**. Base-level [`Peaks::range_minmax`] walks
+/// one bin per [`PEAK_BASE_BIN`] frames, so one whole-piece column would walk the whole
+/// source. [`Peaks::level_for`] picks the pyramid level whose bins are no finer than a
+/// column, so a column costs one or two bins at any zoom — the difference between a
+/// canvas that scales with pixels and one that scales with samples.
+pub struct Peaks {
+    /// Frames per **base** bin, from the sidecar header — carried in the format, not
+    /// assumed to equal [`PEAK_BASE_BIN`], so a future writer can change it.
+    base_bin: u64,
+    frames: u64,
+    sample_rate: u32,
+    /// Level k's bins each cover `base_bin << k` frames; level 0 is the base.
+    levels: Vec<PeakLevel>,
+}
+
+impl Peaks {
+    /// Total frames the pyramid covers.
+    pub fn frames(&self) -> u64 {
+        self.frames
+    }
+
+    /// The rate the sidecar was written at.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// Frames per base bin.
+    pub fn base_bin(&self) -> u64 {
+        self.base_bin.max(1)
+    }
+
+    /// How many pyramid levels the sidecar carries.
+    pub fn levels(&self) -> usize {
+        self.levels.len()
+    }
+
+    /// Frames each bin of `level` covers, with `level` pulled back to a level that
+    /// carries data (a short source's coarse levels are empty).
+    pub fn bin_frames(&self, level: usize) -> u64 {
+        self.raw_bin_frames(self.clamp_level(level))
+    }
+
+    /// The finest level whose bins are **no finer than** `frames_per_column` — i.e. the
+    /// coarsest level that still gives at least one bin per column, so a column reads
+    /// one or two bins rather than `frames_per_column` frames.
+    ///
+    /// Below the base bin this is level 0: the pyramid cannot honestly serve a column
+    /// narrower than a bin (it would repeat the same bin and claim detail the data does
+    /// not have), so the caller's viewport must not ask — see the iced shell's
+    /// `MIN_FRAMES_PER_POINT`.
+    pub fn level_for(&self, frames_per_column: u64) -> usize {
+        let per = frames_per_column.max(1);
+        let mut level = 0;
+        while level + 1 < self.levels() && self.raw_bin_frames(level + 1) <= per {
+            level += 1;
+        }
+        self.clamp_level(level)
+    }
+
+    /// Min/max over the frame range `[start, end)`, read from `level`'s bins.
+    ///
+    /// `None` for an empty or out-of-data range, and for a level with no data: a UI
+    /// query can hit both, and neither is a panic. The bins a range touches are a
+    /// superset of it, so the answer is **at least** as wide as the true extremes of the
+    /// range and never narrower — the honest direction for a drawing.
+    pub fn range_minmax_at(&self, level: usize, start: u64, end: u64) -> Option<(f32, f32)> {
+        if start >= end || end > self.frames {
+            return None;
+        }
+        let (mins, maxs) = self.levels.get(self.clamp_level(level))?;
+        if mins.is_empty() {
+            return None;
+        }
+        let bin = self.bin_frames(level);
+        // A well-formed sidecar covers its whole frame count at every level it carries,
+        // so `b0` lands in range; the clamp is for a truncated or hand-edited one.
+        let last = mins.len() - 1;
+        let b0 = ((start / bin) as usize).min(last);
+        let b1 = (((end - 1) / bin) as usize).min(last);
+        let mut mn = f32::INFINITY;
+        let mut mx = f32::NEG_INFINITY;
+        for bin in b0..=b1 {
+            mn = mn.min(mins[bin]);
+            mx = mx.max(maxs[bin]);
+        }
+        Some((mn, mx))
+    }
+
+    /// Min/max over `[start, end)` at the **base** level — the same query, and the same
+    /// answer, as a finalized [`PeakBuilder::range_minmax`] over the same range.
+    pub fn range_minmax(&self, start: u64, end: u64) -> Option<(f32, f32)> {
+        self.range_minmax_at(0, start, end)
+    }
+
+    /// Frames per bin at `level` **without** the empty-level fallback, for probing which
+    /// levels the pyramid actually carries.
+    fn raw_bin_frames(&self, level: usize) -> u64 {
+        self.base_bin()
+            .checked_shl(level.min(63) as u32)
+            .unwrap_or(u64::MAX)
+    }
+
+    /// `level`, pulled back to the deepest level that carries data — the coarse levels
+    /// of a short source halve away to nothing.
+    fn clamp_level(&self, level: usize) -> usize {
+        let mut level = level.min(self.levels.len().saturating_sub(1));
+        while level > 0 && self.levels[level].0.is_empty() {
+            level -= 1;
+        }
+        level
+    }
+}
+
 /// The `.peaks` sidecar: magic + header + per-level min/max pairs.
 pub struct PeakFile;
 
@@ -197,6 +319,26 @@ impl PeakFile {
             return r;
         }
         std::fs::rename(&tmp, path).map_err(|e| format!("peaks rename {}: {e}", path.display()))
+    }
+
+    /// The `.peaks` sidecar that belongs to a source's `.wav` — **the one place the
+    /// naming lives**, so the writers (`Pool::import`, `media::Capture`), the pool index
+    /// and a shell that draws the source cannot disagree about it.
+    pub fn sidecar_path(wav: &Path) -> PathBuf {
+        wav.with_extension("peaks")
+    }
+
+    /// Read the sidecar into the query-able [`Peaks`] — the read path a shell draws an
+    /// envelope with. The tuple [`PeakFile::read`] stays the raw parser (diagnostics and
+    /// tests); this is the same data in the shape a drawing wants.
+    pub fn load(path: &Path) -> Result<Peaks, String> {
+        let (base_bin, _, frames, sample_rate, levels) = Self::read(path)?;
+        Ok(Peaks {
+            base_bin: u64::from(base_bin),
+            frames,
+            sample_rate,
+            levels,
+        })
     }
 
     /// Read the sidecar: (base_bin, levels, frames, sample_rate, per-level

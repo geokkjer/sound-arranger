@@ -89,6 +89,18 @@ pub struct Snapshot {
     /// collide with a source the session already holds — the id is required before
     /// the recording starts, so it cannot be discovered afterwards.
     pub pool_ids: Vec<String>,
+    /// The directory the session's pool is bound to (`set_pool`), `None` when no pool
+    /// is bound.
+    ///
+    /// A shell needs it to reach a clip's **material**, not just its id: the id is a
+    /// plain stem, so resolving it to a file is the pool's guarded lookup
+    /// ([`media::Pool::path_for`]) and the `.peaks` sidecar that belongs to that file is
+    /// the pool's own convention ([`media::PeakFile::sidecar_path`]). A shell therefore
+    /// draws a waveform from the **persisted pyramid** rather than re-reading the WAV.
+    ///
+    /// This is a path, never a promise that the material is drawable: a source may have
+    /// no sidecar, and the query that fails is a state the shell must show.
+    pub pool_dir: Option<std::path::PathBuf>,
     /// The **declared rig's source names** (`source add`), in declaration order, so a
     /// shell can offer them: `record <take> source=<name>` binds one, and the shell's
     /// record gesture arms the choice. Names only — the declaration's matcher and
@@ -178,6 +190,7 @@ impl Default for Snapshot {
             recording: None,
             last_take: None,
             pool_ids: Vec::new(),
+            pool_dir: None,
             sources: Vec::new(),
             timeline: TimelineStatus::default(),
             audio: None,
@@ -737,6 +750,10 @@ fn publish(session: &HostSession, shared: &Mutex<Snapshot>, audio: &AudioState) 
     // Cached (see `HostSession::pool_ids`): this runs on every pump tick, and
     // listing the pool reads a directory.
     s.pool_ids = session.pool_ids().to_vec();
+    // The pool's directory, so a shell can resolve a clip's source id to its file and
+    // read the `.peaks` sidecar beside it (a `PathBuf` clone is cheaper than the id
+    // list above, which is already cloned every tick).
+    s.pool_dir = session.pool_dir().map(std::path::Path::to_path_buf);
     // The declared rig, names only: a shell arms one of these for `record`. Cheap
     // to clone (a handful of short strings) and it never touches a device.
     s.sources = session.sources().iter().map(|d| d.name.clone()).collect();

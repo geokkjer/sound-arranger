@@ -323,7 +323,8 @@ impl ChannelWriter {
         sample_rate: u32,
     ) -> Result<(), String> {
         self.writer.finalize()?;
-        let peaks_path = pool_dir.join(format!("{take_id}.ch{k}.peaks"));
+        let wav_path = pool_dir.join(format!("{take_id}.ch{k}.wav"));
+        let peaks_path = PeakFile::sidecar_path(&wav_path);
         PeakFile::write(&peaks_path, &mut self.peaks, sample_rate)?;
         Ok(())
     }

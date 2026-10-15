@@ -4802,12 +4802,24 @@ fn the_pool_id_cache_lists_the_pool_and_survives_a_failed_refresh() {
         s.pool_ids().is_empty(),
         "nothing is listed before a pool is bound"
     );
+    assert!(
+        s.pool_dir().is_none(),
+        "and no directory is published before one is bound"
+    );
     s.execute(&HostCommand::Pool { dir: pool.clone() })
         .expect("pool");
     assert!(
         s.pool_ids().iter().any(|id| id == "held.ch0"),
         "set_pool lists what the directory holds: {:?}",
         s.pool_ids()
+    );
+    // The **directory** is published with the ids: a shell resolves a clip's source to
+    // its file through the pool's guarded lookup and reads the `.peaks` sidecar beside
+    // it, so an id alone is not enough to draw with.
+    assert_eq!(
+        s.pool_dir(),
+        Some(pool.as_path()),
+        "the bound pool's directory is what a shell resolves sources through"
     );
 
     // A **rebind** clears: the previous pool's names must not follow the session to

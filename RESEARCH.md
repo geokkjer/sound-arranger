@@ -195,7 +195,12 @@ evaluation note is [`.agents/notes/proposed/architecture/2026-09-21-iced-shell-e
 
 1. **Canvas parity.** The Vue timeline's maths (`timelineView` / `timelineEdit` / `timelineTicks` +
    unit tests) and its peak-pyramid drawing have to exist in iced's `canvas` widget at 60 fps
-   before this is a real option. Unmeasured.
+   before this is a real option. **Measured 2026-10-15:** the iced canvas draws real envelopes from
+   the persisted `.peaks` pyramid (resolved through the pool directory the snapshot publishes, queried
+   level-aware), with zoom/scroll/fit/click-to-seek and the workflow's focus split, and holds
+   **steady p50 16.7–17.0 ms (59–60 fps), p95 18.7–30.4 ms** with the transport running under
+   Mesa's *software* renderer — the reference maths is now the **TUI's**, the Vue shell being
+   retired. Clip **editing** is still unbuilt.
 2. **The widget gap.** reka-ui/shadcn give menus, dialogs, popovers, tooltips, context menus,
    comboboxes, virtualised lists, drag-and-drop, and text inputs with IME. iced ships a smaller
    core set (`button`, `text_input`, `pick_list`, `slider`, `pane_grid`, `table`, `scrollable`,
@@ -220,6 +225,16 @@ so it cannot drift from it; iced must be built with `canvas` **and** `image` for
 console is now real faders on the host's parameter fold — the demo's `master.gain 0.8` boots as
 master **−1.9 dB** while `ch0…ch3` sit at +0.0 dB, and a drag sends a logged `set_param`
 ([screenshot](spikes/iced-shell/mixer-fold.png), [spike README](spikes/iced-shell/README.md)).
+
+**The timeline is drawn, and timed (2026-10-15).** `cargo run --wave <file.wav>` imports a piece
+into the spike's own pool and places it; the canvas draws each clip's envelope from the pool's
+persisted pyramid (`media::Peaks`, new read side), the snapshot publishes the pool directory a shell
+resolves a source through, `Tab` focuses the timeline (`+ - 0 h l`, click to seek — the workflow's
+own per-panel split, no new key), and `--wave … --perf` measures the redraw cadence and the envelope
+columns per redraw: 2 tracks / 6 clips / 1,628 columns, **steady p50 16.7–17.0 ms (59–60 fps), p95
+18.7–30.4 ms** across three runs on Mesa's software path (0.4–1.0 s redraw gaps appear with 0
+columns too — the compositor, not the draw; `--perf` reports them by value). The decision note is
+[the iced timeline draws the pool material](.agents/notes/implemented/feature/2026-10-15-iced-timeline-draws-the-pool-material.md).
 
 **The shell and the model are one decision (2026-09-21).** The direction is that the UI should be
 *for audio what vim/helix/emacs is for text* — modal, selection-first, with the existing `host v1`

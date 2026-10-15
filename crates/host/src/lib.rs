@@ -878,6 +878,16 @@ impl HostSession {
         &self.pool_ids
     }
 
+    /// The directory the pool is bound to, `None` when none is — the path a shell
+    /// resolves a clip's `source` through ([`media::Pool::path_for`], the guarded
+    /// lookup) and reads the `.peaks` sidecar beside it with.
+    ///
+    /// The directory, not a listing: a shell that draws material wants a *file*, and the
+    /// pool's own lookup is what keeps a crafted id from reaching outside the pool.
+    pub fn pool_dir(&self) -> Option<&std::path::Path> {
+        self.pool_dir.as_deref()
+    }
+
     /// Rebuild the snapshot's cached arrangement.
     ///
     /// [`Self::arrangement`] *reconstructs* the timeline from the editor's log, so it is

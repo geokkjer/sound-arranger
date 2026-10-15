@@ -68,8 +68,9 @@ question, and keep the Tauri + Vue shell shipped until those measurements exist.
   48 kHz / 2 ch, the transport drives it, the channel and master meters and the readout follow the
   audio, and `--probe` observes live meter signal (peak 0.88) headlessly.
 - **The mixer is stock-widget material, and it reads the log** (2026-09-22). The spike's console
-  uses `iced_audio 0.17` `VSlider`s on a dB range (`DBRange`, −60…+12 dB, unity at ~83 % of the
-  travel) — one fader per channel plus the master, a live meter and a dB readout beside each. The
+  uses `iced_audio 0.17` `VSlider`s on a dB range (`DBRange`, **derived from the mixer's declared
+  gain bounds** → −60…+6.0 dB, unity at ~91 % of the travel) — one fader per channel plus the
+  master, a live meter and a dB readout beside each. The
   positions come from the host's **parameter fold**: the demo script's `master.gain 0.8` boots as
   **master −1.9 dB** (20·log10(0.8)) while `ch0…ch3` sit at +0.0 dB, and a drag sends a logged
   `set_param` back (screenshot:
@@ -77,6 +78,23 @@ question, and keep the Tauri + Vue shell shipped until those measurements exist.
   pin the strip↔parameter mapping and the dB range round trip. The widget crate tracks iced
   exactly (it depends on `iced_core`/`iced_graphics` 0.14, the version this spike uses), so it
   cannot drift from the shell.
+- **The canvas timeline draws real pool material, with a viewport, and the frame budget is
+  measured** (2026-10-15) — acceptance criterion 2 below. `--wave <file>` imports a piece into the
+  spike's own session pool and places it (one source per channel, cut into consecutive clips so the
+  `src_start` offsets and the clip boundaries are real); the canvas draws each clip's **envelope**
+  from the pool's persisted `.peaks` pyramid, resolved through the pool directory the snapshot now
+  publishes (`Snapshot::pool_dir`) and queried level-aware (`Peaks::level_for`/`range_minmax_at`,
+  new on the read side of `media::peaks`), so a column costs one or two bins at any zoom instead of
+  walking the source. Zoom (`+`/`-`, anchored on the playhead, floored at one base bin per point),
+  scroll (`h`/`l`), fit (`0`) and click-to-seek all work, with `Tab` choosing the focused panel —
+  the workflow's own per-panel split, so no key was added to the shared table. Measured with
+  `--perf` on a 30 s stereo piece (2 tracks, 6 clips, **1,628** envelope columns per redraw) under
+  Mesa's **software** renderer: **steady p50 16.7–17.0 ms (59–60 fps), p95 18.7–30.4 ms** across
+  three runs with the transport running (the demo profile, 0 columns, measures p50 13.3 ms / 75 fps
+  in a clean run, so the drawing costs a few ms). Some runs show redraw gaps of 0.4–1.0 s that appear
+  with 0 columns too — the compositor not asking for a frame reads as a stall, and `--perf` reports
+  the gaps by value rather than hiding them. Numbers and the peaks path:
+  [`spikes/iced-shell/README.md`](../../../../spikes/iced-shell/README.md).
 - **The human's read of the window is favourable** — "looks good and more native" than the webview
   shell — and **`egui` and Slint were dismissed by inspection** as not what this app wants. The
   appraisal is an input to the decision, not evidence for it: the acceptance criteria below are
@@ -129,16 +147,21 @@ The evaluation is answered when all of these hold, and the answer is written as 
 rejected) note replacing this one:
 
 1. The spike's `--probe` passes on a clean checkout under the rustup toolchain, and the window
-   opens and renders on this host (niri/Wayland + Mesa).
+   opens and renders on this host (niri/Wayland + Mesa). *Answered.*
 2. A **canvas timeline slice** draws the real media-pool peaks for N clips with the same viewport
    maths as the Vue path (zoom/pan/seek), and holds frame rate while the transport runs.
+   *Answered 2026-10-15 for peaks, viewport and frame rate (see the evidence above): real
+   envelopes from the persisted pyramid, zoom/scroll/fit/click-to-seek, and a measured 60 fps
+   steady p50 on the software renderer. The "same maths as the Vue path" is now the **TUI's**
+   maths, since the Vue shell was retired: same laws, per-shell units.*
 3. A **widget inventory** lists every surface the Vue shell has today (menus, dialogs, context
    menus, tooltips, pickers, text inputs with IME, virtualised lists, drag-and-drop) against iced's
-   core + third-party crates, with the hand-rolled count stated explicitly.
+   core + third-party crates, with the hand-rolled count stated explicitly. *Still open.*
 4. The **UI-as-plugin question** is answered in writing: how (or whether) runtime-contributed UI
-   survives in a compiled Rust shell, and what that costs the composition thesis.
+   survives in a compiled Rust shell, and what that costs the composition thesis. *Still open.*
 5. The transport/meters seam is exercised **only** through `HostCommand` + `Snapshot`, verified by
-   the shell compiling without touching `HostSession`.
+   the shell compiling without touching `HostSession`. *Holds by construction; still not asserted as
+   a gate.*
 
 ## Risks
 
@@ -151,9 +174,10 @@ rejected) note replacing this one:
   file dialogs — all hand-rolled or crate-supplied in iced.
 - **The in-process boundary rots.** With no IPC in the way, it becomes easy to reach into the host
   directly; the seam then survives only by discipline (criterion 5).
-- **A spike is not a shell.** The proof covers windowing, threading, transport, and live meters. It
-  deliberately does not cover the timeline, the detail view, or editing — the parts most likely to
-  be worse.
+- **A spike is not a shell.** The proof now covers windowing, threading, transport, live meters,
+  the timeline canvas with real peaks and a viewport, and a measured frame budget. It still does not
+  cover clip **editing** (split/trim/move/fade), the pool panel, or the detail view — the parts most
+  likely to be worse.
 - **Two shells to maintain during the evaluation.** The spikes are excluded from the default build,
   but their dependencies and their drift are still a (small) ongoing cost. Since the retirement
   there is no third shell to keep in step — the frozen Tauri crate is out of the workspace.
