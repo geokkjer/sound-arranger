@@ -56,7 +56,7 @@ pub use clip_editor::{ClipEditor, Interner, decode_op, encode_op, register_handl
 pub use dither::{DITHER_SEED, TpdfDither};
 pub use drift::DriftCompensator;
 pub use midi::{MIDI_OUT_ID, MidiOut};
-pub use peaks::{PEAK_BASE_BIN, PEAK_LEVELS, PeakBuilder, PeakFile};
+pub use peaks::{PEAK_BASE_BIN, PEAK_LEVELS, PeakBuilder, PeakFile, Peaks};
 pub use pool::{Conform, ConformReport, Import, Pool, PoolIndex, PoolSource, Recovery};
 pub use record::{RecordNode, Recorder, WavRecorder};
 pub use resample::Resampler;

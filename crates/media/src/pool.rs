@@ -238,7 +238,7 @@ impl Pool {
                     continue;
                 }
             };
-            let peaks = wav.with_extension("peaks");
+            let peaks = PeakFile::sidecar_path(&wav);
             // id = the file stem (take_id.ch{N})
             let id = wav
                 .file_name()

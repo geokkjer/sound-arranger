@@ -34,8 +34,19 @@
 //!    frame. The span is derived (the arrangement's end, or the furthest frame played),
 //!    never a shell-side constant.
 //!
-//! It is *not* a UI yet: there is no waveform, no clip editing, no text-heavy
-//! layout. Those are the parts that decide iced against ratatui
+//! 8. **It draws the material, and it has a viewport.** Each clip carries the source's
+//!    real envelope, read from the pool's persisted `.peaks` pyramid
+//!    ([`PeakFile::load`]) through the pool directory the snapshot publishes — a
+//!    level-aware query, so a column costs one or two bins at any zoom rather than
+//!    walking the source. The viewport zooms around the playhead, scrolls, fits, and
+//!    seeks by clicking the ruler (`+ - 0 h l`, `Tab` to focus it; the same keys and the
+//!    same meanings as the TUI's timeline). `--wave <file>` imports a piece into the
+//!    spike's own session pool and places it, so there is something real to draw;
+//!    `--perf` measures the frame budget while it plays.
+//!
+//! It is *not* a UI yet: clip editing (split, trim, move), the pool panel, and
+//! text-heavy layout are still missing. Those are the parts that decide iced against
+//! ratatui
 //! ([the two candidate shells](../../.agents/notes/implemented/architecture/2026-09-22-shells-are-iced-and-ratatui-tauri-retired.md)),
 //! and the evaluations record them as the next step.
 //!
@@ -44,15 +55,22 @@
 //! cargo run              # the window (needs a display + an audio device)
 //! cargo run -- --keys    # …with the shared keymap overlay open
 //! cargo run -- --probe   # headless: host thread + snapshot polling, no window
+//! cargo run -- --wave <file.wav>   # import a piece into the session pool and draw it
+//! cargo run -- --wave <file.wav> --perf   # …and measure the frame budget while it plays
 //! cargo test             # the key translation, the command line, the console keys
 //! ```
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use host::HostCommand;
 use host::live::{HostHandle, Snapshot, TimelineStatus};
 
 use iced::keyboard;
+use iced::mouse;
 use iced::widget::canvas;
 use iced::widget::{column, container, progress_bar, row, text, vertical_slider};
 use iced::window;
@@ -60,6 +78,7 @@ use iced::{
     Center, Color, Element, Fill, Length, Point, Rectangle, Renderer, Size, Subscription, Theme,
 };
 use iced_audio::{DBRange, Normal, NormalParam};
+use media::peaks::{PEAK_BASE_BIN, PeakFile, Peaks};
 use workflow::{Action, Key as WorkflowKey, Mode};
 
 /// The demo profile — the `docs/FIRST_SESSION.md` chain, so the meters have
@@ -204,14 +223,36 @@ fn main() -> iced::Result {
 
     // `--keys` opens the keymap overlay at boot: the same affordance the TUI spike has,
     // and what makes the help screenshotable (a GUI's keys cannot be piped in).
-    let keys = std::env::args().any(|arg| arg == "--keys");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let keys = args.iter().any(|arg| arg == "--keys");
 
-    iced::application(move || Spike::boot(keys), Spike::update, Spike::view)
-        .title(Spike::title)
-        .subscription(Spike::subscription)
-        .theme(Spike::theme)
-        .window_size((920.0, 520.0))
-        .run()
+    // `--wave <file>` imports a copy into the spike's own session pool at the session
+    // rate and places it — the piece the timeline draws. Without it the demo profile
+    // has no clips, so the canvas is a lane bed and there is nothing to measure.
+    let wave = args
+        .windows(2)
+        .find(|pair| pair[0] == "--wave")
+        .map(|pair| PathBuf::from(&pair[1]));
+    if args.iter().any(|arg| arg == "--wave") && wave.is_none() {
+        eprintln!("--wave needs a path: --wave <file.wav>");
+        std::process::exit(2);
+    }
+    // `--perf` measures the redraw cadence while the transport plays and exits with the
+    // numbers. A GUI cannot be scripted from outside, so the shell measures itself —
+    // the same shape as `--sweep` and `--record-check`, and why it needs a display.
+    let perf = args.iter().any(|arg| arg == "--perf");
+
+    let boot_wave = wave.clone();
+    iced::application(
+        move || Spike::boot(keys, boot_wave.clone(), perf),
+        Spike::update,
+        Spike::view,
+    )
+    .title(Spike::title)
+    .subscription(Spike::subscription)
+    .theme(Spike::theme)
+    .window_size((920.0, 520.0))
+    .run()
 }
 
 /// The whole shell state: the host actor (a `Send + Sync` handle — the session
@@ -254,6 +295,155 @@ struct Spike {
     /// Shell state, like the take id: the host binds the name at `record` time and the
     /// take report carries it back.
     record_source: Option<String>,
+    /// Which panel `+ - 0 h l j k` act on. The workflow's own split: the key is shared,
+    /// the meaning is the focus's ([`Action::Zoom`]/[`Action::Fit`] are "zoom / fit" or
+    /// "ride / unity"), so the timeline's viewport is reachable without growing a key
+    /// the table does not have.
+    focus: Focus,
+    /// The timeline's viewport, **shared with the canvas program** (an `Arc` clone) so
+    /// the draw can fit it to the width only the draw knows, and the keys read back the
+    /// width the last draw measured. Behind a `Mutex` because the canvas program is
+    /// rebuilt each redraw and cannot borrow the shell.
+    viewport: Arc<Mutex<Viewport>>,
+    /// The active track the timeline's focus moves (`j`/`k` when it has focus), so the
+    /// lane under the playhead has a home in the shell rather than in the draw.
+    active_track: usize,
+    /// The sources' persisted pyramids, loaded lazily from the pool's `.peaks` sidecars
+    /// and cached — a drawing must not read a file per frame.
+    peaks: HashMap<String, SourcePeaks>,
+    /// The pool directory `peaks` was loaded against. A rebind changes it, and the old
+    /// pool's material is not this pool's.
+    peaks_pool: Option<PathBuf>,
+    /// `--perf`: sample the redraw cadence while the transport plays, then print and exit.
+    /// `None` for a normal run.
+    perf: Option<PerfRun>,
+    /// Envelope columns drawn in the last redraw, shared with the canvas program (the
+    /// draw is the only place that knows). `--perf` reports it beside the frame interval,
+    /// so the shell's own work is attributed rather than assumed.
+    perf_columns: Arc<AtomicUsize>,
+}
+
+/// The focused panel — the shell's half of the workflow's per-panel keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Console,
+    Timeline,
+}
+
+/// One source's pyramid, or why there is none: a clip whose material cannot be drawn is
+/// a state the shell shows, not a hole it draws silence through.
+enum SourcePeaks {
+    Loaded(Arc<Peaks>),
+    Missing(String),
+}
+
+/// `--perf` state: when the measurement started, and the redraw intervals seen.
+struct PerfRun {
+    started: std::time::Instant,
+    intervals: Vec<f32>,
+    last: Option<std::time::Instant>,
+    /// Envelope columns drawn in the last frame — the shell's own per-frame work, which
+    /// is the half of the budget this change controls.
+    columns: usize,
+}
+
+/// How long `--perf` measures before it prints and exits.
+const PERF_WINDOW: Duration = Duration::from_secs(6);
+/// Redraws `--perf` does not count as steady state. The first frames carry the window and
+/// shader (or software-renderer) warm-up, and a one-second stall there is a startup cost,
+/// not a frame-budget failure — it is reported separately rather than averaged away or
+/// hidden.
+const PERF_WARMUP_FRAMES: usize = 30;
+/// An interval longer than this is a **stall**, not a slow frame, and is reported by value:
+/// a percentile would hide it, and a stall is what decides whether a loop is usable.
+const PERF_STALL_MS: f32 = 100.0;
+
+impl PerfRun {
+    /// One redraw arrived: note the interval since the previous one, and stop when the
+    /// window is up. A GUI cannot be scripted from outside, so the shell prints its own
+    /// numbers — the same reason `--sweep` drives its own fader.
+    fn sample(&mut self, columns: usize, summary: &str) {
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last {
+            self.intervals.push((now - last).as_secs_f32() * 1000.0);
+        }
+        self.last = Some(now);
+        self.columns = columns;
+        if now.duration_since(self.started) < PERF_WINDOW {
+            return;
+        }
+        let elapsed = now.duration_since(self.started).as_secs_f32();
+        let steady: Vec<f32> = self
+            .intervals
+            .iter()
+            .skip(PERF_WARMUP_FRAMES)
+            .copied()
+            .collect();
+        let worst_start = self
+            .intervals
+            .iter()
+            .take(PERF_WARMUP_FRAMES)
+            .copied()
+            .fold(0.0f32, f32::max);
+        println!(
+            "perf: {} redraws in {elapsed:.2} s (the transport ran throughout)",
+            self.intervals.len(),
+        );
+        if !steady.is_empty() {
+            let mut sorted = steady.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let pct = |p: f64| -> f32 {
+                let index = ((sorted.len() - 1) as f64 * p).round() as usize;
+                sorted[index]
+            };
+            println!(
+                "perf: steady p50 {:.2} ms ({:.1} fps), p95 {:.2} ms, max {:.2} ms over {} \
+                 frames (skipping the first {PERF_WARMUP_FRAMES})",
+                pct(0.50),
+                1000.0 / pct(0.50).max(0.001),
+                pct(0.95),
+                pct(1.0),
+                sorted.len(),
+            );
+            // A percentile hides a stall, and a stall is the thing that decides whether a
+            // loop is usable — so the outliers are named, with their values.
+            let stalls: Vec<f32> = self
+                .intervals
+                .iter()
+                .skip(PERF_WARMUP_FRAMES)
+                .copied()
+                .filter(|ms| *ms > PERF_STALL_MS)
+                .collect();
+            println!(
+                "perf: stalls over {PERF_STALL_MS:.0} ms after warm-up: {} {}",
+                stalls.len(),
+                stalls
+                    .iter()
+                    .map(|ms| format!("{ms:.0} ms"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+        println!(
+            "perf: startup — longest of the first {PERF_WARMUP_FRAMES} intervals {worst_start:.2} ms \
+             (window + shader warm-up, not a frame-budget failure)"
+        );
+        println!(
+            "perf: envelope columns in the last redraw: {} (one per point per visible clip)",
+            self.columns
+        );
+        println!("perf: what the shell held — {summary}");
+        println!(
+            "perf: a frame is a snapshot poll + host publish + this canvas; the shell's own \
+             work is the envelope query"
+        );
+        println!(
+            "perf: a gap between redraws is not always the shell — a window the compositor is \
+             not showing receives no frame callbacks, and that reads as a stall here. Compare a \
+             run with 0 envelope columns (the demo profile) to tell the two apart."
+        );
+        std::process::exit(0);
+    }
 }
 
 /// A pool directory for this run, **created**, so the shell can record.
@@ -272,6 +462,89 @@ fn demo_pool_dir() -> std::path::PathBuf {
         .join("iced-pool")
 }
 
+/// How many consecutive clips `--wave` cuts each imported source into: enough clips,
+/// tracks and non-zero `src_start` offsets that the canvas draws several real envelopes
+/// out of one pyramid — the shape the peaks mapping and the viewport are exercised by.
+const WAVE_CLIPS_PER_SOURCE: u64 = 3;
+
+/// Import `path` into the spike's pool at the session rate, and build the `host v1`
+/// script that places it: one track per channel, each channel cut into
+/// [`WAVE_CLIPS_PER_SOURCE`] **consecutive** clips.
+///
+/// Consecutive matters: the clips play exactly like the file, while giving the canvas
+/// several clips whose `src_start` is not zero — which is the case a peaks mapping gets
+/// wrong if it ignores the region offset. (The TUI's `--wave` places one clip per
+/// channel; a spike that measures a *timeline* needs more than one clip to measure.)
+fn wave_script(path: &Path) -> Result<(String, String), String> {
+    let dir = demo_pool_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("pool dir {}: {e}", dir.display()))?;
+    // `host v1` is whitespace-separated, so a path with whitespace cannot be named in it.
+    // Renaming is the honest fix; quoting soup is not (the same guard the TUI makes).
+    if dir.to_string_lossy().split_whitespace().count() != 1 {
+        return Err(format!(
+            "the pool path '{}' contains whitespace — set the workspace somewhere simple",
+            dir.display()
+        ));
+    }
+
+    let pool = media::Pool::open(&dir)?;
+    let imported = pool.import(path, SAMPLE_RATE as u32)?;
+    if imported.frames_out() == 0 {
+        return Err(format!("{} has no audio frames", path.display()));
+    }
+    let sources = &imported.sources;
+    if sources.is_empty() {
+        return Err(format!("{} imported no sources", path.display()));
+    }
+
+    let mut script = String::from("host v1\n");
+    // The load carries the pool, so the piece can resolve its own sources — and
+    // `load` replaces the session wholesale, so a pool bound before it would be gone.
+    script.push_str(&format!("pool {}\n", dir.display()));
+    script.push_str(&format!(
+        "mount mixer channels={} @0\n",
+        sources.len().max(2)
+    ));
+    if sources.len() == 2 {
+        // One source per channel, hard-panned: the pair plays as stereo instead of
+        // collapsing the right channel into the centre.
+        script.push_str("set_param mixer ch0.pan -1 @0\n");
+        script.push_str("set_param mixer ch1.pan 1 @0\n");
+    }
+
+    let mut clips = 0u64;
+    for (track, source) in sources.iter().enumerate() {
+        script.push_str(&format!("arrange add_track t{track}\n"));
+        for part in 0..WAVE_CLIPS_PER_SOURCE {
+            let start = source.frames_out * part / WAVE_CLIPS_PER_SOURCE;
+            let end = source.frames_out * (part + 1) / WAVE_CLIPS_PER_SOURCE;
+            if end <= start {
+                continue;
+            }
+            // Clip ids are global to the arrangement, not per track: a counter, so the
+            // second track's first clip is not `c0` again (the host refuses a duplicate).
+            script.push_str(&format!(
+                "arrange add_clip t{track} c{clips} {} {start} {} {start} 0 0 1.0\n",
+                source.id,
+                end - start,
+            ));
+            clips += 1;
+        }
+    }
+
+    let note = format!(
+        "wave — {} imported, {clips} clip(s) on {} track(s){}",
+        imported.id,
+        sources.len(),
+        if imported.converted() {
+            " (resampled to the session rate)"
+        } else {
+            ""
+        }
+    );
+    Ok((script, note))
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     /// A repaint tick — poll the host's published snapshot.
@@ -283,15 +556,32 @@ enum Message {
     Key(WorkflowKey),
     /// A fader gesture: `strip` is the channel (or the master, last).
     Fader(usize, f32),
+    /// A click on the timeline: seek to this frame, through the same command a key uses.
+    SeekTo(u64),
 }
 
 impl Spike {
     /// Boot: open the live host (with audio when a device exists) and load the
     /// demo profile. A failure is surfaced in `status`, never a panic — a shell
     /// with no signal is a state, not a crash.
-    fn boot(keys: bool) -> Self {
+    fn boot(keys: bool, wave: Option<PathBuf>, perf: bool) -> Self {
         let mut spike = Self::from_host(HostHandle::spawn_with_audio());
         spike.help = keys;
+        if let Some(path) = wave {
+            spike.open_wave(&path);
+        }
+        if perf {
+            spike.perf = Some(PerfRun {
+                started: std::time::Instant::now(),
+                intervals: Vec::new(),
+                last: None,
+                columns: 0,
+            });
+            // The measurement is a play-through: start here so the owner sees the piece
+            // move while it is measured, and so the frame budget includes the transport
+            // running (the criterion is "holds frame rate while the transport runs").
+            spike.play();
+        }
         spike
     }
 
@@ -352,9 +642,58 @@ impl Spike {
             span_frames: 0,
             grid: workflow::Grid::default(),
             record_source: None,
+            focus: Focus::Console,
+            viewport: Arc::new(Mutex::new(Viewport::default())),
+            active_track: 0,
+            peaks: HashMap::new(),
+            peaks_pool: None,
+            perf: None,
+            perf_columns: Arc::new(AtomicUsize::new(0)),
         };
         spike.adopt();
         spike
+    }
+
+    /// `--wave <file>`: import a copy into the spike's **session pool** at the session
+    /// rate and load the piece it makes, so the timeline draws real pool material.
+    ///
+    /// The import is a copy on purpose: a pool is session-owned working material, and
+    /// pointing the pool at the user's directory would let the pool pass rewrite their
+    /// file ([`media::Pool::import`]). A failure is a status line, never a panic — a
+    /// spike with no piece still has a window.
+    fn open_wave(&mut self, path: &Path) {
+        let (script, note) = match wave_script(path) {
+            Ok(built) => built,
+            Err(e) => {
+                self.status = format!("--wave: {e}");
+                return;
+            }
+        };
+        let script = match host::parse_script(&script) {
+            Ok(script) => script,
+            Err(e) => {
+                self.status = format!("--wave: the script it built does not parse: {e}");
+                return;
+            }
+        };
+        match self.host.load(&script) {
+            Ok(_) => {
+                self.snap = self.host.snapshot();
+                // The pool the script bound is the one the peaks come from; a new pool
+                // drops the old material's pyramids.
+                self.peaks.clear();
+                self.peaks_pool = None;
+                // A load starts at frame 0: the viewport fits the new piece rather than
+                // keeping the previous one's zoom.
+                self.span_frames = 0;
+                if let Ok(mut view) = self.viewport.lock() {
+                    *view = Viewport::default();
+                }
+                self.adopt();
+                self.status = note;
+            }
+            Err(e) => self.status = format!("--wave: load refused: {e}"),
+        }
     }
 
     /// Take the mixer's fader positions from the host's **parameter fold** — the
@@ -453,6 +792,44 @@ impl Spike {
                 // stopped instead of rescaling every frame. A backward move (a `:load`,
                 // a seek, a rewind) starts a new pass and forgets the old maximum.
                 self.span_frames = advance_span(self.span_frames, self.snap.frame);
+                // The pyramids the arrangement now needs, read once each (the map is the
+                // cache) — a poll tick is the only place a file is opened.
+                self.adopt_peaks();
+                if self.perf.is_some() {
+                    // The canvas counts what it drew; the shell reports it *and* resets, so
+                    // the number is this frame's work rather than every frame's sum.
+                    let columns = self.perf_columns.swap(0, Ordering::Relaxed);
+                    let (clips, tracks) = self
+                        .snap
+                        .timeline
+                        .timeline
+                        .as_ref()
+                        .map(|timeline| {
+                            (
+                                timeline
+                                    .tracks
+                                    .iter()
+                                    .map(|track| track.clips.len())
+                                    .sum::<usize>(),
+                                timeline.tracks.len(),
+                            )
+                        })
+                        .unwrap_or((0, 0));
+                    let loaded = self
+                        .peaks
+                        .values()
+                        .filter(|entry| matches!(entry, SourcePeaks::Loaded(_)))
+                        .count();
+                    let missing = self.peaks.len() - loaded;
+                    let summary = format!(
+                        "{tracks} track(s), {clips} clip(s), {loaded} source(s) drawn, \
+                         {missing} without peaks; last status: {}",
+                        self.status
+                    );
+                    if let Some(perf) = self.perf.as_mut() {
+                        perf.sample(columns, &summary);
+                    }
+                }
             }
             Message::Play => self.play(),
             Message::Stop => {
@@ -461,6 +838,12 @@ impl Spike {
             Message::Rewind => self.rewind(),
             Message::Key(key) => self.on_key(key),
             Message::Fader(index, gesture) => self.gesture(index, gesture),
+            Message::SeekTo(frame) => {
+                // A click is a decision about the timeline, so it takes the focus the way
+                // clicking a panel does in the TUI.
+                self.focus = Focus::Timeline;
+                self.seek_frame(frame);
+            }
         }
     }
 
@@ -556,9 +939,11 @@ impl Spike {
             }
             Action::Rewind => self.rewind(),
             Action::SeekSeconds(seconds) => self.seek_seconds(seconds),
-            Action::Vertical(direction) => self.select_strip(direction),
-            Action::Zoom(direction) => self.ride(direction),
-            Action::Fit => self.set_selected_fader(1.0),
+            Action::Vertical(direction) => self.vertical(direction),
+            Action::Timeline(direction) => self.timeline_scroll(direction),
+            Action::Zoom(direction) => self.zoom_or_ride(direction),
+            Action::Fit => self.fit_or_unity(),
+            Action::CycleFocus(direction) => self.cycle_focus(direction),
             Action::Undo => {
                 let _ = self.command(HostCommand::Undo);
             }
@@ -693,6 +1078,16 @@ impl Spike {
         let _ = self.command(HostCommand::TransportSeek { frame: target });
     }
 
+    /// `j`/`k`: the **focused panel** moves — the console's selected strip (channels
+    /// first, master last), or the timeline's active track. The key is the workflow's; the
+    /// meaning is the focus's, exactly as [`Action::Zoom`] and [`Action::Fit`] are.
+    fn vertical(&mut self, direction: i32) {
+        match self.focus {
+            Focus::Console => self.select_strip(direction),
+            Focus::Timeline => self.select_track(direction),
+        }
+    }
+
     /// `j`/`k`: move the console's selected strip (channels first, master last).
     fn select_strip(&mut self, direction: i32) {
         let count = self.faders.len() as i32;
@@ -708,8 +1103,210 @@ impl Spike {
         self.status = format!("selected {label}");
     }
 
+    /// `j`/`k` with the timeline focused: move the active track.
+    fn select_track(&mut self, direction: i32) {
+        let tracks = self
+            .snap
+            .timeline
+            .timeline
+            .as_ref()
+            .map_or(0, |timeline| timeline.tracks.len());
+        if tracks == 0 {
+            self.status = "the arrangement has no tracks".to_string();
+            return;
+        }
+        self.active_track =
+            (self.active_track as i32 + direction).clamp(0, tracks as i32 - 1) as usize;
+        let id = self
+            .snap
+            .timeline
+            .timeline
+            .as_ref()
+            .and_then(|timeline| timeline.tracks.get(self.active_track))
+            .map(|track| track.id.clone())
+            .unwrap_or_default();
+        self.status = format!("active track {id}");
+    }
+
+    /// `Tab`/`Shift-Tab`: the focused panel. Two panels, so a direction wraps the same
+    /// either way — the workflow's [`Action::CycleFocus`] carries a direction for shells
+    /// with more.
+    fn cycle_focus(&mut self, _direction: i32) {
+        self.focus = match self.focus {
+            Focus::Console => Focus::Timeline,
+            Focus::Timeline => Focus::Console,
+        };
+        self.status = match self.focus {
+            Focus::Console => "focus: console (`+ -` ride the selected fader)".to_string(),
+            Focus::Timeline => {
+                "focus: timeline (`+ -` zoom, `h l` scroll, `0` fit, click to seek)".to_string()
+            }
+        };
+    }
+
+    /// The content length every timeline mapping clamps to: the arrangement's end, or the
+    /// furthest frame played (see [`timeline_span`]).
+    fn content_frames(&self) -> u64 {
+        timeline_span(&self.snap.timeline, self.span_frames)
+    }
+
+    /// The plot width the last draw measured, for a key that has to zoom before the next
+    /// draw happens. Before the first draw there is no measurement, and
+    /// [`DEFAULT_PLOT_WIDTH`] stands in until the draw fits the view properly.
+    fn plot_width(&self) -> f32 {
+        match self.viewport.lock() {
+            Ok(view) => view.width.unwrap_or(DEFAULT_PLOT_WIDTH),
+            Err(_) => DEFAULT_PLOT_WIDTH,
+        }
+    }
+
+    /// `+`/`-`: the focused panel's "more / less" — zoom the timeline, or ride the
+    /// selected fader. The same split the TUI makes; the workflow's own doc says so.
+    fn zoom_or_ride(&mut self, direction: i32) {
+        match self.focus {
+            Focus::Console => self.ride(direction),
+            Focus::Timeline => {
+                let (total, width) = (self.content_frames(), self.plot_width());
+                if total == 0 {
+                    self.status = "nothing to zoom — the arrangement is empty".to_string();
+                    return;
+                }
+                // Anchor on the playhead, kept inside the content: zooming holds what you
+                // are looking at rather than jumping to the start.
+                let anchor = self.snap.frame.min(total);
+                if let Ok(mut view) = self.viewport.lock() {
+                    view.zoom(total, width, anchor, direction > 0);
+                    self.status = format!(
+                        "timeline zoom: {:.1} ms/point, view {:.2}–{:.2} s",
+                        view.ms_per_point(self.snap.sample_rate),
+                        view.start as f64 / f64::from(self.snap.sample_rate.max(1)),
+                        (view.start + view.visible(width)) as f64
+                            / f64::from(self.snap.sample_rate.max(1)),
+                    );
+                }
+            }
+        }
+    }
+
+    /// `0`: the focused panel's neutral default — fit the timeline, or the selected fader
+    /// to unity.
+    fn fit_or_unity(&mut self) {
+        match self.focus {
+            Focus::Console => self.set_selected_fader(1.0),
+            Focus::Timeline => {
+                let (total, width) = (self.content_frames(), self.plot_width());
+                if let Ok(mut view) = self.viewport.lock() {
+                    view.fit(total, width);
+                }
+                self.status = "timeline: fit to the piece".to_string();
+            }
+        }
+    }
+
+    /// `h`/`l`: scroll the timeline by an eighth of the screen. With the console focused
+    /// there is nothing to scroll, and the shell says so rather than doing nothing.
+    fn timeline_scroll(&mut self, direction: i64) {
+        if self.focus != Focus::Timeline {
+            self.status = "`h`/`l` scroll the timeline — `Tab` focuses it".to_string();
+            return;
+        }
+        let (total, width) = (self.content_frames(), self.plot_width());
+        if let Ok(mut view) = self.viewport.lock() {
+            view.scroll(total, width, direction);
+            self.status = format!(
+                "timeline: view {:.2}–{:.2} s",
+                view.start as f64 / f64::from(self.snap.sample_rate.max(1)),
+                (view.start + view.visible(width)) as f64 / f64::from(self.snap.sample_rate.max(1)),
+            );
+        }
+    }
+
+    /// Seek to `frame` — the same `TransportSeek` a key sends, snapped to the workflow's
+    /// grid when one is armed (a click that lands 3 ms off the beat is a click that lands
+    /// 3 ms off the beat, and the grid is what the shell already has to fix it).
+    fn seek_frame(&mut self, frame: u64) {
+        let total = self.content_frames();
+        let raw = frame.min(total);
+        let target = self.snap_frame(raw);
+        let _ = self.command(HostCommand::TransportStop);
+        let _ = self.command(HostCommand::TransportSeek { frame: target });
+        self.status = if target == raw {
+            format!("seek to frame {target}")
+        } else {
+            format!("seek to frame {target} (snapped from {raw})")
+        };
+    }
+
+    /// Round `frame` to the armed grid division, in the **beat** domain the snapshot's
+    /// tempo map owns — the TUI's `snap_frame`, from the same published map.
+    fn snap_frame(&self, frame: u64) -> u64 {
+        let map = &self.snap.tempo_map;
+        let Some(grid) = self.grid.grid(map.meter_at(frame)) else {
+            return frame;
+        };
+        map.frame_at(grid.nearest(map.beat_at(frame)))
+    }
+
+    /// Load any pyramid the arrangement needs and the cache does not hold.
+    ///
+    /// Called on the poll tick, so a source is read **once** — the map is the cache, and a
+    /// failure is cached too (a missing sidecar must not become a file read per frame). A
+    /// **rebind** (`set_pool` through the command line, or a script's `pool` line) changes
+    /// the directory the whole cache belongs to, so it is dropped rather than mixed.
+    fn adopt_peaks(&mut self) {
+        if self.snap.pool_dir != self.peaks_pool {
+            self.peaks.clear();
+            self.peaks_pool = self.snap.pool_dir.clone();
+        }
+        let wanted: Vec<String> = self
+            .snap
+            .timeline
+            .timeline
+            .as_ref()
+            .map(|timeline| {
+                timeline
+                    .tracks
+                    .iter()
+                    .flat_map(|track| track.clips.iter().map(|clip| clip.source.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Nothing new to read on almost every frame — and then this is a poll tick that
+        // opens no file and stats no directory at all.
+        if wanted.iter().all(|id| self.peaks.contains_key(id)) {
+            return;
+        }
+        let Some(dir) = self.snap.pool_dir.clone() else {
+            return;
+        };
+        let Ok(pool) = media::Pool::open(&dir) else {
+            return;
+        };
+        for id in wanted {
+            if self.peaks.contains_key(&id) {
+                continue;
+            }
+            // The pool's own guarded lookup, never a join of the id onto the directory: a
+            // clip's source is a token in the log, so it can carry `../`.
+            let entry = match pool.path_for(&id) {
+                Some(wav) => match PeakFile::load(&PeakFile::sidecar_path(&wav)) {
+                    Ok(peaks) => SourcePeaks::Loaded(Arc::new(peaks)),
+                    Err(e) => SourcePeaks::Missing(e),
+                },
+                None => SourcePeaks::Missing(format!("no source '{id}' in the pool")),
+            };
+            // A source that cannot be drawn says so **once** (the cache is the guard: the
+            // next frame finds the entry) instead of silently drawing a plain bar that
+            // reads as silence.
+            if let SourcePeaks::Missing(why) = &entry {
+                self.status = format!("timeline: no peaks for '{id}' — {why}");
+            }
+            self.peaks.insert(id, entry);
+        }
+    }
+
     /// `+`/`-`: ride the selected fader (the workflow's `Zoom`, which the focused
-    /// panel reads as zoom or as a fader move — iced has a console, so it is a fader).
+    /// panel reads as zoom or as a fader move).
     fn ride(&mut self, direction: i32) {
         let index = self.selected;
         if index >= self.faders.len() {
@@ -1026,32 +1623,72 @@ impl Spike {
     /// The arrangement comes from `Snapshot::timeline` — the host's **cached**
     /// reconstruction, behind an `Arc`, so the per-frame poll clones a pointer rather
     /// than the whole piece. The canvas is a real one: one lane per track, each clip a
-    /// rectangle mapped from `at_frame`/`src_len`, and the playhead at `snap.frame`. The
-    /// span is the arrangement's end or the furthest frame played, whichever is greater,
-    /// so a loaded piece is visible before it is played and the view never rescales
-    /// under a stopped transport.
+    /// rectangle with the source's **real envelope** inside it (read from the pool's
+    /// `.peaks` pyramid through the directory the snapshot publishes), and the playhead at
+    /// `snap.frame`. The content length is the arrangement's end or the furthest frame
+    /// played, whichever is greater, so a loaded piece is visible before it is played and
+    /// the view never rescales under a stopped transport; the **viewport** maps it.
     ///
     /// An `error` on the status is drawn **as the error**, never as an empty timeline:
     /// the host can fail to reconstruct a poisoned arrangement, and a shell that drew
     /// nothing would be saying "the piece is empty" about a piece it could not read.
     fn timeline(&self) -> Element<'_, Message> {
         let status = &self.snap.timeline;
-        let span = timeline_span(status, self.span_frames);
+        let total = timeline_span(status, self.span_frames);
         let clips = status
             .timeline
             .as_ref()
             .map_or(0, |t| t.tracks.iter().map(|track| track.clips.len()).sum());
-        let caption = format!(
-            "{:.2} s / {:.2} s · {} clip(s)",
+        let (view_start, view_end, density) = match self.viewport.lock() {
+            Ok(view) => {
+                let width = view.width.unwrap_or(DEFAULT_PLOT_WIDTH);
+                (
+                    view.start,
+                    (view.start + view.visible(width)).min(total),
+                    view.ms_per_point(self.snap.sample_rate),
+                )
+            }
+            Err(_) => (0, total, 0.0),
+        };
+        let missing = self
+            .peaks
+            .values()
+            .filter(|entry| matches!(entry, SourcePeaks::Missing(_)))
+            .count();
+        let mut caption = format!(
+            "{:.2} s / {:.2} s · {} clip(s) · {:.1} ms/pt · view {:.2}–{:.2} s",
             self.snap.seconds,
-            span as f64 / f64::from(self.snap.sample_rate.max(1)),
-            clips
+            total as f64 / f64::from(self.snap.sample_rate.max(1)),
+            clips,
+            density,
+            view_start as f64 / f64::from(self.snap.sample_rate.max(1)),
+            view_end as f64 / f64::from(self.snap.sample_rate.max(1)),
         );
+        if missing > 0 {
+            caption.push_str(&format!(" · {missing} source(s) without peaks"));
+        }
+        if self.focus == Focus::Timeline {
+            caption.push_str("  [focused: + - zoom, h l scroll, 0 fit]");
+        } else {
+            caption.push_str("  [Tab focuses the timeline]");
+        }
         let tracks = status.timeline.as_ref().map_or(0, |t| t.tracks.len());
         let canvas: Element<'_, Message> = canvas::Canvas::new(TimelineView {
             status: status.clone(),
             frame: self.snap.frame,
-            span,
+            total,
+            active_track: self.active_track,
+            focused: self.focus == Focus::Timeline,
+            viewport: Arc::clone(&self.viewport),
+            peaks: self
+                .peaks
+                .iter()
+                .filter_map(|(id, entry)| match entry {
+                    SourcePeaks::Loaded(peaks) => Some((id.clone(), Arc::clone(peaks))),
+                    SourcePeaks::Missing(_) => None,
+                })
+                .collect(),
+            columns: Arc::clone(&self.perf_columns),
         })
         .width(Fill)
         .height(Length::Fixed(timeline_height(tracks)))
@@ -1162,28 +1799,281 @@ fn timeline_span(status: &TimelineStatus, played: u64) -> u64 {
     end.max(played)
 }
 
-/// A timeline frame's x within a plot `width`, for a `span` of frames.
+/// The timeline's **viewport**, in points — the iced shell's unit.
 ///
-/// The one mapping the timeline draws with, kept pure so the geometry can be tested
-/// without a renderer. A zero span (nothing placed, nothing played) draws at the left
-/// edge rather than dividing by zero, and a frame past the span clamps to the right edge
-/// so a stale span never draws outside the box.
-fn frame_x(frame: u64, span: u64, width: f32) -> f32 {
-    if span == 0 || width <= 0.0 {
-        return 0.0;
-    }
-    (frame as f64 / span as f64).clamp(0.0, 1.0) as f32 * width
+/// The TUI's timeline has the same laws in terminal cells
+/// ([`spikes/tui-shell/src/timeline.rs`](../../tui-shell/src/timeline.rs)): zoom by two
+/// around an anchor, scroll by a fraction of the screen, clamp inside the content, and
+/// never finer than the peak pyramid can honestly serve. The maths is per-shell **by
+/// design**, not by accident: the workflow crate leaves geometry to the shell ("a shell
+/// owns the playhead, the active track, and the text it builds"), and a point is not a
+/// cell. What the two shells share is the *key*, and what it means — `+ - 0 h l` on the
+/// focused panel.
+///
+/// The pyramid's floor is the real limit: below one base bin per point the envelope would
+/// repeat a bin and claim detail the data does not have, so zooming in stops there
+/// ([`MIN_FRAMES_PER_POINT`]).
+#[derive(Debug, Clone, Copy)]
+struct Viewport {
+    /// The first visible frame.
+    start: u64,
+    /// Frames per point — `f64` because zoom is a ratio, and a fit rarely lands on one.
+    frames_per_point: f64,
+    /// The plot width the view was last fitted to, if it has been drawn. The draw knows
+    /// the width; the keys read it back, which is why the shell and the canvas share one
+    /// viewport.
+    width: Option<f32>,
 }
 
-/// A clip's `(x, width)` in plot points, from its placement and its span.
+/// The finest zoom the peak pyramid can honestly serve: one base bin per point
+/// ([`PEAK_BASE_BIN`] = 256 frames ≈ 5.3 ms/point at 48 kHz). Below it a column would
+/// draw the *same* bin repeatedly and claim detail that is not in the sidecar.
+const MIN_FRAMES_PER_POINT: f64 = PEAK_BASE_BIN as f64;
+/// How far *out* of the content the view may zoom: zooming out past the whole piece is
+/// allowed (a DAW shows margin around it), up to this multiple of the fitted density.
+const ZOOM_OUT_MARGIN: f64 = 4.0;
+/// A scroll key moves an eighth of the screen — small enough to be a nudge, large enough
+/// to be a move.
+const SCROLL_FRACTION: f64 = 8.0;
+
+impl Default for Viewport {
+    fn default() -> Self {
+        Viewport {
+            start: 0,
+            frames_per_point: MIN_FRAMES_PER_POINT,
+            width: None,
+        }
+    }
+}
+
+impl Viewport {
+    /// Frames visible across `width` points — zero for a plot with no width, so a
+    /// degenerate draw cannot claim to show content.
+    fn visible(&self, width: f32) -> u64 {
+        if width <= 0.0 {
+            return 0;
+        }
+        (self.frames_per_point * f64::from(width)).round() as u64
+    }
+
+    /// The density that shows `total` frames across `width` points.
+    fn fitted_density(total: u64, width: f32) -> f64 {
+        (total as f64 / f64::from(width.max(1.0))).max(MIN_FRAMES_PER_POINT)
+    }
+
+    /// Show the whole piece.
+    fn fit(&mut self, total: u64, width: f32) {
+        self.frames_per_point = Self::fitted_density(total, width);
+        self.start = 0;
+        self.width = Some(width.max(1.0));
+    }
+
+    /// The first draw knows the real plot width, and so does every draw after a resize; fit
+    /// once whenever the width differs from the one the view was fitted to, so "fit" (and the
+    /// density readout) are honest rather than measured against an assumed width. A resize
+    /// therefore refits — the TUI's rule, and the alternative is holding a zoom against a
+    /// width it was not chosen for.
+    fn fit_if_needed(&mut self, total: u64, width: f32) {
+        let width = width.max(1.0);
+        if self.width != Some(width) {
+            self.fit(total, width);
+        }
+    }
+
+    /// The coarsest zoom: the fitted density times [`ZOOM_OUT_MARGIN`].
+    fn max_frames_per_point(total: u64, width: f32) -> f64 {
+        Self::fitted_density(total, width) * ZOOM_OUT_MARGIN
+    }
+
+    /// Zoom by a factor of two around `anchor` (a frame), which stays at the same
+    /// fraction of the screen — the TUI's rule, and what makes zooming feel anchored
+    /// rather than jumpy.
+    fn zoom(&mut self, total: u64, width: f32, anchor: u64, in_: bool) {
+        let width = width.max(1.0);
+        let before = self.frames_per_point;
+        let next = if in_ { before / 2.0 } else { before * 2.0 };
+        let per = next.clamp(
+            MIN_FRAMES_PER_POINT,
+            Self::max_frames_per_point(total, width),
+        );
+        if (per - before).abs() < f64::EPSILON {
+            return;
+        }
+        self.frames_per_point = per;
+        let anchor = anchor.min(total);
+        let offset = ((anchor - self.start.min(anchor)) as f64) * per / before;
+        self.start = anchor.saturating_sub(offset.min(self.visible(width) as f64) as u64);
+        self.width = Some(width);
+        self.clamp(total, width);
+    }
+
+    /// Scroll by a fraction of the screen.
+    fn scroll(&mut self, total: u64, width: f32, direction: i64) {
+        let width = width.max(1.0);
+        let delta = (self.frames_per_point * f64::from(width) / SCROLL_FRACTION) * direction as f64;
+        self.start = (self.start as f64 + delta).max(0.0) as u64;
+        self.width = Some(width);
+        self.clamp(total, width);
+    }
+
+    /// Keep the viewport inside the content: a short piece still starts at 0, and the
+    /// view never runs off the right end (the fitted view is exactly the whole piece).
+    fn clamp(&mut self, total: u64, width: f32) {
+        let visible = self.visible(width);
+        let limit = total.saturating_sub(visible.min(total));
+        self.start = self.start.min(limit);
+    }
+
+    /// The frame under plot point `x` (x measured **inside** the plot, after the label
+    /// gutter). Clamped to `total`, so a click past the end lands on the end.
+    fn frame_at(&self, x: f32, total: u64) -> u64 {
+        let frame = self.start as f64 + f64::from(x.max(0.0)) * self.frames_per_point;
+        (frame.max(0.0) as u64).min(total)
+    }
+
+    /// The x of `frame` inside the plot — [`frame_at`](Self::frame_at)'s inverse, and the
+    /// only mapping a clip or the playhead is drawn with.
+    fn x_at(&self, frame: u64) -> f32 {
+        ((frame.saturating_sub(self.start)) as f64 / self.frames_per_point) as f32
+    }
+
+    /// Milliseconds per point — the density number the evaluation asks for, shown live
+    /// rather than argued about.
+    fn ms_per_point(&self, sample_rate: u32) -> f64 {
+        self.frames_per_point / f64::from(sample_rate.max(1)) * 1000.0
+    }
+}
+
+/// The plot width assumed before the first draw has measured the real one — only used to
+/// render a caption (the draw itself always fits to the width it is given).
+const DEFAULT_PLOT_WIDTH: f32 = 600.0;
+
+/// Up to two contiguous source-frame ranges: what one column of one clip reads.
 ///
-/// The clip's own width is the mapped distance between `at_frame` and
-/// `at_frame + src_len`, so a clip that runs past the span clamps to a zero-width (or
-/// truncated) bar at the right edge instead of overflowing the canvas.
-fn clip_span(at_frame: u64, src_len: u64, span: u64, width: f32) -> (f32, f32) {
-    let x = frame_x(at_frame, span, width);
-    let end = frame_x(at_frame.saturating_add(src_len), span, width);
-    (x, (end - x).max(0.0))
+/// Two, because a column shorter than a loop can cross exactly one loop boundary; a column
+/// covering a whole loop or more reads the loop once. A fixed array keeps the mapping
+/// allocation-free in a draw path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceRanges {
+    ranges: [(u64, u64); 2],
+    count: usize,
+}
+
+impl SourceRanges {
+    fn empty() -> Self {
+        SourceRanges {
+            ranges: [(0, 0); 2],
+            count: 0,
+        }
+    }
+
+    fn one(range: (u64, u64)) -> Self {
+        SourceRanges {
+            ranges: [range, (0, 0)],
+            count: 1,
+        }
+    }
+
+    fn push(&mut self, range: (u64, u64)) {
+        if self.count < 2 && range.0 < range.1 {
+            self.ranges[self.count] = range;
+            self.count += 1;
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.ranges[..self.count].iter().copied()
+    }
+
+    fn count(&self) -> usize {
+        self.count
+    }
+}
+
+/// The **source** frame ranges a clip's timeline range `[from, to)` reads, honouring the
+/// clip's region offset, a baked loop and a reversed direction.
+///
+/// This is the peaks mapping's whole subtlety, and the place a waveform is drawn wrong if
+/// it is not: a clip whose region does not start at 0 must draw the pyramid from
+/// `src_start`, not from 0, or every clip of a cut-up take draws the same first seconds.
+/// A reversed region reads its frames backwards — the min/max envelope of a set does not
+/// care about order, so the reversal is a *range* mirror, not a mirrored drawing. (The
+/// model refuses a clip that is both looped and reversed — "loop phase is not
+/// representable" — so the two never have to compose.)
+fn clip_source_ranges(clip: &media::Clip, from: u64, to: u64) -> SourceRanges {
+    let start = from.max(clip.at_frame);
+    let end = to.min(clip.at_frame.saturating_add(clip.src_len));
+    if clip.src_len == 0 || end <= start {
+        return SourceRanges::empty();
+    }
+    let loop_len = match clip.loop_len {
+        Some(len) if len > 0 => len,
+        _ => clip.src_len,
+    };
+    let (o0, o1) = (start - clip.at_frame, end - clip.at_frame);
+    // Offsets map to source frames; `src_len - 1 - offset` is the reversed read.
+    let map = |s: u64, e: u64| -> (u64, u64) {
+        if clip.reversed {
+            (
+                clip.src_start + clip.src_len.saturating_sub(e),
+                clip.src_start + clip.src_len.saturating_sub(s),
+            )
+        } else {
+            (clip.src_start + s, clip.src_start + e)
+        }
+    };
+    // A column covering a whole loop or more reads the loop once: the repeats are the same
+    // material, and normalising over them would measure what a listener hears once.
+    if o1 - o0 >= loop_len {
+        return SourceRanges::one(map(0, loop_len));
+    }
+    let mut out = SourceRanges::empty();
+    let mut offset = o0;
+    // Fewer than `loop_len` offsets span at most two loop segments, so two ranges suffice.
+    while offset < o1 && out.count() < 2 {
+        let segment_end = ((offset / loop_len) + 1) * loop_len;
+        let segment_end = segment_end.min(o1);
+        out.push(map(offset % loop_len, (segment_end - 1) % loop_len + 1));
+        offset = segment_end;
+    }
+    out
+}
+
+/// The envelope columns a clip's visible span maps to: for each one-point column, the
+/// `(x, min, max)` the pyramid holds for the **source frames under that column**.
+///
+/// The frame range comes from the viewport, not from the clip's width, which is what makes
+/// the envelope the same shape at every zoom — and the pyramid level is chosen from the
+/// same number, so a column costs one or two bins rather than `frames_per_point` frames.
+/// A column the data does not cover is skipped, never faked.
+fn envelope_columns(
+    clip: &media::Clip,
+    peaks: &Peaks,
+    view: &Viewport,
+    total: u64,
+    from_x: f32,
+    to_x: f32,
+) -> Vec<(f32, f32, f32)> {
+    let level = peaks.level_for(view.frames_per_point.round().max(1.0) as u64);
+    let mut columns = Vec::new();
+    let mut x = from_x.max(0.0).floor();
+    while x < to_x {
+        let f0 = view.frame_at(x, total);
+        let f1 = view.frame_at(x + 1.0, total).max(f0 + 1);
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for (start, end) in clip_source_ranges(clip, f0, f1).iter() {
+            if let Some((min, max)) = peaks.range_minmax_at(level, start, end) {
+                lo = lo.min(min);
+                hi = hi.max(max);
+            }
+        }
+        if lo <= hi {
+            columns.push((x, lo, hi));
+        }
+        x += 1.0;
+    }
+    columns
 }
 
 /// The canvas's height for `tracks` lanes — one lane per track, a minimum of one so an
@@ -1209,25 +2099,79 @@ const TIMELINE_PLAYHEAD_WIDTH: f32 = 2.0;
 const TIMELINE_BG: Color = Color::from_rgb(0.06, 0.06, 0.08);
 const TIMELINE_LANE: Color = Color::from_rgb(0.12, 0.12, 0.16);
 const TIMELINE_CLIP: Color = Color::from_rgb(0.30, 0.55, 0.85);
+/// A clip whose source has no readable peaks: a *different* colour, so "not drawn" never
+/// reads as "silence".
+const TIMELINE_CLIP_MUTED: Color = Color::from_rgb(0.24, 0.28, 0.34);
+/// The source envelope inside a clip — lighter than the body so the shape reads.
+const TIMELINE_ENVELOPE: Color = Color::from_rgb(0.82, 0.93, 1.0);
 const TIMELINE_CLIP_EDGE: Color = Color::from_rgb(0.55, 0.78, 1.0);
 const TIMELINE_PLAYHEAD: Color = Color::from_rgb(1.0, 0.55, 0.35);
 const TIMELINE_LABEL: Color = Color::from_rgb(0.75, 0.78, 0.85);
+/// The active track's id, when the timeline has the focus.
+const TIMELINE_ACTIVE_LABEL: Color = Color::from_rgb(1.0, 0.85, 0.55);
 /// The muted colour of "there is nothing to draw, and why".
 const TIMELINE_MUTED: Color = Color::from_rgb(0.62, 0.48, 0.48);
 
 /// The timeline canvas program.
 ///
-/// It owns its data — a cloned [`TimelineStatus`] (an `Arc` clone, not the piece) plus
-/// the playhead frame and the span — so the canvas needs no borrow of the shell and is
+/// It owns its data — a cloned [`TimelineStatus`] (an `Arc` clone, not the piece), the
+/// playhead frame, the content length, a pyramid per source (an `Arc` clone each) and a
+/// handle on the shell's viewport — so the canvas needs no borrow of the shell and is
 /// rebuilt from each snapshot. It is deliberately **not** cached: an edit, an undo or a
-/// load can change the arrangement under it, and a cached geometry would keep drawing
-/// the piece the shell no longer holds.
+/// load can change the arrangement under it, and a cached geometry would keep drawing the
+/// piece the shell no longer holds. (The *pyramids* are cached, in the shell, because
+/// reading a sidecar per frame is I/O; the geometry is not, because it is cheap and the
+/// arrangement can change on any frame.)
 struct TimelineView {
     status: TimelineStatus,
     /// The transport's frame, for the playhead.
     frame: u64,
-    /// The span every x maps against (see [`timeline_span`]).
-    span: u64,
+    /// The content length every mapping clamps to (see [`timeline_span`]).
+    total: u64,
+    /// The track the timeline's focus is on (`j`/`k`), highlighted in the gutter.
+    active_track: usize,
+    /// Whether the timeline is the focused panel. The canvas is told rather than left to
+    /// infer it: a gutter label must not look active on its own.
+    focused: bool,
+    /// The shell's viewport, shared so the draw can fit it to the width only the draw
+    /// knows, and the keys can read that width back.
+    viewport: Arc<Mutex<Viewport>>,
+    /// The loaded pyramids, by pool source id. A clip whose source is absent is drawn as a
+    /// muted bar — never as silence.
+    peaks: HashMap<String, Arc<Peaks>>,
+    /// Envelope columns drawn this redraw, for `--perf`.
+    columns: Arc<AtomicUsize>,
+}
+
+impl TimelineView {
+    /// The plot inside `bounds`: `(x, width)`, right of the track-id gutter.
+    fn plot(bounds: Rectangle) -> (f32, f32) {
+        let x = TIMELINE_LABEL_WIDTH;
+        (x, (bounds.width - x - TIMELINE_PAD).max(1.0))
+    }
+
+    /// The viewport as this draw sees it, fitted to the plot width the first time (and
+    /// after a resize). A poisoned lock is not a reason to lose the drawing: it falls back
+    /// to a fitted view that just is not shared.
+    fn view(&self, plot_width: f32) -> Viewport {
+        match self.viewport.lock() {
+            Ok(mut view) => {
+                view.fit_if_needed(self.total, plot_width);
+                *view
+            }
+            Err(_) => {
+                let mut view = Viewport::default();
+                view.fit(self.total, plot_width);
+                view
+            }
+        }
+    }
+
+    /// Whether the timeline is the focused panel — the canvas is told, because a gutter
+    /// label must not pretend to be active on its own.
+    fn active(&self) -> bool {
+        self.focused
+    }
 }
 
 impl canvas::Program<Message> for TimelineView {
@@ -1271,8 +2215,10 @@ impl canvas::Program<Message> for TimelineView {
             return vec![canvas_frame.into_geometry()];
         };
 
-        let plot_x = TIMELINE_LABEL_WIDTH;
-        let plot_width = (bounds.width - plot_x - TIMELINE_PAD).max(1.0);
+        let (plot_x, plot_width) = Self::plot(bounds);
+        // The viewport is fitted here, where the real width is known, and read back by the
+        // keys afterwards — the one place the shell and the canvas share state.
+        let view = self.view(plot_width);
         let lanes = timeline.tracks.len().max(1) as f32;
         let lane_height =
             ((bounds.height - TIMELINE_PAD * 2.0 - TIMELINE_LANE_GAP * (lanes - 1.0)) / lanes)
@@ -1303,23 +2249,57 @@ impl canvas::Program<Message> for TimelineView {
                 content: track.id.clone(),
                 position: Point::new(4.0, y + lane_height / 2.0),
                 max_width: TIMELINE_LABEL_WIDTH - 8.0,
-                color: TIMELINE_LABEL,
+                color: if index == self.active_track && self.active() {
+                    TIMELINE_ACTIVE_LABEL
+                } else {
+                    TIMELINE_LABEL
+                },
                 size: 11.0.into(),
                 align_y: iced::alignment::Vertical::Center,
                 ..canvas::Text::default()
             });
             for clip in &track.clips {
-                let (x, width) = clip_span(clip.at_frame, clip.src_len, self.span, plot_width);
-                if width <= 0.0 {
+                let x0 = (plot_x + view.x_at(clip.at_frame)).max(plot_x);
+                let x1 = (plot_x + view.x_at(clip.at_frame.saturating_add(clip.src_len)))
+                    .min(plot_x + plot_width);
+                if x1 <= x0 {
                     continue;
                 }
                 let bar = Rectangle {
-                    x: plot_x + x,
+                    x: x0,
                     y: y + 1.0,
-                    width: width.max(1.0),
+                    width: (x1 - x0).max(1.0),
                     height: (lane_height - 2.0).max(1.0),
                 };
-                canvas_frame.fill_rectangle(bar.position(), bar.size(), TIMELINE_CLIP);
+                let pyramid = self.peaks.get(&clip.source);
+                // The clip's body: the source's envelope when it is loaded, a muted fill
+                // when it is not, so "no peaks" is a different *colour* rather than a
+                // silence drawn as if it were material.
+                canvas_frame.fill_rectangle(
+                    bar.position(),
+                    bar.size(),
+                    if pyramid.is_some() {
+                        TIMELINE_CLIP
+                    } else {
+                        TIMELINE_CLIP_MUTED
+                    },
+                );
+                if let Some(peaks) = pyramid {
+                    let mid = bar.y + bar.height / 2.0;
+                    let half = (bar.height / 2.0) - 1.0;
+                    let columns =
+                        envelope_columns(clip, peaks, &view, self.total, x0 - plot_x, x1 - plot_x);
+                    for (column, lo, hi) in &columns {
+                        let top = mid - hi.clamp(-1.0, 1.0) * half;
+                        let bottom = mid - lo.clamp(-1.0, 1.0) * half;
+                        canvas_frame.fill_rectangle(
+                            Point::new(plot_x + column, top),
+                            Size::new(1.0, (bottom - top).max(1.0)),
+                            TIMELINE_ENVELOPE,
+                        );
+                    }
+                    self.columns.fetch_add(columns.len(), Ordering::Relaxed);
+                }
                 canvas_frame.stroke_rectangle(
                     bar.position(),
                     bar.size(),
@@ -1331,17 +2311,44 @@ impl canvas::Program<Message> for TimelineView {
         }
 
         // The playhead, over the lanes and clamped to the plot.
-        let x = plot_x + frame_x(self.frame, self.span, plot_width);
-        canvas_frame.fill_rectangle(
-            Point::new(x - TIMELINE_PLAYHEAD_WIDTH / 2.0, TIMELINE_PAD),
-            Size::new(
-                TIMELINE_PLAYHEAD_WIDTH,
-                (bounds.height - TIMELINE_PAD * 2.0).max(1.0),
-            ),
-            TIMELINE_PLAYHEAD,
-        );
+        let x = plot_x + view.x_at(self.frame);
+        if x >= plot_x && x <= plot_x + plot_width {
+            canvas_frame.fill_rectangle(
+                Point::new(x - TIMELINE_PLAYHEAD_WIDTH / 2.0, TIMELINE_PAD),
+                Size::new(
+                    TIMELINE_PLAYHEAD_WIDTH,
+                    (bounds.height - TIMELINE_PAD * 2.0).max(1.0),
+                ),
+                TIMELINE_PLAYHEAD,
+            );
+        }
 
         vec![canvas_frame.into_geometry()]
+    }
+
+    /// A click anywhere in the plot seeks — the same command a key would send, so there is
+    /// one path to the host and one log. The canvas is the only place that knows the plot's
+    /// geometry, which is why the hit-test lives here and the message carries the frame.
+    fn update(
+        &self,
+        _state: &mut (),
+        event: &canvas::Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Option<iced::widget::Action<Message>> {
+        let canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event else {
+            return None;
+        };
+        let position = cursor.position_in(bounds)?;
+        let (plot_x, plot_width) = Self::plot(bounds);
+        let x = position.x - plot_x;
+        if !(0.0..=plot_width).contains(&x) {
+            return None;
+        }
+        let view = self.view(plot_width);
+        Some(iced::widget::Action::publish(Message::SeekTo(
+            view.frame_at(x, self.total),
+        )))
     }
 }
 
@@ -2373,29 +3380,219 @@ mod timeline {
         }
     }
 
-    /// The clip mapping is the timeline's one piece of arithmetic: zero span, frame 0,
-    /// a fractional placement, and a clamp past the end.
+    /// The viewport is the timeline's one piece of arithmetic. A fitted view shows the
+    /// whole piece across the plot; a zoom halves the density and holds its anchor; a
+    /// scroll moves by a fraction of the screen; and everything stays inside the content.
+    #[test]
+    fn the_viewport_maps_frames_to_points_and_back() {
+        // A 10 s piece across 200 points fits at 2400 frames/point, whole.
+        let mut view = Viewport::default();
+        view.fit(480_000, 200.0);
+        assert_eq!(view.start, 0);
+        assert!((view.frames_per_point - 2400.0).abs() < 1e-9);
+        assert_eq!(view.visible(200.0), 480_000);
+
+        // The mapping is the identity in both directions, and clamps at the ends.
+        assert_eq!(view.frame_at(0.0, 480_000), 0);
+        assert_eq!(view.frame_at(100.0, 480_000), 240_000);
+        assert!((view.x_at(240_000) - 100.0).abs() < 1e-4);
+        assert_eq!(view.frame_at(1e9, 480_000), 480_000, "past the end clamps");
+        assert_eq!(view.frame_at(-5.0, 480_000), 0, "before the start clamps");
+
+        // Zoom in around the playhead: the anchor stays where it was on screen.
+        view.zoom(480_000, 200.0, 240_000, true);
+        assert!((view.frames_per_point - 1200.0).abs() < 1e-9);
+        assert_eq!(view.x_at(240_000).round(), 100.0, "the anchor holds");
+
+        // Scroll one eighth of the screen (200 points × 1200 frames ÷ 8 = 30,000).
+        let before = view.start;
+        view.scroll(480_000, 200.0, 1);
+        assert_eq!(view.start, before + 30_000);
+        // …and the far end still stops at the content.
+        view.scroll(480_000, 200.0, 1_000);
+        assert_eq!(view.start, 480_000 - view.visible(200.0));
+    }
+
+    /// Zoom stops at the pyramid's floor: below one base bin per point the envelope would
+    /// repeat a bin and claim detail the sidecar does not hold.
+    #[test]
+    fn zoom_never_goes_below_the_pyramid_floor() {
+        let mut view = Viewport::default();
+        view.fit(48_000, 400.0);
+        for _ in 0..40 {
+            view.zoom(48_000, 400.0, 24_000, true);
+        }
+        assert_eq!(
+            view.frames_per_point, MIN_FRAMES_PER_POINT,
+            "one base bin per point is the floor"
+        );
+        // Zooming out is bounded by the fitted density times the margin.
+        for _ in 0..40 {
+            view.zoom(48_000, 400.0, 24_000, false);
+        }
+        let max = Viewport::max_frames_per_point(48_000, 400.0);
+        assert!(
+            (view.frames_per_point - max).abs() < 1e-9,
+            "{}",
+            view.frames_per_point
+        );
+    }
+
+    /// A zero-length piece does not divide by zero, and neither does a zero-width plot.
+    #[test]
+    fn a_degenerate_view_is_not_a_panic() {
+        let mut view = Viewport::default();
+        view.fit(0, 0.0);
+        assert_eq!(view.visible(0.0), 0);
+        assert_eq!(view.frame_at(10.0, 0), 0);
+        assert_eq!(view.x_at(0), 0.0);
+        view.zoom(0, 0.0, 0, true);
+        view.scroll(0, 0.0, 1);
+        view.clamp(0, 0.0);
+        // A piece shorter than the floor still shows its whole length across the plot.
+        let mut tiny = Viewport::default();
+        tiny.fit(100, 200.0);
+        assert_eq!(tiny.frames_per_point, MIN_FRAMES_PER_POINT);
+        assert_eq!(tiny.visible(200.0), MIN_FRAMES_PER_POINT as u64 * 200);
+    }
+
+    /// A clip's source ranges honour the **region offset**: a clip reading the middle of a
+    /// take must draw the middle of the pyramid, not the first seconds again.
+    #[test]
+    fn a_clip_reads_its_region_not_the_start_of_the_source() {
+        let mut clip = clip("c0", 0, 1000);
+        clip.src_start = 5000;
+        clip.src_len = 1000;
+
+        // Timeline frames 0..100 read source 5000..5100.
+        assert_eq!(
+            clip_source_ranges(&clip, 0, 100),
+            SourceRanges::one((5000, 5100))
+        );
+        // Frames outside the clip are not this clip's material.
+        assert_eq!(clip_source_ranges(&clip, 1000, 1100), SourceRanges::empty());
+        // A range crossing the clip's edge is clamped to it.
+        assert_eq!(
+            clip_source_ranges(&clip, 900, 1500),
+            SourceRanges::one((5900, 6000))
+        );
+    }
+
+    /// A reversed clip reads its region backwards — the range mirrors, so the same set of
+    /// samples is queried (a min/max envelope does not care about order).
+    #[test]
+    fn a_reversed_clip_mirrors_its_source_range() {
+        let mut clip = clip("c0", 0, 1000);
+        clip.src_start = 200;
+        clip.reversed = true;
+        // The clip's first frame is the region's top: frames 0..100 read 1100..1200.
+        assert_eq!(
+            clip_source_ranges(&clip, 0, 100),
+            SourceRanges::one((1100, 1200))
+        );
+        assert_eq!(
+            clip_source_ranges(&clip, 900, 1000),
+            SourceRanges::one((200, 300))
+        );
+    }
+
+    /// A looped clip repeats its loop; a column covering more than one loop reads the loop
+    /// once, and a column crossing a boundary reads two ranges.
+    #[test]
+    fn a_looped_clip_wraps_its_source_range() {
+        let mut clip = clip("c0", 0, 3000); // three loops of 1000
+        clip.src_start = 0;
+        clip.loop_len = Some(1000);
+
+        // Inside one loop: a plain range.
+        assert_eq!(
+            clip_source_ranges(&clip, 100, 200),
+            SourceRanges::one((100, 200))
+        );
+        // Crossing the boundary at 1000: two contiguous ranges, in source order.
+        let crossing = clip_source_ranges(&clip, 950, 1050);
+        assert_eq!(crossing.count(), 2);
+        let ranges: Vec<(u64, u64)> = crossing.iter().collect();
+        assert_eq!(ranges, vec![(950, 1000), (0, 50)]);
+        // A whole loop or more is the loop, read once.
+        assert_eq!(
+            clip_source_ranges(&clip, 500, 1600),
+            SourceRanges::one((0, 1000))
+        );
+    }
+
+    /// The envelope a clip draws is read from the pyramid at the level the zoom implies,
+    /// one column per point, and a column only exists where the data does.
+    #[test]
+    fn the_envelope_columns_follow_the_viewport() {
+        let path = std::env::temp_dir().join(format!("iced-peaks-{}.spk", std::process::id()));
+        let frames = 480_000u64; // 10 s: long enough that the fit is above the floor
+        let mut builder = media::PeakBuilder::new();
+        builder.push(&vec![0.5f32; frames as usize]);
+        media::PeakFile::write(&path, &mut builder, 48_000).unwrap();
+        let peaks = PeakFile::load(&path).unwrap();
+
+        let clip = clip("c0", 0, frames);
+        let mut view = Viewport::default();
+        view.fit(frames, 400.0);
+        assert!(
+            view.frames_per_point > MIN_FRAMES_PER_POINT,
+            "the fixture is fitted, not floored"
+        );
+
+        let columns = envelope_columns(&clip, &peaks, &view, frames, 0.0, 400.0);
+        assert_eq!(columns.len(), 400, "one column per point of the piece");
+        for (_, lo, hi) in &columns {
+            assert!(*lo <= *hi, "a column's min never exceeds its max");
+            assert!(
+                (*hi - 0.5).abs() < 1e-6 && (*lo - 0.5).abs() < 1e-6,
+                "the constant signal reads back as itself: {lo}..{hi}"
+            );
+        }
+
+        // The level is chosen from the zoom: no finer than a column, and no coarser than
+        // it has to be — a column costs one or two bins at any density.
+        let per_column = view.frames_per_point.round() as u64;
+        let level = peaks.level_for(per_column);
+        assert!(peaks.bin_frames(level) <= per_column);
+        if level + 1 < peaks.levels() {
+            assert!(peaks.bin_frames(level + 1) > per_column);
+        }
+
+        // A clip whose region is past the pyramid's frames draws nothing, rather than
+        // repeating the last bin as if it were material.
+        let mut past = clip.clone();
+        past.src_start = frames;
+        assert!(
+            envelope_columns(&past, &peaks, &view, frames, 0.0, 400.0).is_empty(),
+            "no data, no faked columns"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The clip mapping clamps at both ends: frame 0 sits at the left, a fractional
+    /// placement lands where the ratio says, and a frame past the content runs off the plot
+    /// (the draw clips it) without wrapping or going negative.
     #[test]
     fn the_clip_mapping_is_bounded() {
-        // A zero/empty span draws at the left rather than dividing by zero, at any
-        // canvas width (including a degenerate one).
-        assert_eq!(frame_x(500, 0, 200.0), 0.0);
-        assert_eq!(clip_span(0, 0, 0, 200.0), (0.0, 0.0));
-        assert_eq!(clip_span(500, 500, 1_000, 0.0), (0.0, 0.0));
+        let mut view = Viewport::default();
+        view.fit(0, 200.0);
+        assert_eq!(view.frame_at(0.0, 0), 0, "an empty piece has no frame");
 
-        // A clip at frame 0 starts at the left and spans its own length.
-        assert_eq!(clip_span(0, 500, 1_000, 200.0), (0.0, 100.0));
-
-        // A fractional mapping lands where the ratio says (250/1000 of 200 = 50).
-        let (x, width) = clip_span(250, 250, 1_000, 200.0);
-        assert!((x - 50.0).abs() < 1e-4, "x = {x}");
-        assert!((width - 50.0).abs() < 1e-4, "width = {width}");
-
-        // Past the span, both ends clamp to the right edge: never outside the box.
-        assert_eq!(frame_x(5_000, 1_000, 200.0), 200.0);
-        assert_eq!(clip_span(1_500, 500, 1_000, 200.0), (200.0, 0.0));
-        // A clip that starts before the end and runs past it is truncated there.
-        assert_eq!(clip_span(750, 500, 1_000, 200.0), (150.0, 50.0));
+        // 200,000 frames across 200 points: 1000 frames per point.
+        view.fit(200_000, 200.0);
+        assert_eq!(view.x_at(0), 0.0);
+        assert!((view.x_at(500) - 0.5).abs() < 1e-4);
+        assert!((view.x_at(250) - 0.25).abs() < 1e-4);
+        assert!(
+            (view.x_at(200_000) - 200.0).abs() < 1e-4,
+            "the end is the plot's edge"
+        );
+        assert!((view.x_at(5_000) - 5.0).abs() < 1e-4);
+        // A frame before the viewport start clamps to the left edge (saturating), never a
+        // wrapped or negative x.
+        view.scroll(200_000, 200.0, 1);
+        assert_eq!(view.x_at(0), 0.0);
     }
 
     /// The span is the arrangement's end or the furthest frame played, whichever is
@@ -2481,6 +3678,119 @@ mod timeline {
             // redraw; there is no renderer here, so this is where "builds" is pinned.
             let _ = spike.timeline();
         }
+    }
+}
+
+#[cfg(test)]
+mod wave {
+    use super::*;
+
+    /// A stereo float-WAV fixture at the session rate: a left channel and its inverse, so
+    /// a channel mix-up is visible in the peaks.
+    fn fixture(name: &str, frames: usize) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("{name}-{}.wav", std::process::id()));
+        let mut writer =
+            media::wav::WavWriter::create_float(&path, SAMPLE_RATE as u32, 2).expect("create");
+        let mut interleaved = Vec::with_capacity(frames * 2);
+        for i in 0..frames {
+            let sample = (i as f32 / 64.0).sin() * 0.4;
+            interleaved.push(sample);
+            interleaved.push(-sample);
+        }
+        writer.write(&interleaved).expect("samples");
+        writer.finalize().expect("finalize");
+        path
+    }
+
+    /// `--wave` end to end, headless: the file is imported into the session pool, the
+    /// script it builds places **consecutive** clips (so the region offset is exercised),
+    /// the host publishes the arrangement, and the shell loads each source's persisted
+    /// pyramid — which is what the canvas draws an envelope from.
+    ///
+    /// This is the one test that covers the whole slice without a window: import → pool →
+    /// sidecar → level-aware envelope query.
+    #[test]
+    fn a_wave_becomes_a_piece_the_timeline_can_draw() {
+        let frames = 48_000usize; // 1 s per channel
+        let path = fixture("iced-wave-fixture", frames);
+
+        let (script, note) = wave_script(&path).expect("the import builds a script");
+        assert!(script.starts_with("host v1"), "{script}");
+        assert!(
+            script.contains("pool "),
+            "the script binds the pool: {script}"
+        );
+        // One clip per channel per cut — the import splits a stereo file into two mono
+        // sources, and each is cut into [`WAVE_CLIPS_PER_SOURCE`] consecutive clips.
+        let expected_clips = WAVE_CLIPS_PER_SOURCE as usize * 2;
+        assert_eq!(script.matches("add_clip").count(), expected_clips);
+        assert!(note.contains("2 track(s)"), "{note}");
+
+        let mut spike = Spike::headless();
+        spike.open_wave(&path);
+        assert!(
+            spike.status.contains("clip(s)"),
+            "the shell reports what it loaded: {}",
+            spike.status
+        );
+        // The poll tick is where the pyramids are read — the same path the window takes.
+        spike.update(Message::Tick);
+
+        let timeline = spike
+            .snap
+            .timeline
+            .timeline
+            .clone()
+            .expect("the arrangement is published");
+        assert_eq!(timeline.tracks.len(), 2, "one track per channel");
+        let clips: usize = timeline.tracks.iter().map(|track| track.clips.len()).sum();
+        assert_eq!(clips, expected_clips, "the piece has real clips to draw");
+
+        // The second clip of the first track reads a region that does not start at 0 —
+        // the case a peaks mapping gets wrong by drawing the pyramid from frame 0.
+        let second = timeline.tracks[0].clips[1].clone();
+        assert!(second.src_start > 0, "a cut-up clip has a region offset");
+        let peaks = match spike.peaks.get(&second.source) {
+            Some(SourcePeaks::Loaded(peaks)) => Arc::clone(peaks),
+            Some(SourcePeaks::Missing(why)) => panic!("no peaks for {}: {why}", second.source),
+            None => panic!("{} was never loaded", second.source),
+        };
+        assert_eq!(peaks.frames(), frames as u64);
+
+        // And a draw of that clip's region, at the shell's fitted view, finds an envelope
+        // there — the last link between the sidecar and the canvas.
+        let mut view = Viewport::default();
+        view.fit(timeline.end_frame().expect("an end"), 400.0);
+        let columns = envelope_columns(
+            &second,
+            &peaks,
+            &view,
+            timeline.end_frame().unwrap(),
+            0.0,
+            400.0,
+        );
+        assert!(
+            !columns.is_empty(),
+            "the imported source's pyramid answers an envelope query"
+        );
+        // The fixture swings ±0.4, so the drawn extremes are inside [-0.4, 0.4] and at
+        // least one column is non-silent.
+        assert!(columns.iter().any(|(_, lo, hi)| *hi > 0.1 || *lo < -0.1));
+        assert!(columns.iter().all(|(_, lo, hi)| *lo >= -0.5 && *hi <= 0.5));
+
+        // The import wrote sources into the spike's **real** session pool, so the test
+        // takes its own material back out: the pool is shared with `--record-check`, and a
+        // test that left fixtures there would grow it on every run.
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            && let Ok(entries) = std::fs::read_dir(demo_pool_dir())
+        {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(stem) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }
 
